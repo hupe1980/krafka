@@ -10,12 +10,12 @@
 //! - Supports HTTP and HTTPS, GET / POST / DELETE with JSON bodies.
 //! - Handles both `Content-Length` and `Transfer-Encoding: chunked` response
 //!   bodies.
-//! - Response bodies are capped at [`MAX_BODY_BYTES`] to prevent runaway
+//! - Response bodies are capped at `MAX_BODY_BYTES` to prevent runaway
 //!   memory consumption on malicious or buggy servers.
 //! - Every status / header / chunk-size / trailer line is capped at
-//!   [`MAX_LINE_BYTES`] and the header block at [`MAX_HEADERS`] entries, so a
+//!   `MAX_LINE_BYTES` and the header block at `MAX_HEADERS` entries, so a
 //!   hostile server cannot exhaust memory by streaming an endless "header".
-//! - A wall-clock timeout always applies (see [`DEFAULT_HTTP_TIMEOUT`]), so a
+//! - A wall-clock timeout always applies (see `DEFAULT_HTTP_TIMEOUT`), so a
 //!   slowloris peer cannot pin a task forever.
 
 use std::sync::Arc;
@@ -45,7 +45,7 @@ const MAX_LINE_BYTES: u64 = 8 * 1024;
 /// Hard cap on the number of response header lines accepted.
 ///
 /// Prevents a server from streaming an unbounded number of short header lines
-/// (each individually under [`MAX_LINE_BYTES`]) to the same effect.
+/// (each individually under `MAX_LINE_BYTES`) to the same effect.
 const MAX_HEADERS: usize = 100;
 
 /// Hard cap on the number of trailer lines accepted after a chunked body.
@@ -59,7 +59,7 @@ const MAX_TRAILERS: usize = 32;
 pub(crate) const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Read one newline-terminated line, rejecting anything longer than
-/// [`MAX_LINE_BYTES`].
+/// `MAX_LINE_BYTES`.
 ///
 /// `BufReader::read_line` is unbounded by design, so the reader is wrapped in
 /// `take(MAX_LINE_BYTES + 1)` for the duration of the read. Coming back with
@@ -263,7 +263,7 @@ pub(crate) struct HttpClient {
     tls_config: Arc<rustls::ClientConfig>,
     /// Wall-clock budget for one request (connect + TLS + write + read).
     ///
-    /// Always set: callers that pass `None` get [`DEFAULT_HTTP_TIMEOUT`].
+    /// Always set: callers that pass `None` get `DEFAULT_HTTP_TIMEOUT`.
     timeout: Duration,
 }
 
@@ -272,7 +272,7 @@ impl HttpClient {
     /// WebPKI trust roots bundled in the `webpki-roots` crate.
     ///
     /// `timeout` bounds the whole request. `None` selects
-    /// [`DEFAULT_HTTP_TIMEOUT`] rather than disabling the bound.
+    /// `DEFAULT_HTTP_TIMEOUT` rather than disabling the bound.
     pub fn with_webpki_roots(timeout: Option<Duration>) -> Result<Self> {
         let tls_config = make_tls_config()?;
         Ok(Self {
@@ -433,8 +433,8 @@ async fn do_request(
 /// Parse a complete HTTP/1.1 response.
 ///
 /// Every read is bounded: the status line, each header line and each chunk
-/// header at [`MAX_LINE_BYTES`]; the header block at [`MAX_HEADERS`] lines;
-/// the body at [`MAX_BODY_BYTES`] — enforced *before* allocating in every
+/// header at `MAX_LINE_BYTES`; the header block at `MAX_HEADERS` lines;
+/// the body at `MAX_BODY_BYTES` — enforced *before* allocating in every
 /// branch, including the `Connection: close` read-to-EOF path.
 async fn read_response<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) -> Result<HttpResponse> {
     // Status line: `HTTP/1.1 200 OK\r\n`

@@ -23,6 +23,11 @@ enumerate every location that declares krafka's version and require it to equal
 
 Snippets may abbreviate to `MAJOR.MINOR` (`"0.15"`), which is what Cargo
 resolves anyway; a snippet naming a *different* minor is an error.
+
+Rule 3 mostly has nothing to check now: the guides install with `cargo add`,
+which names no version at all, so a bump cannot make them stale. That took the
+count from 21 declarations to 3. The rule stays because the cheapest moment to
+catch a hand-written `krafka = "0.17"` is the moment someone adds one.
 """
 
 from __future__ import annotations

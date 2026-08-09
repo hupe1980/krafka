@@ -17,7 +17,9 @@ mod record;
 mod retry;
 mod transaction;
 
-pub use accumulator::{AccumulatorConfig, RecordAccumulator, RecordAccumulatorHandle};
+pub use accumulator::{
+    AccumulatorConfig, DeliveryHandle, RecordAccumulator, RecordAccumulatorHandle,
+};
 pub use config::{Acks, ProducerConfig};
 pub use idempotent::{
     PartitionSequenceSnapshot, ProducerIdentity, ProducerIdentitySnapshot, ProducerStateStore,
@@ -30,16 +32,15 @@ pub use partitioner::{
 pub use record::{DeliveryConfirmation, ProducerRecord, RecordMetadata};
 pub use retry::{RetryContext, RetryPolicy};
 pub use transaction::{
-    TopicPartitionOffset, TransactionState, TransactionVersion, TransactionalProducer,
-    TransactionalProducerBuilder, TransactionalProducerConfig,
+    PreparedTxnState, TopicPartitionOffset, TransactionOutcome, TransactionState,
+    TransactionVersion, TransactionalProducer, TransactionalProducerBuilder,
+    TransactionalProducerConfig,
 };
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
 use std::time::{Duration, Instant};
 
-use bytes::{BufMut as _, Bytes};
-use tokio::sync::Semaphore;
+use bytes::Bytes;
 use tracing::{debug, info, warn};
 
 use crate::PartitionId;
@@ -49,27 +50,13 @@ use crate::metadata::ClusterMetadata;
 use crate::metrics::{ConnectionMetrics, ProducerMetrics as ProducerMetricsInner};
 use crate::network::{ConnectionConfig, ConnectionPool};
 use crate::protocol::{
-    ApiKey, Compression, InitProducerIdRequest, InitProducerIdResponse, ProducePartitionData,
-    ProduceRequest, ProduceResponse, ProduceTopicData, RecordBatchBuilder, VersionedDecode,
-    VersionedEncode, versions,
+    ApiKey, Compression, InitProducerIdRequest, InitProducerIdResponse, ProduceRequest,
+    ProduceResponse, VersionedDecode, VersionedEncode, versions,
 };
 use crate::serdes::Serializer;
 
 use self::idempotent::ErasedProducerStateStore;
-use self::record::{RoutedRecord, TopicHandle};
-use crate::barrier::{InFlightBarrier, InFlightOpGuard};
-
-struct SendMemoryReservation {
-    bytes: usize,
-    memory_permits: Arc<Semaphore>,
-    _buffered_record_guard: accumulator::BufferedRecordGuard,
-}
-
-impl Drop for SendMemoryReservation {
-    fn drop(&mut self) {
-        self.memory_permits.add_permits(self.bytes);
-    }
-}
+use crate::barrier::InFlightBarrier;
 
 /// A Kafka producer.
 pub struct Producer {
@@ -81,35 +68,23 @@ pub struct Producer {
     pool: Arc<ConnectionPool>,
     /// Partitioner.
     partitioner: Arc<dyn Partitioner>,
-    /// Record accumulator for batching (when linger > 0).
-    accumulator: Option<RecordAccumulatorHandle>,
+    /// Record accumulator.
+    ///
+    /// Every send goes through it, at every `linger` setting including zero —
+    /// see [`ProducerBuilder::linger`]. There is deliberately no second,
+    /// unbatched send path: it duplicated the retry, sequence-recovery,
+    /// leader-hint and dead-letter logic, and it had no per-partition dispatch
+    /// FIFO, so concurrent sends to one partition could reach the broker out of
+    /// sequence order and fail an idempotent producer permanently.
+    accumulator: RecordAccumulatorHandle,
     /// Barrier over all started send operations and shutdown state.
     in_flight_barrier: Arc<InFlightBarrier>,
-    /// Retry policy for transient failures.
-    retry_policy: RetryPolicy,
     /// Shared metrics.
     metrics: Arc<ProducerMetricsInner>,
-    /// FIFO memory gate used by the direct-send path when linger = 0.
-    memory_permits: Arc<Semaphore>,
-    /// Effective producer memory capacity after semaphore-limit clamping.
-    memory_capacity: usize,
-    /// Maximum encoded Kafka request frame size in bytes.
-    /// Records exceeding this limit are rejected before reaching the network.
-    max_request_size: usize,
-    /// Number of records currently admitted into the direct-send path.
-    buffered_records: Arc<AtomicUsize>,
-    /// Semaphore limiting concurrent in-flight requests per producer.
-    in_flight_semaphore: Arc<Semaphore>,
     /// Producer interceptor.
     interceptor: Arc<dyn crate::interceptor::ProducerInterceptor>,
     /// Producer identity for idempotent production (PID, epoch, sequences).
     identity: Option<Arc<ProducerIdentity>>,
-    /// Optional pluggable persistence hook for producer identity state.
-    ///
-    /// When set, a snapshot is persisted (fire-and-forget) after each
-    /// successful batch acknowledgement and loaded once during `build()` to
-    /// restore sequence state for transactional producers.
-    state_store: Option<Arc<dyn ErasedProducerStateStore>>,
     /// Optional key encoder applied transparently in `send_record`.
     ///
     /// When set, the record key is passed through this encoder (schema
@@ -123,12 +98,6 @@ pub struct Producer {
     /// `send_record` call.  Equivalent to `value.serializer` in the Java
     /// `KafkaProducer`.
     value_serializer: Option<Arc<dyn Serializer>>,
-    /// Optional dead-letter queue for permanently-failed records.
-    ///
-    /// When set, records on the direct-send path (linger = 0) that exhaust
-    /// all retries or hit a non-retriable error are routed here before the
-    /// error is returned to the caller.
-    dlq: Option<Arc<dyn crate::dlq::DeadLetterQueue>>,
     /// Whether this client owns its connection pool.
     ///
     /// `false` when the pool was borrowed from a
@@ -138,16 +107,6 @@ pub struct Producer {
     /// connections and fail their in-flight requests — which is what happened
     /// until `AdminClient`'s handling of this was extended to its siblings.
     pool_owned: bool,
-}
-
-fn is_unknown_producer_id_error(error: &KrafkaError) -> bool {
-    matches!(
-        error,
-        KrafkaError::Broker {
-            code: ErrorCode::UnknownProducerId,
-            ..
-        }
-    )
 }
 
 async fn init_idempotent_producer_id(
@@ -325,18 +284,17 @@ async fn recover_unknown_producer_id(
     // lock) pair: no concurrent thread can allocate sequences against the
     // current PID between the retryability check and the state reset.
     //
-    // On the accumulator path this check effectively always succeeds: the
-    // per-partition dispatch FIFO guarantees this batch is the only one in
-    // flight for its partition, so no newer allocation can exist. It can still
-    // fail on the direct-send path (linger = 0), where several sends to one
-    // partition run concurrently up to `max_in_flight`.
+    // This check effectively always succeeds: the per-partition dispatch FIFO
+    // guarantees this batch is the only one in flight for its partition, so no
+    // newer allocation can exist. It is kept because the invariant is the
+    // reason the in-place recovery below is sound, and a future change that
+    // broke it would otherwise corrupt sequences silently.
     if !identity.check_and_reset_if_retryable(topic, partition, base_sequence, record_count)? {
         // Previously this poisoned the identity, permanently bricking the
-        // producer whenever more than one batch was outstanding — which is the
-        // normal state at the default `max_in_flight = 5`. Instead, request a
-        // re-initialisation: the next dispatch obtains a fresh PID and restarts
-        // every partition at sequence 0. Concurrent batches still using the old
-        // PID fail and are retried under the new one.
+        // producer whenever more than one batch was outstanding. Instead,
+        // request a re-initialisation: the next dispatch obtains a fresh PID
+        // and restarts every partition at sequence 0. Concurrent batches still
+        // using the old PID fail and are retried under the new one.
         warn!(
             topic,
             partition,
@@ -521,10 +479,7 @@ impl std::fmt::Debug for Producer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Producer")
             .field("client_id", &self.config.client_id)
-            .field("batching", &self.accumulator.is_some())
             .field("idempotent", &self.identity.is_some())
-            .field("max_request_size", &self.max_request_size)
-            .field("memory_capacity", &self.memory_capacity)
             .field("connections", &self.pool.len())
             .field("owns_pool", &self.owns_pool())
             .finish_non_exhaustive()
@@ -535,41 +490,6 @@ impl Producer {
     /// Create a new producer builder.
     pub fn builder() -> ProducerBuilder {
         ProducerBuilder::default()
-    }
-
-    async fn reserve_send_memory(&self, record_size: usize) -> Result<SendMemoryReservation> {
-        accumulator::check_record_admission(
-            record_size,
-            self.memory_capacity,
-            self.max_request_size,
-        )?;
-
-        let permit = match tokio::time::timeout(
-            self.config.max_block,
-            self.memory_permits.acquire_many(record_size as u32),
-        )
-        .await
-        {
-            Ok(Ok(permit)) => permit,
-            Ok(Err(_)) => return Err(KrafkaError::invalid_state("producer memory gate closed")),
-            Err(_) => {
-                return Err(KrafkaError::timeout(
-                    "producer send: max_block exceeded while waiting for buffer memory \
-                     (ProducerConfig::max_block)",
-                ));
-            }
-        };
-
-        permit.forget();
-
-        Ok(SendMemoryReservation {
-            bytes: record_size,
-            memory_permits: self.memory_permits.clone(),
-            _buffered_record_guard: accumulator::BufferedRecordGuard::new(
-                self.buffered_records.clone(),
-                self.metrics.clone(),
-            ),
-        })
     }
 
     /// Create a new producer with the given configuration.
@@ -598,11 +518,6 @@ impl Producer {
 
             if let Some(ref auth) = config.auth {
                 pool_config_builder = pool_config_builder.auth(auth.clone());
-            }
-
-            #[cfg(feature = "socks5")]
-            if let Some(ref proxy) = config.proxy {
-                pool_config_builder = pool_config_builder.proxy(proxy.clone());
             }
 
             let mut pool_config = pool_config_builder.build()?;
@@ -700,9 +615,10 @@ impl Producer {
         // boundaries to stick to. That is pre-KIP-480 behaviour and is actively
         // harmful: round-robin spreads consecutive records across every
         // partition, so a topic with N partitions produces N separate Produce
-        // requests where sticky produces one. Sticky partitioning still helps at
-        // linger = 0 because records that arrive while a request is in flight
-        // coalesce behind it.
+        // requests where sticky produces one. Sticky partitioning helps at
+        // `linger = 0` too, because records that arrive while a request is in
+        // flight coalesce into the batch behind it — see
+        // `RecordAccumulator::dispatch_unblocked_partitions`.
         let partitioner: Arc<dyn Partitioner> =
             partitioner.unwrap_or_else(|| Arc::new(UniformStickyPartitioner::new()));
 
@@ -715,9 +631,6 @@ impl Producer {
 
         // Shared metrics
         let metrics = Arc::new(ProducerMetricsInner::default());
-        let memory_capacity = accumulator::effective_memory_capacity(config.buffer_memory);
-        let memory_permits = Arc::new(Semaphore::new(memory_capacity));
-        let buffered_records = Arc::new(AtomicUsize::new(0));
 
         if config.buffer_memory == 0 {
             warn!(
@@ -726,42 +639,35 @@ impl Producer {
             );
         }
 
-        // In-flight semaphore (shared between direct and batched send paths)
-        let in_flight_semaphore = Arc::new(Semaphore::new(config.max_in_flight));
         let in_flight_barrier = Arc::new(InFlightBarrier::new());
 
-        // Create accumulator if linger > 0 for batching
-        let accumulator = if !config.linger.is_zero() {
-            let acc_config = accumulator::AccumulatorConfig {
-                batch_size: config.batch_size,
-                linger: config.linger,
-                compression: config.compression,
-                compression_level: config.compression_level,
-                topic_compression: config.topic_compression.clone().into_iter().collect(),
-                acks: config.acks.to_i16(),
-                client_id: config.client_id.clone(),
-                request_timeout: config.request_timeout,
-                max_request_size: config.max_request_size,
-                buffer_memory: config.buffer_memory,
-                max_block_ms: config.max_block,
-                in_flight_semaphore: in_flight_semaphore.clone(),
-                interceptor: interceptor.clone(),
-                identity: identity.clone(),
-                partitioner: partitioner.clone(),
-                state_store: state_store.clone(),
-                transactional_id: None,
-                dead_letter_queue: config.dead_letter_queue.clone(),
-            };
-            Some(accumulator::RecordAccumulator::spawn(
-                acc_config,
-                metadata.clone(),
-                retry_policy.clone(),
-                metrics.clone(),
-                in_flight_barrier.clone(),
-            ))
-        } else {
-            None
+        // One send path, always. See `Producer::accumulator`.
+        let acc_config = accumulator::AccumulatorConfig {
+            batch_size: config.batch_size,
+            linger: config.linger,
+            compression: config.compression,
+            compression_level: config.compression_level,
+            topic_compression: config.topic_compression.clone().into_iter().collect(),
+            acks: config.acks.to_i16(),
+            client_id: config.client_id.clone(),
+            request_timeout: config.request_timeout,
+            max_request_size: config.max_request_size,
+            buffer_memory: config.buffer_memory,
+            max_block_ms: config.max_block,
+            interceptor: interceptor.clone(),
+            identity: identity.clone(),
+            partitioner: partitioner.clone(),
+            state_store: state_store.clone(),
+            transactional_id: None,
+            dead_letter_queue: config.dead_letter_queue.clone(),
         };
+        let accumulator = accumulator::RecordAccumulator::spawn(
+            acc_config,
+            metadata.clone(),
+            retry_policy.clone(),
+            metrics.clone(),
+            in_flight_barrier.clone(),
+        );
 
         Ok(Self {
             config: config.clone(),
@@ -770,19 +676,11 @@ impl Producer {
             partitioner,
             accumulator,
             in_flight_barrier,
-            retry_policy,
             metrics,
-            memory_permits,
-            memory_capacity,
-            max_request_size: config.max_request_size,
-            buffered_records,
-            in_flight_semaphore,
             interceptor,
             identity,
-            state_store,
             key_serializer,
             value_serializer,
-            dlq: config.dead_letter_queue,
             pool_owned,
         })
     }
@@ -835,15 +733,72 @@ impl Producer {
         self.send_record(record).await
     }
 
-    /// Send a producer record.
+    /// Send a producer record and wait for the broker to acknowledge it.
+    ///
+    /// Equivalent to `enqueue(record).await?.await`. Use
+    /// [`enqueue`](Self::enqueue) when you need several records in flight at
+    /// once — awaiting each acknowledgement before sending the next costs a
+    /// full round trip per record.
     pub async fn send_record(&self, record: ProducerRecord) -> Result<RecordMetadata> {
+        self.enqueue(record).await?.await
+    }
+
+    /// Queue a record for sending and return as soon as it is **queued**.
+    ///
+    /// The returned [`DeliveryHandle`] resolves to the broker's answer. This is
+    /// the shape of Java's `Producer.send()`, and it exists for the same
+    /// reason: separating "this record has taken its place in the stream" from
+    /// "this record is durable" is what lets a caller pipeline without giving
+    /// up ordering.
+    ///
+    /// # Ordering
+    ///
+    /// **Produce order is enqueue order.** If `enqueue(a)` returns before
+    /// `enqueue(b)` is called, `a` reaches its partition before `b` — whatever
+    /// order the two handles are polled in, and whether or not they are polled
+    /// at all.
+    ///
+    /// That guarantee is why this method exists. [`send_record`](Self::send_record)
+    /// fuses the enqueue and the acknowledgement into one future, so a caller
+    /// who builds N of them and polls them concurrently gets records appended in
+    /// *poll* order, not call order — and under buffer-memory backpressure the
+    /// two diverge, because a send that cannot get its permit yields and lets a
+    /// later one append first. Pipelining on top of the fused future therefore
+    /// requires polling every outstanding future in submission order on every
+    /// wake, which is both subtle and O(window) per wake.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use futures::stream::{FuturesUnordered, StreamExt};
+    /// use krafka::producer::{Producer, ProducerRecord};
+    ///
+    /// # async fn example(producer: &Producer) -> Result<(), krafka::error::KrafkaError> {
+    /// let mut acks = FuturesUnordered::new();
+    /// for i in 0..1000 {
+    ///     // Ordering is fixed here, in loop order.
+    ///     acks.push(producer.enqueue(ProducerRecord::new("events", vec![i as u8])).await?);
+    /// }
+    /// // Completion order is irrelevant to what the broker stored.
+    /// while let Some(result) = acks.next().await {
+    ///     let metadata = result?;
+    ///     let _ = metadata.offset;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// The outer `Result` covers everything up to and including the enqueue:
+    /// interceptors, serializers, record validation, unknown topics, and the
+    /// up-to-`max_block` wait for buffer memory. The handle covers delivery.
+    pub async fn enqueue(&self, record: ProducerRecord) -> Result<DeliveryHandle> {
         // `delivery.timeout.ms` covers everything from `send()` entry, so
         // the clock starts here — before schema encoding, partition lookup and,
-        // critically, before the up-to-`max_block` wait for buffer memory in
-        // `reserve_send_memory`. Starting it at the first network attempt (as
-        // this path used to) silently excluded up to 60 s of blocking from the
-        // delivery budget. The accumulator path already charges from the moment
-        // the first record entered the batch.
+        // critically, before the up-to-`max_block` wait for buffer memory.
+        // Starting it at the first network attempt silently excluded up to 60 s
+        // of blocking from the delivery budget.
         let send_started_at = Instant::now();
         let operation_guard = self.in_flight_barrier.start("producer")?;
 
@@ -894,596 +849,22 @@ impl Producer {
             }
         };
 
-        // Use accumulator for batching if available (linger > 0)
-        if let Some(ref accumulator) = self.accumulator {
-            return accumulator
-                .append_routed_with_guard(topic, record, record_size, partition, operation_guard)
-                .await;
-        }
-
-        // Direct send (non-batched mode when linger = 0)
-        self.send_to_partition(
-            topic,
-            partition,
-            record,
-            record_size,
-            operation_guard,
-            send_started_at,
-        )
-        .await
-    }
-
-    /// Send a record to a specific partition.
-    ///
-    /// Retries transient failures with exponential backoff.
-    /// Triggers metadata refresh on leader-change errors.
-    /// Limits concurrent in-flight requests via semaphore (max_in_flight).
-    /// For idempotent producers, tracks sequence numbers and handles
-    /// `OutOfOrderSequenceNumber` with sequence reset + batch rebuild.
-    async fn send_to_partition(
-        &self,
-        topic: TopicHandle,
-        partition: PartitionId,
-        record: RoutedRecord,
-        record_size: usize,
-        operation_guard: InFlightOpGuard,
-        send_started_at: Instant,
-    ) -> Result<RecordMetadata> {
-        let _operation_guard = operation_guard;
-        let _memory_reservation = self.reserve_send_memory(record_size).await?;
-
-        // Build the owned topic string once for RecordMetadata construction,
-        // avoiding repeated allocations in the retry loop.
-        let topic_owned = topic.to_string();
-
-        // Ensure the idempotent PID is initialized before acquiring the in-flight
-        // permit. This keeps the semaphore pressure zero during the init RPC.
-        if let Some(identity) = self.identity.as_ref() {
-            ensure_idempotent_producer_id_initialized(identity, &self.metadata, &self.retry_policy)
-                .await?;
-        }
-
-        // Acquire in-flight permit before sending
-        let _permit = self
-            .in_flight_semaphore
-            .acquire()
-            .await
-            .map_err(|_| KrafkaError::invalid_state("in-flight semaphore closed"))?;
-
-        // Allocate sequence for idempotent production (before retry loop — retries
-        // must resend the same sequence for the broker to de-duplicate).
-        //
-        // Uses checked_allocate_sequence to atomically verify that the identity
-        // is still initialized at the moment of allocation, eliminating the TOCTOU
-        // window where a concurrent reset() could clear the PID between
-        // is_initialized() and next_sequence().
-        let mut sequence: Option<i32> = if let Some(ref identity) = self.identity {
-            match identity.checked_allocate_sequence(topic.as_ref(), partition, 1)? {
-                Some(seq) => Some(seq),
-                None => {
-                    // Race: identity was reset between ensure_initialized and now.
-                    // Re-initialize and retry the allocation once.
-                    ensure_idempotent_producer_id_initialized(
-                        identity,
-                        &self.metadata,
-                        &self.retry_policy,
-                    )
-                    .await?;
-                    Some(identity.checked_allocate_sequence(topic.as_ref(), partition, 1)?.ok_or_else(|| {
-                        KrafkaError::invalid_state(
-                            "producer identity reset during sequence allocation; retry the send",
-                        )
-                    })?)
-                }
-            }
-        } else {
-            None
-        };
-
-        // Build the produce request once (reused across retries).
-        let mut request =
-            match self.build_produce_request(topic.as_ref(), partition, &record, sequence) {
-                Ok(r) => r,
-                Err(e) => {
-                    if let (Some(identity), Some(base)) = (self.identity.as_ref(), sequence) {
-                        Self::release_failed_sequence(identity, topic.as_ref(), partition, base);
-                    }
-                    return Err(e);
-                }
-            };
-
-        // Charge the delivery-timeout budget from `send_record` entry, so
-        // buffer-memory blocking counts against it (Java semantics).
-        let mut retry_ctx = RetryContext::new_with_start(
-            self.retry_policy.clone(),
-            format!("produce({topic}-{partition})"),
-            send_started_at,
-        );
-
-        loop {
-            let mut leader_hint_applied = false;
-            let result = self
-                .do_send(
-                    topic.as_ref(),
-                    partition,
-                    &request,
-                    &mut leader_hint_applied,
-                )
-                .await;
-            // Convert DuplicateSequenceNumber to success — the broker
-            // already committed this batch (idempotent dedup worked).
-            let result = if let Err(KrafkaError::Broker { code, .. }) = &result
-                && *code == ErrorCode::DuplicateSequenceNumber
-                && self.identity.is_some()
-            {
-                debug!(
-                    topic = %topic,
-                    partition = partition,
-                    "DuplicateSequenceNumber — dedup confirmed"
-                );
-                Ok(RecordMetadata {
-                    topic: topic_owned.clone(),
-                    partition,
-                    offset: -1,
-                    timestamp: -1,
-                    delivery: DeliveryConfirmation::Deduplicated,
-                })
-            } else {
-                result
-            };
-
-            match result {
-                Ok(metadata) => {
-                    retry_ctx.record_success();
-
-                    // Acknowledge sequence on success and persist state.
-                    if let (Some(identity), Some(seq)) = (&self.identity, sequence) {
-                        identity.acknowledge(topic.as_ref(), partition, seq);
-
-                        // Fire-and-forget snapshot persistence.  Errors are
-                        // logged and do not fail the produce operation.
-                        if let Some(ref store) = self.state_store {
-                            let snapshot = identity.snapshot();
-                            let store = Arc::clone(store);
-                            tokio::spawn(async move {
-                                if let Err(err) = store.store_erased(&snapshot).await {
-                                    warn!(error = %err, "Failed to persist producer state snapshot");
-                                }
-                            });
-                        }
-                    }
-
-                    self.metrics
-                        .record_send_for_topic(topic.as_ref(), record.payload_size_bytes());
-                    self.metrics.connections.set(self.pool.len() as u64);
-                    crate::interceptor::safe_on_acknowledgement(
-                        &*self.interceptor,
-                        &metadata,
-                        None,
-                    );
-                    return Ok(metadata);
-                }
-                Err(e) => {
-                    if is_unknown_producer_id_error(&e)
-                        && let (Some(identity), Some(current_sequence)) =
-                            (self.identity.as_ref(), sequence)
-                    {
-                        warn!(
-                            topic = %topic,
-                            partition = partition,
-                            "UnknownProducerId, reinitializing idempotent producer state"
-                        );
-                        let new_sequence = match recover_unknown_producer_id(
-                            identity,
-                            &self.metadata,
-                            &self.retry_policy,
-                            topic.as_ref(),
-                            partition,
-                            current_sequence,
-                            1,
-                        )
-                        .await
-                        {
-                            Ok(new_sequence) => new_sequence,
-                            Err(recovery_error) => {
-                                self.metrics.record_error_for_topic(topic.as_ref());
-                                let dummy_metadata = RecordMetadata {
-                                    topic: topic_owned.clone(),
-                                    partition,
-                                    offset: -1,
-                                    timestamp: 0,
-                                    delivery: DeliveryConfirmation::Failed,
-                                };
-                                crate::interceptor::safe_on_acknowledgement(
-                                    &*self.interceptor,
-                                    &dummy_metadata,
-                                    Some(&recovery_error),
-                                );
-                                return Err(recovery_error);
-                            }
-                        };
-                        sequence = Some(new_sequence);
-                        match self.build_produce_request(
-                            topic.as_ref(),
-                            partition,
-                            &record,
-                            sequence,
-                        ) {
-                            Ok(new_request) => request = new_request,
-                            Err(build_error) => {
-                                if let Some(base) = sequence {
-                                    Self::release_failed_sequence(
-                                        identity,
-                                        topic.as_ref(),
-                                        partition,
-                                        base,
-                                    );
-                                }
-                                self.metrics.record_error_for_topic(topic.as_ref());
-                                let dummy_metadata = RecordMetadata {
-                                    topic: topic_owned.clone(),
-                                    partition,
-                                    offset: -1,
-                                    timestamp: 0,
-                                    delivery: DeliveryConfirmation::Failed,
-                                };
-                                crate::interceptor::safe_on_acknowledgement(
-                                    &*self.interceptor,
-                                    &dummy_metadata,
-                                    Some(&build_error),
-                                );
-                                return Err(build_error);
-                            }
-                        }
-                    } else if let KrafkaError::Broker { code, .. } = &e
-                        && *code == ErrorCode::OutOfOrderSequenceNumber
-                        && let Some(ref identity) = self.identity
-                    {
-                        // Only rewind when this send is provably
-                        // head-of-line. Otherwise `OUT_OF_ORDER_SEQUENCE_NUMBER`
-                        // means an earlier batch was lost and resending here
-                        // would fill the gap with the wrong data while
-                        // reporting success.
-                        let head_of_line = sequence.is_some_and(|base| {
-                            identity
-                                .can_reset_after_out_of_order(topic.as_ref(), partition, base, 1)
-                                .unwrap_or(false)
-                        });
-                        if !head_of_line {
-                            let fatal = out_of_order_data_loss_error(
-                                topic.as_ref(),
-                                partition,
-                                sequence.unwrap_or(-1),
-                            );
-                            self.metrics.record_error_for_topic(topic.as_ref());
-                            return Err(fatal);
-                        }
-                        warn!(
-                            topic = %topic,
-                            partition = partition,
-                            "OutOfOrderSequenceNumber for head-of-line send, resetting \
-                             sequence and rebuilding batch"
-                        );
-                        let new_seq =
-                            match identity.reset_and_allocate(topic.as_ref(), partition, 1) {
-                                Ok(s) => s,
-                                Err(e) => {
-                                    self.metrics.record_error_for_topic(topic.as_ref());
-                                    return Err(e);
-                                }
-                            };
-                        sequence = Some(new_seq);
-                        match self.build_produce_request(
-                            topic.as_ref(),
-                            partition,
-                            &record,
-                            sequence,
-                        ) {
-                            Ok(r) => request = r,
-                            Err(build_err) => {
-                                // Rollback the freshly allocated sequence
-                                if let Some(base) = sequence {
-                                    Self::release_failed_sequence(
-                                        identity,
-                                        topic.as_ref(),
-                                        partition,
-                                        base,
-                                    );
-                                }
-                                self.metrics.record_error_for_topic(topic.as_ref());
-                                let dummy_metadata = RecordMetadata {
-                                    topic: topic_owned.clone(),
-                                    partition,
-                                    offset: -1,
-                                    timestamp: 0,
-                                    delivery: DeliveryConfirmation::Failed,
-                                };
-                                crate::interceptor::safe_on_acknowledgement(
-                                    &*self.interceptor,
-                                    &dummy_metadata,
-                                    Some(&build_err),
-                                );
-                                return Err(build_err);
-                            }
-                        }
-                        // Fall through to retry logic (OOSN is retriable)
-                    } else if e.is_retriable() && !leader_hint_applied {
-                        // The broker did not name a replacement leader, so the
-                        // only way to learn where this partition moved is to
-                        // ask. Refresh metadata on leader-not-available /
-                        // not-leader errors.
-                        debug!(
-                            topic = %topic,
-                            partition = partition,
-                            error = %e,
-                            "Transient error, refreshing metadata"
-                        );
-                        if let Err(refresh_err) = self
-                            .metadata
-                            .refresh_for_topics_forced(Some(&[topic.as_ref()]))
-                            .await
-                        {
-                            debug!(error = %refresh_err, "Metadata refresh failed during retry");
-                        }
-                    }
-
-                    if let Some(backoff) = retry_ctx.record_failure(&e) {
-                        self.metrics.retries.inc();
-                        retry_ctx.wait(backoff).await;
-                        continue;
-                    }
-                    // Final failure — return the unused sequence so the next
-                    // send doesn't trigger an unnecessary OOSN round-trip. Only
-                    // safe when this send still owns the tail of the partition's
-                    // allocated range.
-                    if let (Some(identity), Some(base)) = (self.identity.as_ref(), sequence) {
-                        Self::release_failed_sequence(identity, topic.as_ref(), partition, base);
-                    }
-                    self.metrics.record_error_for_topic(topic.as_ref());
-                    let dummy_metadata = RecordMetadata {
-                        topic: topic_owned.clone(),
-                        partition,
-                        offset: -1,
-                        timestamp: 0,
-                        delivery: DeliveryConfirmation::Failed,
-                    };
-                    crate::interceptor::safe_on_acknowledgement(
-                        &*self.interceptor,
-                        &dummy_metadata,
-                        Some(&e),
-                    );
-                    // Route to dead-letter queue if configured.
-                    if let Some(ref dlq) = self.dlq {
-                        let dlq_record = ProducerRecord {
-                            topic: topic_owned.clone(),
-                            partition: Some(partition),
-                            key: record.key.clone(),
-                            value: record.value.clone(),
-                            timestamp: record.timestamp,
-                            headers: record.headers.clone(),
-                            record_name: None,
-                        };
-                        dlq.send(dlq_record, e.to_string()).await;
-                    }
-                    return Err(e);
-                }
-            }
-        }
-    }
-
-    /// Return an unused single-record sequence to the partition counter.
-    ///
-    /// Only rewinds when this send still owns the tail of the partition's
-    /// allocated range. If a concurrent send has already allocated past
-    /// it, rewinding would hand the same sequence to two requests, so instead
-    /// the partition's sequences are dropped and a producer-ID re-init is
-    /// requested for the next dispatch.
-    fn release_failed_sequence(
-        identity: &ProducerIdentity,
-        topic: &str,
-        partition: PartitionId,
-        base_sequence: i32,
-    ) {
-        match identity.rollback_sequence(topic, partition, base_sequence) {
-            Ok(RollbackOutcome::RolledBack) => {}
-            Ok(RollbackOutcome::NotTail) | Err(_) => {
-                warn!(
-                    topic,
-                    partition,
-                    base_sequence,
-                    "Failed send no longer owns the tail of its sequence range; resetting \
-                     partition sequences and requesting a producer-ID re-init instead of \
-                     rewinding into a newer allocation"
-                );
-                identity.reset_partition_sequences(topic, partition);
-                identity.request_reinit();
-            }
-        }
-    }
-
-    /// Build a produce request for a single record.
-    ///
-    /// When `sequence` is `Some`, the batch is tagged with the idempotent
-    /// producer identity (PID, epoch, base_sequence).
-    fn build_produce_request(
-        &self,
-        topic: &str,
-        partition: PartitionId,
-        record: &RoutedRecord,
-        sequence: Option<i32>,
-    ) -> Result<ProduceRequest> {
-        let mut batch_builder = RecordBatchBuilder::new()
-            .compression(self.config.compression_for(topic))
-            .compression_level(self.config.compression_level);
-
-        // Propagate user-supplied timestamp to the batch
-        if let Some(ts) = record.timestamp {
-            batch_builder = batch_builder.base_timestamp(ts);
-        }
-
-        // Tag with idempotent producer identity
-        if let (Some(identity), Some(seq)) = (&self.identity, sequence) {
-            batch_builder =
-                batch_builder.producer(identity.producer_id(), identity.producer_epoch(), seq);
-        }
-
-        batch_builder = record.append_to_batch_builder(batch_builder);
-
-        let batch = batch_builder.build();
-        let batch_bytes = batch.encode()?;
-
-        Ok(ProduceRequest {
-            transactional_id: None,
-            acks: self.config.acks.to_i16(),
-            timeout_ms: crate::util::duration_to_millis_i32(self.config.request_timeout),
-            topic_data: vec![ProduceTopicData {
-                name: topic.to_string(),
-                topic_id: None,
-                partition_data: vec![ProducePartitionData {
-                    index: partition,
-                    records: batch_bytes,
-                }],
-            }],
-        })
-    }
-
-    /// Single attempt to send a pre-built produce request to a partition.
-    ///
-    /// `leader_hint_applied` is set when the broker rejected the send but named
-    /// the partition's new leader (KIP-951) and that leader was folded into the
-    /// metadata cache. The caller uses it to retry straight away rather than
-    /// paying for a metadata refresh that would only confirm what the cache
-    /// already holds.
-    async fn do_send(
-        &self,
-        topic: &str,
-        partition: PartitionId,
-        request: &ProduceRequest,
-        leader_hint_applied: &mut bool,
-    ) -> Result<RecordMetadata> {
-        *leader_hint_applied = false;
-        let _timer = self.metrics.send_latency.start();
-
-        // Get connection to the leader
-        let conn = self
-            .metadata
-            .get_leader_connection(topic, partition)
-            .await?;
-
-        // Negotiate Produce version for this broker.
-        let mut version = conn
-            .negotiate_api_version(
-                ApiKey::Produce,
-                versions::PRODUCE_MAX,
-                versions::PRODUCE_MIN,
-            )
-            .ok_or_else(|| {
-                KrafkaError::protocol_kind(
-                    ProtocolErrorKind::UnknownApiVersion,
-                    "no mutually supported Produce API version",
-                )
-            })?;
-
-        // KIP-516: Produce v13+ uses topic UUIDs on the wire instead of names.
-        // We need a mutable copy only when filling topic IDs.
-        let mut owned_request;
-        let effective_request: &ProduceRequest = if version >= 13 {
-            owned_request = request.clone();
-            if !fill_produce_topic_ids(&mut owned_request, &self.metadata) {
-                // UUIDs not yet in cache — fall back to name-based v12
-                version = 12;
-                request
-            } else {
-                &owned_request
-            }
-        } else {
-            request
-        };
-
-        // Encode once and validate frame size.  The encoded body is reused in
-        // the I/O path below, eliminating a second encode on the hot path.
-        let encoded_body = encode_and_validate_produce_request(
-            &self.config.client_id,
-            self.config.max_request_size,
-            version,
-            effective_request,
-        )?;
-
-        // acks=0 (fire-and-forget): Kafka sends no response, so don't wait for one (R6.1 fix)
-        if self.config.acks == Acks::None {
-            conn.send_fire_and_forget(ApiKey::Produce, version, |buf| {
-                buf.put_slice(&encoded_body);
-                Ok(())
-            })
-            .await?;
-
-            return Ok(RecordMetadata {
-                topic: topic.to_string(),
+        self.accumulator
+            .enqueue_routed_with_guard(
+                topic,
+                record,
+                record_size,
                 partition,
-                offset: -1, // Unknown — broker doesn't confirm
-                timestamp: -1,
-                delivery: DeliveryConfirmation::Unacknowledged,
-            });
-        }
-
-        // Send request and wait for response (acks=1 or acks=-1/all)
-        let response = conn
-            .send_request(ApiKey::Produce, version, |buf| {
-                buf.put_slice(&encoded_body);
-                Ok(())
-            })
-            .await?;
-
-        // Decode response
-        let mut buf = response;
-        let produce_response = ProduceResponse::decode_versioned(version, &mut buf)?;
-
-        // KIP-219: honour broker-reported throttle time. Produce carries it as
-        // the response's trailing field, so it is picked up here rather than by
-        // the generic leading-field hook in the connection layer.
-        conn.notify_throttle(produce_response.throttle_time_ms);
-
-        // Check for errors
-        for topic_response in &produce_response.responses {
-            for partition_response in &topic_response.partition_responses {
-                if partition_response.index == partition {
-                    if !partition_response.error_code.is_ok() {
-                        *leader_hint_applied = apply_produce_leader_hint(
-                            &self.metadata,
-                            topic,
-                            partition,
-                            &produce_response,
-                            partition_response,
-                        );
-                        return Err(KrafkaError::broker(
-                            partition_response.error_code,
-                            format!("produce failed for {topic}-{partition}"),
-                        ));
-                    }
-
-                    return Ok(RecordMetadata {
-                        topic: topic.to_string(),
-                        partition,
-                        offset: partition_response.base_offset,
-                        timestamp: partition_response.log_append_time_ms,
-                        delivery: DeliveryConfirmation::Offset,
-                    });
-                }
-            }
-        }
-
-        Err(KrafkaError::protocol_kind(
-            ProtocolErrorKind::Malformed,
-            "partition not found in response",
-        ))
+                operation_guard,
+                send_started_at,
+            )
+            .await
     }
 
     /// Flush all pending records.
     pub async fn flush(&self) -> Result<()> {
         let target = self.in_flight_barrier.snapshot();
-        if let Some(ref accumulator) = self.accumulator {
-            accumulator.flush().await?;
-        }
+        self.accumulator.flush().await?;
 
         self.in_flight_barrier.wait_for(target).await;
         Ok(())
@@ -1562,9 +943,7 @@ impl Producer {
 
         let graceful_close = async {
             // Shutdown accumulator first to flush pending records.
-            if let Some(ref accumulator) = self.accumulator
-                && let Err(e) = accumulator.shutdown().await
-            {
+            if let Err(e) = self.accumulator.shutdown().await {
                 warn!("Accumulator shutdown error during close: {e}");
             }
 
@@ -1667,11 +1046,10 @@ impl Drop for Producer {
             return;
         }
 
-        // Take the handle so the accumulator task is not dropped along with
+        // Clone the handle so the accumulator task is not dropped along with
         // `self`; the spawned task keeps it alive until the flush completes.
-        if let Some(accumulator) = self.accumulator.take()
-            && let Ok(runtime) = tokio::runtime::Handle::try_current()
-        {
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let accumulator = self.accumulator.clone();
             drop(runtime.spawn(async move {
                 if let Err(err) = accumulator.shutdown().await {
                     warn!(error = %err, "Best-effort flush on Producer drop failed");
@@ -1779,13 +1157,11 @@ impl ProducerBuilder {
     ///
     /// # Scope
     ///
-    /// Both send paths, batched (`linger > 0`) and direct (`linger = 0`).
-    ///
-    /// This used to be direct-send only, which meant configuring a DLQ
-    /// alongside any batching silently disabled it — and batching is the
-    /// configuration a throughput-tuned producer runs in. The accumulator keeps
-    /// each record's key, value, headers and timestamp for the lifetime of its
-    /// batch, so there was never anything preventing it.
+    /// Every send, at every `linger` setting, and on the
+    /// `TransactionalProducer` too — there is one send path. The accumulator
+    /// keeps each record's key, value, headers and timestamp for the lifetime
+    /// of its batch, which is what makes the record reconstructable at the
+    /// point of permanent failure.
     pub fn dead_letter_queue(mut self, dlq: Arc<dyn crate::dlq::DeadLetterQueue>) -> Self {
         self.config.dead_letter_queue = Some(dlq);
         self
@@ -1816,7 +1192,7 @@ impl ProducerBuilder {
     /// Route all broker connections through a SOCKS5 proxy.
     #[cfg(feature = "socks5")]
     pub fn proxy(mut self, proxy: crate::network::ProxyConfig) -> Self {
-        self.config.proxy = Some(proxy);
+        self.config.transport.proxy = Some(proxy);
         self
     }
 
@@ -1934,16 +1310,6 @@ impl ProducerBuilder {
         self
     }
 
-    /// Set max in-flight requests per connection.
-    ///
-    /// Limits the number of concurrent produce requests sent to a single broker.
-    /// Higher values increase throughput but can cause reordering under retries.
-    /// Must be >= 1 (validated at build time). Default: 5.
-    pub fn max_in_flight(mut self, max: usize) -> Self {
-        self.config.max_in_flight = max;
-        self
-    }
-
     /// Set the maximum encoded Kafka request frame size in bytes.
     pub fn max_request_size(mut self, bytes: usize) -> Self {
         self.config.max_request_size = bytes;
@@ -1997,8 +1363,10 @@ impl ProducerBuilder {
     /// the producer epoch on each new init, fencing any previous instance with the
     /// same ID. (KIP-360 / Kafka 2.5+)
     ///
-    /// Requires `acks = All`. If `max_in_flight` is set above 5, it is
-    /// automatically capped to 5 at build time (with an `info!` log).
+    /// Requires `acks = All`. Unlike the Java client there is no
+    /// `max.in.flight ≤ 5` rule to observe: the record accumulator keeps
+    /// exactly one batch per partition on the wire, so sequence order and wire
+    /// order cannot diverge in the first place.
     pub fn idempotent(mut self, enable: bool) -> Self {
         self.config.idempotent = enable;
         self
@@ -2225,9 +1593,9 @@ impl ProducerBuilder {
     /// a configuration reason. Useful for validating settings at startup, in a
     /// test, or in a config-linting tool, none of which want a broker.
     ///
-    /// Note that validation also *normalises*: an idempotent producer's
-    /// `max_in_flight` is capped to 5 (KIP-679), so the returned config may
-    /// differ from what was set.
+    /// Note that validation also *normalises* — for example clamping a
+    /// compression level into the selected codec's range — so the returned
+    /// config may differ from what was set.
     ///
     /// # Errors
     ///
@@ -2294,6 +1662,7 @@ mod tests {
 
     use crate::metadata::ClusterMetadata;
     use crate::network::{ConnectionConfig, ConnectionPool};
+    use crate::protocol::{ProducePartitionData, ProduceTopicData};
 
     #[test]
     fn test_producer_builder() {
@@ -2495,8 +1864,7 @@ mod tests {
     /// longer permanently brick the producer.
     ///
     /// The old behaviour poisoned the identity whenever more than one batch was
-    /// outstanding — the normal state at the default `max_in_flight = 5` — and
-    /// every subsequent send failed forever. Now a re-initialisation is
+    /// outstanding, and every subsequent send failed forever. Now a re-initialisation is
     /// requested instead: the send fails and is retriable, and the next
     /// dispatch obtains a fresh PID with all partitions restarted at 0.
     #[tokio::test]
@@ -2571,63 +1939,20 @@ mod tests {
         assert_eq!(snapshot.buffered_records, 7);
     }
 
-    #[tokio::test]
-    async fn test_direct_send_rejects_record_larger_than_buffer_memory() {
-        let pool = Arc::new(ConnectionPool::new(ConnectionConfig::default()));
-        let metadata = Arc::new(ClusterMetadata::new(
-            vec!["localhost:9092".to_string()],
-            pool.clone(),
-            Duration::from_secs(300),
-        ));
-        let metrics = Arc::new(ProducerMetricsInner::default());
-
-        let producer = Producer {
-            config: ProducerConfig {
-                buffer_memory: 16,
-                ..ProducerConfig::default()
-            },
-            metadata,
-            pool,
-            partitioner: Arc::new(DefaultPartitioner::new()),
-            accumulator: None,
-            in_flight_barrier: Arc::new(InFlightBarrier::new()),
-            retry_policy: RetryPolicy::default(),
-            metrics: metrics.clone(),
-            memory_permits: Arc::new(Semaphore::new(16)),
-            memory_capacity: 16,
-            max_request_size: 0,
-            buffered_records: Arc::new(AtomicUsize::new(0)),
-            in_flight_semaphore: Arc::new(Semaphore::new(1)),
-            interceptor: Arc::new(crate::interceptor::NoOpProducerInterceptor),
-            identity: None,
-            state_store: None,
-            key_serializer: None,
-            value_serializer: None,
-            pool_owned: true,
-            dlq: None,
-        };
-
-        let record = RoutedRecord {
-            key: None,
-            value: Bytes::from(vec![0u8; 1024]),
-            timestamp: None,
-            headers: Vec::new(),
-        };
-
-        let err = producer
-            .send_to_partition(
-                Arc::<str>::from("topic"),
-                0,
-                record,
-                1024,
-                producer.in_flight_barrier.start("producer").unwrap(),
-                Instant::now(),
-            )
-            .await
-            .expect_err("direct send must reject records larger than buffer_memory");
-
-        assert!(err.to_string().contains("buffer_memory"));
-        assert_eq!(metrics.buffered_records.get(), 0);
+    /// A record larger than `buffer_memory` is rejected before it can block.
+    ///
+    /// It could never be admitted — the byte-granular permit pool never
+    /// accumulates that many permits — so blocking for `max_block` and then
+    /// timing out would report the wrong cause. Admission is checked up front
+    /// on the one send path, in `check_record_admission`.
+    #[test]
+    fn a_record_larger_than_buffer_memory_is_rejected_up_front() {
+        let err = accumulator::check_record_admission(1024, 16, usize::MAX)
+            .expect_err("a record larger than buffer_memory must be rejected");
+        assert!(
+            err.to_string().contains("buffer_memory"),
+            "the error must name the setting to raise, got: {err}"
+        );
     }
 
     #[test]
@@ -2640,13 +1965,6 @@ mod tests {
         assert_eq!(policy.max_retries, 10);
         assert_eq!(policy.initial_backoff(), Duration::from_millis(50));
         assert_eq!(policy.max_backoff(), Duration::from_secs(30));
-    }
-
-    #[test]
-    fn test_producer_config_max_in_flight_default() {
-        let config = ProducerConfig::default();
-        // Default max_in_flight should be a reasonable value > 0
-        assert!(config.max_in_flight > 0);
     }
 
     #[test]
@@ -2686,31 +2004,6 @@ mod tests {
         match result {
             Err(e) => assert!(e.to_string().contains("acks")),
             Ok(_) => panic!("expected config error for idempotent with acks != All"),
-        }
-    }
-
-    #[test]
-    fn test_idempotent_autocaps_max_in_flight() {
-        // Validation lives in one place (`config::validate`) and is reachable
-        // without a live broker via the synchronous `build_config` terminal.
-        let cfg = Producer::builder()
-            .bootstrap_servers("localhost:9092")
-            .idempotent(true)
-            .max_in_flight(10)
-            .build_config()
-            .expect("idempotent config should auto-cap max_in_flight to 5");
-        assert_eq!(cfg.max_in_flight(), 5);
-    }
-
-    #[tokio::test]
-    async fn test_producer_builder_rejects_zero_max_in_flight() {
-        let mut builder = Producer::builder().bootstrap_servers("localhost:9092");
-        builder.config.max_in_flight = 0;
-        let result = builder.build().await;
-
-        match result {
-            Err(e) => assert!(e.to_string().contains("max_in_flight")),
-            Ok(_) => panic!("expected error for max_in_flight=0"),
         }
     }
 

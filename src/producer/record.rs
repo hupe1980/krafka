@@ -300,11 +300,6 @@ impl RoutedRecord {
         self.key.as_deref()
     }
 
-    #[inline]
-    pub(crate) fn payload_size_bytes(&self) -> u64 {
-        self.value.len() as u64 + self.key.as_ref().map(|key| key.len() as u64).unwrap_or(0)
-    }
-
     pub(crate) fn append_to_batch_builder(
         &self,
         batch_builder: RecordBatchBuilder,

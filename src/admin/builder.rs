@@ -47,6 +47,42 @@ impl AdminClientBuilder {
         self
     }
 
+    /// Set how many times a controller- or coordinator-routed request is
+    /// attempted before failing.
+    ///
+    /// Counts *additional* attempts, matching the Java admin client's `retries`
+    /// and this crate's own `RetryPolicy::max_retries`: `retries(0)` still
+    /// makes one attempt, and the default of 5 makes six.
+    ///
+    /// Raise it on a cluster whose controller elections are slow — the default
+    /// budget is a few seconds of real time, and `create_topics` during a
+    /// rolling controller restart can need more.
+    pub fn retries(mut self, retries: u32) -> Self {
+        self.config.retries = retries;
+        self
+    }
+
+    /// Set the initial backoff between controller/coordinator retry attempts.
+    ///
+    /// Growth is exponential (2×) up to a 10 s ceiling, with 10 % jitter so a
+    /// fleet of admin clients watching one controller election does not arrive
+    /// at the newly elected controller as a single wave. Default: 100 ms.
+    ///
+    /// For full control over growth and jitter, use
+    /// [`retry_backoff_policy`](Self::retry_backoff_policy).
+    pub fn retry_backoff(mut self, backoff: Duration) -> Self {
+        self.config.retry_backoff.initial_backoff = backoff;
+        self
+    }
+
+    /// Replace the whole retry backoff policy — growth, ceiling and jitter.
+    ///
+    /// See [`retry_backoff`](Self::retry_backoff) for the common case.
+    pub fn retry_backoff_policy(mut self, policy: crate::util::BackoffPolicy) -> Self {
+        self.config.retry_backoff = policy;
+        self
+    }
+
     /// Set the connect timeout: how long TCP establishment to one broker may
     /// take. Default: 10 s.
     ///
@@ -104,7 +140,7 @@ impl AdminClientBuilder {
     /// Routes all broker connections through the specified SOCKS5 proxy.
     #[cfg(feature = "socks5")]
     pub fn proxy(mut self, proxy: crate::network::ProxyConfig) -> Self {
-        self.config.proxy = Some(proxy);
+        self.config.transport.proxy = Some(proxy);
         self
     }
 
@@ -203,7 +239,7 @@ impl AdminClientBuilder {
     /// `bootstrap_servers` is empty and no shared client was supplied.
     pub fn build_config(self) -> Result<AdminConfig> {
         if self.shared.is_none() && self.config.bootstrap_servers.is_empty() {
-            return Err(KrafkaError::config("bootstrap.servers is required"));
+            return Err(KrafkaError::config("bootstrap_servers is required"));
         }
         Ok(self.config)
     }
@@ -211,7 +247,7 @@ impl AdminClientBuilder {
     /// Build the admin client.
     pub async fn build(self) -> Result<AdminClient> {
         if self.shared.is_none() && self.config.bootstrap_servers.is_empty() {
-            return Err(KrafkaError::config("bootstrap.servers is required"));
+            return Err(KrafkaError::config("bootstrap_servers is required"));
         }
 
         // `pool_owned` decides whether `AdminClient::close()` may tear the pool
@@ -236,11 +272,6 @@ impl AdminClientBuilder {
 
             if let Some(ref auth) = self.config.auth {
                 conn_config_builder = conn_config_builder.auth(auth.clone());
-            }
-
-            #[cfg(feature = "socks5")]
-            if let Some(ref proxy) = self.config.proxy {
-                conn_config_builder = conn_config_builder.proxy(proxy.clone());
             }
 
             let mut conn_config = conn_config_builder.build()?;

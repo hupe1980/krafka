@@ -345,9 +345,8 @@ let snapshot = tracker.snapshot();
 
 Enable the `telemetry` feature for native OTLP protobuf export and KIP-714 broker telemetry:
 
-```toml
-[dependencies]
-krafka = { version = "0.17.0", features = ["telemetry"] }
+```sh
+cargo add krafka --features telemetry
 ```
 
 Export metrics as OTLP protobuf bytes for ingestion by any OTLP-compatible backend:

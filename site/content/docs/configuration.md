@@ -16,15 +16,14 @@ slug_id = "configuration"
 | `acks` | Acks | `All` | Acknowledgment level for durability (default changed to All for idempotent) |
 | `compression` | Compression | `None` | Compression codec for messages |
 | `batch_size` | usize | `16384` | Maximum bytes per batch (must be >= 1) |
-| `linger` | Duration | `0ms` | Time to wait for batching |
+| `linger` | Duration | `0ms` | How long a partial batch may *wait* for more records. `0` still batches — see [Producer › What `linger` actually controls](@/docs/producer.md) |
 | `request_timeout` | Duration | `30s` | Timeout for broker requests |
 | `delivery_timeout` | Duration | `120s` | Total time budget for queueing, sending, and retries |
 | `retries` | u32 | `u32::MAX` | Number of retries on failure; bounded by `delivery_timeout` |
 | `retry_backoff` | Duration | `100ms` | Wait between retries |
-| `max_in_flight` | usize | `5` | Max concurrent in-flight requests per connection. Automatically capped to 5 when idempotent is enabled. |
 | `metadata_max_age` | Duration | `5m` | Max age before metadata refresh |
 | `metadata_topic_cache_ttl` | `Option<Duration>` | `Some(5m)` | TTL for topic entries in the partial-refresh cache. `None` disables eviction. |
-| `idempotent` | bool | `true` | Enable idempotent production (KIP-679, requires acks=All; `max_in_flight` is auto-capped to 5) |
+| `idempotent` | bool | `true` | Enable idempotent production (KIP-679, requires acks=All) |
 | `metadata_recovery_strategy` | MetadataRecoveryStrategy | `Rebootstrap` | Recovery strategy when metadata refresh fails (KIP-899, extended by KIP-1102) |
 | `metadata_recovery_rebootstrap_trigger` | Duration | `5m` | Duration after which failing refreshes trigger a rebootstrap |
 
@@ -158,8 +157,39 @@ let consumer = Consumer::builder()
 | `bootstrap_servers` | String | Required | Comma-separated list of host:port pairs |
 | `client_id` | String | `"krafka-admin"` | Client identifier |
 | `request_timeout` | Duration | `30s` | Timeout for admin operations |
+| `connect_timeout` | Duration | `10s` | TCP establishment budget; also the floor on `request_timeout` |
+| `metadata_max_age` | Duration | `5m` | Max age before metadata refresh |
+| `retries` | u32 | `5` | *Additional* attempts for a controller- or coordinator-routed request, as in the Java admin client — `retries(0)` still makes one attempt, the default makes six. Raise it on a cluster whose controller elections are slow. |
+| `retry_backoff` | Duration | `100ms` | Initial backoff between those attempts. Exponential (2×) to a 10 s ceiling with 10 % jitter; `retry_backoff_policy(..)` replaces the whole policy. |
 | `metadata_recovery_strategy` | MetadataRecoveryStrategy | `Rebootstrap` | Recovery strategy when metadata refresh fails (KIP-899, extended by KIP-1102) |
 | `metadata_recovery_rebootstrap_trigger` | Duration | `5m` | Duration after which failing refreshes trigger a rebootstrap |
+
+### Controller and coordinator retries
+
+A `NOT_CONTROLLER` answer means the controller moved, and the only correct
+response is to re-resolve it and try again — `create_topics` during a rolling
+controller restart hits this routinely. krafka refreshes metadata, reconnects,
+and retries up to `retries` times.
+
+Both settings used to be compile-time constants: five attempts spaced by a flat
+100 ms, with the documentation claiming they were `retry.backoff.ms`. Two things
+were wrong with that. The budget is about a second of real time, which is short
+for a KRaft election, and the flat sleep had **no jitter** — so every admin
+client watching one election retried in lockstep and arrived at the newly
+elected controller as a single wave.
+
+```rust,compile
+use krafka::admin::AdminClient;
+use std::time::Duration;
+
+let admin = AdminClient::builder()
+    .bootstrap_servers("localhost:9092")
+    // A cluster whose elections take a few seconds.
+    .retries(15)
+    .retry_backoff(Duration::from_millis(250))
+    .build()
+    .await?;
+```
 
 ### Admin Client Builder Example
 
@@ -200,9 +230,9 @@ let err = Producer::builder()
     .unwrap_err();
 ```
 
-Validation also *normalises*: an idempotent producer's
-`max_in_flight` is capped to 5 (KIP-679), so the returned config may differ from
-what was set.
+Validation also *normalises* — a compression level is clamped into the selected
+codec's range, for example — so the returned config may differ from what was
+set.
 
 > **There is exactly one builder per client.** krafka used to ship a second,
 > internal `*ConfigBuilder` alongside each public builder. They duplicated 72
@@ -226,7 +256,9 @@ type is never itself a behaviour change.
 | `tcp_nodelay` | bool | `true` | Disable Nagle. Kafka already batches, so Nagle only adds latency. |
 | `tcp_keepalive` | `Option<Duration>` | `Some(60s)` | Keeps NAT/firewall state alive. Set below the middlebox idle timeout — this is the fix for "the consumer stops receiving after exactly N minutes". |
 | `max_response_size` | usize | `100 MiB` | Largest accepted response frame. **Raise** it above the topic's `max.message.bytes`: Kafka returns at least one full record batch even when it exceeds `fetch.max.bytes`, so a larger message stalls the partition permanently. **Lower** it to bound memory. |
-| `max_in_flight_requests` | usize | `10` | Per-connection in-flight cap. Real backpressure — submitters wait, they are not rejected. Worst-case memory is `max_response_size × max_in_flight_requests`. |
+| `max_in_flight_requests` | usize | `10` | Per-connection in-flight cap. Real backpressure — submitters wait, they are not rejected. Worst-case memory is `max_response_size × max_in_flight_requests`. Unlike the Java client this has no bearing on ordering: krafka keeps one batch per partition on the wire regardless. |
+| `socket_send_buffer` | `Option<usize>` | `None` (OS default) | `SO_SNDBUF` for every broker socket — the Java client's `send.buffer.bytes`. Raise it on a high bandwidth-delay-product link, where the socket buffer rather than the network is the throughput ceiling. |
+| `socket_receive_buffer` | `Option<usize>` | `None` (OS default) | `SO_RCVBUF` — the Java client's `receive.buffer.bytes`. The fetch-side counterpart, and the one that matters for a consumer on a long link. |
 | `high_priority_channel_capacity` | usize | `64` | Depth of the heartbeat/metadata command channel. |
 | `normal_priority_channel_capacity` | usize | `256` | Depth of the produce/fetch command channel. |
 | `max_high_priority_bypasses_per_round` | usize | `4` | How far heartbeats may cut ahead of data traffic before one normal-priority drain is forced. |
@@ -243,6 +275,7 @@ use std::time::Duration;
 let transport = TransportConfig::builder()
     .tcp_keepalive(Some(Duration::from_secs(30)))
     .max_response_size(200 * 1024 * 1024)
+    .socket_receive_buffer(Some(4 * 1024 * 1024))   // long-haul fetch
     .max_connections(Some(64))
     .tls_reload_interval(Some(Duration::from_secs(3600)))
     .build()?;
@@ -275,6 +308,22 @@ construction with an error naming a value the builder could not change.
 `AdminClient` hard-coded its metadata age. `tests/builder_surface.rs` now
 asserts the matrix at compile time.
 
+Two checks keep it that way, and they answer different questions:
+
+- **`tests/builder_surface.rs`** — *do these specific methods exist on every
+  client?* Each line fails to compile if the method it names disappears. This
+  is the right tool for a cross-client judgement ("both consumers should accept
+  a deserializer"), which no script can infer.
+- **`just config-reachability`** — *is any field unreachable?* It walks every
+  config struct's fields and requires each to have a same-named builder setter
+  and public accessor, or an entry in an exception list carrying a reason.
+
+The second exists because the first is blind by construction to the defect it
+was written for: a setting nobody remembered to expose is also a setting nobody
+remembered to add a line for. `ShareConsumerConfig` carried five such fields —
+including all four of KIP-932's fetch knobs, read when the `ShareFetch` request
+was built and settable by no one — while passing `builder_surface.rs`.
+
 ### Per-client timeouts
 
 These stay on the client builders, because they are request semantics rather
@@ -293,8 +342,8 @@ DNS resolution, so broker hostnames are sent as-is (not pre-resolved).
 
 Enable the `socks5` feature:
 
-```toml
-krafka = { version = "0.17.0", features = ["socks5"] }
+```sh
+cargo add krafka --features socks5
 ```
 
 ### Proxy Without Authentication
@@ -406,7 +455,7 @@ let producer = Producer::builder()
     .bootstrap_servers("localhost:9092")
     .acks(Acks::None)
     .batch_size(1)
-    .linger(Duration::ZERO)
+    .linger(Duration::ZERO)    // The default: never wait, but still coalesce under load
     .build()
     .await?;
 ```

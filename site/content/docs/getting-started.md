@@ -9,12 +9,9 @@ slug_id = "getting-started"
 
 ## Installation
 
-Add krafka to your `Cargo.toml`:
-
-```toml
-[dependencies]
-krafka = "0.17.0"
-tokio = { version = "1", features = ["full"] }
+```sh
+cargo add krafka
+cargo add tokio --features full
 ```
 
 ## Prerequisites

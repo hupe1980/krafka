@@ -350,8 +350,8 @@ The implementation follows RFC 7628 GS2 framing:
 Enable the `oauth-oidc` feature and krafka fetches access tokens itself, instead
 of you writing the OAuth client:
 
-```toml
-krafka = { version = "0.17.0", features = ["oauth-oidc"] }
+```sh
+cargo add krafka --features oauth-oidc
 ```
 
 Two ways to authenticate to the token endpoint:
@@ -445,8 +445,8 @@ krafka's TLS is `rustls`, which needs a crypto backend. `ring` is the default;
 `rustls-aws-lc-rs` selects aws-lc-rs, preferable on AWS Graviton and in
 FIPS-oriented deployments:
 
-```toml
-krafka = { version = "0.17.0", default-features = false, features = ["rustls-aws-lc-rs", "compression"] }
+```sh
+cargo add krafka --no-default-features --features rustls-aws-lc-rs,compression
 ```
 
 The two features are **additive**. Cargo features cannot be made mutually
@@ -493,9 +493,8 @@ let tls_config = TlsConfig::new()
 
 By default, krafka uses compiled-in `webpki-roots`. To use the operating system trust store on macOS, Windows, or Linux, enable the `native-tls-roots` feature and opt in explicitly:
 
-```toml
-[dependencies]
-krafka = { version = "0.17.0", features = ["native-tls-roots"] }
+```sh
+cargo add krafka --features native-tls-roots
 ```
 
 ```rust,compile
@@ -638,8 +637,8 @@ For production deployments on EC2, ECS, Lambda, or EKS, use the AWS SDK default 
 ```rust,compile
 use krafka::auth::{AuthConfig, AwsMskIamCredentials};
 
-// Requires the `aws-msk` feature in Cargo.toml:
-// krafka = { version = "0.17.0", features = ["aws-msk"] }
+// Requires the `aws-msk` feature:
+//   cargo add krafka --features aws-msk
 
 // Loads from (in order):
 // 1. Environment variables

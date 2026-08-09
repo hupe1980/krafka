@@ -50,8 +50,9 @@ pub trait ProducerInterceptor: Send + Sync + fmt::Debug {
 
 All methods have default no-op implementations, so you only need to override the hooks you care about.
 
-**Note:** `on_acknowledgement` is called for *all* send paths — both the direct send path
-(linger = 0) and the batched accumulator path (linger > 0).
+**Note:** `on_acknowledgement` fires exactly once per record, on success and on
+permanent failure alike, at every `linger` setting and on the
+`TransactionalProducer` too — there is only one send path to instrument.
 
 ### Example: Tracing Headers
 

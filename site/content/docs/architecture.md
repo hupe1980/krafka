@@ -72,7 +72,8 @@ krafka/
 │   ├── config.rs      # Producer configuration
 │   ├── partitioner.rs # Partitioning strategies
 │   ├── batch.rs       # Record batching
-│   ├── accumulator.rs # Record accumulator with linger timer
+│   ├── accumulator.rs # Record accumulator: the one send path (batching,
+│   │                  # per-partition dispatch FIFO, retries, DLQ)
 │   ├── record.rs      # Producer records
 │   ├── retry.rs       # Retry policy with exponential backoff
 │   └── idempotent.rs  # Idempotent producer (PID, sequence tracking)

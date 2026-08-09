@@ -202,13 +202,13 @@ detection. This is the shape behind most configuration and lookup-table
 use cases.
 
 ```rust,compile
-use krafka::consumer::CompactedTopicConsumer;
+use krafka::consumer::{CompactedTopicConsumer, Consumer};
 
-let mut table = CompactedTopicConsumer::builder()
-    .bootstrap_servers("localhost:9092")
-    .topic("user-profiles")
-    .build()
-    .await?;
+let mut table = CompactedTopicConsumer::from_consumer_builder(
+    Consumer::builder().bootstrap_servers("localhost:9092"),
+    "user-profiles",
+)
+.await?;
 
 // Read from the beginning until every partition reaches its end offset.
 table.scan(Duration::from_secs(1)).await?;
@@ -246,10 +246,9 @@ equivalent of Java's `key.serializer` / `value.serializer`. Pair it with
 [`schemreg`](https://crates.io/crates/schemreg), which covers the Confluent
 registry, AWS Glue, Apicurio, and Avro / Protobuf / JSON codecs:
 
-```toml
-[dependencies]
-krafka   = "0.17"
-schemreg = { version = "0.4", features = ["confluent", "avro"] }
+```sh
+cargo add krafka
+cargo add schemreg --features confluent,avro
 ```
 
 The two traits do not know about each other, so bridge them with a newtype.

@@ -498,7 +498,7 @@ struct ShareConsumerInner {
     pool_owned: bool,
     /// Application-level metrics.
     ///
-    /// Reuses [`ConsumerMetrics`] rather than defining a share-group-specific
+    /// Reuses [`ConsumerMetrics`](crate::metrics::ConsumerMetrics) rather than defining a share-group-specific
     /// type: a share consumer polls, receives records, acknowledges and hits
     /// errors exactly as a classic consumer does, and the counters mean the
     /// same thing. `commits` counts acknowledgement flushes, which is the
@@ -582,6 +582,13 @@ struct ShareConsumerInner {
     /// `wakeup()` followed by `close()`, and `wakeup()` does not wait for the
     /// poll it interrupts to unwind.
     in_flight_polls: Arc<InFlightBarrier>,
+    /// Acquisition-lock duration most recently reported by a broker
+    /// (KIP-1222), in milliseconds, or `-1` before the first `ShareFetch`.
+    acquisition_lock_timeout_ms: AtomicI32,
+    /// Optional decoder applied to every consumed record's key.
+    key_deserializer: Option<Arc<dyn crate::serdes::Deserializer>>,
+    /// Optional decoder applied to every consumed record's value.
+    value_deserializer: Option<Arc<dyn crate::serdes::Deserializer>>,
 }
 
 impl Drop for ShareConsumerInner {
@@ -645,6 +652,8 @@ impl ShareConsumer {
     async fn new(
         config: ShareConsumerConfig,
         shared: Option<(Arc<ConnectionPool>, Arc<ClusterMetadata>)>,
+        key_deserializer: Option<Arc<dyn crate::serdes::Deserializer>>,
+        value_deserializer: Option<Arc<dyn crate::serdes::Deserializer>>,
     ) -> Result<Self> {
         let pool_owned = shared.is_none();
         let (pool, metadata) = if let Some((pool, metadata)) = shared {
@@ -659,11 +668,6 @@ impl ShareConsumer {
 
             if let Some(ref auth) = config.auth {
                 pool_config_builder = pool_config_builder.auth(auth.clone());
-            }
-
-            #[cfg(feature = "socks5")]
-            if let Some(ref proxy) = config.proxy {
-                pool_config_builder = pool_config_builder.proxy(proxy.clone());
             }
 
             let mut pool_config = pool_config_builder.build()?;
@@ -727,6 +731,9 @@ impl ShareConsumer {
             wakeup_flag: AtomicBool::new(false),
             wakeup_notify: Notify::new(),
             in_flight_polls: Arc::new(InFlightBarrier::new()),
+            acquisition_lock_timeout_ms: AtomicI32::new(-1),
+            key_deserializer,
+            value_deserializer,
         })))
     }
 
@@ -1070,10 +1077,12 @@ impl ShareConsumer {
                 .collect();
 
             // Wait at most the caller's poll timeout, and never longer than the
-            // configured `fetch_max_wait_ms`, so a long poll timeout does not
+            // configured `fetch_max_wait`, so a long poll timeout does not
             // silently override the fetch-side setting.
-            let poll_wait_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
-            let max_wait_ms = poll_wait_ms.min(self.0.config.fetch_max_wait_ms.max(0));
+            let poll_wait_ms = crate::util::duration_to_millis_i32(timeout);
+            let max_wait_ms = poll_wait_ms.min(crate::util::duration_to_millis_i32(
+                self.0.config.fetch_max_wait,
+            ));
 
             let mut request = ShareFetchRequest {
                 group_id: Some(group_id.clone()),
@@ -1208,6 +1217,18 @@ impl ShareConsumer {
                             {
                                 let mut sessions = self.0.share_sessions.lock().await;
                                 sessions.get_or_create(broker_id).on_success();
+                            }
+
+                            // KIP-1222: the broker reports how long an
+                            // acquisition lock lasts. Record it — without it an
+                            // application has no way to learn the deadline
+                            // `AcknowledgeType::Renew` exists to extend, since
+                            // `group.share.record.lock.duration.ms` is a
+                            // broker-side setting a client cannot read.
+                            if response.acquisition_lock_timeout_ms > 0 {
+                                self.0
+                                    .acquisition_lock_timeout_ms
+                                    .store(response.acquisition_lock_timeout_ms, Ordering::Relaxed);
                             }
 
                             // Decode records from the response and restore only the
@@ -1424,7 +1445,71 @@ impl ShareConsumer {
         // Only the records actually returned to the caller are tracked.
         self.register_delivered_records(&all_records).await;
 
+        // Deserialization runs *after* registration, which is the opposite of
+        // the subscription consumer and is deliberate.
+        //
+        // A share consumer cannot `seek()` past a record it cannot decode —
+        // there are no positions to seek. Its escape hatch is
+        // `acknowledge_by_offset(topic, partition, offset, Reject)`, and that
+        // call requires the offset to be registered as pending. Deserializing
+        // first would leave the poison record unregistered and therefore
+        // unrejectable: the acquisition lock would expire, the broker would
+        // redeliver it, and the same poll would fail again forever with no way
+        // out.
+        //
+        // The cost is that in *implicit* mode the batch has already been
+        // queued for `Accept` by the time the failure is seen. That is what
+        // implicit mode means — `poll()` acknowledges what it delivers — and
+        // an application that needs to arbitrate poison records should use
+        // explicit mode, where nothing is acknowledged without its say-so.
+        self.deserialize_batch(&mut all_records).await?;
+
         Ok(all_records)
+    }
+
+    /// Apply the configured key/value deserializers to a delivered batch.
+    ///
+    /// Fails on the first record either decoder rejects, naming it precisely so
+    /// the caller can reject that offset and move on.
+    async fn deserialize_batch(&self, records: &mut [ConsumerRecord]) -> Result<()> {
+        if self.0.key_deserializer.is_none() && self.0.value_deserializer.is_none() {
+            return Ok(());
+        }
+        for record in records.iter_mut() {
+            if let (Some(decoder), Some(value)) =
+                (&self.0.value_deserializer, record.value.as_ref())
+            {
+                let decoded = decoder
+                    .deserialize(value.clone(), &record.topic, false)
+                    .await
+                    .map_err(|e| {
+                        KrafkaError::record_deserialization(
+                            &record.topic,
+                            record.partition,
+                            record.offset,
+                            "value",
+                            e.to_string(),
+                        )
+                    })?;
+                record.value = Some(decoded);
+            }
+            if let (Some(decoder), Some(key)) = (&self.0.key_deserializer, record.key.as_ref()) {
+                let decoded = decoder
+                    .deserialize(key.clone(), &record.topic, true)
+                    .await
+                    .map_err(|e| {
+                        KrafkaError::record_deserialization(
+                            &record.topic,
+                            record.partition,
+                            record.offset,
+                            "key",
+                            e.to_string(),
+                        )
+                    })?;
+                record.key = Some(decoded);
+            }
+        }
+        Ok(())
     }
 
     /// Register records that are about to be handed to the application.
@@ -2156,6 +2241,54 @@ impl ShareConsumer {
     /// and fall back to bootstrap servers (KIP-899).
     pub async fn rebootstrap(&self) {
         self.0.metadata.rebootstrap().await;
+    }
+
+    /// How long an acquisition lock lasts, as most recently reported by a
+    /// broker (KIP-1222).
+    ///
+    /// `None` before the first `ShareFetch` completes, and on brokers older
+    /// than Kafka 4.2, which do not report it.
+    ///
+    /// # Why this exists
+    ///
+    /// [`AcknowledgeType::Renew`] extends a record's acquisition lock so that
+    /// long-running processing does not have the record redelivered to another
+    /// member. Renewing requires knowing *when* — and the deadline is derived
+    /// from `group.share.record.lock.duration.ms`, a **broker-side** setting a
+    /// client cannot read from its own configuration. Without this accessor an
+    /// application was told to renew before a deadline it had no way to learn,
+    /// so the only workable strategy was to renew blindly on a timer tuned by
+    /// guesswork.
+    ///
+    /// The lock starts when the broker *acquires* the record, which is when it
+    /// builds the fetch response — so treat the value as an upper bound on the
+    /// time remaining once `poll()` returns, and renew with margin.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let lock = consumer
+    ///     .acquisition_lock_timeout()
+    ///     .unwrap_or(Duration::from_secs(30));
+    /// // Renew once the record is halfway to losing its lock.
+    /// let renew_after = lock / 2;
+    ///
+    /// for record in consumer.poll(timeout).await? {
+    ///     let started = Instant::now();
+    ///     while !work_is_done(&record) {
+    ///         step(&record).await;
+    ///         if started.elapsed() >= renew_after {
+    ///             consumer.acknowledge(&record, AcknowledgeType::Renew).await?;
+    ///         }
+    ///     }
+    ///     consumer.acknowledge(&record, AcknowledgeType::Accept).await?;
+    /// }
+    /// ```
+    #[inline]
+    #[must_use]
+    pub fn acquisition_lock_timeout(&self) -> Option<Duration> {
+        let ms = self.0.acquisition_lock_timeout_ms.load(Ordering::Relaxed);
+        (ms > 0).then(|| Duration::from_millis(ms as u64))
     }
 
     /// Snapshot the share consumer's application metrics.
@@ -3026,6 +3159,10 @@ pub struct ShareConsumerBuilder {
     config: ShareConsumerConfig,
     /// Pre-built pool and metadata from a [`KrafkaClient`](crate::client::KrafkaClient).
     shared: Option<(Arc<ConnectionPool>, Arc<ClusterMetadata>)>,
+    /// Optional decoder applied to every consumed record's key.
+    key_deserializer: Option<Arc<dyn crate::serdes::Deserializer>>,
+    /// Optional decoder applied to every consumed record's value.
+    value_deserializer: Option<Arc<dyn crate::serdes::Deserializer>>,
 }
 
 impl ShareConsumerBuilder {
@@ -3105,9 +3242,91 @@ impl ShareConsumerBuilder {
         self
     }
 
-    /// Set the fetch max wait time in milliseconds.
-    pub fn fetch_max_wait_ms(mut self, ms: i32) -> Self {
-        self.config.fetch_max_wait_ms = ms;
+    /// Set how long a broker may hold a `ShareFetch` waiting for
+    /// [`fetch_min_bytes`](Self::fetch_min_bytes) to accumulate.
+    ///
+    /// Capped by the `poll()` timeout, so a short poll is never made to wait
+    /// for a long fetch. Defaults to 500 ms — the same trade as the regular
+    /// consumer's [`fetch_max_wait`](crate::consumer::ConsumerBuilder::fetch_max_wait).
+    pub fn fetch_max_wait(mut self, wait: Duration) -> Self {
+        self.config.fetch_max_wait = wait;
+        self
+    }
+
+    /// Set the minimum bytes a broker must have before answering a
+    /// `ShareFetch`.
+    ///
+    /// Raising it trades latency for fewer, fuller responses; the broker still
+    /// answers after [`fetch_max_wait`](Self::fetch_max_wait) regardless.
+    /// Defaults to 1 (answer as soon as anything is available).
+    pub fn fetch_min_bytes(mut self, bytes: i32) -> Self {
+        self.config.fetch_min_bytes = bytes;
+        self
+    }
+
+    /// Set the maximum bytes one `ShareFetch` response may carry.
+    ///
+    /// Defaults to 50 MiB, matching the regular consumer's `fetch_max_bytes`.
+    pub fn fetch_max_bytes(mut self, bytes: i32) -> Self {
+        self.config.fetch_max_bytes = bytes;
+        self
+    }
+
+    /// Set the maximum number of records the broker may **acquire** for this
+    /// member in one `ShareFetch` (KIP-932 `MaxRecords`).
+    ///
+    /// This is the share-group analogue of a fetch size: acquired records hold
+    /// an acquisition lock until they are acknowledged or the lock expires, so
+    /// it bounds how much of the share group's backlog this member can hold at
+    /// once. Distinct from [`max_poll_records`](Self::max_poll_records), which
+    /// bounds what a single `poll()` hands the application. Defaults to 5000.
+    pub fn max_records(mut self, max: i32) -> Self {
+        self.config.max_records = max;
+        self
+    }
+
+    /// Set the batch size the broker should aim for when acquiring records
+    /// (KIP-932 `BatchSize`).
+    ///
+    /// A hint, not a limit: the broker uses it to decide how to carve the
+    /// acquired range into acknowledgement batches. Defaults to 500.
+    pub fn batch_size(mut self, size: i32) -> Self {
+        self.config.batch_size = size;
+        self
+    }
+
+    /// Set how long metadata refreshes may keep failing before the client
+    /// re-bootstraps from the seed list (KIP-899).
+    ///
+    /// Only consulted when the strategy is
+    /// [`MetadataRecoveryStrategy::Rebootstrap`](crate::metadata::MetadataRecoveryStrategy::Rebootstrap).
+    /// Defaults to 5 minutes.
+    pub fn metadata_recovery_rebootstrap_trigger(mut self, duration: Duration) -> Self {
+        self.config.metadata_recovery_rebootstrap_trigger = duration;
+        self
+    }
+
+    /// Set a decoder applied to every consumed record's **key**.
+    ///
+    /// The share consumer hands back the same [`ConsumerRecord`] as the regular
+    /// consumer, so it takes the same
+    /// [`Deserializer`](crate::serdes::Deserializer) hook — schema-registry
+    /// framing, envelope decryption, application-level decompression. Without
+    /// it, a share-group application had to decode by hand what a subscription
+    /// consumer got transparently.
+    pub fn key_deserializer(mut self, deserializer: Arc<dyn crate::serdes::Deserializer>) -> Self {
+        self.key_deserializer = Some(deserializer);
+        self
+    }
+
+    /// Set a decoder applied to every consumed record's **value**.
+    ///
+    /// See [`key_deserializer`](Self::key_deserializer).
+    pub fn value_deserializer(
+        mut self,
+        deserializer: Arc<dyn crate::serdes::Deserializer>,
+    ) -> Self {
+        self.value_deserializer = Some(deserializer);
         self
     }
 
@@ -3244,7 +3463,7 @@ impl ShareConsumerBuilder {
     /// Set SOCKS5 proxy configuration.
     #[cfg(feature = "socks5")]
     pub fn proxy(mut self, proxy: crate::network::ProxyConfig) -> Self {
-        self.config.proxy = Some(proxy);
+        self.config.transport.proxy = Some(proxy);
         self
     }
 
@@ -3261,7 +3480,7 @@ impl ShareConsumerBuilder {
     /// Build the share consumer.
     pub async fn build(self) -> Result<ShareConsumer> {
         if self.shared.is_none() && self.config.bootstrap_servers.is_empty() {
-            return Err(KrafkaError::config("bootstrap.servers is required"));
+            return Err(KrafkaError::config("bootstrap_servers is required"));
         }
         if self.config.group_id.is_empty() {
             return Err(KrafkaError::config(
@@ -3286,7 +3505,13 @@ impl ShareConsumerBuilder {
                 self.config.max_poll_records,
             )));
         }
-        ShareConsumer::new(self.config, self.shared).await
+        ShareConsumer::new(
+            self.config,
+            self.shared,
+            self.key_deserializer,
+            self.value_deserializer,
+        )
+        .await
     }
 }
 
@@ -3296,6 +3521,46 @@ mod tests {
     use super::*;
     use crate::error::ErrorCode;
     use crate::protocol::ShareAcquiredRecords;
+
+    /// The broker-reported acquisition-lock duration must reach the
+    /// application (KIP-1222).
+    ///
+    /// `AcknowledgeType::Renew` extends a record's acquisition lock, and its
+    /// own documentation tells the caller to renew before the deadline. The
+    /// deadline comes from `group.share.record.lock.duration.ms`, which is a
+    /// **broker-side** setting no client can read from its own configuration —
+    /// so the only place it can come from is the `ShareFetch` response. That
+    /// field was decoded and dropped, leaving `Renew` documented, reachable,
+    /// and impossible to schedule correctly.
+    #[test]
+    fn the_acquisition_lock_timeout_reaches_the_application() {
+        let consumer = test_share_consumer(AcknowledgementMode::Explicit);
+
+        assert_eq!(
+            consumer.acquisition_lock_timeout(),
+            None,
+            "before any fetch, and on brokers that do not report it, there is \
+             nothing to report"
+        );
+
+        // What a successful ShareFetch records.
+        consumer
+            .0
+            .acquisition_lock_timeout_ms
+            .store(30_000, Ordering::Relaxed);
+        assert_eq!(
+            consumer.acquisition_lock_timeout(),
+            Some(Duration::from_secs(30)),
+            "the value the broker reported must be what the application sees"
+        );
+
+        // A broker older than Kafka 4.2 sends -1; that is absence, not zero.
+        consumer
+            .0
+            .acquisition_lock_timeout_ms
+            .store(-1, Ordering::Relaxed);
+        assert_eq!(consumer.acquisition_lock_timeout(), None);
+    }
 
     fn test_share_consumer(acknowledgement_mode: AcknowledgementMode) -> ShareConsumer {
         let mut config = ShareConsumer::builder()
@@ -3338,6 +3603,9 @@ mod tests {
             wakeup_flag: AtomicBool::new(false),
             wakeup_notify: Notify::new(),
             in_flight_polls: Arc::new(InFlightBarrier::new()),
+            acquisition_lock_timeout_ms: AtomicI32::new(-1),
+            key_deserializer: None,
+            value_deserializer: None,
         }))
     }
 
@@ -3384,7 +3652,7 @@ mod tests {
         let result = ShareConsumer::builder().group_id("sg").build().await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("bootstrap.servers"), "got: {err}");
+        assert!(err.contains("bootstrap_servers"), "got: {err}");
     }
 
     #[tokio::test]
@@ -4668,22 +4936,26 @@ mod tests {
         assert!(!consumer.0.wakeup_flag.load(Ordering::Acquire));
     }
 
-    /// `fetch_max_wait_ms` must actually bound the fetch wait rather than being
+    /// `fetch_max_wait` must actually bound the fetch wait rather than being
     /// ignored in favour of the poll timeout.
     #[test]
     fn test_fetch_max_wait_bounds_the_poll_timeout() {
         let config = ShareConsumer::builder()
             .bootstrap_servers("localhost:9092")
             .group_id("sg")
-            .fetch_max_wait_ms(250)
+            .fetch_max_wait(Duration::from_millis(250))
             .config;
 
-        let poll_wait_ms = Duration::from_secs(30).as_millis().min(i32::MAX as u128) as i32;
-        let effective = poll_wait_ms.min(config.fetch_max_wait_ms.max(0));
-        assert_eq!(effective, 250, "fetch_max_wait_ms must cap the fetch wait");
+        let configured = crate::util::duration_to_millis_i32(config.fetch_max_wait());
+        let poll_wait_ms = crate::util::duration_to_millis_i32(Duration::from_secs(30));
+        assert_eq!(
+            poll_wait_ms.min(configured),
+            250,
+            "fetch_max_wait must cap the fetch wait"
+        );
 
         // A poll timeout shorter than the config wins.
-        let short = Duration::from_millis(10).as_millis() as i32;
-        assert_eq!(short.min(config.fetch_max_wait_ms.max(0)), 10);
+        let short = crate::util::duration_to_millis_i32(Duration::from_millis(10));
+        assert_eq!(short.min(configured), 10);
     }
 }

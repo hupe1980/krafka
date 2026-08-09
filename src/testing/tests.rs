@@ -104,6 +104,148 @@ async fn a_real_producer_appends_records_at_broker_assigned_offsets() {
     );
 }
 
+/// Produce order must follow **enqueue** order, not the order acknowledgements
+/// are awaited in.
+///
+/// This is the guarantee `enqueue()` exists to provide, and the reason a fused
+/// `send_record()` future cannot provide it: a fused future does its append
+/// somewhere inside its own polling, so N of them polled concurrently append in
+/// poll order. Under buffer-memory backpressure the two orders diverge — a send
+/// that cannot get its permit yields and a later one appends first.
+///
+/// The test awaits the handles in deliberately reversed order. If ordering were
+/// established by the await rather than by the enqueue, the log would come back
+/// reversed.
+#[tokio::test]
+async fn produce_order_follows_enqueue_order_not_await_order() {
+    const RECORDS: usize = 64;
+
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("events", 1);
+
+    let producer = Producer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .build()
+        .await
+        .expect("producer should connect");
+
+    // Enqueue in order 0..N. Ordering is fixed by these calls returning.
+    let mut handles = Vec::with_capacity(RECORDS);
+    for i in 0..RECORDS {
+        let handle = producer
+            .enqueue(
+                crate::producer::ProducerRecord::new("events", vec![i as u8]).with_partition(0),
+            )
+            .await
+            .expect("enqueue should succeed");
+        assert_eq!(
+            handle.partition(),
+            0,
+            "the partition is known at enqueue time"
+        );
+        handles.push((i, handle));
+    }
+
+    // Await them backwards.
+    let mut offsets = vec![0i64; RECORDS];
+    for (i, handle) in handles.into_iter().rev() {
+        offsets[i] = handle
+            .await
+            .expect("every record must be acknowledged")
+            .offset;
+    }
+
+    producer.close().await;
+
+    assert_eq!(
+        broker.next_offset("events", 0),
+        Some(RECORDS as i64),
+        "every record must be appended exactly once"
+    );
+
+    // The offset assigned to record `i` must increase with `i`: the broker
+    // stored them in enqueue order.
+    for window in offsets.windows(2) {
+        assert!(
+            window[0] < window[1],
+            "records must be stored in enqueue order, got offsets {offsets:?}"
+        );
+    }
+}
+
+/// The **default** producer — `linger = 0`, idempotence on — must batch, and
+/// concurrent sends to one partition must not corrupt its sequence stream.
+///
+/// Both properties come from the same place: every send goes through the record
+/// accumulator, which keeps exactly one batch per partition on the wire and
+/// coalesces everything that arrives during that round trip into the next one.
+///
+/// Before this, `linger = 0` bypassed the accumulator entirely for a
+/// second, unbatched send path. That path issued one `Produce` request per
+/// record — the throughput cost — and allowed up to five of them to race onto
+/// the wire at once with no per-partition ordering, so an idempotent producer
+/// could see its own sequences arrive out of order and fail permanently with
+/// `OUT_OF_ORDER_SEQUENCE_NUMBER`. This test fails on that code in both
+/// assertions.
+#[tokio::test]
+async fn the_default_producer_batches_concurrent_sends_to_one_partition() {
+    const RECORDS: usize = 200;
+
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("events", 1);
+
+    let producer = std::sync::Arc::new(
+        Producer::builder()
+            .bootstrap_servers(broker.bootstrap_servers())
+            .request_timeout(SHORT_REQUEST_TIMEOUT)
+            .connect_timeout(SHORT_CONNECT_TIMEOUT)
+            // No `.linger(..)`: this is the out-of-the-box configuration.
+            .build()
+            .await
+            .expect("producer should connect"),
+    );
+
+    // Force every record onto one partition so they share one sequence stream.
+    let mut tasks = tokio::task::JoinSet::new();
+    for i in 0..RECORDS {
+        let producer = producer.clone();
+        tasks.spawn(async move {
+            producer
+                .send_record(
+                    crate::producer::ProducerRecord::new("events", format!("v{i}").into_bytes())
+                        .with_partition(0),
+                )
+                .await
+        });
+    }
+
+    let mut acknowledged = 0usize;
+    while let Some(joined) = tasks.join_next().await {
+        let _ = joined
+            .expect("send task should not panic")
+            .expect("every send must be acknowledged");
+        acknowledged += 1;
+    }
+    producer.close().await;
+
+    assert_eq!(acknowledged, RECORDS);
+    assert_eq!(
+        broker.next_offset("events", 0),
+        Some(RECORDS as i64),
+        "every record must be appended exactly once"
+    );
+
+    let produce_requests = broker.request_count(ApiKey::Produce);
+    assert!(
+        produce_requests <= RECORDS / 10,
+        "the default producer must coalesce concurrent sends: {produce_requests} Produce \
+         requests for {RECORDS} records is barely batching (the unbatched path sent one \
+         request per record; the accumulator sends a handful)"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // NOT_CONTROLLER on CreateTopics
 // ---------------------------------------------------------------------------
@@ -165,6 +307,53 @@ async fn a_permanently_missing_controller_gives_up_instead_of_looping() {
     assert!(
         (2..=10).contains(&attempts),
         "retries should be bounded, saw {attempts} attempts"
+    );
+}
+
+/// The controller retry budget must be the *configured* one.
+///
+/// It used to be a hardcoded 5 attempts spaced by a flat 100 ms — no jitter, no
+/// growth, and no way to change it. On a cluster whose controller elections
+/// take longer than the ~500 ms that buys, `create_topics` during a rolling
+/// controller restart failed with "the controller did not stabilise" when
+/// waiting a little longer would have worked. The docs meanwhile claimed the
+/// gap was `retry.backoff.ms`, a setting that did not exist.
+#[tokio::test]
+async fn the_controller_retry_budget_is_the_configured_one() {
+    let broker = FakeBroker::start().await.unwrap();
+    let admin = AdminClient::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        // `retries` counts additional attempts, so this is four tries.
+        .retries(3)
+        .retry_backoff(Duration::from_millis(1))
+        .build()
+        .await
+        .expect("admin client should connect");
+
+    broker.on(ApiKey::CreateTopics, |_| {
+        Control::Error(ErrorCode::NotController)
+    });
+
+    let outcome = admin
+        .create_topics(vec![NewTopic::new("orders", 1, 1).unwrap()], SETTLE, false)
+        .await;
+    assert!(
+        outcome.is_err(),
+        "a permanent NOT_CONTROLLER must terminate"
+    );
+
+    assert_eq!(
+        broker.request_count(ApiKey::CreateTopics),
+        4,
+        "retries(3) must mean three retries on top of the first attempt"
+    );
+
+    let message = outcome.expect_err("checked above").to_string();
+    assert!(
+        message.contains("retries"),
+        "the error must name the setting to raise, got: {message}"
     );
 }
 
@@ -1565,6 +1754,134 @@ async fn transport_default_response_size_still_connects() {
 /// `Arc`-wrapped on the next line — both sockets would open and nothing here
 /// would be refused.
 #[tokio::test]
+async fn broker_throttle_is_honoured_and_counted() {
+    let broker = FakeBroker::start().await.unwrap();
+
+    let client = crate::client::KrafkaClient::builder(broker.bootstrap_servers())
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .build()
+        .await
+        .expect("client should connect");
+
+    let conn = client
+        .pool()
+        .get_connection(&broker.bootstrap_servers())
+        .await
+        .expect("connection to the fake broker");
+
+    // A fresh connection is not throttled.
+    assert!(
+        conn.throttle_remaining().is_none(),
+        "a connection starts un-throttled"
+    );
+
+    // KIP-219: the broker reports a throttle, the client records the deadline.
+    conn.notify_throttle(60);
+    let remaining = conn
+        .throttle_remaining()
+        .expect("the reported throttle must be pending");
+    assert!(
+        remaining <= Duration::from_millis(60) && remaining > Duration::from_millis(20),
+        "the pending delay must reflect what the broker asked for, got {remaining:?}"
+    );
+
+    // A *shorter* throttle must not shorten a longer one already pending.
+    conn.notify_throttle(5);
+    assert!(
+        conn.throttle_remaining().expect("still pending") > Duration::from_millis(20),
+        "a later, smaller throttle must not cut a longer window short"
+    );
+
+    let metrics = client.pool().metrics();
+    assert_eq!(metrics.snapshot().throttle_delays, 0, "nothing waited yet");
+
+    // Waiting it out both sleeps and counts.
+    let waited = conn
+        .await_throttle()
+        .await
+        .expect("there was a delay to wait");
+    assert!(waited > Duration::ZERO);
+    assert!(
+        conn.throttle_remaining().is_none(),
+        "the window is spent once it has been waited out"
+    );
+
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.throttle_delays, 1);
+    assert!(
+        snapshot.throttle_delay_ms > 0,
+        "a counted delay with zero duration is not a measurement"
+    );
+
+    // And an un-throttled connection neither sleeps nor counts.
+    assert!(conn.await_throttle().await.is_none());
+    assert_eq!(metrics.snapshot().throttle_delays, 1);
+}
+
+#[tokio::test]
+async fn a_throttle_the_producer_waits_out_is_counted() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("events", 1);
+
+    let client = crate::client::KrafkaClient::builder(broker.bootstrap_servers())
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .build()
+        .await
+        .expect("client should connect");
+    let pool = client.pool().clone();
+
+    let producer = crate::producer::Producer::builder()
+        .with_client(&client)
+        .build()
+        .await
+        .expect("producer should connect");
+
+    // One send establishes the connection to the leader.
+    let _ = producer
+        .send("events", None, b"warm-up")
+        .await
+        .expect("send should be acknowledged");
+
+    let metrics = producer.connection_metrics();
+    assert_eq!(
+        metrics.snapshot().throttle_delays,
+        0,
+        "nothing has been throttled yet"
+    );
+
+    // Impose a throttle the way a broker would (KIP-219), then send again.
+    // The pool is shared, so reaching the same connection through a client
+    // built on it is enough to reach the producer's own socket.
+    let conn = pool
+        .get_connection(&broker.bootstrap_servers())
+        .await
+        .expect("the connection is already open");
+    conn.notify_throttle(40);
+
+    let _ = producer
+        .send("events", None, b"throttled")
+        .await
+        .expect("a throttled send still succeeds, just later");
+
+    producer.close().await;
+
+    let snapshot = metrics.snapshot();
+    assert_eq!(
+        snapshot.throttle_delays, 1,
+        "the producer waits out the throttle before dispatching, and that wait \
+         has to be counted — it used to sleep on `throttle_remaining()` directly, \
+         which consumed the window before the request path could record it, so \
+         this metric read zero on the path most likely to be throttled"
+    );
+    assert!(
+        snapshot.throttle_delay_ms > 0,
+        "a counted delay with zero duration is not a measurement"
+    );
+}
+
+#[tokio::test]
 async fn transport_max_connections_bounds_the_pool() {
     let broker = FakeBroker::start_cluster(2).await.unwrap();
     broker.create_topic("events", 2);
@@ -2824,6 +3141,79 @@ async fn an_abort_does_not_poison_the_next_transaction() {
 
     let _ = consumer.close().await;
     producer.close().await;
+}
+
+/// `committed_records` and `all_records` must differ by exactly the aborted
+/// records — and must agree with what a real `read_committed` consumer sees.
+///
+/// The *difference* between the two accessors is what an exactly-once test is
+/// actually asserting, which is why both exist. They read the broker's log
+/// directly, so a test using them has no consumer, no bounded poll loop and no
+/// iteration count to tune — the shape that quietly becomes flaky.
+///
+/// The last assertion is the one that matters: reading the log directly is only
+/// useful if it agrees with the protocol path.
+#[tokio::test]
+async fn the_fake_brokers_two_record_views_differ_by_the_aborted_records() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("orders", 1);
+
+    let producer = txn_producer_for(&broker, "txn-views").await;
+    producer.init_transactions().await.expect("init");
+
+    producer.begin_transaction().expect("begin 1");
+    for i in 0..3 {
+        let _ = producer
+            .send("orders", None, format!("aborted-{i}").as_bytes())
+            .await
+            .expect("send");
+    }
+    producer.abort_transaction().await.expect("abort");
+
+    producer.begin_transaction().expect("begin 2");
+    for i in 0..2 {
+        let _ = producer
+            .send("orders", None, format!("committed-{i}").as_bytes())
+            .await
+            .expect("send");
+    }
+    producer.commit_transaction().await.expect("commit");
+    producer.close().await;
+
+    let committed = broker.committed_records("orders").expect("log decodes");
+    let all = broker.all_records("orders").expect("log decodes");
+
+    let values = |records: &[crate::consumer::ConsumerRecord]| -> Vec<String> {
+        records
+            .iter()
+            .filter_map(|r| r.value.as_ref())
+            .map(|v| String::from_utf8_lossy(v).into_owned())
+            .collect()
+    };
+
+    assert_eq!(
+        values(&committed),
+        vec!["committed-0".to_string(), "committed-1".to_string()],
+        "an aborted transaction must be invisible to the committed view"
+    );
+    assert_eq!(
+        values(&all).len(),
+        5,
+        "the uncommitted view must show every record, aborted included"
+    );
+    assert!(
+        !values(&all).iter().any(|v| v.starts_with("__")),
+        "control batches are never records"
+    );
+
+    // The direct read must agree with the protocol path.
+    let consumer = reader_for(&broker, "orders", IsolationLevel::ReadCommitted).await;
+    assert_eq!(
+        drain(&consumer, 8).await,
+        values(&committed),
+        "committed_records() must match what a read_committed consumer receives"
+    );
+    let _ = consumer.close().await;
 }
 
 /// Offsets sent to a transaction must move only when the transaction commits.

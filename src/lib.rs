@@ -133,7 +133,7 @@
 //! ```toml
 //! [dependencies]
 //! # `ring` (or `rustls-aws-lc-rs`) is required — without it the build fails.
-//! krafka = { version = "0.17.0", default-features = false, features = ["lz4", "ring"] }
+//! cargo add krafka --no-default-features --features lz4,ring
 //! ```
 
 #![cfg_attr(docsrs, feature(doc_cfg))]

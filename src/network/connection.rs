@@ -73,14 +73,45 @@ struct ConnectionLoopParams {
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// use krafka::network::{ConnectionConfig, ProxyConfig};
+/// Set it on the client directly:
 ///
-/// let proxy = ProxyConfig::new("socks5-proxy:1080");
-/// let config = ConnectionConfig::builder()
-///     .proxy(proxy)
-///     .build()?;
+/// ```rust,no_run
+/// use krafka::network::ProxyConfig;
+/// use krafka::producer::Producer;
+///
+/// # async fn example() -> Result<(), krafka::error::KrafkaError> {
+/// let producer = Producer::builder()
+///     .bootstrap_servers("broker:9092")
+///     .proxy(ProxyConfig::new("bastion:1080"))
+///     .build()
+///     .await?;
+/// # Ok(())
+/// # }
 /// ```
+///
+/// Or on a shared [`TransportConfig`](crate::network::TransportConfig), which
+/// is the right shape when several clients travel the same network path — the
+/// proxy is a property of the path, not of the client:
+///
+/// ```rust,no_run
+/// use krafka::network::{ProxyConfig, TransportConfig};
+///
+/// # fn example() -> Result<(), krafka::error::KrafkaError> {
+/// let transport = TransportConfig::builder()
+///     .proxy(ProxyConfig::new("bastion:1080"))
+///     .build()?;
+/// # let _ = transport;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Both write to the same place: `ProducerBuilder::proxy` and its siblings are
+/// shorthand for setting it on the builder's transport config, so there is no
+/// precedence rule to get wrong.
+///
+/// The previous example here built a [`ConnectionConfig`], which no client
+/// builder accepts — a reader who followed it reached a type they could not
+/// use.
 #[cfg(feature = "socks5")]
 #[derive(Clone)]
 pub struct ProxyConfig {
@@ -664,6 +695,23 @@ impl ConnectionConfigBuilder {
         self
     }
 
+    /// Set `SO_SNDBUF` for every broker socket, or `None` for the OS default.
+    ///
+    /// See [`TransportConfig::socket_send_buffer`](crate::network::TransportConfig::socket_send_buffer),
+    /// which is how a client builder reaches this.
+    pub fn socket_send_buffer(mut self, bytes: Option<usize>) -> Self {
+        self.0.send_buffer_size = bytes;
+        self
+    }
+
+    /// Set `SO_RCVBUF` for every broker socket, or `None` for the OS default.
+    ///
+    /// See [`TransportConfig::socket_receive_buffer`](crate::network::TransportConfig::socket_receive_buffer).
+    pub fn socket_receive_buffer(mut self, bytes: Option<usize>) -> Self {
+        self.0.recv_buffer_size = bytes;
+        self
+    }
+
     /// Set the maximum number of in-flight requests per connection.
     ///
     /// Limits the number of requests waiting for a response on a single
@@ -671,12 +719,16 @@ impl ConnectionConfigBuilder {
     ///
     /// # Idempotent / transactional producers
     ///
-    /// The Kafka protocol guarantees exactly-once ordering only when
-    /// `max.in.flight.requests.per.connection ≤ 5`. Setting a higher value
-    /// disables the sequence-number ordering guarantee. The producer builder
-    /// ([`crate::producer::ProducerConfigBuilder::max_in_flight`]) automatically enforces this
-    /// cap when idempotent mode is active; if you configure the connection
-    /// config separately, ensure this value is ≤ 5 for idempotent producers.
+    /// Kafka's `max.in.flight.requests.per.connection ≤ 5` rule exists because
+    /// the Java client permits several batches per *partition* to be on the
+    /// wire at once and has to repair their order after a retry.
+    ///
+    /// krafka does not: the record accumulator admits exactly one batch per
+    /// partition, dispatched in the order batches were sealed, so a partition's
+    /// sequence order and its wire order cannot diverge. This setting is
+    /// therefore purely a transport concern — how many requests may be
+    /// outstanding on one socket — and raising it weakens no ordering or
+    /// idempotence guarantee.
     pub fn max_in_flight_requests(mut self, max: usize) -> Self {
         self.0.max_in_flight_requests = max.max(1);
         self
@@ -2803,13 +2855,44 @@ impl BrokerConnection {
     /// Return the remaining throttle delay for this connection, if any.
     ///
     /// Returns `Some(duration)` if the broker's throttle window has not yet
-    /// elapsed, `None` otherwise.  Callers can use this to delay dispatching
-    /// new work before acquiring expensive resources (e.g. in-flight permits).
+    /// elapsed, `None` otherwise.
+    ///
+    /// Prefer [`await_throttle`](Self::await_throttle) if you intend to wait:
+    /// sleeping on this value directly consumes the window without recording
+    /// it, which is how the producer path came to report zero throttle delay
+    /// while being throttled.
     #[inline]
     pub fn throttle_remaining(&self) -> Option<Duration> {
         self.throttle_until
             .lock()
             .checked_duration_since(Instant::now())
+    }
+
+    /// Sleep out any remaining broker-imposed throttle, **recording** the
+    /// delay (KIP-219).
+    ///
+    /// The recording is the reason this exists rather than callers sleeping on
+    /// [`throttle_remaining`](Self::throttle_remaining) themselves. The
+    /// producer did exactly that, one layer above the request path — and
+    /// because the sleep consumed the throttle window, the connection layer's
+    /// own check then found nothing left to wait for and recorded nothing. The
+    /// single metric that answers "is the broker throttling us" read zero on
+    /// the path most likely to be throttled, which is worse than having no
+    /// metric at all: a zero that means "not measured" looks like evidence.
+    ///
+    /// Returns the delay that was applied, if any.
+    pub async fn await_throttle(&self) -> Option<Duration> {
+        let remaining = self.throttle_remaining()?;
+        debug!(
+            delay_ms = remaining.as_millis() as u64,
+            broker = %self.address,
+            "Delaying request due to broker throttle (KIP-219)"
+        );
+        self.config
+            .connection_metrics
+            .record_throttle_delay(remaining);
+        tokio::time::sleep(remaining).await;
+        Some(remaining)
     }
 
     /// Send a request with automatic priority based on API key.
@@ -2911,19 +2994,7 @@ impl BrokerConnection {
 
         // KIP-219: honour broker throttle for normal-priority requests.
         if priority == RequestPriority::Normal {
-            let remaining = {
-                let deadline = self.throttle_until.lock();
-                deadline.checked_duration_since(Instant::now())
-            };
-            if let Some(delay) = remaining {
-                debug!(
-                    delay_ms = delay.as_millis() as u64,
-                    broker = %self.address,
-                    "Delaying request due to broker throttle (KIP-219)"
-                );
-                self.config.connection_metrics.record_throttle_delay(delay);
-                tokio::time::sleep(delay).await;
-            }
+            self.await_throttle().await;
         }
 
         let correlation_id = self.correlation_id_gen.next();
@@ -4721,36 +4792,12 @@ mod tests {
     // KIP-219: Broker throttle compliance
     // ========================================================================
 
-    #[test]
-    fn test_throttle_initial_state_is_past() {
-        // The throttle deadline starts at `Instant::now()`, so any remaining
-        // delay must be effectively zero. Consecutive `Instant::now()` calls
-        // can observe the same instant on fast machines, which yields `Some(0)`.
-        let deadline = Instant::now();
-        let throttle = parking_lot::Mutex::new(deadline);
-        let guard = throttle.lock();
-        let remaining = guard.checked_duration_since(Instant::now());
-        assert!(remaining.unwrap_or_default() <= Duration::from_millis(1));
-    }
-
-    #[test]
-    fn test_throttle_future_deadline_yields_delay() {
-        let future = Instant::now() + Duration::from_secs(10);
-        let throttle = parking_lot::Mutex::new(future);
-        let guard = throttle.lock();
-        let remaining = guard.checked_duration_since(Instant::now());
-        assert!(remaining.is_some());
-        assert!(remaining.unwrap() > Duration::from_secs(5));
-    }
-
-    #[test]
-    fn test_throttle_past_deadline_yields_no_delay() {
-        // A deadline 1ms in the past means no delay.
-        let past = Instant::now() - Duration::from_millis(1);
-        let throttle = parking_lot::Mutex::new(past);
-        let guard = throttle.lock();
-        assert!(guard.checked_duration_since(Instant::now()).is_none());
-    }
+    // The KIP-219 behaviour is exercised against a real `BrokerConnection` in
+    // `testing::tests::broker_throttle_is_honoured_and_counted`. Three unit
+    // tests used to live here that built their own `parking_lot::Mutex<Instant>`
+    // and asserted over `checked_duration_since` — they tested `std::time`
+    // arithmetic, never touched `BrokerConnection`, and so could not have
+    // caught the defect where the producer's throttle wait went uncounted.
 
     #[test]
     fn test_extract_clock_skew_secs_valid_timestamp() {

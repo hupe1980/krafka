@@ -12,12 +12,14 @@
 use ahash::AHashMap;
 use bytes::BufMut as _;
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Semaphore, mpsc, oneshot};
-use tokio::time::interval;
 use tracing::{debug, trace, warn};
 
 use crate::barrier::{InFlightBarrier, InFlightOpGuard};
@@ -74,6 +76,15 @@ const MAX_BATCH_SPLIT_DEPTH: u8 = 2;
 /// many entries, so steady-state producers never pay for the scan.
 const PARTITION_INFLIGHT_PRUNE_THRESHOLD: usize = 1024;
 
+/// How long the accumulator's run loop sleeps when nothing is due.
+///
+/// Nothing correctness-critical hangs off it: dispatch is driven by appends and
+/// by batch completions, and `linger > 0` batches wake the loop at their own
+/// deadline. This is the housekeeping floor — it bounds how long a stale
+/// dispatch-FIFO entry can linger before pruning, and gives the notify-driven
+/// path a backstop. One wake-up per second per idle producer.
+const IDLE_TICK: Duration = Duration::from_secs(1);
+
 /// Per-`(topic, partition)` in-flight FIFO serializer.
 ///
 /// # Why this exists
@@ -100,7 +111,7 @@ const PARTITION_INFLIGHT_PRUNE_THRESHOLD: usize = 1024;
 ///
 /// Cross-partition concurrency is untouched: each `(topic, partition)` has its
 /// own instance.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct PartitionInFlight {
     /// Next ticket to hand out. Only mutated from the accumulator run loop.
     next_ticket: AtomicU64,
@@ -108,9 +119,35 @@ struct PartitionInFlight {
     now_serving: AtomicU64,
     /// Woken every time `now_serving` advances.
     advance: tokio::sync::Notify,
+    /// Woken every time a batch *completes*, so the accumulator's run loop can
+    /// dispatch whatever accumulated behind it without waiting for a tick.
+    dispatch: Arc<tokio::sync::Notify>,
 }
 
 impl PartitionInFlight {
+    /// Create a dispatch slot that reports completions to `dispatch`.
+    fn new(dispatch: Arc<tokio::sync::Notify>) -> Self {
+        Self {
+            next_ticket: AtomicU64::new(0),
+            now_serving: AtomicU64::new(0),
+            advance: tokio::sync::Notify::new(),
+            dispatch,
+        }
+    }
+
+    /// Release the current holder and wake both the next batch in line and the
+    /// accumulator's dispatch loop.
+    ///
+    /// `notify_one` rather than `notify_waiters` for the dispatch side: the run
+    /// loop is usually *not* parked on it (it sits in a `select!` that also
+    /// watches the request channel and the timer), and `notify_one` stores a
+    /// permit so a completion landing between two iterations still triggers the
+    /// next dispatch instead of being lost.
+    fn release(&self) {
+        self.now_serving.fetch_add(1, Ordering::AcqRel);
+        self.advance.notify_waiters();
+        self.dispatch.notify_one();
+    }
     /// Draw the next FIFO ticket for this partition.
     ///
     /// Called from the accumulator run loop at batch-seal time, so the ticket
@@ -126,7 +163,9 @@ impl PartitionInFlight {
 
     /// Whether every ticket handed out for this partition has completed.
     ///
-    /// Used to prune idle entries from the accumulator's partition map.
+    /// Two callers: pruning idle entries from the accumulator's partition map,
+    /// and deciding whether an unfilled batch may be dispatched now or should
+    /// keep accumulating behind the batch already on the wire.
     fn is_idle(&self) -> bool {
         self.now_serving.load(Ordering::Acquire) == self.next_ticket.load(Ordering::Acquire)
     }
@@ -181,8 +220,7 @@ impl Drop for PartitionTicket {
         // partition waits forever. Once acquired, the resulting `PartitionTurn`
         // owns the release instead.
         if !self.acquired {
-            self.slot.now_serving.fetch_add(1, Ordering::AcqRel);
-            self.slot.advance.notify_waiters();
+            self.slot.release();
         }
     }
 }
@@ -199,8 +237,7 @@ struct PartitionTurn {
 
 impl Drop for PartitionTurn {
     fn drop(&mut self) {
-        self.slot.now_serving.fetch_add(1, Ordering::AcqRel);
-        self.slot.advance.notify_waiters();
+        self.slot.release();
     }
 }
 
@@ -336,6 +373,59 @@ impl Drop for BufferedRecordGuard {
     }
 }
 
+/// A record's place in the produce stream, and a future for its acknowledgement.
+///
+/// Returned by [`Producer::enqueue`](crate::producer::Producer::enqueue) once
+/// the record is **queued**. Awaiting it waits for the broker.
+///
+/// # Ordering
+///
+/// The ordering guarantee is established when the enqueue returns, not when
+/// this handle is awaited. Two records enqueued in a known order are produced
+/// in that order, whatever order their handles are polled in — so a caller may
+/// collect handles into a `FuturesUnordered`, await them out of order, or drop
+/// them, without disturbing the stream.
+///
+/// # Dropping
+///
+/// Dropping a handle does **not** cancel the send: the record is already in the
+/// accumulator and will be produced. It only discards the acknowledgement.
+/// Use [`Producer::flush`](crate::producer::Producer::flush) or
+/// [`close`](crate::producer::Producer::close) to wait for records whose
+/// handles were dropped.
+#[derive(Debug)]
+#[must_use = "a dropped DeliveryHandle discards the acknowledgement; the record is still sent"]
+pub struct DeliveryHandle {
+    response_rx: oneshot::Receiver<AppendResponse>,
+    /// The partition the record was routed to, known at enqueue time.
+    partition: PartitionId,
+}
+
+impl DeliveryHandle {
+    /// The partition this record was routed to.
+    ///
+    /// Known at enqueue time, so it is available without awaiting.
+    #[inline]
+    #[must_use]
+    pub fn partition(&self) -> PartitionId {
+        self.partition
+    }
+}
+
+impl Future for DeliveryHandle {
+    type Output = Result<RecordMetadata>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match Pin::new(&mut self.response_rx).poll(cx) {
+            Poll::Ready(Ok(AppendResponse::Done(result))) => Poll::Ready(result),
+            Poll::Ready(Err(_)) => Poll::Ready(Err(KrafkaError::invalid_state(
+                "accumulator response dropped",
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 /// Response from the accumulator for an append attempt.
 ///
 /// Backpressure (buffer-memory exhaustion) is handled entirely in the handle
@@ -354,6 +444,14 @@ struct AppendCommand {
     record: RoutedRecord,
     partition: PartitionId,
     record_size: usize,
+    /// When the caller entered `send()`.
+    ///
+    /// `delivery_timeout` is documented as covering everything from that
+    /// moment, which includes the up-to-`max_block` wait for buffer memory this
+    /// record may have just spent. Charging from batch creation instead would
+    /// silently exclude that wait — for a backpressured producer, potentially
+    /// the largest part of it.
+    send_started_at: Instant,
     response_tx: oneshot::Sender<AppendResponse>,
     operation_guard: InFlightOpGuard,
     /// Tracks this append in the buffered-records gauge from successful
@@ -469,8 +567,9 @@ impl RecordAccumulatorHandle {
         record: ProducerRecord,
         partition: PartitionId,
     ) -> Result<RecordMetadata> {
+        let send_started_at = Instant::now();
         let operation_guard = self.in_flight_barrier.start("producer")?;
-        self.append_with_guard(record, partition, operation_guard)
+        self.append_with_guard(record, partition, operation_guard, send_started_at)
             .await
     }
 
@@ -479,6 +578,7 @@ impl RecordAccumulatorHandle {
         record: ProducerRecord,
         partition: PartitionId,
         operation_guard: InFlightOpGuard,
+        send_started_at: Instant,
     ) -> Result<RecordMetadata> {
         let record_size = record.estimated_size();
         let routed = record.into_routed_parts();
@@ -488,6 +588,7 @@ impl RecordAccumulatorHandle {
             record_size,
             partition,
             operation_guard,
+            send_started_at,
         )
         .await
     }
@@ -499,7 +600,37 @@ impl RecordAccumulatorHandle {
         record_size: usize,
         partition: PartitionId,
         operation_guard: InFlightOpGuard,
+        send_started_at: Instant,
     ) -> Result<RecordMetadata> {
+        self.enqueue_routed_with_guard(
+            topic,
+            record,
+            record_size,
+            partition,
+            operation_guard,
+            send_started_at,
+        )
+        .await?
+        .await
+    }
+
+    /// Append a record and return once it is **queued**, not once it is
+    /// acknowledged.
+    ///
+    /// The returned [`DeliveryHandle`] resolves to the broker's answer. The
+    /// split is what makes ordering expressible: two records whose enqueue
+    /// completed in a known order occupy the accumulator's channel in that
+    /// order, and the run loop drains it FIFO — so produce order follows call
+    /// order regardless of the order the handles are later awaited.
+    pub(crate) async fn enqueue_routed_with_guard(
+        &self,
+        topic: TopicHandle,
+        record: RoutedRecord,
+        record_size: usize,
+        partition: PartitionId,
+        operation_guard: InFlightOpGuard,
+        send_started_at: Instant,
+    ) -> Result<DeliveryHandle> {
         let deadline = tokio::time::Instant::now() + self.max_block_ms;
 
         // Reject records that cannot physically be admitted (exceeds the
@@ -556,6 +687,7 @@ impl RecordAccumulatorHandle {
                 record,
                 partition,
                 record_size,
+                send_started_at,
                 response_tx,
                 operation_guard,
                 _buffered_record_guard: buffered_record_guard,
@@ -573,12 +705,10 @@ impl RecordAccumulatorHandle {
             }
         }
 
-        match response_rx
-            .await
-            .map_err(|_| KrafkaError::invalid_state("accumulator response dropped"))?
-        {
-            AppendResponse::Done(result) => result,
-        }
+        Ok(DeliveryHandle {
+            response_rx,
+            partition,
+        })
     }
 
     /// Flush all pending batches.
@@ -627,10 +757,7 @@ pub struct AccumulatorConfig {
     /// Compression level, or `None` for the codec's own default.
     ///
     /// Applies to whichever codec is selected for the batch, including a
-    /// per-topic override. This field exists because it was missing: the
-    /// direct-send path honoured `compression_level` and this one silently
-    /// dropped it, so the setting applied to exactly the configuration
-    /// (`linger = 0`) that batches the least.
+    /// per-topic override.
     pub compression_level: Option<i32>,
     /// Per-topic compression overrides.
     ///
@@ -652,8 +779,6 @@ pub struct AccumulatorConfig {
     /// Maximum time to block waiting for buffer memory (ms).
     /// If memory is not available within this time, an error is returned.
     pub max_block_ms: Duration,
-    /// In-flight semaphore for concurrency limiting (shared with direct send path).
-    pub in_flight_semaphore: Arc<Semaphore>,
     /// Producer interceptor for on_acknowledgement callbacks.
     pub interceptor: Arc<dyn ProducerInterceptor>,
     /// Producer identity for idempotent production (PID, epoch, sequences).
@@ -684,10 +809,7 @@ pub struct AccumulatorConfig {
     ///
     /// Invoked once per record after the retry budget is exhausted (or on a
     /// non-retriable error), immediately before the failure is handed back to
-    /// the caller — the same point at which the direct-send path routes to the
-    /// DLQ. Before this field existed the producer DLQ was reachable only when
-    /// `linger = 0`, so configuring both a DLQ and any batching silently
-    /// disabled the DLQ.
+    /// the caller.
     pub(crate) dead_letter_queue: Option<Arc<dyn crate::dlq::DeadLetterQueue>>,
 }
 
@@ -705,7 +827,6 @@ impl Clone for AccumulatorConfig {
             max_request_size: self.max_request_size,
             buffer_memory: self.buffer_memory,
             max_block_ms: self.max_block_ms,
-            in_flight_semaphore: self.in_flight_semaphore.clone(),
             interceptor: self.interceptor.clone(),
             identity: self.identity.clone(),
             partitioner: self.partitioner.clone(),
@@ -748,7 +869,6 @@ impl Default for AccumulatorConfig {
             max_request_size: crate::protocol::MAX_MESSAGE_SIZE,
             buffer_memory: 32 * 1024 * 1024, // 32 MB default (same as Kafka Java client)
             max_block_ms: Duration::from_secs(60), // 60 seconds default
-            in_flight_semaphore: Arc::new(Semaphore::new(5)), // default max_in_flight
             interceptor: Arc::new(crate::interceptor::NoOpProducerInterceptor),
             identity: None,
             partitioner: Arc::new(super::partitioner::UniformStickyPartitioner::new()),
@@ -803,17 +923,32 @@ struct AccumulatorBatch {
     max_size: usize,
     /// Pending records waiting to be sent.
     pending: Vec<PendingRecord>,
-    /// When the batch was created (for linger expiry).
-    created_at: Instant,
+    /// When this batch was opened — the **linger** clock.
+    ///
+    /// Deliberately separate from [`deadline_from`](Self::deadline_from): linger
+    /// asks "how long has this batch been collecting records", which starts when
+    /// the batch exists. Charging it from the earliest record's `send()` entry
+    /// instead would make a batch whose first record spent 30 s waiting on
+    /// buffer memory arrive already linger-expired, dispatching a batch of one
+    /// the instant it opened.
+    opened_at: Instant,
+    /// Earliest `send()` entry among this batch's records — the
+    /// **delivery-timeout** clock.
+    ///
+    /// A record that waited on buffer memory must not get a fresh budget just
+    /// because it joined a young batch, so this only ever moves backwards.
+    deadline_from: Instant,
 }
 
 impl AccumulatorBatch {
     fn new(max_size: usize) -> Self {
+        let now = Instant::now();
         Self {
             current_size: 0,
             max_size,
             pending: Vec::new(),
-            created_at: Instant::now(),
+            opened_at: now,
+            deadline_from: now,
         }
     }
 
@@ -849,8 +984,24 @@ impl AccumulatorBatch {
         self.current_size += record_size;
     }
 
+    /// How long this batch has been collecting records — the linger clock.
     fn age(&self) -> Duration {
-        self.created_at.elapsed()
+        self.opened_at.elapsed()
+    }
+
+    /// The instant this batch's linger window expires.
+    fn linger_deadline(&self, linger: Duration) -> Instant {
+        self.opened_at + linger
+    }
+
+    /// Pull the batch's delivery clock back to `started_at` if that is earlier.
+    ///
+    /// Monotonic in one direction only: a batch's budget can be widened by an
+    /// older record joining it, never narrowed by a newer one.
+    fn charge_from(&mut self, started_at: Instant) {
+        if started_at < self.deadline_from {
+            self.deadline_from = started_at;
+        }
     }
 }
 
@@ -887,6 +1038,14 @@ pub struct RecordAccumulator {
     /// idempotent sequence) until batch *n* is acknowledged or permanently
     /// failed. See [`PartitionInFlight`].
     partition_inflight: AHashMap<(TopicHandle, PartitionId), Arc<PartitionInFlight>>,
+    /// Signalled by [`PartitionInFlight::release`] whenever a batch completes.
+    ///
+    /// This is what makes `linger = 0` behave like the Java client rather than
+    /// like "one record per request": a record that arrives while its partition
+    /// already has a batch on the wire keeps accumulating, and the moment that
+    /// batch is acknowledged the run loop dispatches whatever collected behind
+    /// it — no linger tick, no added latency.
+    dispatch_notify: Arc<tokio::sync::Notify>,
 }
 
 impl RecordAccumulator {
@@ -942,6 +1101,7 @@ impl RecordAccumulator {
             memory_permits: memory_permits.clone(),
             partitioner: accumulator_partitioner,
             partition_inflight: AHashMap::new(),
+            dispatch_notify: Arc::new(tokio::sync::Notify::new()),
         };
 
         let memory_permits_panic = memory_permits.clone();
@@ -973,14 +1133,30 @@ impl RecordAccumulator {
     }
 
     /// Run the accumulator background task.
+    ///
+    /// # Why there is no fixed tick
+    ///
+    /// This loop used to drive a 1 ms `interval`, which was affordable when the
+    /// accumulator only existed for `linger > 0` producers. Now that every
+    /// producer has one, a fixed tick would wake the runtime a thousand times a
+    /// second for every `Producer` in the process, including idle ones.
+    ///
+    /// Instead each iteration sleeps until the moment something is actually due:
+    /// the earliest open batch's linger deadline, or [`IDLE_TICK`] when nothing
+    /// is open. Dispatch itself is event-driven — an append or a batch
+    /// completion wakes the loop directly — so the timer is only ever a
+    /// deadline, never a poll.
     async fn run(mut self, mut receiver: mpsc::Receiver<AccumulatorMessage>) {
-        // Linger timer interval - check every 1ms for expired batches
-        let linger_check_interval = Duration::from_millis(1).max(self.config.linger / 10);
-        let mut linger_timer = interval(linger_check_interval);
-        linger_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let dispatch_notify = self.dispatch_notify.clone();
 
         loop {
+            let wake_at = self.next_wake_deadline();
             tokio::select! {
+                () = dispatch_notify.notified() => {
+                    // A batch finished; a partition that was holding records
+                    // back because it had one on the wire can send now.
+                    self.dispatch_unblocked_partitions();
+                }
                 msg = receiver.recv() => {
                     match msg {
                         Some(AccumulatorMessage::Append(append)) => {
@@ -1003,13 +1179,32 @@ impl RecordAccumulator {
                         }
                     }
                 }
-                _ = linger_timer.tick() => {
+                () = tokio::time::sleep_until(wake_at.into()) => {
                     self.check_linger_expiry();
                 }
             }
         }
 
         debug!("Accumulator shutdown complete");
+    }
+
+    /// When the loop next has something time-driven to do.
+    ///
+    /// With `linger > 0` that is the earliest open batch's linger deadline.
+    /// With `linger = 0` no batch is ever waiting on a clock — dispatch is
+    /// driven by appends and completions — so this is purely the housekeeping
+    /// tick, and the same is true when there is nothing buffered at all.
+    fn next_wake_deadline(&self) -> Instant {
+        let idle = Instant::now() + IDLE_TICK;
+        if self.config.linger.is_zero() {
+            return idle;
+        }
+        self.batches
+            .values()
+            .filter(|batch| !batch.is_empty())
+            .map(|batch| batch.linger_deadline(self.config.linger))
+            .min()
+            .map_or(idle, |deadline| deadline.min(idle))
     }
 
     /// Handle appending a record.
@@ -1025,6 +1220,7 @@ impl RecordAccumulator {
             record,
             partition,
             record_size,
+            send_started_at,
             response_tx,
             operation_guard,
             _buffered_record_guard: buffered_record_guard,
@@ -1044,6 +1240,11 @@ impl RecordAccumulator {
             .batches
             .entry(key.clone())
             .or_insert_with(|| AccumulatorBatch::new(batch_size));
+
+        // The batch's delivery clock is the *earliest* `send()` entry among its
+        // records, so a record that waited for buffer memory does not get a
+        // fresh budget just because it joined a young batch.
+        accumulator_batch.charge_from(send_started_at);
 
         // Check if the record fits in the current batch. If so, move it
         // directly into PendingRecord (zero clones). The batch only tracks
@@ -1072,9 +1273,21 @@ impl RecordAccumulator {
                 self.partitioner
                     .on_new_batch(key.0.as_ref(), partition, partition_count);
                 self.flush_batch(&key);
-            } else if self.config.linger.is_zero() {
-                // linger=0 means send immediately without waiting
-                // for the next linger timer tick (up to 1ms delay otherwise).
+            } else if self.config.linger.is_zero() && self.partition_is_idle(&key) {
+                // `linger = 0` means "do not *wait* for more records", not
+                // "never batch". With nothing on the wire there is nothing to
+                // wait for, so this record goes out immediately — the
+                // low-latency case, unchanged.
+                //
+                // With a batch already in flight, sealing this one now would
+                // only park it behind the other in the per-partition FIFO and
+                // buy a full round trip of latency for a batch of one. Leaving
+                // it open lets the records arriving during that round trip
+                // coalesce into it, and `dispatch_unblocked_partitions` sends
+                // it the instant the wire frees up. This is what
+                // `linger.ms = 0` does in the Java client, and it is the
+                // difference between one record per round trip and one *batch*
+                // per round trip.
                 trace!("Linger=0 for {}-{}, flushing immediately", key.0, partition);
                 self.flush_batch(&key);
             }
@@ -1090,6 +1303,7 @@ impl RecordAccumulator {
 
             // Create new batch and add record
             let mut new_batch = AccumulatorBatch::new(batch_size);
+            new_batch.charge_from(send_started_at);
 
             if new_batch.would_fit(record_size) {
                 new_batch.track(record_size);
@@ -1126,7 +1340,10 @@ impl RecordAccumulator {
         self.prune_idle_partition_inflight();
 
         if self.config.linger.is_zero() {
-            self.flush_all_ready();
+            // Safety net for the notify-driven path: a completion notification
+            // is consumed by a single `select!` arm, so a burst that resolves
+            // several partitions at once could otherwise leave one waiting.
+            self.dispatch_unblocked_partitions();
             return;
         }
 
@@ -1165,12 +1382,25 @@ impl RecordAccumulator {
     /// `spawn_batches_detached` so the run loop is never blocked by network
     /// I/O. The shared `send_semaphore` caps the total concurrent task count
     /// across all in-flight waves to `MAX_CONCURRENT_BATCH_SENDS`.
-    fn flush_all_ready(&mut self) {
+    fn partition_is_idle(&self, key: &(TopicHandle, PartitionId)) -> bool {
+        self.partition_inflight
+            .get(key)
+            .is_none_or(|slot| slot.is_idle())
+    }
+
+    /// Dispatch the accumulated batch of every partition whose wire is free.
+    ///
+    /// This is the `linger = 0` drain. Partitions that still have a batch in
+    /// flight are skipped and keep accumulating, so the records that arrive
+    /// during a round trip travel together in the next request instead of one
+    /// per request.
+    fn dispatch_unblocked_partitions(&mut self) {
         let keys_to_flush: Vec<_> = self
             .batches
             .iter()
             .filter(|(_, batch)| !batch.is_empty())
             .map(|(key, _)| key.clone())
+            .filter(|key| self.partition_is_idle(key))
             .collect();
 
         if keys_to_flush.is_empty() {
@@ -1248,7 +1478,7 @@ impl RecordAccumulator {
                     topic,
                     partition,
                     batch.pending,
-                    batch.created_at,
+                    batch.deadline_from,
                     guard,
                     ticket,
                     metadata,
@@ -1333,10 +1563,11 @@ impl RecordAccumulator {
         // ticket order is exactly seal order. The send task blocks on this
         // ticket before allocating a sequence, which is what makes idempotent
         // sequence order match wire order.
+        let dispatch_notify = &self.dispatch_notify;
         let ticket = self
             .partition_inflight
             .entry(key.clone())
-            .or_default()
+            .or_insert_with(|| Arc::new(PartitionInFlight::new(dispatch_notify.clone())))
             .take_ticket();
         Some(ExtractedBatch {
             batch,
@@ -1460,9 +1691,6 @@ impl RecordAccumulator {
             }
         }
 
-        // Acquire in-flight permit before sending (accumulator was
-        // bypassing max_in_flight). The permit is held until this batch completes.
-        let _permit = config.in_flight_semaphore.acquire().await;
         let _timer = metrics.send_latency.start();
 
         Self::produce_pending(
@@ -1477,6 +1705,59 @@ impl RecordAccumulator {
             0,
         )
         .await;
+    }
+
+    /// Reserve `record_count` idempotent sequence numbers for this batch.
+    ///
+    /// Returns `Ok(None)` for a non-idempotent producer, which has no sequence
+    /// space to allocate from.
+    ///
+    /// A transactional producer is never re-initialised here: its producer ID
+    /// and epoch come from the transaction coordinator and are owned by
+    /// `TransactionalProducer`. Running a plain `InitProducerId` would replace
+    /// a fenced identity with an unfenced one, so a cleared transactional
+    /// identity is reported instead.
+    async fn allocate_sequence_range(
+        config: &AccumulatorConfig,
+        metadata: &Arc<ClusterMetadata>,
+        retry_policy: &RetryPolicy,
+        topic: &TopicHandle,
+        partition: PartitionId,
+        record_count: i32,
+    ) -> Result<Option<i32>> {
+        let Some(identity) = config.identity.as_ref() else {
+            return Ok(None);
+        };
+
+        if let Some(base) =
+            identity.checked_allocate_sequence(topic.as_ref(), partition, record_count)?
+        {
+            return Ok(Some(base));
+        }
+
+        if config.transactional_id.is_some() {
+            return Err(KrafkaError::invalid_state(
+                "transactional producer identity was cleared before the batch could allocate \
+                 a sequence range; the transaction must be aborted and restarted",
+            ));
+        }
+
+        // The identity was cleared between the caller's initialisation check
+        // and this allocation. Re-initialise and try once more; a second
+        // failure means another reset is racing us, which is retriable.
+        super::ensure_idempotent_producer_id_initialized(identity, metadata, retry_policy).await?;
+        identity
+            .checked_allocate_sequence(topic.as_ref(), partition, record_count)?
+            .map(Some)
+            .ok_or_else(|| {
+                KrafkaError::broker(
+                    ErrorCode::UnknownProducerId,
+                    format!(
+                        "producer identity was reset while allocating sequences for \
+                         {topic}-{partition}; retry the send"
+                    ),
+                )
+            })
     }
 
     /// Terminally fail every record in `pending` with `error`.
@@ -1604,7 +1885,7 @@ impl RecordAccumulator {
     ///
     /// **Must** be called while holding this partition's [`PartitionTurn`]:
     /// the sequence range is allocated here, and the ordering guarantee in
-    /// [`send_extracted_batch`] depends on no other batch for the partition
+    /// `send_extracted_batch` depends on no other batch for the partition
     /// allocating concurrently.
     ///
     /// `split_depth` bounds the `MESSAGE_TOO_LARGE` recursion — see
@@ -1663,11 +1944,21 @@ impl RecordAccumulator {
         // dispatch order and the failing batch is always the tail *and* the
         // head of the partition's outstanding range. That is what makes the
         // rollback and out-of-order checks below decidable.
-        let mut sequence: Option<i32> = match config
-            .identity
-            .as_ref()
-            .map(|id| id.allocate_sequence(topic.as_ref(), partition, record_count))
-            .transpose()
+        // `checked_allocate_sequence` rather than `allocate_sequence`: the
+        // caller checked initialisation, but a batch for a *different*
+        // partition can clear the producer ID between then and now (that is
+        // what `UnknownProducerId` recovery does). Allocating through the
+        // unchecked call in that window would stamp the batch with producer ID
+        // `-1` — a silently non-idempotent write, with no error anywhere.
+        let mut sequence: Option<i32> = match Self::allocate_sequence_range(
+            config,
+            metadata,
+            retry_policy,
+            topic,
+            partition,
+            record_count,
+        )
+        .await
         {
             Ok(s) => s,
             Err(e) => {
@@ -1748,15 +2039,10 @@ impl RecordAccumulator {
             // normal-priority requests, but checking here avoids performing
             // API-version negotiation while the quota window is still open,
             // reducing wasted work per iteration.
-            if let Some(delay) = conn.throttle_remaining() {
-                debug!(
-                    delay_ms = delay.as_millis() as u64,
-                    topic = %topic,
-                    partition = partition,
-                    "Delaying batch send due to broker throttle (KIP-219)"
-                );
-                tokio::time::sleep(delay).await;
-            }
+            // `await_throttle` rather than sleeping on `throttle_remaining`:
+            // the wait has to be counted, and doing it here consumes the
+            // window before the request path's own check can see it.
+            conn.await_throttle().await;
 
             // Negotiate Produce version for this broker.
             let mut produce_version = match conn.negotiate_api_version(
@@ -2262,6 +2548,78 @@ mod tests {
         assert!(batch.age() >= Duration::from_millis(10));
     }
 
+    /// The linger clock and the delivery clock are separate.
+    ///
+    /// `delivery_timeout` is charged from `send()` entry so the wait for buffer
+    /// memory counts against it. Linger is not: it asks how long the *batch*
+    /// has been collecting. Sharing one field made a batch whose first record
+    /// had waited on backpressure open already linger-expired, so it dispatched
+    /// a batch of one immediately — turning the fix for one setting into a
+    /// regression in another.
+    #[test]
+    fn backpressure_charges_the_delivery_clock_but_not_the_linger_clock() {
+        const LINGER: Duration = Duration::from_millis(50);
+
+        let mut batch = AccumulatorBatch::new(16384);
+        let opened_at = batch.opened_at;
+
+        // A record that entered `send()` a minute ago and only now got memory.
+        let waited_since = opened_at - Duration::from_secs(60);
+        batch.charge_from(waited_since);
+
+        assert_eq!(
+            batch.deadline_from, waited_since,
+            "the delivery budget must cover the backpressure wait"
+        );
+        assert_eq!(
+            batch.opened_at, opened_at,
+            "the linger window must not be retroactively expired by it"
+        );
+        assert!(
+            batch.linger_deadline(LINGER) > Instant::now(),
+            "a freshly opened batch must still have its full linger window"
+        );
+
+        // And the delivery clock only ever moves backwards.
+        batch.charge_from(opened_at + Duration::from_secs(1));
+        assert_eq!(batch.deadline_from, waited_since);
+    }
+
+    /// An idle producer must not wake the runtime on a fixed tick.
+    ///
+    /// Every producer now owns an accumulator — at `linger = 0` too — so a
+    /// millisecond `interval` would cost a thousand wake-ups per second per
+    /// idle `Producer` in the process. Nothing is due when nothing is
+    /// buffered, so the loop sleeps for `IDLE_TICK` instead.
+    #[tokio::test]
+    async fn an_idle_accumulator_sleeps_instead_of_polling() {
+        let mut accumulator = test_accumulator(Duration::from_millis(5));
+        let now = Instant::now();
+
+        assert!(
+            accumulator.next_wake_deadline() >= now + IDLE_TICK - Duration::from_millis(1),
+            "an empty accumulator has nothing due before the housekeeping tick"
+        );
+
+        accumulator
+            .batches
+            .insert((Arc::from("orders"), 0), non_empty_batch());
+        let wake = accumulator.next_wake_deadline();
+        assert!(
+            wake < now + IDLE_TICK,
+            "an open batch must wake the loop at its linger deadline, not the idle tick"
+        );
+
+        let mut immediate = test_accumulator(Duration::ZERO);
+        immediate
+            .batches
+            .insert((Arc::from("orders"), 0), non_empty_batch());
+        assert!(
+            immediate.next_wake_deadline() >= now + IDLE_TICK - Duration::from_millis(1),
+            "linger = 0 dispatch is event-driven; the timer is housekeeping only"
+        );
+    }
+
     #[test]
     fn test_accumulator_batch_new() {
         let batch = AccumulatorBatch::new(32768);
@@ -2281,7 +2639,6 @@ mod tests {
             max_request_size: 131072,
             buffer_memory: 64 * 1024 * 1024,
             max_block_ms: Duration::from_secs(30),
-            in_flight_semaphore: Arc::new(Semaphore::new(5)),
             interceptor: Arc::new(crate::interceptor::NoOpProducerInterceptor),
             identity: None,
             partitioner: Arc::new(crate::producer::partitioner::DefaultPartitioner::new()),
@@ -2321,6 +2678,45 @@ mod tests {
                 .start("test")
                 .expect("a fresh barrier is open"),
         }
+    }
+
+    /// A bare accumulator for exercising the run loop's pure decisions.
+    ///
+    /// It is never spawned, so nothing here reaches the network; the fields
+    /// under test (`batches`, `config.linger`) are the only ones read.
+    fn test_accumulator(linger: Duration) -> RecordAccumulator {
+        let pool = Arc::new(crate::network::ConnectionPool::new(
+            crate::network::ConnectionConfig::default(),
+        ));
+        RecordAccumulator {
+            config: AccumulatorConfig {
+                linger,
+                ..AccumulatorConfig::default()
+            },
+            batches: AHashMap::new(),
+            metadata: Arc::new(ClusterMetadata::new(
+                vec!["127.0.0.1:9092".to_string()],
+                pool,
+                Duration::from_secs(300),
+            )),
+            send_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_BATCH_SENDS)),
+            in_flight_memory: Arc::new(AtomicUsize::new(0)),
+            retry_policy: RetryPolicy::default(),
+            metrics: Arc::new(ProducerMetrics::default()),
+            memory_permits: Arc::new(Semaphore::new(1024)),
+            partitioner: Arc::new(crate::producer::DefaultPartitioner::new()),
+            partition_inflight: AHashMap::new(),
+            dispatch_notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// A batch holding one record, so `is_empty()` is false.
+    fn non_empty_batch() -> AccumulatorBatch {
+        let mut batch = AccumulatorBatch::new(16384);
+        batch
+            .pending
+            .push(test_pending(bytes::Bytes::from_static(b"v")));
+        batch
     }
 
     /// A payload with enough structure that the compression level changes the
@@ -2370,10 +2766,9 @@ mod tests {
 
     /// `compression_level` must reach the **batched** encoder.
     ///
-    /// It did not. `ProducerBuilder::compression_level` was applied only in
-    /// `build_produce_request`, the direct-send path taken when `linger = 0`.
-    /// Any producer with `linger > 0` — the throughput-tuned configuration, and
-    /// the *only* configuration a `TransactionalProducer` has — silently
+    /// It did not, for as long as the producer had a second send path:
+    /// `compression_level` was read only there, so every batched producer —
+    /// and every `TransactionalProducer`, which has no other mode — silently
     /// encoded at the codec's default level. Nothing reported it, because a
     /// batch compressed at the wrong level is a perfectly valid batch.
     ///
@@ -2462,11 +2857,10 @@ mod tests {
 
     /// A permanently failed batch must reach the dead-letter queue.
     ///
-    /// `ProducerBuilder::dead_letter_queue` used to be documented as
-    /// direct-send-only, which meant configuring a DLQ alongside any batching
-    /// silently disabled it — and batching is what a throughput-tuned producer
-    /// runs, and the only thing a `TransactionalProducer` does. The records
-    /// were available the whole time; nothing was reading them.
+    /// `ProducerBuilder::dead_letter_queue` was once wired to the producer's
+    /// second send path only, so configuring a DLQ alongside any batching
+    /// silently disabled it. The records were available the whole time;
+    /// nothing was reading them.
     ///
     /// Negative control: deleting the `dead_letter_queue` block from
     /// `fail_pending` leaves the DLQ empty and this fails.
@@ -2832,7 +3226,7 @@ mod tests {
     /// can yield `0, 1, 2, …`.
     #[tokio::test]
     async fn test_same_partition_batches_dispatch_in_seal_order() {
-        let slot = Arc::new(PartitionInFlight::default());
+        let slot = Arc::new(PartitionInFlight::new(Arc::new(tokio::sync::Notify::new())));
         let tickets: Vec<PartitionTicket> = (0..8).map(|_| slot.take_ticket()).collect();
         let order = Arc::new(parking_lot::Mutex::new(Vec::new()));
 
@@ -2873,7 +3267,7 @@ mod tests {
 
         let identity = Arc::new(ProducerIdentity::new());
         identity.initialize(1, 0);
-        let slot = Arc::new(PartitionInFlight::default());
+        let slot = Arc::new(PartitionInFlight::new(Arc::new(tokio::sync::Notify::new())));
         let tickets: Vec<PartitionTicket> = (0..BATCHES).map(|_| slot.take_ticket()).collect();
         let observed = Arc::new(parking_lot::Mutex::new(Vec::new()));
 
@@ -2906,8 +3300,8 @@ mod tests {
     /// able to hold their turns simultaneously.
     #[tokio::test]
     async fn test_different_partitions_are_not_serialized() {
-        let a = Arc::new(PartitionInFlight::default());
-        let b = Arc::new(PartitionInFlight::default());
+        let a = Arc::new(PartitionInFlight::new(Arc::new(tokio::sync::Notify::new())));
+        let b = Arc::new(PartitionInFlight::new(Arc::new(tokio::sync::Notify::new())));
         let turn_a = a.take_ticket().acquire().await;
 
         // Partition B must not be blocked by partition A's held turn.
@@ -2924,7 +3318,7 @@ mod tests {
     /// partition would wait forever.
     #[tokio::test]
     async fn test_dropped_ticket_does_not_stall_the_partition() {
-        let slot = Arc::new(PartitionInFlight::default());
+        let slot = Arc::new(PartitionInFlight::new(Arc::new(tokio::sync::Notify::new())));
         let abandoned = slot.take_ticket();
         let next = slot.take_ticket();
 
@@ -2937,10 +3331,31 @@ mod tests {
         assert!(slot.is_idle());
     }
 
+    /// Completing a batch wakes the accumulator's dispatch loop, not just the
+    /// next batch in the partition's FIFO.
+    ///
+    /// This is what makes `linger = 0` coalesce: records arriving during a
+    /// round trip stay in the open batch, and the loop must be told the moment
+    /// the wire frees up or they would sit there until the next tick.
+    #[tokio::test]
+    async fn a_completed_batch_wakes_the_dispatch_loop() {
+        let dispatch = Arc::new(tokio::sync::Notify::new());
+        let slot = Arc::new(PartitionInFlight::new(dispatch.clone()));
+
+        let turn = slot.take_ticket().acquire().await;
+        drop(turn);
+
+        // `notify_one` stores a permit, so the wake-up survives the gap
+        // between the completion and the loop's next `select!` iteration.
+        tokio::time::timeout(Duration::from_millis(500), dispatch.notified())
+            .await
+            .expect("a batch completion must wake the dispatch loop");
+    }
+
     /// A completed partition reports idle so it can be pruned from the map.
     #[tokio::test]
     async fn test_partition_inflight_idle_tracking() {
-        let slot = Arc::new(PartitionInFlight::default());
+        let slot = Arc::new(PartitionInFlight::new(Arc::new(tokio::sync::Notify::new())));
         assert!(slot.is_idle());
 
         let ticket = slot.take_ticket();

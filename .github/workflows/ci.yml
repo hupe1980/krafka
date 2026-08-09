@@ -143,6 +143,22 @@ jobs:
       - uses: extractions/setup-just@v3
       - run: just test-reachability
 
+  config-reachability:
+    name: No config field that cannot be set
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: extractions/setup-just@v3
+      - run: just config-reachability
+
+  protocol-reachability:
+    name: No decoded field that is never read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: extractions/setup-just@v3
+      - run: just protocol-reachability
+
   doc:
     name: Documentation
     runs-on: ubuntu-latest

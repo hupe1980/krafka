@@ -14,6 +14,30 @@ use crate::protocol::{
 
 #[allow(clippy::wildcard_imports)]
 use super::*;
+use crate::protocol::CreatableReplicaAssignment;
+
+/// Translate a [`NewTopic`]'s replica placement into the wire form.
+///
+/// Sorted by partition index so the request is byte-deterministic — a
+/// `HashMap` iterates in an unspecified order, and a request whose bytes change
+/// between runs is one nobody can diff against a packet capture.
+fn replica_assignments(topic: &NewTopic) -> Vec<CreatableReplicaAssignment> {
+    if topic.replica_assignments.is_empty() {
+        return Vec::new();
+    }
+    let mut assignments: Vec<CreatableReplicaAssignment> = topic
+        .replica_assignments
+        .iter()
+        .map(
+            |(&partition_index, broker_ids)| CreatableReplicaAssignment {
+                partition_index,
+                broker_ids: broker_ids.clone(),
+            },
+        )
+        .collect();
+    assignments.sort_unstable_by_key(|a| a.partition_index);
+    assignments
+}
 
 impl AdminClient {
     /// Create topics.
@@ -62,7 +86,7 @@ impl AdminClient {
                                 name: t.name.clone(),
                                 num_partitions: t.num_partitions,
                                 replication_factor: t.replication_factor,
-                                assignments: Vec::new(),
+                                assignments: replica_assignments(t),
                                 configs: t
                                     .configs
                                     .iter()

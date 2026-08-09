@@ -431,7 +431,7 @@ fn build_insecure_tls_config(config: &TlsConfig) -> Result<ClientConfig> {
 /// A certificate verifier that accepts any server certificate without validation.
 ///
 /// Carries a reference to the [`CryptoProvider`] used when building the
-/// [`ClientConfig`] so that [`supported_verify_schemes`] always returns schemes
+/// [`ClientConfig`] so that `supported_verify_schemes` always returns schemes
 /// consistent with that provider (instead of relying on the global default).
 #[derive(Debug)]
 struct NoServerCertVerifier {

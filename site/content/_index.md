@@ -81,10 +81,9 @@ make actually reach the wire.
 
 ## Install
 
-```toml
-[dependencies]
-krafka = "0.17"
-tokio = { version = "1", features = ["full"] }
+```sh
+cargo add krafka
+cargo add tokio --features full
 ```
 
 ## Produce
