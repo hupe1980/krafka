@@ -18,9 +18,8 @@ directly: an in-process broker speaking the real wire protocol over a real TCP
 socket, so the client under test is the actual `Producer`, `Consumer` or
 `AdminClient`, exercising its real network path.
 
-```toml
-[dev-dependencies]
-krafka = { version = "0.17", features = ["test-broker"] }
+```sh
+cargo add --dev krafka --features test-broker
 ```
 
 ## A first test

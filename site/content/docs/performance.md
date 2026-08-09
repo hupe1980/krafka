@@ -118,10 +118,11 @@ connection at any time, and responses are demultiplexed by correlation ID.
 
 A previous `connections_per_broker` setting and its `BrokerConnectionBundle`
 type have been **removed**. They were never wired into the connection pool, so
-setting them had no effect. They are not coming back in that form, because
-spreading one partition's produce traffic across several sockets would break
-the idempotent producer's ordering guarantee — `max.in.flight.requests` bounds
-reordering *per connection*, so a partition's batches must stay on one socket.
+setting them had no effect. They are not coming back in that form: krafka
+guarantees per-partition ordering by keeping exactly one batch per partition on
+the wire, and that guarantee is only meaningful while a partition's batches
+travel over one socket in dispatch order. Spreading them across several
+connections would put the ordering back in the hands of the scheduler.
 
 If you need more parallelism to one broker today, run more clients: each
 `Producer`/`Consumer` built without `.with_client(...)` owns its own pool. Use
@@ -180,6 +181,10 @@ let transport = TransportConfig::builder()
     //   max_response_size × max_in_flight_requests
     // 16 × 100 MiB = 1.6 GiB. Lower one or the other on a memory-tight host.
     .max_response_size(32 * 1024 * 1024)
+    // On a high bandwidth-delay-product link the socket buffer, not the
+    // network, is the ceiling. `None` (the default) leaves the OS value.
+    .socket_send_buffer(Some(4 * 1024 * 1024))
+    .socket_receive_buffer(Some(4 * 1024 * 1024))
     // Match the broker's connections.max.idle.ms.
     .connections_max_idle(Some(Duration::from_secs(9 * 60)))
     // Bound file descriptors on a cluster whose broker count can jump.
@@ -292,7 +297,7 @@ Fetch sessions are enabled automatically — no configuration needed. Error reco
 
 ## Memory Backpressure
 
-Configure memory limits to prevent OOM during high throughput. When batching is enabled (`linger > 0`) and the buffer is full, `send()` blocks the caller for up to `max_block` waiting for in-flight batches to drain, matching the Kafka Java client's `max.block.ms` semantics:
+Configure memory limits to prevent OOM during high throughput. When the buffer is full, `send()` blocks the caller for up to `max_block` waiting for in-flight batches to drain, matching the Kafka Java client's `max.block.ms` semantics. That wait counts against `delivery_timeout`, which is charged from the moment you call `send()`:
 
 ```rust
 use krafka::producer::AccumulatorConfig;

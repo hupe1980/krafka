@@ -74,7 +74,9 @@ mod builder;
 mod configs;
 mod features;
 mod group_offsets;
+pub use group_offsets::OffsetVisibility;
 mod groups;
+pub use groups::GroupListing;
 mod offsets;
 mod partitions;
 mod quotas;
@@ -100,22 +102,12 @@ const DEFAULT_RESPONSE_PARTITION_LIMIT: i32 = 2000;
 /// bound.
 const MAX_DESCRIBE_TOPIC_PARTITIONS_PAGES: usize = 10_000;
 
-/// How many times a controller-only request is re-issued after the broker
-/// answers `NOT_CONTROLLER` / `UNKNOWN_CONTROLLER_ID`.
+/// Default number of attempts for a controller- or coordinator-routed request.
 ///
-/// Mirrors the Java admin client, which retries controller-routed requests up
-/// to `retries` times spaced by `retry.backoff.ms`.
-const CONTROLLER_MAX_ATTEMPTS: u32 = 5;
-
-/// Backoff between controller re-resolution attempts (`retry.backoff.ms`).
-const CONTROLLER_RETRY_BACKOFF: Duration = Duration::from_millis(100);
-
-/// How many times coordinator discovery (`FindCoordinator`) is retried on a
-/// retriable error before the operation fails.
-const COORDINATOR_MAX_ATTEMPTS: u32 = 5;
-
-/// Backoff between `FindCoordinator` attempts.
-const COORDINATOR_RETRY_BACKOFF: Duration = Duration::from_millis(100);
+/// Mirrors the Java admin client's `retries`. Configurable per client through
+/// [`AdminClientBuilder::retries`](crate::admin::AdminClientBuilder::retries);
+/// this is only the default.
+const DEFAULT_ADMIN_RETRIES: u32 = 5;
 
 /// `true` when an error code means "you sent this to the wrong broker; find the
 /// controller again".
@@ -150,6 +142,23 @@ pub struct NewTopic {
     pub replication_factor: i16,
     /// Topic configuration overrides.
     pub configs: HashMap<String, String>,
+    /// Explicit replica placement: partition index → broker IDs, first entry
+    /// being the preferred leader.
+    ///
+    /// Empty (the default) lets the controller place replicas, which is what
+    /// most callers want. Set it when placement is the point:
+    ///
+    /// - **Rack-aware placement** the controller's own rule would not produce.
+    /// - **Mirroring an existing topic's layout**, so a replacement topic
+    ///   colocates with the one it replaces.
+    /// - **Reproducing a broker's assignment in a test**, where "wherever the
+    ///   controller feels like" is not an assertion.
+    ///
+    /// Kafka requires that `num_partitions` and `replication_factor` be `-1`
+    /// when this is set, since the assignment already determines both.
+    /// [`with_replica_assignment`](Self::with_replica_assignment) sets all
+    /// three consistently and validates the shape.
+    pub replica_assignments: HashMap<i32, Vec<i32>>,
 }
 
 impl NewTopic {
@@ -189,6 +198,87 @@ impl NewTopic {
             num_partitions,
             replication_factor,
             configs: HashMap::new(),
+            replica_assignments: HashMap::new(),
+        })
+    }
+
+    /// Create a topic with an explicit replica placement.
+    ///
+    /// `assignments` maps partition index to the broker IDs that should hold
+    /// its replicas, first entry being the preferred leader. The partition
+    /// count and replication factor follow from the map, so both are sent as
+    /// `-1` — Kafka rejects a request that specifies an assignment *and* a
+    /// count.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use krafka::admin::NewTopic;
+    /// use std::collections::HashMap;
+    ///
+    /// # fn example() -> Result<(), krafka::error::KrafkaError> {
+    /// // Three partitions, RF 2, pinned across racks the controller cannot see.
+    /// let topic = NewTopic::with_replica_assignment(
+    ///     "orders",
+    ///     HashMap::from([
+    ///         (0, vec![1, 4]),
+    ///         (1, vec![2, 5]),
+    ///         (2, vec![3, 6]),
+    ///     ]),
+    /// )?;
+    /// # let _ = topic;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `name` is invalid, if `assignments` is empty, if any
+    /// partition has no replicas, or if the replica lists have differing
+    /// lengths — Kafka requires a uniform replication factor across the
+    /// partitions of one topic, and a broker rejects the request with
+    /// `INVALID_REPLICA_ASSIGNMENT` rather than explaining which partition
+    /// disagreed.
+    pub fn with_replica_assignment(
+        name: impl Into<String>,
+        assignments: HashMap<i32, Vec<i32>>,
+    ) -> Result<Self> {
+        let name = name.into();
+        validate_topic_name(&name)?;
+        if assignments.is_empty() {
+            return Err(KrafkaError::config(
+                "replica assignment must name at least one partition",
+            ));
+        }
+
+        let mut replication_factor = None;
+        for (partition, brokers) in &assignments {
+            if brokers.is_empty() {
+                return Err(KrafkaError::config(format!(
+                    "partition {partition} has no replicas"
+                )));
+            }
+            match replication_factor {
+                None => replication_factor = Some(brokers.len()),
+                Some(expected) if expected != brokers.len() => {
+                    return Err(KrafkaError::config(format!(
+                        "every partition must have the same replication factor; \
+                         partition {partition} has {} where an earlier one has {expected}",
+                        brokers.len()
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
+
+        Ok(Self {
+            name,
+            // Kafka rejects a request that carries both an assignment and a
+            // count, because the assignment already determines both.
+            num_partitions: -1,
+            replication_factor: -1,
+            configs: HashMap::new(),
+            replica_assignments: assignments,
         })
     }
 
@@ -690,6 +780,21 @@ pub struct DelegationToken {
     /// returned from [`AdminClient::create_delegation_token()`] because the
     /// Create response does not include the renewer list.
     pub renewers: Vec<DelegationTokenRenewer>,
+    /// Principal type of whoever *requested* the token, when it differs from
+    /// the owner (KIP-373, `CreateDelegationToken` v3+).
+    ///
+    /// `None` on older brokers, and when the requester is the owner.
+    ///
+    /// KIP-373 lets one principal request a token *on behalf of* another —
+    /// how a superuser provisions a token for a service account. The owner is
+    /// who the token authenticates as; the requester is who asked for it, and
+    /// that is the field an audit trail needs. Both were decoded from the
+    /// response and dropped before reaching the caller, so the distinction the
+    /// KIP exists to record was invisible.
+    pub token_requester_principal_type: Option<String>,
+    /// Principal name of whoever requested the token. See
+    /// [`token_requester_principal_type`](Self::token_requester_principal_type).
+    pub token_requester_principal_name: Option<String>,
 }
 
 impl std::fmt::Debug for DelegationToken {
@@ -914,9 +1019,6 @@ pub struct AdminConfig {
     pub(crate) metadata_recovery_rebootstrap_trigger: Duration,
     /// Authentication configuration (optional).
     pub(crate) auth: Option<AuthConfig>,
-    /// SOCKS5 proxy configuration (optional).
-    #[cfg(feature = "socks5")]
-    pub(crate) proxy: Option<crate::network::ProxyConfig>,
     /// Socket- and pool-level transport tuning.
     ///
     /// Defaults reproduce krafka's historical behaviour; see
@@ -927,6 +1029,23 @@ pub struct AdminConfig {
     /// Was hard-coded to 5 min at the one construction site, so an admin
     /// client on a fast-churning cluster could not shorten it.
     pub(crate) metadata_max_age: Duration,
+    /// How many times a controller- or coordinator-routed request is re-issued
+    /// after the broker answers `NOT_CONTROLLER`, `UNKNOWN_CONTROLLER_ID` or a
+    /// retriable coordinator error.
+    ///
+    /// Counts *additional* attempts, as in the Java admin client and in this
+    /// crate's own [`RetryPolicy`](crate::producer::RetryPolicy): `retries(0)`
+    /// still makes one attempt. Default: 5, i.e. six attempts.
+    pub(crate) retries: u32,
+    /// Backoff between those attempts.
+    ///
+    /// Exponential with jitter, like every other retry in this crate — the
+    /// admin client used to be the one place with a fixed 100 ms sleep and no
+    /// jitter, so every admin client watching the same controller election
+    /// retried in lockstep and hit the newly elected controller as one wave.
+    ///
+    /// Defaults to 100 ms initial, 10 s ceiling, 2× growth, 10 % jitter.
+    pub(crate) retry_backoff: crate::util::BackoffPolicy,
 }
 
 impl Default for AdminConfig {
@@ -939,10 +1058,10 @@ impl Default for AdminConfig {
             metadata_recovery_strategy: MetadataRecoveryStrategy::Rebootstrap,
             metadata_recovery_rebootstrap_trigger: Duration::from_secs(300),
             auth: None,
-            #[cfg(feature = "socks5")]
-            proxy: None,
             transport: crate::network::TransportConfig::default(),
             metadata_max_age: Duration::from_secs(300),
+            retries: DEFAULT_ADMIN_RETRIES,
+            retry_backoff: crate::util::BackoffPolicy::default(),
         }
     }
 }
@@ -958,6 +1077,19 @@ impl AdminConfig {
     #[inline]
     pub fn client_id(&self) -> &str {
         &self.client_id
+    }
+
+    /// Returns how many times a controller- or coordinator-routed request is
+    /// attempted before failing.
+    #[inline]
+    pub fn retries(&self) -> u32 {
+        self.retries
+    }
+
+    /// Returns the backoff policy applied between those attempts.
+    #[inline]
+    pub fn retry_backoff(&self) -> &crate::util::BackoffPolicy {
+        &self.retry_backoff
     }
 
     /// Returns the request timeout.
@@ -988,13 +1120,6 @@ impl AdminConfig {
     #[inline]
     pub fn auth(&self) -> Option<&AuthConfig> {
         self.auth.as_ref()
-    }
-
-    /// Returns the SOCKS5 proxy configuration, if set.
-    #[cfg(feature = "socks5")]
-    #[inline]
-    pub fn proxy(&self) -> Option<&crate::network::ProxyConfig> {
-        self.proxy.as_ref()
     }
 }
 
@@ -1136,11 +1261,15 @@ impl AdminClient {
     /// either [`ControllerAttempt::Done`] with the final result, or
     /// [`ControllerAttempt::NotController`] to request re-resolution.
     ///
-    /// Between attempts the admin client waits `retry.backoff.ms`, forces a
-    /// metadata refresh (so the newly elected controller is discovered), and
-    /// reconnects. After [`CONTROLLER_MAX_ATTEMPTS`] unsuccessful attempts the
-    /// last controller error is returned as a hard [`KrafkaError::Broker`],
-    /// never as an `Ok` carrying a per-item error string.
+    /// Between attempts the admin client waits the configured
+    /// [`retry_backoff`](crate::admin::AdminClientBuilder::retry_backoff) —
+    /// exponential with jitter, so a fleet of admin clients watching the same
+    /// election does not hit the new controller as one wave — then forces a
+    /// metadata refresh (so the newly elected controller is discovered) and
+    /// reconnects. After [`retries`](crate::admin::AdminClientBuilder::retries)
+    /// unsuccessful attempts the last controller error is returned as a hard
+    /// [`KrafkaError::Broker`], never as an `Ok` carrying a per-item error
+    /// string.
     async fn with_controller<T, F, Fut>(&self, api: &str, mut op: F) -> Result<T>
     where
         F: FnMut(Arc<BrokerConnection>) -> Fut,
@@ -1149,9 +1278,13 @@ impl AdminClient {
         self.check_not_closed()?;
         let mut last_code = crate::error::ErrorCode::NotController;
 
-        for attempt in 0..CONTROLLER_MAX_ATTEMPTS {
+        // `retries` counts *additional* attempts, as it does in the Java admin
+        // client and in this crate's own `RetryPolicy::max_retries`, so
+        // `retries(0)` still gets one try.
+        let attempts = self.config.retries.saturating_add(1);
+        for attempt in 0..attempts {
             if attempt > 0 {
-                tokio::time::sleep(CONTROLLER_RETRY_BACKOFF).await;
+                tokio::time::sleep(self.config.retry_backoff.calculate_backoff(attempt)).await;
                 // A full refresh re-reads `controller_id`; without it we would
                 // reconnect to the same stale controller forever.
                 if let Err(e) = self.metadata.refresh().await {
@@ -1168,7 +1301,7 @@ impl AdminClient {
                         "{api}: broker reported {code:?} (attempt {}/{}); \
                          re-resolving the controller",
                         attempt + 1,
-                        CONTROLLER_MAX_ATTEMPTS
+                        attempts
                     );
                 }
             }
@@ -1177,7 +1310,9 @@ impl AdminClient {
         Err(KrafkaError::broker(
             last_code,
             format!(
-                "{api}: the controller did not stabilise after {CONTROLLER_MAX_ATTEMPTS} attempts"
+                "{api}: the controller did not stabilise after {attempts} attempts; \
+                 raise AdminClient::builder().retries(..) if elections on this cluster \
+                 take longer"
             ),
         ))
     }
@@ -1202,9 +1337,13 @@ impl AdminClient {
         };
         let mut last_code = crate::error::ErrorCode::CoordinatorNotAvailable;
 
-        for attempt in 0..COORDINATOR_MAX_ATTEMPTS {
+        // `retries` counts *additional* attempts, as it does in the Java admin
+        // client and in this crate's own `RetryPolicy::max_retries`, so
+        // `retries(0)` still gets one try.
+        let attempts = self.config.retries.saturating_add(1);
+        for attempt in 0..attempts {
             if attempt > 0 {
-                tokio::time::sleep(COORDINATOR_RETRY_BACKOFF).await;
+                tokio::time::sleep(self.config.retry_backoff.calculate_backoff(attempt)).await;
             }
 
             let conn = self.get_any_broker_connection().await?;
@@ -1250,7 +1389,7 @@ impl AdminClient {
                 "FindCoordinator for {kind} '{key}' returned {:?} (attempt {}/{})",
                 response.error_code,
                 attempt + 1,
-                COORDINATOR_MAX_ATTEMPTS
+                attempts
             );
         }
 
@@ -2120,6 +2259,29 @@ pub enum OffsetSpec {
     /// The first offset whose timestamp is ≥ the given milliseconds since
     /// the Unix epoch.
     Timestamp(i64),
+    /// The offset of the record carrying the **largest timestamp** in the
+    /// partition (KIP-734, `ListOffsets` v7+).
+    ///
+    /// Not the same as [`Latest`](Self::Latest) when producers write out of
+    /// order — which they do whenever `CreateTime` timestamps come from
+    /// application clocks, or when a partition is fed by several producers.
+    /// This is the spec that answers "when was this partition last genuinely
+    /// written to", which `Latest` cannot.
+    MaxTimestamp,
+    /// The earliest offset still held in the broker's **local** storage
+    /// (KIP-405 tiered storage, `ListOffsets` v8+).
+    ///
+    /// Everything between [`Earliest`](Self::Earliest) and this offset lives in
+    /// remote storage, where reads are typically orders of magnitude slower. A
+    /// consumer or backfill job about to scan from the log start can use the
+    /// gap to decide whether it is about to pull from object storage.
+    EarliestLocal,
+    /// The last offset that has been copied to **remote** storage
+    /// (KIP-1005, `ListOffsets` v9+).
+    ///
+    /// The tiering frontier: everything at or below it survives local
+    /// retention.
+    LatestTiered,
 }
 
 impl OffsetSpec {
@@ -2128,7 +2290,41 @@ impl OffsetSpec {
         match self {
             OffsetSpec::Earliest => -2,
             OffsetSpec::Latest => -1,
+            OffsetSpec::MaxTimestamp => -3,
+            OffsetSpec::EarliestLocal => -4,
+            OffsetSpec::LatestTiered => -5,
             OffsetSpec::Timestamp(ts) => ts,
+        }
+    }
+
+    /// Lowest `ListOffsets` version that understands this spec.
+    ///
+    /// The sentinels are negative timestamps, so a broker that predates one
+    /// does not reject it — it treats the value as an ordinary timestamp and
+    /// answers with the first offset at or after it, which for a negative
+    /// number is the log start. The caller would get a plausible-looking
+    /// answer to a question the broker never understood, so the version is
+    /// checked before the request goes out rather than after.
+    fn min_api_version(self) -> i16 {
+        match self {
+            OffsetSpec::Earliest | OffsetSpec::Latest | OffsetSpec::Timestamp(_) => {
+                crate::protocol::versions::LIST_OFFSETS_MIN
+            }
+            OffsetSpec::MaxTimestamp => 7,
+            OffsetSpec::EarliestLocal => 8,
+            OffsetSpec::LatestTiered => 9,
+        }
+    }
+
+    /// Human-readable name, for error messages.
+    fn name(self) -> &'static str {
+        match self {
+            OffsetSpec::Earliest => "Earliest",
+            OffsetSpec::Latest => "Latest",
+            OffsetSpec::Timestamp(_) => "Timestamp",
+            OffsetSpec::MaxTimestamp => "MaxTimestamp",
+            OffsetSpec::EarliestLocal => "EarliestLocal",
+            OffsetSpec::LatestTiered => "LatestTiered",
         }
     }
 }
@@ -2448,6 +2644,101 @@ mod tests {
         assert_send_sync::<AdminClient>();
     }
 
+    /// An explicit replica placement must reach the wire, and must reject the
+    /// shapes Kafka rejects — with a message naming the partition.
+    ///
+    /// Manual placement was unreachable: `NewTopic` had no way to express it
+    /// and `create_topics` sent `assignments: Vec::new()` unconditionally. That
+    /// rules out rack-aware placement the controller's own rule cannot
+    /// produce, and mirroring an existing topic's layout.
+    #[test]
+    fn replica_assignment_is_expressible_and_validated() {
+        use std::collections::HashMap;
+
+        let topic = NewTopic::with_replica_assignment(
+            "orders",
+            HashMap::from([(0, vec![1, 4]), (1, vec![2, 5])]),
+        )
+        .expect("a uniform assignment is valid");
+
+        // Kafka rejects a request carrying both an assignment and a count.
+        assert_eq!(topic.num_partitions, -1);
+        assert_eq!(topic.replication_factor, -1);
+        assert_eq!(topic.replica_assignments.len(), 2);
+
+        // A ragged replication factor is rejected here, where the message can
+        // name the partition — the broker answers INVALID_REPLICA_ASSIGNMENT
+        // without saying which one disagreed.
+        let ragged = NewTopic::with_replica_assignment(
+            "orders",
+            HashMap::from([(0, vec![1, 4]), (1, vec![2])]),
+        )
+        .expect_err("a ragged replication factor must be rejected");
+        assert!(
+            ragged.to_string().contains("replication factor"),
+            "got: {ragged}"
+        );
+
+        let empty_partition =
+            NewTopic::with_replica_assignment("orders", HashMap::from([(0, Vec::new())]))
+                .expect_err("a partition with no replicas must be rejected");
+        assert!(
+            empty_partition.to_string().contains("partition 0"),
+            "the error must name the partition, got: {empty_partition}"
+        );
+
+        NewTopic::with_replica_assignment("orders", HashMap::new())
+            .expect_err("an empty assignment names no partitions");
+    }
+
+    /// Every `OffsetSpec` must map to the wire sentinel Kafka defines for it,
+    /// and must know the version that introduced it.
+    ///
+    /// The sentinels are negative timestamps. A broker too old to know one
+    /// does not reject it — it answers as though the caller had asked for the
+    /// first offset at or after a negative timestamp, i.e. the log start. So
+    /// an unchecked spec does not fail; it returns a plausible wrong number.
+    #[test]
+    fn offset_spec_sentinels_match_the_protocol_and_carry_their_minimum_version() {
+        use crate::protocol::versions;
+
+        // KIP-734 and the tiered-storage specs (KIP-405, KIP-1005).
+        assert_eq!(OffsetSpec::Earliest.as_timestamp(), -2);
+        assert_eq!(OffsetSpec::Latest.as_timestamp(), -1);
+        assert_eq!(OffsetSpec::MaxTimestamp.as_timestamp(), -3);
+        assert_eq!(OffsetSpec::EarliestLocal.as_timestamp(), -4);
+        assert_eq!(OffsetSpec::LatestTiered.as_timestamp(), -5);
+        assert_eq!(
+            OffsetSpec::Timestamp(1_700_000_000_000).as_timestamp(),
+            1_700_000_000_000
+        );
+
+        assert_eq!(OffsetSpec::MaxTimestamp.min_api_version(), 7);
+        assert_eq!(OffsetSpec::EarliestLocal.min_api_version(), 8);
+        assert_eq!(OffsetSpec::LatestTiered.min_api_version(), 9);
+        for spec in [
+            OffsetSpec::Earliest,
+            OffsetSpec::Latest,
+            OffsetSpec::Timestamp(0),
+        ] {
+            assert_eq!(spec.min_api_version(), versions::LIST_OFFSETS_MIN);
+        }
+
+        // Every sentinel must be reachable at the version krafka negotiates,
+        // or the API promises something the client cannot deliver.
+        for spec in [
+            OffsetSpec::MaxTimestamp,
+            OffsetSpec::EarliestLocal,
+            OffsetSpec::LatestTiered,
+        ] {
+            assert!(
+                spec.min_api_version() <= versions::LIST_OFFSETS_MAX,
+                "{} is unreachable at the negotiated ceiling",
+                spec.name()
+            );
+        }
+    }
+
     #[cfg(feature = "socks5")]
     #[test]
     fn test_admin_config_builder_proxy_round_trip() {
@@ -2456,7 +2747,10 @@ mod tests {
             .proxy(crate::network::ProxyConfig::new("proxy:1080"))
             .build_config()
             .expect("config should build");
-        let proxy = config.proxy().expect("proxy should be set");
+        let proxy = config
+            .transport
+            .proxy()
+            .expect("proxy should reach the transport config");
         assert_eq!(proxy.address(), "proxy:1080");
     }
 
@@ -2499,23 +2793,64 @@ mod tests {
         assert!(crate::error::ErrorCode::NotController.is_retriable());
     }
 
+    /// The default retry budget survives a controller failover without letting
+    /// a destructive operation spin.
     #[test]
     fn test_controller_retry_budget_is_bounded() {
-        // At least one retry is needed to survive a controller failover, and
-        // the budget must stay bounded so a destructive op cannot spin.
-        assert!((2..=10).contains(&CONTROLLER_MAX_ATTEMPTS));
-        assert!(CONTROLLER_RETRY_BACKOFF > Duration::ZERO);
-        // Worst-case added latency stays well inside a typical request timeout.
-        let worst_case = CONTROLLER_RETRY_BACKOFF * CONTROLLER_MAX_ATTEMPTS;
+        let config = AdminConfig::default();
+        assert!((2..=10).contains(&config.retries));
+
+        // Worst case with jitter at its maximum, which is what a caller sizing
+        // a request timeout has to budget for.
+        let worst_case: Duration = (1..config.retries)
+            .map(|attempt| config.retry_backoff.calculate_backoff(attempt))
+            .sum();
+        assert!(worst_case > Duration::ZERO);
         assert!(worst_case < Duration::from_secs(5), "got {worst_case:?}");
     }
 
+    /// The admin client must back off with jitter like every other retry in
+    /// the crate.
+    ///
+    /// It used to sleep a flat 100 ms, so every admin client watching one
+    /// controller election retried in lockstep and arrived at the newly
+    /// elected controller as a single wave — the thundering herd that
+    /// `ClusterMetadata`'s rebootstrap jitter exists to avoid, in the one place
+    /// that ignored the lesson.
     #[test]
-    fn test_coordinator_retry_budget_is_bounded() {
-        assert!((2..=10).contains(&COORDINATOR_MAX_ATTEMPTS));
-        assert!(COORDINATOR_RETRY_BACKOFF > Duration::ZERO);
-        let worst_case = COORDINATOR_RETRY_BACKOFF * COORDINATOR_MAX_ATTEMPTS;
-        assert!(worst_case < Duration::from_secs(5), "got {worst_case:?}");
+    fn admin_retry_backoff_is_exponential_and_jittered() {
+        let config = AdminConfig::default();
+        assert!(
+            config.retry_backoff.jitter_factor() > 0.0,
+            "a fleet of admin clients must not retry in lockstep"
+        );
+
+        // Growth: a later attempt waits longer, even allowing for jitter in
+        // both directions.
+        let first = config.retry_backoff.calculate_backoff(1);
+        let fourth = config.retry_backoff.calculate_backoff(4);
+        assert!(
+            fourth > first * 2,
+            "backoff must grow across attempts, got {first:?} then {fourth:?}"
+        );
+    }
+
+    /// The budget is configurable, which is what makes it usable on a cluster
+    /// whose elections are slower than the default assumes.
+    #[test]
+    fn admin_retry_budget_is_configurable() {
+        let config = AdminClient::builder()
+            .bootstrap_servers("localhost:9092")
+            .retries(20)
+            .retry_backoff(Duration::from_millis(500))
+            .build_config()
+            .expect("a larger retry budget is valid");
+
+        assert_eq!(config.retries(), 20);
+        assert_eq!(
+            config.retry_backoff().initial_backoff(),
+            Duration::from_millis(500)
+        );
     }
 
     /// Coordinator discovery retries only while the error is retriable; a

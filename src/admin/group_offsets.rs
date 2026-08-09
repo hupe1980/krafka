@@ -13,6 +13,30 @@ use crate::protocol::{
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+/// What to do about a committed offset that a transaction has staged but not
+/// yet committed (KIP-447).
+///
+/// The distinction only exists on groups fed by a transactional producer using
+/// `sendOffsetsToTransaction`. On every other group the two are identical,
+/// because nothing can stage an offset.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OffsetVisibility {
+    /// Report the latest offset written to `__consumer_offsets`, including one
+    /// staged by a transaction that has not resolved.
+    ///
+    /// The right answer for a lag dashboard that wants the freshest number and
+    /// can tolerate it moving backwards if the transaction aborts.
+    IncludeUnstable,
+    /// Report only offsets no in-flight transaction can retract.
+    ///
+    /// The right answer for anything that *acts* on the value — a tool that
+    /// resets or reasons about a group's position must not read an offset an
+    /// abort is about to take back. Partitions with an unresolved offset are
+    /// reported as an error rather than omitted.
+    StableOnly,
+}
+
 impl AdminClient {
     /// Delete committed offsets for a consumer group.
     ///
@@ -124,20 +148,36 @@ impl AdminClient {
     ///
     /// The request is sent to the group coordinator.
     ///
+    /// `visibility` decides what to do about an offset a transaction has
+    /// staged but not yet committed — see [`OffsetVisibility`]. It is an
+    /// explicit argument rather than a default because the two answers differ
+    /// on exactly the pipelines where the difference matters, and a lag
+    /// dashboard silently reading the unstable value reports progress that an
+    /// abort can take back.
+    ///
     /// # Example
     ///
     /// ```ignore
     /// let offsets = admin
-    ///     .describe_consumer_group_offsets("my-group", None)
+    ///     .describe_consumer_group_offsets("my-group", None, OffsetVisibility::IncludeUnstable)
     ///     .await?;
     /// for entry in &offsets {
     ///     println!("{}/{}: {}", entry.topic, entry.partition, entry.committed_offset);
     /// }
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// With [`OffsetVisibility::StableOnly`], a partition whose offset is
+    /// staged inside an unresolved transaction is reported by the broker as
+    /// `UNSTABLE_OFFSET_COMMIT`; it is surfaced rather than omitted, since an
+    /// omitted partition is indistinguishable from one the group never
+    /// committed.
     pub async fn describe_consumer_group_offsets(
         &self,
         group_id: &str,
         topic_partitions: Option<&[(&str, &[i32])]>,
+        visibility: OffsetVisibility,
     ) -> Result<Vec<GroupOffsetEntry>> {
         self.check_not_closed()?;
 
@@ -156,7 +196,7 @@ impl AdminClient {
         let request = OffsetFetchRequest {
             group_id: group_id.to_string(),
             topics,
-            require_stable: false,
+            require_stable: visibility == OffsetVisibility::StableOnly,
             member_id: None,
             member_epoch: -1,
         };

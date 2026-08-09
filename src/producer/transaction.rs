@@ -100,6 +100,10 @@ const TV2_MIN_TXN_OFFSET_COMMIT_VERSION: i16 = 5;
 /// epoch that a TV2 producer is required to adopt (KIP-890 TV2).
 const TV2_MIN_END_TXN_VERSION: i16 = 4;
 
+/// Minimum `InitProducerId` version carrying the KIP-939 `enable2Pc` and
+/// `keepPreparedTxn` fields.
+const TV3_MIN_INIT_PRODUCER_ID_VERSION: i16 = 6;
+
 /// The negotiated KIP-890 transaction protocol in use with this cluster.
 ///
 /// Selected once during [`init_transactions`](TransactionalProducer::init_transactions)
@@ -140,16 +144,26 @@ pub enum TransactionVersion {
     ///    next one — this is the defence against hanging transactions and
     ///    zombie writes that TV1 structurally cannot provide.
     V2 = 2,
+    /// KIP-939 transactions (`transaction.version` ≥ 3).
+    ///
+    /// Everything TV2 changes, plus the coordinator will honour `enable2Pc` on
+    /// `InitProducerId`: a producer may declare that an **external**
+    /// coordinator owns its commit decision, and the broker then stops
+    /// applying `transaction.max.timeout.ms` to it. That is the level
+    /// [`TransactionalProducerBuilder::two_phase_commit`] requires.
+    V3 = 3,
 }
 
 impl From<u8> for TransactionVersion {
     /// Decode the discriminant stored in the producer's atomic.
     ///
-    /// Any value other than 2 decodes to [`V1`](TransactionVersion::V1),
-    /// which keeps an impossible discriminant on the safe protocol rather
-    /// than enabling TV2 on a cluster that may not support it.
+    /// Any unrecognised value decodes to [`V1`](TransactionVersion::V1), which
+    /// keeps an impossible discriminant on the safe protocol rather than
+    /// enabling a newer one on a cluster that may not support it.
     fn from(v: u8) -> Self {
-        if v == Self::V2 as u8 {
+        if v == Self::V3 as u8 {
+            Self::V3
+        } else if v == Self::V2 as u8 {
             Self::V2
         } else {
             Self::V1
@@ -162,18 +176,38 @@ impl TransactionVersion {
     ///
     /// Level 0 means the feature is disabled and level 1 only enables flexible
     /// fields in the coordinator's internal state records — neither changes
-    /// the client protocol, so both are [`V1`](Self::V1). Level 2 and above
-    /// enable the KIP-890 client semantics.
+    /// the client protocol, so both are [`V1`](Self::V1). Level 2 enables the
+    /// KIP-890 client semantics; level 3 adds KIP-939 two-phase commit on top
+    /// of them.
     #[must_use]
     pub fn from_feature_level(level: i16) -> Self {
-        if level >= 2 { Self::V2 } else { Self::V1 }
+        if level >= 3 {
+            Self::V3
+        } else if level >= 2 {
+            Self::V2
+        } else {
+            Self::V1
+        }
     }
 
     /// Whether the KIP-890 client semantics are active.
+    ///
+    /// **At least** TV2, not exactly TV2. Every behaviour TV2 introduces —
+    /// implicit partition registration, the mandatory epoch bump on `EndTxn` —
+    /// still holds at TV3, so an equality test here would silently drop a TV3
+    /// cluster back to sending `AddPartitionsToTxn` and mis-handling epoch
+    /// bumps. The name is kept because that is what the semantics are called.
     #[must_use]
     #[inline]
     pub fn is_v2(self) -> bool {
-        matches!(self, Self::V2)
+        matches!(self, Self::V2 | Self::V3)
+    }
+
+    /// Whether the cluster will honour `enable2Pc` (KIP-939).
+    #[must_use]
+    #[inline]
+    pub fn supports_two_phase_commit(self) -> bool {
+        matches!(self, Self::V3)
     }
 }
 
@@ -182,6 +216,7 @@ impl std::fmt::Display for TransactionVersion {
         match self {
             Self::V1 => write!(f, "TV1"),
             Self::V2 => write!(f, "TV2"),
+            Self::V3 => write!(f, "TV3"),
         }
     }
 }
@@ -195,6 +230,9 @@ struct BrokerTransactionSupport {
     /// `max_version_level` of the broker's finalized `transaction.version`
     /// feature, or 0 when the broker did not report the feature at all.
     transaction_version_level: i16,
+    /// Highest mutually supported `InitProducerId` version, or `None` when
+    /// none is. KIP-939's `enable2Pc` field only exists from v6.
+    init_producer_id_max: Option<i16>,
     /// Highest mutually supported `Produce` version, or `None` when none is.
     produce_max: Option<i16>,
     /// Highest mutually supported `TxnOffsetCommit` version.
@@ -228,7 +266,18 @@ impl BrokerTransactionSupport {
             )
             && supports(self.end_txn_max, TV2_MIN_END_TXN_VERSION)
         {
-            TransactionVersion::V2
+            // TV3 needs the same evidence one level up: the feature finalized
+            // at 3 *and* an `InitProducerId` that actually carries the
+            // `enable2Pc` field. Reporting TV3 on a broker that cannot encode
+            // the flag would turn a clear "this cluster does not do 2PC" into
+            // a request the broker silently reads as a plain init.
+            if feature.supports_two_phase_commit()
+                && supports(self.init_producer_id_max, TV3_MIN_INIT_PRODUCER_ID_VERSION)
+            {
+                TransactionVersion::V3
+            } else {
+                TransactionVersion::V2
+            }
         } else {
             TransactionVersion::V1
         }
@@ -285,6 +334,130 @@ pub enum TransactionState {
     /// producer and let the coordinator resolve the transaction via its own
     /// `transaction.timeout.ms`.
     CommitIndeterminate = 7,
+    /// The transaction is **prepared** and awaiting an external coordinator's
+    /// decision (KIP-939 two-phase commit).
+    ///
+    /// Reached only from
+    /// [`prepare_transaction`](TransactionalProducer::prepare_transaction).
+    /// Records can no longer be added; the only moves are `commit`, `abort`, or
+    /// [`complete_transaction`](TransactionalProducer::complete_transaction).
+    ///
+    /// Unlike every other in-flight state this one can outlive the process. The
+    /// coordinator has been told (via `enable_2pc`) not to apply
+    /// `transaction.max.timeout.ms`, so a prepared transaction stays in doubt
+    /// until somebody decides — which is the entire point, and also why a
+    /// forgotten prepared transaction blocks `read_committed` consumers on its
+    /// partitions indefinitely.
+    Prepared = 8,
+}
+
+/// The identity of a **prepared** transaction (KIP-939).
+///
+/// Returned by
+/// [`prepare_transaction`](TransactionalProducer::prepare_transaction) and by
+/// [`init_transactions_keeping_prepared`](TransactionalProducer::init_transactions_keeping_prepared).
+///
+/// # What it is for
+///
+/// In a two-phase commit the *external* coordinator — a database, an XA
+/// manager, a workflow engine — decides whether the distributed transaction
+/// commits. Kafka's side must stay in doubt until that decision arrives, and
+/// must survive the producer process dying in between.
+///
+/// This value is the durable link across that gap. The intended sequence is:
+///
+/// 1. `prepare_transaction()` → a `PreparedTxnState`.
+/// 2. Write it into the external coordinator's store, in the *same* external
+///    transaction the Kafka writes are part of.
+/// 3. If the process dies, the replacement calls
+///    `init_transactions_keeping_prepared()`, reads the stored value back, and
+///    calls [`complete_transaction`](TransactionalProducer::complete_transaction)
+///    with it.
+///
+/// [`Display`](std::fmt::Display) and [`FromStr`](std::str::FromStr) round-trip
+/// it through a short string so step 2 needs no bespoke serialisation:
+///
+/// ```rust
+/// use krafka::producer::PreparedTxnState;
+///
+/// # fn example(state: PreparedTxnState) -> Result<(), krafka::error::KrafkaError> {
+/// let stored: String = state.to_string();
+/// let restored: PreparedTxnState = stored.parse()?;
+/// assert_eq!(restored, state);
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreparedTxnState {
+    producer_id: i64,
+    producer_epoch: i16,
+}
+
+impl PreparedTxnState {
+    /// The state meaning "no transaction was left prepared".
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            producer_id: -1,
+            producer_epoch: -1,
+        }
+    }
+
+    /// Whether this names an actual prepared transaction.
+    #[must_use]
+    pub const fn is_prepared(&self) -> bool {
+        self.producer_id >= 0
+    }
+
+    /// Producer ID of the prepared transaction.
+    #[must_use]
+    pub const fn producer_id(&self) -> i64 {
+        self.producer_id
+    }
+
+    /// Producer epoch of the prepared transaction.
+    #[must_use]
+    pub const fn producer_epoch(&self) -> i16 {
+        self.producer_epoch
+    }
+}
+
+impl std::fmt::Display for PreparedTxnState {
+    /// `producer_id:epoch`, which is what
+    /// [`FromStr`](std::str::FromStr) reads back.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.producer_id, self.producer_epoch)
+    }
+}
+
+impl std::str::FromStr for PreparedTxnState {
+    type Err = KrafkaError;
+
+    fn from_str(s: &str) -> Result<Self> {
+        let malformed = || {
+            KrafkaError::config(format!(
+                "malformed PreparedTxnState {s:?}; expected `producer_id:epoch`"
+            ))
+        };
+        let (id, epoch) = s.split_once(':').ok_or_else(malformed)?;
+        Ok(Self {
+            producer_id: id.trim().parse().map_err(|_| malformed())?,
+            producer_epoch: epoch.trim().parse().map_err(|_| malformed())?,
+        })
+    }
+}
+
+/// How [`complete_transaction`](TransactionalProducer::complete_transaction)
+/// resolved a prepared transaction.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionOutcome {
+    /// The stored state matched the transaction the coordinator still holds, so
+    /// the prepare is known to have been durably recorded — commit.
+    Committed,
+    /// The stored state did not match, so it describes an *older* transaction
+    /// and the prepare never completed — abort.
+    Aborted,
 }
 
 impl From<u8> for TransactionState {
@@ -298,6 +471,7 @@ impl From<u8> for TransactionState {
             5 => Self::FatalError,
             6 => Self::Initializing,
             7 => Self::CommitIndeterminate,
+            8 => Self::Prepared,
             _ => {
                 warn!(
                     discriminant = v,
@@ -320,6 +494,7 @@ impl std::fmt::Display for TransactionState {
             Self::FatalError => "FatalError",
             Self::Initializing => "Initializing",
             Self::CommitIndeterminate => "CommitIndeterminate",
+            Self::Prepared => "Prepared",
         })
     }
 }
@@ -367,8 +542,12 @@ pub struct TransactionalProducerConfig {
     client_id: String,
     /// Transactional ID (required for transactions).
     transactional_id: String,
-    /// Transaction timeout in milliseconds.
-    transaction_timeout_ms: i32,
+    /// How long the coordinator lets a transaction stay open before aborting it.
+    ///
+    /// Held as a `Duration` like every other timeout in the crate; the
+    /// millisecond conversion the wire needs happens once, where the
+    /// `InitProducerId` request is built.
+    transaction_timeout: Duration,
     /// Request timeout.
     request_timeout: Duration,
     /// Time allowed for TCP establishment to one broker.
@@ -402,8 +581,6 @@ pub struct TransactionalProducerConfig {
     buffer_memory: usize,
     /// Maximum time `send` blocks waiting for accumulator buffer memory.
     max_block: Duration,
-    /// Maximum concurrent in-flight produce requests.
-    max_in_flight: usize,
     /// Metadata max age.
     metadata_max_age: Duration,
     /// Topic cache TTL for partial metadata refreshes, or `None` to disable it.
@@ -416,9 +593,26 @@ pub struct TransactionalProducerConfig {
     metadata_recovery_rebootstrap_trigger: Duration,
     /// Authentication configuration.
     auth: Option<AuthConfig>,
-    /// SOCKS5 proxy configuration (optional).
-    #[cfg(feature = "socks5")]
-    proxy: Option<crate::network::ProxyConfig>,
+    /// Participate in an external two-phase commit (KIP-939).
+    ///
+    /// When set, `InitProducerId` is issued with `enable2Pc`, which tells the
+    /// coordinator that an *external* coordinator owns the commit decision and
+    /// that `transaction.max.timeout.ms` must therefore not apply. That is what
+    /// makes [`prepare_transaction`](TransactionalProducer::prepare_transaction)
+    /// meaningful: without it the broker would abort a prepared transaction out
+    /// from under the external coordinator.
+    ///
+    /// Requires `transaction.version` 3 on the broker (`InitProducerId` v6, so
+    /// krafka's `unstable-protocol` feature), plus `WRITE` **and**
+    /// `TWO_PHASE_COMMIT` on the transactional-id resource. Anything less is
+    /// reported by the broker as `TRANSACTIONAL_ID_AUTHORIZATION_FAILED` or
+    /// `UNSUPPORTED_VERSION`.
+    ///
+    /// Setting it alongside an explicit `transaction_timeout` is a
+    /// configuration error: the two contradict each other, and silently
+    /// ignoring the timeout is how an operator ends up believing a bound exists
+    /// that does not.
+    two_phase_commit: bool,
     /// Socket- and pool-level transport tuning.
     ///
     /// Defaults reproduce krafka's historical behaviour; see
@@ -434,7 +628,8 @@ impl Default for TransactionalProducerConfig {
             bootstrap_servers: String::new(),
             client_id: "krafka-txn-producer".to_string(),
             transactional_id: String::new(),
-            transaction_timeout_ms: 60000,
+            transaction_timeout: Duration::from_secs(60),
+            two_phase_commit: false,
             request_timeout: Duration::from_secs(30),
             connect_timeout: crate::network::DEFAULT_CONNECT_TIMEOUT,
             delivery_timeout: Duration::from_secs(120),
@@ -446,14 +641,11 @@ impl Default for TransactionalProducerConfig {
             linger: Duration::from_millis(5),
             buffer_memory: 32 * 1024 * 1024,
             max_block: Duration::from_secs(60),
-            max_in_flight: 5,
             metadata_max_age: Duration::from_secs(300),
             metadata_topic_cache_ttl: Some(Duration::from_secs(300)),
             metadata_recovery_strategy: crate::metadata::MetadataRecoveryStrategy::Rebootstrap,
             metadata_recovery_rebootstrap_trigger: Duration::from_secs(300),
             auth: None,
-            #[cfg(feature = "socks5")]
-            proxy: None,
             transport: crate::network::TransportConfig::default(),
             dead_letter_queue: None,
         }
@@ -482,7 +674,14 @@ impl TransactionalProducerConfig {
     /// Returns the transaction timeout.
     #[inline]
     pub fn transaction_timeout(&self) -> Duration {
-        Duration::from_millis(self.transaction_timeout_ms.max(0) as u64)
+        self.transaction_timeout
+    }
+
+    /// Returns whether this producer participates in an external two-phase
+    /// commit (KIP-939).
+    #[inline]
+    pub fn two_phase_commit(&self) -> bool {
+        self.two_phase_commit
     }
 
     /// Returns the request timeout.
@@ -555,12 +754,6 @@ impl TransactionalProducerConfig {
         self.max_block
     }
 
-    /// Returns the maximum concurrent in-flight produce requests.
-    #[inline]
-    pub fn max_in_flight(&self) -> usize {
-        self.max_in_flight
-    }
-
     /// Returns the metadata max age.
     #[inline]
     pub fn metadata_max_age(&self) -> Duration {
@@ -591,13 +784,6 @@ impl TransactionalProducerConfig {
         self.auth.as_ref()
     }
 
-    /// Returns the SOCKS5 proxy configuration, if set.
-    #[cfg(feature = "socks5")]
-    #[inline]
-    pub fn proxy(&self) -> Option<&crate::network::ProxyConfig> {
-        self.proxy.as_ref()
-    }
-
     /// Returns the acknowledgment level.
     ///
     /// Always [`Acks::All`]: the transaction coordinator can only guarantee
@@ -620,9 +806,13 @@ impl TransactionalProducerConfig {
 ///
 /// `has_shared_pool` relaxes the `bootstrap_servers` requirement for a producer
 /// built with [`TransactionalProducerBuilder::with_client`].
-fn validate(config: &TransactionalProducerConfig, has_shared_pool: bool) -> Result<()> {
+fn validate(
+    config: &TransactionalProducerConfig,
+    has_shared_pool: bool,
+    transaction_timeout_set: bool,
+) -> Result<()> {
     if !has_shared_pool && config.bootstrap_servers.is_empty() {
-        return Err(KrafkaError::config("bootstrap.servers is required"));
+        return Err(KrafkaError::config("bootstrap_servers is required"));
     }
     if config.transactional_id.is_empty() {
         return Err(KrafkaError::config("transactional_id is required"));
@@ -641,17 +831,24 @@ fn validate(config: &TransactionalProducerConfig, has_shared_pool: bool) -> Resu
             config.client_id.len()
         )));
     }
-    if config.transaction_timeout_ms <= 0 {
+    if config.transaction_timeout.is_zero() {
         return Err(KrafkaError::config("transaction_timeout must be > 0"));
+    }
+    if config.two_phase_commit && transaction_timeout_set {
+        return Err(KrafkaError::config(
+            "two_phase_commit and transaction_timeout contradict each other: under \
+             KIP-939 the coordinator must hold a prepared transaction until an \
+             external coordinator decides, so `transaction.max.timeout.ms` is not \
+             applied and the timeout is sent as i32::MAX. Silently ignoring the value \
+             would leave an operator believing in a bound that does not exist. Drop \
+             one of the two.",
+        ));
     }
     if config.max_request_size == 0 {
         return Err(KrafkaError::config("max_request_size must be >= 1"));
     }
     if config.batch_size == 0 {
         return Err(KrafkaError::config("batch_size must be >= 1"));
-    }
-    if config.max_in_flight == 0 {
-        return Err(KrafkaError::config("max_in_flight must be >= 1"));
     }
     if config.delivery_timeout.is_zero() {
         return Err(KrafkaError::config(
@@ -682,7 +879,7 @@ fn validate(config: &TransactionalProducerConfig, has_shared_pool: bool) -> Resu
     // every record still retrying inside it dies with it. Warn rather than
     // reject — the two are set by different people often enough that failing
     // the build would be worse than saying so.
-    let transaction_timeout = Duration::from_millis(config.transaction_timeout_ms.max(0) as u64);
+    let transaction_timeout = config.transaction_timeout;
     if config.delivery_timeout > transaction_timeout {
         warn!(
             delivery_timeout_secs = config.delivery_timeout.as_secs_f64(),
@@ -905,6 +1102,13 @@ pub struct TransactionalProducer {
     partitioner: Arc<dyn Partitioner>,
     /// Transaction state.
     state: AtomicU8,
+    /// The prepared transaction the coordinator reported at
+    /// `init_transactions_keeping_prepared()`, or [`PreparedTxnState::none`].
+    ///
+    /// `ArcSwap` rather than a lock: written once during initialisation and
+    /// read by `complete_transaction`, so the read must never block a caller
+    /// that is mid-recovery.
+    ongoing_prepared_txn: arc_swap::ArcSwap<PreparedTxnState>,
     /// Negotiated KIP-890 protocol, as a [`TransactionVersion`] discriminant.
     ///
     /// Written once by [`init_transactions`](Self::init_transactions) before
@@ -1093,6 +1297,11 @@ impl TransactionalProducer {
 
         Ok(BrokerTransactionSupport {
             transaction_version_level,
+            init_producer_id_max: conn.negotiate_api_version(
+                ApiKey::InitProducerId,
+                versions::INIT_PRODUCER_ID_MAX,
+                versions::INIT_PRODUCER_ID_MIN,
+            ),
             produce_max: conn.negotiate_api_version(
                 ApiKey::Produce,
                 versions::PRODUCE_MAX,
@@ -1369,7 +1578,51 @@ impl TransactionalProducer {
     ///
     /// This must be called before any transactions can be started.
     /// It fetches the producer ID and epoch from the transaction coordinator.
+    /// Initialise the producer, aborting any transaction a previous
+    /// incarnation of this `transactional.id` left open.
+    ///
+    /// This is the normal path, and the one to use unless you are participating
+    /// in an external two-phase commit.
     pub async fn init_transactions(&self) -> Result<()> {
+        self.init_transactions_inner(false).await
+    }
+
+    /// Initialise the producer, **keeping** any transaction a previous
+    /// incarnation left prepared, and report it (KIP-939).
+    ///
+    /// The 2PC recovery entry point. Where
+    /// [`init_transactions`](Self::init_transactions) tells the coordinator to
+    /// abort whatever was in flight — correct when Kafka owns the commit
+    /// decision — this tells it to hold, because an external coordinator owns
+    /// that decision and may already have committed its side.
+    ///
+    /// Returns the prepared transaction the coordinator is still holding, or
+    /// `None` if there is none. Hand it to
+    /// [`complete_transaction`](Self::complete_transaction) together with the
+    /// state you stored before preparing.
+    ///
+    /// # Errors
+    ///
+    /// Requires [`two_phase_commit`](TransactionalProducerBuilder::two_phase_commit)
+    /// on the builder; without it the coordinator was never told to hold, so
+    /// asking it to now would be a lie. The broker additionally requires
+    /// `transaction.version` 3 and the `TWO_PHASE_COMMIT` ACL.
+    pub async fn init_transactions_keeping_prepared(&self) -> Result<Option<PreparedTxnState>> {
+        if !self.config.two_phase_commit {
+            return Err(KrafkaError::invalid_state(
+                "init_transactions_keeping_prepared() requires \
+                 TransactionalProducer::builder().two_phase_commit(true); without it the \
+                 coordinator was not told to hold prepared transactions and has already \
+                 aborted anything this transactional.id left open",
+            ));
+        }
+        self.init_transactions_inner(true).await?;
+
+        let ongoing = **self.ongoing_prepared_txn.load();
+        Ok(ongoing.is_prepared().then_some(ongoing))
+    }
+
+    async fn init_transactions_inner(&self, keep_prepared_txn: bool) -> Result<()> {
         // Atomic CAS: Uninitialized → Initializing
         if let Err(actual) = self.try_transition(
             TransactionState::Uninitialized,
@@ -1390,8 +1643,47 @@ impl TransactionalProducer {
         self.transaction_version
             .store(version as u8, Ordering::SeqCst);
 
+        // Refuse 2PC up front on a cluster that cannot honour it.
+        //
+        // The broker would answer `UNSUPPORTED_VERSION` or
+        // `TRANSACTIONAL_ID_AUTHORIZATION_FAILED`, and both arrive as a bare
+        // error code behind "failed to initialize producer ID" — which names
+        // neither the feature level nor the ACL the operator actually needs.
+        // The version is already known here, so say so.
+        if self.config.two_phase_commit && !version.supports_two_phase_commit() {
+            self.set_state(TransactionState::Uninitialized);
+
+            // Blame the right side. `InitProducerId` v6 is behind krafka's
+            // `unstable-protocol` feature, so a client compiled without it can
+            // never negotiate TV3 no matter how new the cluster is — and an
+            // error naming the cluster would send an operator to check broker
+            // settings that are already correct.
+            let cause = if versions::INIT_PRODUCER_ID_MAX < TV3_MIN_INIT_PRODUCER_ID_VERSION {
+                format!(
+                    "this build of krafka negotiates InitProducerId up to \
+                     v{}, and enable2Pc needs \
+                     v{TV3_MIN_INIT_PRODUCER_ID_VERSION} — enable the \
+                     `unstable-protocol` feature",
+                    versions::INIT_PRODUCER_ID_MAX
+                )
+            } else {
+                format!(
+                    "this cluster negotiated {version}; it must finalize \
+                     transaction.version at 3 and every broker must serve \
+                     InitProducerId v{TV3_MIN_INIT_PRODUCER_ID_VERSION}"
+                )
+            };
+
+            return Err(KrafkaError::invalid_state(format!(
+                "two_phase_commit (KIP-939) is not available: {cause}. The broker \
+                 must also grant TWO_PHASE_COMMIT alongside WRITE on \
+                 transactional_id '{}'.",
+                self.config.transactional_id
+            )));
+        }
+
         // Find transaction coordinator
-        let result = self.do_init_transactions().await;
+        let result = self.do_init_transactions(keep_prepared_txn).await;
         if result.is_err() {
             // Revert state so caller can retry
             self.set_state(TransactionState::Uninitialized);
@@ -1405,7 +1697,7 @@ impl TransactionalProducer {
     /// CoordinatorLoadInProgress) and transient network/timeout failures with
     /// exponential backoff. On each retry the cached coordinator is invalidated
     /// and re-discovered via `FindCoordinator`.
-    async fn do_init_transactions(&self) -> Result<()> {
+    async fn do_init_transactions(&self, keep_prepared_txn: bool) -> Result<()> {
         self.retry_with_coordinator("InitProducerId", |attempt| async move {
             let (_coordinator_id, conn) = self.coordinator_connection(attempt).await?;
 
@@ -1422,10 +1714,17 @@ impl TransactionalProducer {
                     )
                 })?;
 
-            let request = InitProducerIdRequest::transactional(
-                &self.config.transactional_id,
-                self.config.transaction_timeout_ms,
-            );
+            let request = if self.config.two_phase_commit {
+                InitProducerIdRequest::two_phase_commit(
+                    &self.config.transactional_id,
+                    keep_prepared_txn,
+                )
+            } else {
+                InitProducerIdRequest::transactional(
+                    &self.config.transactional_id,
+                    crate::util::duration_to_millis_i32(self.config.transaction_timeout),
+                )
+            };
 
             let response_bytes = conn
                 .send_request(ApiKey::InitProducerId, ip_version, |buf| {
@@ -1445,6 +1744,14 @@ impl TransactionalProducer {
 
             self.identity
                 .initialize(response.producer_id, response.producer_epoch);
+
+            // KIP-939: when `keep_prepared_txn` was set the coordinator reports
+            // the transaction it did *not* abort, so the caller can finish it.
+            // `-1` means there was none.
+            self.ongoing_prepared_txn.store(Arc::new(PreparedTxnState {
+                producer_id: response.ongoing_txn_producer_id,
+                producer_epoch: response.ongoing_txn_producer_epoch,
+            }));
 
             // Restore per-partition sequences from the state store, if one is
             // configured. This is the producer the store exists for: the
@@ -1604,8 +1911,52 @@ impl TransactionalProducer {
         self.send_record(record).await
     }
 
-    /// Send a producer record within the current transaction.
+    /// Send a producer record within the current transaction and wait for the
+    /// broker to acknowledge it.
+    ///
+    /// Equivalent to `enqueue(record).await?.await`. Use
+    /// [`enqueue`](Self::enqueue) to keep several records in flight.
     pub async fn send_record(&self, record: ProducerRecord) -> Result<RecordMetadata> {
+        self.enqueue(record).await?.await
+    }
+
+    /// Queue a record into the current transaction and return as soon as it is
+    /// **queued**.
+    ///
+    /// The transactional counterpart of
+    /// [`Producer::enqueue`](super::Producer::enqueue), with the same ordering
+    /// guarantee: produce order is enqueue order, independent of the order the
+    /// handles are awaited.
+    ///
+    /// It matters more here than on a plain producer. A transaction is a
+    /// latency amplifier — every record inside it is held until the commit — so
+    /// an exactly-once pipeline that awaits each acknowledgement before sending
+    /// the next pays a round trip per record *and* holds the transaction open
+    /// for the sum of them.
+    ///
+    /// # Transaction state
+    ///
+    /// The state checks (`InTransaction`, partition registration under TV1)
+    /// happen during the enqueue, so a record is never queued into a
+    /// transaction that is not open. Errors that must latch transaction state —
+    /// a fenced epoch, an `UnknownProducerId` — are classified when the handle
+    /// resolves, exactly as they were when the two halves were one future.
+    ///
+    /// The handle borrows the producer, so it cannot outlive the transaction it
+    /// belongs to.
+    ///
+    /// # Errors
+    ///
+    /// Every handle must be awaited before
+    /// [`commit_transaction`](Self::commit_transaction) if the caller wants to
+    /// see per-record failures; the commit itself waits for the in-flight
+    /// barrier regardless, so a dropped handle cannot commit a transaction
+    /// around an unfinished record.
+    pub async fn enqueue(&self, record: ProducerRecord) -> Result<TransactionalDeliveryHandle<'_>> {
+        // `delivery_timeout` is charged from here — before serialization,
+        // partition lookup and the up-to-`max_block` wait for buffer memory —
+        // so the budget covers everything the caller experiences as `send()`.
+        let send_started_at = std::time::Instant::now();
         let operation_guard = self.in_flight_barrier.start("transactional producer")?;
         let current = self.state();
         if current != TransactionState::InTransaction {
@@ -1689,16 +2040,35 @@ impl TransactionalProducer {
         // and the transactional ID, and drives retries. The per-partition
         // dispatch FIFO inside the accumulator keeps sequence order == wire
         // order for this partition.
-        let result = self
+        let enqueued = self
             .accumulator
-            .append_routed_with_guard(topic, record, record_size, partition, operation_guard)
+            .enqueue_routed_with_guard(
+                topic,
+                record,
+                record_size,
+                partition,
+                operation_guard,
+                send_started_at,
+            )
             .await;
 
-        // The accumulator has no view of transaction state, so classify its
-        // error here: a fenced epoch reported on the produce path must latch
-        // FatalError exactly as one reported by a coordinator RPC.
-        let result = self.classify_transaction_result(result);
-        match result {
+        // An enqueue failure is classified immediately; a delivery failure is
+        // classified by the handle, which is the same code either way.
+        Ok(TransactionalDeliveryHandle {
+            inner: self.classify_produce_result(enqueued)?,
+            producer: self,
+        })
+    }
+
+    /// Apply transactional classification to a produce outcome.
+    ///
+    /// The accumulator has no view of transaction state, so a fenced epoch or
+    /// an `UnknownProducerId` reported on the produce path has to latch the
+    /// same state here that a coordinator RPC would. Shared by the enqueue and
+    /// by [`TransactionalDeliveryHandle`] so the two halves cannot classify
+    /// differently.
+    fn classify_produce_result<T>(&self, result: Result<T>) -> Result<T> {
+        match self.classify_transaction_result(result) {
             Err(error) if Self::is_unknown_producer_id_error(&error) => {
                 Err(self.mark_unknown_producer_id_abort_required("transactional produce"))
             }
@@ -2219,6 +2589,181 @@ impl TransactionalProducer {
         Ok((response.node_id, response.host, response.port))
     }
 
+    /// Prepare the open transaction and hand back its identity (KIP-939).
+    ///
+    /// The "prepare" half of a two-phase commit. Every buffered record is
+    /// flushed to its partition, after which the producer accepts no more
+    /// records: the only remaining moves are
+    /// [`commit_transaction`](Self::commit_transaction),
+    /// [`abort_transaction`](Self::abort_transaction) or
+    /// [`complete_transaction`](Self::complete_transaction).
+    ///
+    /// # It sends nothing
+    ///
+    /// There is no "prepare" request in the Kafka protocol, and this issues
+    /// none. The prepare is the *flush*: once every record is durably written
+    /// to its partition and no commit marker follows, the transaction is
+    /// in doubt on the broker exactly as a prepared transaction should be. The
+    /// coordinator was told at `InitProducerId` time (via `enable2Pc`) not to
+    /// time it out, so it will stay that way until somebody decides.
+    ///
+    /// # The returned state must be stored before you report success
+    ///
+    /// Write it into the external coordinator's store, inside the same external
+    /// transaction the Kafka writes belong to. It is the only link back to this
+    /// transaction if the process dies, and a prepared transaction with no
+    /// stored state cannot be resolved by anything except a human — it will sit
+    /// in doubt forever, blocking `read_committed` consumers on its partitions.
+    ///
+    /// # Errors
+    ///
+    /// Requires a transaction to be open on a producer built with
+    /// [`two_phase_commit`](TransactionalProducerBuilder::two_phase_commit).
+    /// Without the latter the coordinator was never told to hold the
+    /// transaction, so `transaction.max.timeout.ms` still applies and
+    /// "prepared" would be a promise krafka cannot keep — the broker reports
+    /// the same condition as `INVALID_TXN_STATE`.
+    pub async fn prepare_transaction(&self) -> Result<PreparedTxnState> {
+        if !self.config.two_phase_commit {
+            return Err(KrafkaError::invalid_state(
+                "prepare_transaction() requires \
+                 TransactionalProducer::builder().two_phase_commit(true); without it the \
+                 coordinator applies transaction.max.timeout.ms and would abort the \
+                 prepared transaction out from under the external coordinator",
+            ));
+        }
+        self.ensure_transaction_can_continue("prepare transaction")?;
+
+        // Close the transaction to new records *before* draining it, for the
+        // same reason `commit_transaction` does: `send_record` admits a record
+        // when it observes `InTransaction`, so flushing first would leave a
+        // window in which a concurrent send lands after the flush and is
+        // neither prepared nor rejected.
+        if let Err(actual) =
+            self.try_transition(TransactionState::InTransaction, TransactionState::Prepared)
+        {
+            return Err(KrafkaError::invalid_state(format!(
+                "cannot prepare in state {actual:?}; a transaction must be open"
+            )));
+        }
+
+        // Drain everything. A record still in the accumulator when the external
+        // coordinator is told "prepared" is a record that may never be written,
+        // which is precisely the guarantee 2PC is bought to avoid.
+        let target = self.in_flight_barrier.snapshot();
+        self.in_flight_barrier.wait_for(target).await;
+        if let Err(error) = self.accumulator.flush().await {
+            // Put the transaction back so the caller can retry or abort; a
+            // half-prepared transaction is not a state anyone can act on.
+            //
+            // A CAS, not `set_state`: a concurrent `abort_transaction()` may
+            // have taken `Prepared -> Aborting` while this flush was running,
+            // and forcing the state back would stomp a teardown already in
+            // progress — resurrecting a transaction the caller has abandoned.
+            let _ =
+                self.try_transition(TransactionState::Prepared, TransactionState::InTransaction);
+            return Err(error);
+        }
+
+        let state = PreparedTxnState {
+            producer_id: self.identity.producer_id(),
+            producer_epoch: self.identity.producer_epoch(),
+        };
+        info!(
+            transactional_id = %self.config.transactional_id,
+            producer_id = state.producer_id,
+            producer_epoch = state.producer_epoch,
+            "Transaction prepared; awaiting the external coordinator's decision"
+        );
+        Ok(state)
+    }
+
+    /// Resolve a prepared transaction against the state that was stored before
+    /// preparing (KIP-939).
+    ///
+    /// Call after
+    /// [`init_transactions_keeping_prepared`](Self::init_transactions_keeping_prepared)
+    /// with the [`PreparedTxnState`] read back from the external coordinator's
+    /// store.
+    ///
+    /// # The decision rule
+    ///
+    /// If `stored` matches the transaction the coordinator is still holding,
+    /// the prepare completed *and* was durably recorded externally — so the
+    /// external transaction committed, and this side must commit to match.
+    ///
+    /// If it does not match, the stored value describes an older transaction:
+    /// the prepare never got far enough to be recorded, so the external side
+    /// rolled back and this side must abort.
+    ///
+    /// A mismatch is therefore the *normal* outcome of a crash between the
+    /// flush and the external write, not an error.
+    ///
+    /// # Errors
+    ///
+    /// Fails if no transaction was left prepared — there is nothing to
+    /// resolve, and quietly succeeding would hide a caller that lost track of
+    /// which producer it is recovering.
+    pub async fn complete_transaction(
+        &self,
+        stored: PreparedTxnState,
+    ) -> Result<TransactionOutcome> {
+        let ongoing = **self.ongoing_prepared_txn.load();
+        if !ongoing.is_prepared() {
+            return Err(KrafkaError::invalid_state(
+                "complete_transaction(): the coordinator is holding no prepared \
+                 transaction for this transactional.id. Call \
+                 init_transactions_keeping_prepared() first, and check its return \
+                 value — `None` means there is nothing to resolve",
+            ));
+        }
+
+        if stored == ongoing {
+            info!(
+                transactional_id = %self.config.transactional_id,
+                producer_id = ongoing.producer_id,
+                "Recovered prepared transaction matches the stored state; committing"
+            );
+            self.commit_prepared(ongoing).await?;
+            Ok(TransactionOutcome::Committed)
+        } else {
+            info!(
+                transactional_id = %self.config.transactional_id,
+                stored = %stored,
+                ongoing = %ongoing,
+                "Recovered prepared transaction does not match the stored state; \
+                 the prepare was never recorded externally, so aborting"
+            );
+            self.abort_prepared(ongoing).await?;
+            Ok(TransactionOutcome::Aborted)
+        }
+    }
+
+    /// Drive a recovered prepared transaction to a commit marker.
+    async fn commit_prepared(&self, ongoing: PreparedTxnState) -> Result<()> {
+        self.adopt_prepared(ongoing);
+        self.commit_transaction().await
+    }
+
+    /// Drive a recovered prepared transaction to an abort marker.
+    async fn abort_prepared(&self, ongoing: PreparedTxnState) -> Result<()> {
+        self.adopt_prepared(ongoing);
+        self.abort_transaction().await
+    }
+
+    /// Adopt a recovered transaction's producer identity and mark it prepared.
+    ///
+    /// `EndTxn` must carry the producer ID and epoch of the transaction being
+    /// finished, which for a recovered one is the *ongoing* pair the
+    /// coordinator reported — not the fresh pair `InitProducerId` just issued
+    /// to this process. Sending the fresh pair would fence the very transaction
+    /// the call is trying to resolve.
+    fn adopt_prepared(&self, ongoing: PreparedTxnState) {
+        self.identity
+            .initialize(ongoing.producer_id, ongoing.producer_epoch);
+        self.set_state(TransactionState::Prepared);
+    }
+
     /// Commit the current transaction.
     pub async fn commit_transaction(&self) -> Result<()> {
         self.ensure_transaction_can_continue("commit transaction")?;
@@ -2247,6 +2792,12 @@ impl TransactionalProducer {
                 TransactionState::InTransaction,
                 TransactionState::Committing,
             )
+            .or_else(|_| {
+                // KIP-939: a prepared transaction is committed by the external
+                // coordinator's decision, so `Prepared` is a legal starting
+                // point for exactly this transition.
+                self.try_transition(TransactionState::Prepared, TransactionState::Committing)
+            })
             .or_else(|_| {
                 self.try_transition(
                     TransactionState::CommitIndeterminate,
@@ -2407,6 +2958,9 @@ impl TransactionalProducer {
         let transition = self
             .try_transition(TransactionState::InTransaction, TransactionState::Aborting)
             .or_else(|_| {
+                self.try_transition(TransactionState::Prepared, TransactionState::Aborting)
+            })
+            .or_else(|_| {
                 self.try_transition(TransactionState::Committing, TransactionState::Aborting)
             });
 
@@ -2437,12 +2991,12 @@ impl TransactionalProducer {
         let needs_reinitialize = self.abort_required.swap(false, Ordering::SeqCst);
         let result = if needs_reinitialize {
             match self.end_transaction(false).await {
-                Ok(()) => self.do_init_transactions().await,
+                Ok(()) => self.do_init_transactions(false).await,
                 Err(error) if Self::is_unknown_producer_id_error(&error) => {
                     debug!(
                         "Abort observed UnknownProducerId after transactional error; reinitializing producer identity"
                     );
-                    self.do_init_transactions().await
+                    self.do_init_transactions(false).await
                 }
                 Err(error) => Err(error),
             }
@@ -2920,6 +3474,52 @@ fn is_fatal_transaction_error(error_code: ErrorCode, version: TransactionVersion
     )
 }
 
+/// A record's place in an open transaction, and a future for its acknowledgement.
+///
+/// Returned by [`TransactionalProducer::enqueue`]. See
+/// [`DeliveryHandle`](super::DeliveryHandle) for the ordering and drop
+/// semantics; this adds transaction-state classification when the
+/// acknowledgement resolves, so a fenced epoch latches `FatalError` and an
+/// `UnknownProducerId` marks the transaction abort-required whichever half of
+/// the send reports it.
+///
+/// Borrows the producer, so it cannot outlive the transaction it belongs to.
+///
+/// No `Debug`: `TransactionalProducer` deliberately has none, because its
+/// config can carry SASL credentials and the crate's `secret-debug` check keeps
+/// credential-bearing types out of formatted output.
+#[must_use = "a dropped handle discards the acknowledgement; the record is still sent"]
+pub struct TransactionalDeliveryHandle<'a> {
+    inner: super::DeliveryHandle,
+    producer: &'a TransactionalProducer,
+}
+
+impl TransactionalDeliveryHandle<'_> {
+    /// The partition this record was routed to, known at enqueue time.
+    #[inline]
+    #[must_use]
+    pub fn partition(&self) -> crate::PartitionId {
+        self.inner.partition()
+    }
+}
+
+impl std::future::Future for TransactionalDeliveryHandle<'_> {
+    type Output = Result<RecordMetadata>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let producer = self.producer;
+        match std::pin::Pin::new(&mut self.inner).poll(cx) {
+            std::task::Poll::Ready(result) => {
+                std::task::Poll::Ready(producer.classify_produce_result(result))
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
 /// Builder for [`TransactionalProducer`].
 ///
 /// Mirrors [`ProducerBuilder`](super::ProducerBuilder) setter for setter, with
@@ -2949,6 +3549,12 @@ pub struct TransactionalProducerBuilder {
     shared: Option<(Arc<ConnectionPool>, Arc<ClusterMetadata>)>,
     /// Optional pluggable persistence hook for producer identity state.
     state_store: Option<Arc<dyn super::idempotent::ErasedProducerStateStore>>,
+    /// Whether the caller set `transaction_timeout` explicitly.
+    ///
+    /// Needed to distinguish "left at the default" from "asked for 60 s", so
+    /// that combining it with `two_phase_commit` can be rejected without
+    /// rejecting every 2PC producer that never touched the setting.
+    transaction_timeout_set: bool,
 }
 
 impl TransactionalProducerBuilder {
@@ -2973,8 +3579,31 @@ impl TransactionalProducerBuilder {
     /// Set the transaction timeout.
     ///
     /// Defaults to 60 seconds. Must be greater than zero.
+    ///
+    /// Contradicts [`two_phase_commit`](Self::two_phase_commit), which is
+    /// rejected at build time rather than resolved silently.
     pub fn transaction_timeout(mut self, timeout: Duration) -> Self {
-        self.config.transaction_timeout_ms = crate::util::duration_to_millis_i32(timeout);
+        self.config.transaction_timeout = timeout;
+        self.transaction_timeout_set = true;
+        self
+    }
+
+    /// Participate in an external two-phase commit (KIP-939).
+    ///
+    /// Enables [`prepare_transaction`](TransactionalProducer::prepare_transaction),
+    /// [`init_transactions_keeping_prepared`](TransactionalProducer::init_transactions_keeping_prepared)
+    /// and [`complete_transaction`](TransactionalProducer::complete_transaction),
+    /// and tells the coordinator not to apply `transaction.max.timeout.ms` to
+    /// this producer's transactions — which is what makes "prepared" a state
+    /// the broker will actually hold.
+    ///
+    /// Requires `transaction.version` 3 on the broker (`InitProducerId` v6,
+    /// hence krafka's `unstable-protocol` feature) and both `WRITE` and
+    /// `TWO_PHASE_COMMIT` on the transactional-id resource.
+    ///
+    /// See [`TransactionalProducerConfig::two_phase_commit`].
+    pub fn two_phase_commit(mut self, enable: bool) -> Self {
+        self.config.two_phase_commit = enable;
         self
     }
 
@@ -3032,12 +3661,6 @@ impl TransactionalProducerBuilder {
     /// Set the maximum time `send` blocks waiting for buffer memory.
     pub fn max_block(mut self, max_block: Duration) -> Self {
         self.config.max_block = max_block;
-        self
-    }
-
-    /// Set the maximum number of concurrent in-flight produce requests.
-    pub fn max_in_flight(mut self, max: usize) -> Self {
-        self.config.max_in_flight = max;
         self
     }
 
@@ -3189,7 +3812,7 @@ impl TransactionalProducerBuilder {
     /// Routes all broker connections through the specified SOCKS5 proxy.
     #[cfg(feature = "socks5")]
     pub fn proxy(mut self, proxy: crate::network::ProxyConfig) -> Self {
-        self.config.proxy = Some(proxy);
+        self.config.transport.proxy = Some(proxy);
         self
     }
 
@@ -3351,7 +3974,11 @@ impl TransactionalProducerBuilder {
     /// `batch_size`, a compression codec whose Cargo feature is not enabled, a
     /// compression level the selected codec cannot use, and so on.
     pub fn build_config(self) -> Result<TransactionalProducerConfig> {
-        validate(&self.config, self.shared.is_some())?;
+        validate(
+            &self.config,
+            self.shared.is_some(),
+            self.transaction_timeout_set,
+        )?;
         Ok(self.config)
     }
 
@@ -3369,7 +3996,11 @@ impl TransactionalProducerBuilder {
         // One validator, shared with `build_config`. Keeping the rules in a
         // free function rather than inline here is what makes the synchronous
         // terminal possible at all.
-        validate(&self.config, self.shared.is_some())?;
+        validate(
+            &self.config,
+            self.shared.is_some(),
+            self.transaction_timeout_set,
+        )?;
 
         let pool_owned = self.shared.is_none();
         let (pool, metadata) = if let Some((pool, metadata)) = self.shared.clone() {
@@ -3384,11 +4015,6 @@ impl TransactionalProducerBuilder {
 
             if let Some(ref auth) = self.config.auth {
                 pool_config_builder = pool_config_builder.auth(auth.clone());
-            }
-
-            #[cfg(feature = "socks5")]
-            if let Some(ref proxy) = self.config.proxy {
-                pool_config_builder = pool_config_builder.proxy(proxy.clone());
             }
 
             let mut pool_config = pool_config_builder.build()?;
@@ -3477,9 +4103,6 @@ impl TransactionalProducerBuilder {
                 max_request_size: self.config.max_request_size,
                 buffer_memory: self.config.buffer_memory,
                 max_block_ms: self.config.max_block,
-                in_flight_semaphore: Arc::new(tokio::sync::Semaphore::new(
-                    self.config.max_in_flight.max(1),
-                )),
                 interceptor: interceptor.clone(),
                 identity: Some(identity.clone()),
                 partitioner: partitioner.clone(),
@@ -3499,6 +4122,7 @@ impl TransactionalProducerBuilder {
             pool,
             partitioner,
             state: AtomicU8::new(TransactionState::Uninitialized as u8),
+            ongoing_prepared_txn: arc_swap::ArcSwap::from_pointee(PreparedTxnState::none()),
             // Overwritten by init_transactions() once the cluster's finalized
             // transaction.version has been read; TV1 is the safe default.
             transaction_version: AtomicU8::new(TransactionVersion::V1 as u8),
@@ -3559,7 +4183,7 @@ mod tests {
     fn test_transactional_producer_config_default() {
         let config = TransactionalProducerConfig::default();
         assert_eq!(config.client_id, "krafka-txn-producer");
-        assert_eq!(config.transaction_timeout_ms, 60000);
+        assert_eq!(config.transaction_timeout, Duration::from_secs(60));
         assert_eq!(config.max_request_size, crate::protocol::MAX_MESSAGE_SIZE);
     }
 
@@ -3699,6 +4323,7 @@ mod tests {
             pool,
             partitioner: Arc::new(UniformStickyPartitioner::new()),
             state: AtomicU8::new(TransactionState::InTransaction as u8),
+            ongoing_prepared_txn: arc_swap::ArcSwap::from_pointee(PreparedTxnState::none()),
             transaction_version: AtomicU8::new(TransactionVersion::V1 as u8),
             abort_required: AtomicBool::new(false),
             coordinator_id: RwLock::new(None),
@@ -3755,6 +4380,7 @@ mod tests {
             pool,
             partitioner: Arc::new(UniformStickyPartitioner::new()),
             state: AtomicU8::new(TransactionState::InTransaction as u8),
+            ongoing_prepared_txn: arc_swap::ArcSwap::from_pointee(PreparedTxnState::none()),
             transaction_version: AtomicU8::new(TransactionVersion::V1 as u8),
             abort_required: AtomicBool::new(false),
             coordinator_id: RwLock::new(None),
@@ -3812,6 +4438,7 @@ mod tests {
             pool,
             partitioner: Arc::new(UniformStickyPartitioner::new()),
             state: AtomicU8::new(TransactionState::InTransaction as u8),
+            ongoing_prepared_txn: arc_swap::ArcSwap::from_pointee(PreparedTxnState::none()),
             transaction_version: AtomicU8::new(TransactionVersion::V1 as u8),
             abort_required: AtomicBool::new(true),
             coordinator_id: RwLock::new(None),
@@ -4189,11 +4816,155 @@ mod tests {
         assert_eq!(TransactionState::from(val), TransactionState::Initializing);
     }
 
+    // ── KIP-939 two-phase commit ──────────────────────────────────────────
+
+    /// `PreparedTxnState` must round-trip through a string, because that is
+    /// how it reaches the external coordinator's store — the only link back to
+    /// a prepared transaction if the process dies.
+    #[test]
+    fn prepared_txn_state_round_trips_through_a_string() {
+        let state = PreparedTxnState {
+            producer_id: 4242,
+            producer_epoch: 7,
+        };
+        assert_eq!(state.to_string(), "4242:7");
+        assert_eq!(
+            "4242:7".parse::<PreparedTxnState>().expect("valid"),
+            state,
+            "a state written to a database must read back identical"
+        );
+
+        // Whitespace survives a round trip through a text column.
+        assert_eq!(
+            " 4242 : 7 ".parse::<PreparedTxnState>().expect("valid"),
+            state
+        );
+
+        for malformed in ["", "4242", "4242:", ":7", "abc:7", "4242:xyz"] {
+            let err = malformed
+                .parse::<PreparedTxnState>()
+                .expect_err("malformed state must not silently become a valid one");
+            assert!(
+                err.to_string().contains("producer_id:epoch"),
+                "the error must show the expected shape, got: {err}"
+            );
+        }
+    }
+
+    /// "No prepared transaction" must be distinguishable from one with
+    /// producer ID 0, which is a perfectly ordinary producer ID.
+    #[test]
+    fn the_absent_prepared_state_is_distinguishable_from_a_real_one() {
+        assert!(!PreparedTxnState::none().is_prepared());
+        assert!(
+            PreparedTxnState {
+                producer_id: 0,
+                producer_epoch: 0
+            }
+            .is_prepared(),
+            "producer ID 0 is a real producer ID, not an absence"
+        );
+    }
+
+    /// 2PC and an explicit transaction timeout contradict each other, and the
+    /// contradiction must be refused rather than resolved silently.
+    ///
+    /// Under KIP-939 the coordinator does not apply
+    /// `transaction.max.timeout.ms` to a prepared transaction — that is the
+    /// point — and krafka sends `i32::MAX`. Accepting a timeout and ignoring it
+    /// would leave an operator believing in a bound that does not exist.
+    #[test]
+    fn two_phase_commit_and_an_explicit_timeout_are_refused_together() {
+        let err = TransactionalProducer::builder()
+            .bootstrap_servers("localhost:9092")
+            .transactional_id("txn")
+            .two_phase_commit(true)
+            .transaction_timeout(Duration::from_secs(30))
+            .build_config()
+            .expect_err("the two settings contradict each other");
+        assert!(err.to_string().contains("two_phase_commit"), "got: {err}");
+
+        // Either alone is fine, including 2PC on a producer that never touched
+        // the timeout — the default must not be mistaken for an explicit one.
+        TransactionalProducer::builder()
+            .bootstrap_servers("localhost:9092")
+            .transactional_id("txn")
+            .two_phase_commit(true)
+            .build_config()
+            .expect("2PC without an explicit timeout is the normal configuration");
+    }
+
+    /// The 2PC entry points must refuse to run on a producer that never
+    /// enabled 2PC, rather than issuing a request the coordinator will
+    /// misinterpret.
+    #[tokio::test]
+    async fn the_two_phase_entry_points_require_the_setting() {
+        let producer = test_producer(TransactionVersion::V2);
+        producer.set_state(TransactionState::InTransaction);
+
+        let err = producer
+            .prepare_transaction()
+            .await
+            .expect_err("prepare without 2PC must be refused");
+        assert!(err.to_string().contains("two_phase_commit"), "got: {err}");
+
+        let err = producer
+            .init_transactions_keeping_prepared()
+            .await
+            .expect_err("keeping prepared transactions without 2PC must be refused");
+        assert!(err.to_string().contains("two_phase_commit"), "got: {err}");
+    }
+
+    /// `complete_transaction` must refuse when nothing was left prepared.
+    ///
+    /// Succeeding quietly would hide a caller that has lost track of which
+    /// producer it is recovering — the one situation where being wrong is
+    /// expensive.
+    #[tokio::test]
+    async fn completing_without_a_prepared_transaction_is_an_error() {
+        let producer = test_producer(TransactionVersion::V2);
+        producer.set_state(TransactionState::Ready);
+        let err = producer
+            .complete_transaction(PreparedTxnState {
+                producer_id: 1,
+                producer_epoch: 0,
+            })
+            .await
+            .expect_err("there is nothing to complete");
+        assert!(
+            err.to_string()
+                .contains("init_transactions_keeping_prepared"),
+            "the error must name the call that was skipped, got: {err}"
+        );
+    }
+
     #[test]
     fn test_transaction_state_unknown_maps_to_fatal() {
-        // Values not explicitly mapped fall to FatalError. 7 is now
-        // CommitIndeterminate, so the first unmapped discriminant is 8.
-        assert_eq!(TransactionState::from(8), TransactionState::FatalError);
+        // Values not explicitly mapped fall to FatalError. 8 is now
+        // Prepared (KIP-939), so the first unmapped discriminant is 9.
+        //
+        // The round-trip below is what keeps this honest: adding a state and
+        // forgetting the `From<u8>` arm would silently map it to FatalError,
+        // and this asserts every declared discriminant survives the trip.
+        for state in [
+            TransactionState::Uninitialized,
+            TransactionState::Ready,
+            TransactionState::InTransaction,
+            TransactionState::Committing,
+            TransactionState::Aborting,
+            TransactionState::FatalError,
+            TransactionState::Initializing,
+            TransactionState::CommitIndeterminate,
+            TransactionState::Prepared,
+        ] {
+            assert_eq!(
+                TransactionState::from(state as u8),
+                state,
+                "{state} must survive the u8 round trip"
+            );
+        }
+
+        assert_eq!(TransactionState::from(9), TransactionState::FatalError);
         assert_eq!(TransactionState::from(255), TransactionState::FatalError);
     }
 
@@ -4503,6 +5274,7 @@ mod tests {
             pool,
             partitioner: Arc::new(UniformStickyPartitioner::new()),
             state: AtomicU8::new(TransactionState::InTransaction as u8),
+            ongoing_prepared_txn: arc_swap::ArcSwap::from_pointee(PreparedTxnState::none()),
             transaction_version: AtomicU8::new(version as u8),
             abort_required: AtomicBool::new(false),
             coordinator_id: RwLock::new(None),
@@ -4561,10 +5333,75 @@ mod tests {
     ) -> BrokerTransactionSupport {
         BrokerTransactionSupport {
             transaction_version_level: level,
+            // Enough for TV3 when the feature level allows it; the TV3 tests
+            // below vary this deliberately.
+            init_producer_id_max: Some(TV3_MIN_INIT_PRODUCER_ID_VERSION),
             produce_max: Some(produce),
             txn_offset_commit_max: Some(txn_offset_commit),
             end_txn_max: Some(end_txn),
         }
+    }
+
+    /// TV3 needs the same kind of evidence TV2 does: the finalized feature
+    /// level **and** an API version that can actually carry the new field.
+    ///
+    /// Finalized features are cluster-wide metadata and can be observed before
+    /// every broker has restarted into a build that serves the matching API
+    /// versions. Trusting the level alone would have krafka send `enable2Pc`
+    /// to a broker whose `InitProducerId` predates the field, where it is not
+    /// rejected — it is simply not there, and the coordinator applies
+    /// `transaction.max.timeout.ms` to a transaction the caller believes is
+    /// exempt.
+    #[test]
+    fn tv3_requires_an_init_producer_id_that_can_carry_enable_2pc() {
+        let mut broker = support(
+            3,
+            TV2_MIN_PRODUCE_VERSION,
+            TV2_MIN_TXN_OFFSET_COMMIT_VERSION,
+            TV2_MIN_END_TXN_VERSION,
+        );
+        assert_eq!(broker.version(), TransactionVersion::V3);
+
+        broker.init_producer_id_max = Some(TV3_MIN_INIT_PRODUCER_ID_VERSION - 1);
+        assert_eq!(
+            broker.version(),
+            TransactionVersion::V2,
+            "a broker that cannot encode enable2Pc is not a TV3 broker, whatever \
+             the feature level says"
+        );
+
+        broker.init_producer_id_max = None;
+        assert_eq!(broker.version(), TransactionVersion::V2);
+
+        // And the level still gates it: a v6-capable broker at level 2 is TV2.
+        let mut level_2 = support(
+            2,
+            TV2_MIN_PRODUCE_VERSION,
+            TV2_MIN_TXN_OFFSET_COMMIT_VERSION,
+            TV2_MIN_END_TXN_VERSION,
+        );
+        level_2.init_producer_id_max = Some(TV3_MIN_INIT_PRODUCER_ID_VERSION);
+        assert_eq!(level_2.version(), TransactionVersion::V2);
+    }
+
+    /// The negotiated version is the minimum across brokers, so one lagging
+    /// broker holds the whole cluster at the level it can serve.
+    #[test]
+    fn a_single_lagging_broker_holds_the_cluster_below_tv3() {
+        let tv3 = support(
+            3,
+            TV2_MIN_PRODUCE_VERSION,
+            TV2_MIN_TXN_OFFSET_COMMIT_VERSION,
+            TV2_MIN_END_TXN_VERSION,
+        );
+        let mut lagging = tv3;
+        lagging.init_producer_id_max = Some(TV3_MIN_INIT_PRODUCER_ID_VERSION - 1);
+
+        assert_eq!(
+            negotiated_transaction_version(&[tv3, lagging]),
+            TransactionVersion::V2,
+            "a rolling upgrade must not enable 2PC before every broker can serve it"
+        );
     }
 
     /// A broker that finalizes transaction.version at 2+ and can serve every
@@ -4594,11 +5431,32 @@ mod tests {
             TransactionVersion::from_feature_level(2),
             TransactionVersion::V2
         );
-        // A future level must not silently fall back to TV1.
+        // Level 3 is KIP-939.
         assert_eq!(
             TransactionVersion::from_feature_level(3),
-            TransactionVersion::V2
+            TransactionVersion::V3
         );
+        // A future level must not silently fall back — it keeps the highest
+        // protocol krafka knows, whose semantics are a subset of whatever
+        // comes next.
+        assert_eq!(
+            TransactionVersion::from_feature_level(4),
+            TransactionVersion::V3
+        );
+
+        // TV3 must keep every TV2 behaviour. An equality test in `is_v2()`
+        // would send a TV3 cluster back to AddPartitionsToTxn and the wrong
+        // epoch handling — silently, since both are legal requests.
+        assert!(TransactionVersion::V2.is_v2());
+        assert!(
+            TransactionVersion::V3.is_v2(),
+            "TV3 is a superset of TV2, not an alternative to it"
+        );
+        assert!(!TransactionVersion::V1.is_v2());
+
+        assert!(TransactionVersion::V3.supports_two_phase_commit());
+        assert!(!TransactionVersion::V2.supports_two_phase_commit());
+        assert!(!TransactionVersion::V1.supports_two_phase_commit());
         // A negative level cannot appear on the wire, but must not enable TV2.
         assert_eq!(
             TransactionVersion::from_feature_level(-1),

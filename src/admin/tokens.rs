@@ -29,12 +29,22 @@ impl AdminClient {
     ///
     /// # Arguments
     ///
+    /// * `owner` - Principal the token is issued **for**, as a `(type, name)`
+    ///   pair, or `None` for the authenticated caller. Requesting a token on
+    ///   behalf of another principal is KIP-373 and needs
+    ///   `CreateDelegationToken` v3+ plus `CreateTokens` authorisation on that
+    ///   principal — it is how a superuser provisions a token for a service
+    ///   account that never authenticates interactively. The requester is
+    ///   recorded alongside the owner and comes back on
+    ///   [`DelegationToken::token_requester_principal_name`], which is what an
+    ///   audit trail needs.
     /// * `renewers` - Principals authorized to renew the token (type, name pairs).
     ///   Pass an empty slice to allow only the token owner to renew.
     /// * `max_lifetime` - Maximum token lifetime. Use `None` for the server
     ///   default (typically 7 days).
     pub async fn create_delegation_token(
         &self,
+        owner: Option<(&str, &str)>,
         renewers: &[(&str, &str)],
         max_lifetime: Option<Duration>,
     ) -> Result<CreateDelegationTokenResult> {
@@ -50,17 +60,26 @@ impl AdminClient {
         let max_lifetime_ms = max_lifetime
             .map(crate::util::duration_to_millis_i64)
             .unwrap_or(-1);
+        let (owner_principal_type, owner_principal_name) = match owner {
+            Some((principal_type, principal_name)) => (
+                Some(principal_type.to_string()),
+                Some(principal_name.to_string()),
+            ),
+            None => (None, None),
+        };
 
         // `CreateDelegationToken` is controller-only.
         let response = self
             .with_controller("CreateDelegationToken", |conn| {
                 let wire_renewers = &wire_renewers;
+                let owner_principal_type = owner_principal_type.clone();
+                let owner_principal_name = owner_principal_name.clone();
                 async move {
                     let request = CreateDelegationTokenRequest {
                         renewers: wire_renewers.clone(),
                         max_lifetime_ms,
-                        owner_principal_type: None,
-                        owner_principal_name: None,
+                        owner_principal_type,
+                        owner_principal_name,
                     };
 
                     let version = conn
@@ -107,6 +126,8 @@ impl AdminClient {
                     token_id: response.token_id,
                     hmac: response.hmac,
                     renewers: Vec::new(),
+                    token_requester_principal_type: response.token_requester_principal_type,
+                    token_requester_principal_name: response.token_requester_principal_name,
                 }),
                 error: None,
             }
@@ -294,6 +315,8 @@ impl AdminClient {
                 max_timestamp_ms: t.max_timestamp_ms,
                 token_id: t.token_id,
                 hmac: t.hmac,
+                token_requester_principal_type: t.token_requester_principal_type,
+                token_requester_principal_name: t.token_requester_principal_name,
                 renewers: t
                     .renewers
                     .into_iter()
@@ -435,6 +458,8 @@ mod tests {
                 principal_type: "User".into(),
                 principal_name: "bob".into(),
             }],
+            token_requester_principal_type: Some("User".into()),
+            token_requester_principal_name: Some("admin".into()),
         };
 
         let rendered = format!("{token:?}");

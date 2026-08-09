@@ -140,6 +140,25 @@ impl AdminClient {
                         )
                     })?;
 
+                // The sentinel specs are negative timestamps, so a broker that
+                // predates one does not reject it — it answers as if the value
+                // were an ordinary timestamp, which for a negative number
+                // means the log start. That is a plausible-looking answer to a
+                // question the broker never understood, so the mismatch is
+                // caught here rather than surfacing as silently wrong data.
+                let required = spec.min_api_version();
+                if version < required {
+                    return Err(KrafkaError::protocol_kind(
+                        ProtocolErrorKind::UnknownApiVersion,
+                        format!(
+                            "OffsetSpec::{} needs ListOffsets v{required}, but the broker \
+                             negotiated v{version}; it would answer as though the sentinel \
+                             were an ordinary timestamp",
+                            spec.name()
+                        ),
+                    ));
+                }
+
                 let response_bytes = conn
                     .send_request(ApiKey::ListOffsets, version, |buf| {
                         request.encode_versioned(version, buf)
@@ -240,8 +259,18 @@ impl AdminClient {
         self.check_not_closed()?;
 
         // 1. Fetch committed offsets.
+        //
+        // `IncludeUnstable`: lag is a monitoring signal, and reporting the
+        // freshest committed position is more useful here than refusing to
+        // answer because some partition has a transaction in flight. A lag
+        // number that dips when a transaction aborts is the honest shape of
+        // the underlying data; an error is not.
         let committed = self
-            .describe_consumer_group_offsets(group_id, topic_partitions)
+            .describe_consumer_group_offsets(
+                group_id,
+                topic_partitions,
+                OffsetVisibility::IncludeUnstable,
+            )
             .await?;
 
         if committed.is_empty() {

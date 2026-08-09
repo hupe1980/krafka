@@ -114,6 +114,42 @@ pub enum KrafkaError {
         message: String,
     },
 
+    /// A consumed record could not be deserialized.
+    ///
+    /// Carries the record's coordinates rather than only a message, because
+    /// the only way to make progress past a permanently undeserializable
+    /// record is to seek past it — and that needs the topic, partition and
+    /// offset:
+    ///
+    /// ```rust,ignore
+    /// match consumer.poll(timeout).await {
+    ///     Err(KrafkaError::RecordDeserialization { topic, partition, offset, .. }) => {
+    ///         consumer.seek(&topic, partition, offset + 1).await?;
+    ///     }
+    ///     other => other?,
+    /// };
+    /// ```
+    ///
+    /// The consumer does **not** advance past the offending record on its own:
+    /// the record and everything fetched behind it are put back, so nothing is
+    /// skipped silently. Equivalent to the Java client's
+    /// `RecordDeserializationException`.
+    #[error(
+        "failed to deserialize the {part} of {topic}-{partition} at offset {offset}: {message}"
+    )]
+    RecordDeserialization {
+        /// Topic the record was read from.
+        topic: String,
+        /// Partition the record was read from.
+        partition: crate::PartitionId,
+        /// Offset of the record that could not be deserialized.
+        offset: i64,
+        /// Which half of the record failed — `"key"` or `"value"`.
+        part: &'static str,
+        /// Human-readable description of the failure.
+        message: String,
+    },
+
     /// Schema registry errors.
     ///
     /// The `source` field preserves the underlying transport or decode error
@@ -157,6 +193,19 @@ impl Clone for KrafkaError {
                 message: message.clone(),
             },
             Self::Serialization { message } => Self::Serialization {
+                message: message.clone(),
+            },
+            Self::RecordDeserialization {
+                topic,
+                partition,
+                offset,
+                part,
+                message,
+            } => Self::RecordDeserialization {
+                topic: topic.clone(),
+                partition: *partition,
+                offset: *offset,
+                part,
                 message: message.clone(),
             },
             Self::Http { message, source } => Self::Http {
@@ -250,6 +299,27 @@ impl KrafkaError {
     #[cold]
     pub fn serialization(message: impl Into<String>) -> Self {
         Self::Serialization {
+            message: message.into(),
+        }
+    }
+
+    /// Create a new record-deserialization error.
+    ///
+    /// `part` is `"key"` or `"value"`; the topic, partition and offset are
+    /// what let the caller seek past the record.
+    #[cold]
+    pub fn record_deserialization(
+        topic: impl Into<String>,
+        partition: crate::PartitionId,
+        offset: i64,
+        part: &'static str,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::RecordDeserialization {
+            topic: topic.into(),
+            partition,
+            offset,
+            part,
             message: message.into(),
         }
     }

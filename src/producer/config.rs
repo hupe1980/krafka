@@ -100,8 +100,6 @@ pub struct ProducerConfig {
     pub(crate) retries: u32,
     /// Time between retries.
     pub(crate) retry_backoff: Duration,
-    /// Max in-flight requests per connection.
-    pub(crate) max_in_flight: usize,
     /// Maximum encoded Kafka request frame size in bytes.
     pub(crate) max_request_size: usize,
     /// Enable idempotent producer.
@@ -110,8 +108,10 @@ pub struct ProducerConfig {
     /// obtains a Producer ID from the broker and tracks sequence numbers per
     /// partition to guarantee exactly-once delivery within a session.
     ///
-    /// Requires `acks = All`. `max_in_flight` is automatically capped to 5
-    /// at build time if a higher value is configured.
+    /// Requires `acks = All`. Per-partition ordering is guaranteed
+    /// structurally — the record accumulator keeps exactly one batch per
+    /// partition on the wire — so there is no in-flight-request limit to
+    /// configure for it, unlike the Java client's `max.in.flight ≤ 5` rule.
     pub(crate) idempotent: bool,
     /// Max block time when buffer is full.
     pub(crate) max_block: Duration,
@@ -133,9 +133,6 @@ pub struct ProducerConfig {
     pub(crate) metadata_recovery_rebootstrap_trigger: Duration,
     /// Authentication configuration (optional).
     pub(crate) auth: Option<AuthConfig>,
-    /// SOCKS5 proxy configuration (optional).
-    #[cfg(feature = "socks5")]
-    pub(crate) proxy: Option<crate::network::ProxyConfig>,
     /// Socket- and pool-level transport tuning.
     ///
     /// Defaults reproduce krafka's historical behaviour; see
@@ -144,7 +141,7 @@ pub struct ProducerConfig {
     /// Optional dead-letter queue for permanently-failed records.
     ///
     /// When set, records that exhaust all retries (or encounter a
-    /// non-retriable error) on the direct-send path are routed to this DLQ
+    /// non-retriable error) are routed to this DLQ
     /// before the error is returned to the caller.
     pub(crate) dead_letter_queue: Option<Arc<dyn DeadLetterQueue>>,
 }
@@ -165,7 +162,6 @@ impl Default for ProducerConfig {
             delivery_timeout: Duration::from_secs(120),
             retries: u32::MAX,
             retry_backoff: Duration::from_millis(100),
-            max_in_flight: 5,
             max_request_size: crate::protocol::MAX_MESSAGE_SIZE,
             idempotent: true,
             max_block: Duration::from_secs(60),
@@ -175,8 +171,6 @@ impl Default for ProducerConfig {
             metadata_recovery_strategy: MetadataRecoveryStrategy::Rebootstrap,
             metadata_recovery_rebootstrap_trigger: Duration::from_secs(300),
             auth: None,
-            #[cfg(feature = "socks5")]
-            proxy: None,
             transport: crate::network::TransportConfig::default(),
             dead_letter_queue: None,
         }
@@ -270,12 +264,6 @@ impl ProducerConfig {
         self.retry_backoff
     }
 
-    /// Returns the max in-flight requests per connection.
-    #[inline]
-    pub fn max_in_flight(&self) -> usize {
-        self.max_in_flight
-    }
-
     /// Returns the maximum encoded request frame size in bytes.
     #[inline]
     pub fn max_request_size(&self) -> usize {
@@ -328,13 +316,6 @@ impl ProducerConfig {
     #[inline]
     pub fn auth(&self) -> Option<&AuthConfig> {
         self.auth.as_ref()
-    }
-
-    /// Returns the SOCKS5 proxy configuration, if set.
-    #[cfg(feature = "socks5")]
-    #[inline]
-    pub fn proxy(&self) -> Option<&crate::network::ProxyConfig> {
-        self.proxy.as_ref()
     }
 }
 
@@ -419,7 +400,7 @@ pub(crate) fn validate_compression(
 ///
 /// # Why this is a free function
 ///
-/// There used to be two producer builders: a public [`ProducerBuilder`] that
+/// There used to be two producer builders: a public [`ProducerBuilder`](crate::producer::ProducerBuilder) that
 /// every caller uses, and a `ProducerConfigBuilder` that nothing outside this
 /// crate's own tests ever touched. Each carried its own copy of these rules,
 /// and the copies had **diverged**: the public path — the only one anybody ran
@@ -432,21 +413,21 @@ pub(crate) fn validate_compression(
 ///
 /// The second builder is gone and this is the single place the rules live.
 /// Both the synchronous
-/// [`build_config`](ProducerBuilder::build_config) terminal and the async
-/// [`build`](ProducerBuilder::build) call it, so they cannot disagree again.
+/// [`build_config`](crate::producer::ProducerBuilder::build_config) terminal and the async
+/// [`build`](crate::producer::ProducerBuilder::build) call it, so they cannot disagree again.
 ///
 /// # Normalisation
 ///
-/// Takes `&mut` because validation is not purely a predicate: an idempotent
-/// producer's `max_in_flight` is capped to 5 here (KIP-679), matching the Java
-/// client and librdkafka, rather than being rejected.
+/// Takes `&mut` because validation is not purely a predicate: it normalises a
+/// few fields (for example clamping compression levels into the selected
+/// codec's range) rather than only rejecting them.
 ///
 /// `has_shared_pool` relaxes the `bootstrap_servers` requirement: a client
-/// built with [`with_client`](ProducerBuilder::with_client) inherits an
+/// built with [`with_client`](crate::producer::ProducerBuilder::with_client) inherits an
 /// already-connected pool and has no bootstrap list of its own.
 pub(crate) fn validate(config: &mut ProducerConfig, has_shared_pool: bool) -> Result<()> {
     if !has_shared_pool && config.bootstrap_servers.is_empty() {
-        return Err(KrafkaError::config("bootstrap_servers must not be empty"));
+        return Err(KrafkaError::config("bootstrap_servers is required"));
     }
 
     // Validate client_id against the Kafka wire limit for KafkaString (i16::MAX).
@@ -461,12 +442,6 @@ pub(crate) fn validate(config: &mut ProducerConfig, has_shared_pool: bool) -> Re
         return Err(KrafkaError::config(format!(
             "batch_size must be >= 1 (got {})",
             config.batch_size
-        )));
-    }
-    if config.max_in_flight == 0 {
-        return Err(KrafkaError::config(format!(
-            "max_in_flight must be >= 1 (got {})",
-            config.max_in_flight
         )));
     }
     if config.max_request_size == 0 {
@@ -523,19 +498,6 @@ pub(crate) fn validate(config: &mut ProducerConfig, has_shared_pool: bool) -> Re
                 "idempotent producer requires acks = All (got {:?})",
                 config.acks
             )));
-        }
-        // Idempotent production requires max_in_flight ≤ 5 per the Kafka
-        // protocol specification (KIP-679).  Rather than rejecting the
-        // configuration with an error, we silently cap it to 5 — the same
-        // behaviour as the Java client, librdkafka, and kafka-go — and emit
-        // an info-level message so operators can see the adjustment.
-        if config.max_in_flight > 5 {
-            tracing::info!(
-                configured = config.max_in_flight,
-                effective = 5,
-                "idempotent producer requires max_in_flight ≤ 5; capping automatically"
-            );
-            config.max_in_flight = 5;
         }
         // Warn when idempotency is enabled without a transactional_id:
         // idempotent producers prevent duplicates within a session but do NOT
@@ -899,21 +861,6 @@ mod tests {
     }
 
     #[test]
-    fn test_config_builder_max_in_flight() {
-        // max_in_flight=10 requires idempotent=false
-        let config = crate::producer::Producer::builder()
-            .bootstrap_servers("localhost:9092")
-            .idempotent(false)
-            .max_in_flight(10)
-            .build_config()
-            .unwrap();
-        assert_eq!(
-            config.max_in_flight, 10,
-            "max_in_flight should be set by builder"
-        );
-    }
-
-    #[test]
     fn test_config_builder_metadata_max_age() {
         let config = crate::producer::Producer::builder()
             .bootstrap_servers("localhost:9092")
@@ -982,7 +929,10 @@ mod tests {
             .proxy(crate::network::ProxyConfig::new("proxy:1080"))
             .build_config()
             .unwrap();
-        let proxy = config.proxy().expect("proxy should be set");
+        let proxy = config
+            .transport
+            .proxy()
+            .expect("proxy should reach the transport config");
         assert_eq!(proxy.address(), "proxy:1080");
     }
 
@@ -1026,14 +976,6 @@ mod tests {
     }
 
     #[test]
-    fn test_config_builder_rejects_zero_max_in_flight() {
-        let err = crate::producer::Producer::builder()
-            .max_in_flight(0)
-            .build_config();
-        assert!(err.is_err());
-    }
-
-    #[test]
     fn test_config_builder_rejects_zero_max_request_size() {
         let err = crate::producer::Producer::builder()
             .max_request_size(0)
@@ -1064,30 +1006,6 @@ mod tests {
             .acks(Acks::Leader)
             .build_config();
         assert!(err.is_err());
-    }
-
-    #[test]
-    fn test_config_builder_autocaps_idempotent_with_high_in_flight() {
-        // max_in_flight > 5 with idempotent enabled: auto-capped to 5, not an error.
-        let config = crate::producer::Producer::builder()
-            .bootstrap_servers("localhost:9092")
-            .idempotent(true)
-            .max_in_flight(10)
-            .build_config()
-            .expect("should auto-cap, not error");
-        assert_eq!(config.max_in_flight(), 5);
-    }
-
-    #[test]
-    fn test_config_builder_idempotent_keeps_low_in_flight() {
-        // max_in_flight ≤ 5 is preserved exactly.
-        let config = crate::producer::Producer::builder()
-            .bootstrap_servers("localhost:9092")
-            .idempotent(true)
-            .max_in_flight(3)
-            .build_config()
-            .expect("should succeed");
-        assert_eq!(config.max_in_flight(), 3);
     }
 
     #[test]

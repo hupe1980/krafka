@@ -27,6 +27,15 @@ For every Markdown file under `site/content/`:
      or re-exports.
   2. `.method(` at the start of a line — a builder-chain or receiver call. The
      name must be a function the crate defines, or be in ALLOWLIST.
+  3. Any mention at all — prose or code — of a name in REMOVED.
+
+Rule 3 exists because rules 1 and 2 both missed a stale `max_in_flight` in the
+producer guide's prose: it was inside backticks with no `.` and no `(`, so
+neither pattern saw it. A general "backticked snake_case must resolve" rule is
+not viable — the guides legitimately name 90-odd metric names, protocol fields
+and broker settings that are not crate symbols. Naming the removals explicitly
+is precise, costs one line per removal, and is exactly the case that rots:
+nobody greps the guides for a name they just deleted.
 
 Arity and shape are not checked here; that needs a compiler. `just docs-test`
 (xtask/docs_test.py) compiles every snippet marked ```rust,compile, which is
@@ -65,6 +74,28 @@ ALLOWLIST = {
     "with_no_client_auth", "with_safe_defaults", "builder",
     # serde / misc
     "to_owned", "from", "try_into", "deserialize", "serialize",
+    # Illustrative database calls in the two-phase-commit example. The external
+    # coordinator is the point of KIP-939, so the guide has to show one; these
+    # are `postgres`-shaped placeholders, not krafka API.
+    "query_one", "execute",
+}
+
+
+# Public API that was deliberately removed, checked everywhere — prose and code
+# fences alike, since a stale mention is stale wherever it sits.
+#
+# Only add a name that **no other crate in the guides can legitimately own**.
+# `SchemaEncoder` and `SchemaDecoder` were tried here and had to be taken out
+# again: krafka dropped them in 0.17, but the cookbook correctly names
+# `schemreg::traits::SchemaEncoder` when showing how to bridge the two crates.
+# A removal that shares a name with a live third-party type does not belong in
+# this set.
+REMOVED = {
+    # 0.18: the producer's second, unbatched send path was deleted. Ordering is
+    # now structural (one batch per partition on the wire), so the setting has
+    # no invariant left to protect; the per-connection ceiling is
+    # `TransportConfig::max_in_flight_requests`.
+    "max_in_flight",
 }
 
 
@@ -85,6 +116,9 @@ def crate_symbols() -> set[str]:
 
 def main() -> int:
     defined = crate_symbols() | ALLOWLIST
+    removed_pattern = re.compile(
+        r"\b(" + "|".join(sorted(map(re.escape, REMOVED))) + r")\b"
+    )
     failures: list[tuple[str, str, int]] = []
     scanned = 0
 
@@ -101,6 +135,9 @@ def main() -> int:
             if m.group(1) not in defined:
                 failures.append((rel, m.group(1), text[: m.start()].count("\n") + 1))
 
+        for m in removed_pattern.finditer(text):
+            failures.append((rel, m.group(1), text[: m.start()].count("\n") + 1))
+
     if failures:
         print("Documentation API check FAILED\n", file=sys.stderr)
         seen = set()
@@ -108,13 +145,21 @@ def main() -> int:
             if (rel, name) in seen:
                 continue
             seen.add((rel, name))
-            print(
-                f"  - {rel}:{line}  `{name}` is not defined by the crate.\n"
-                "    Either the guide names a renamed or removed API, or the name "
-                "belongs to\n    another crate and should be added to ALLOWLIST in "
-                "xtask/doc_api.py.\n",
-                file=sys.stderr,
-            )
+            if name in REMOVED:
+                print(
+                    f"  - {rel}:{line}  `{name}` was removed from the public API.\n"
+                    "    Rewrite the passage; see REMOVED in xtask/doc_api.py for what\n"
+                    "    replaced it.\n",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"  - {rel}:{line}  `{name}` is not defined by the crate.\n"
+                    "    Either the guide names a renamed or removed API, or the name "
+                    "belongs to\n    another crate and should be added to ALLOWLIST in "
+                    "xtask/doc_api.py.\n",
+                    file=sys.stderr,
+                )
         return 1
 
     print(f"✓ Documentation API: {scanned} files scanned, every krafka name resolves")

@@ -372,7 +372,7 @@ impl ConsumerBuilder {
     /// Routes all broker connections through the specified SOCKS5 proxy.
     #[cfg(feature = "socks5")]
     pub fn proxy(mut self, proxy: crate::network::ProxyConfig) -> Self {
-        self.config.proxy = Some(proxy);
+        self.config.transport.proxy = Some(proxy);
         self
     }
 
@@ -592,7 +592,7 @@ impl ConsumerBuilder {
         // connection pool, so that one check is done here rather than in the
         // shared validator, which has no visibility into `shared`.
         if self.shared.is_none() && self.config.bootstrap_servers.is_empty() {
-            return Err(KrafkaError::config("bootstrap.servers is required"));
+            return Err(KrafkaError::config("bootstrap_servers is required"));
         }
         if self.config.enable_auto_commit && self.config.group_id.is_none() {
             tracing::warn!(

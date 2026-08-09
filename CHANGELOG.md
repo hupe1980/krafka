@@ -15,6 +15,494 @@ not a complete record.
 
 Nothing yet.
 
+## [0.18.0] — 2026-08-08
+
+The producer's second, unbatched send path is deleted. It was the **default**
+configuration (`linger = 0`), it issued one Produce request per record, and it
+had no per-partition dispatch order — so concurrent sends to one partition
+could fail an idempotent producer permanently. Every send now goes through the
+record accumulator.
+
+Plus a consumer ordering defect (`recv()` could hand back a partition's records
+out of order) and a silent data-loss path (a deserializer error skipped the
+records it rejected).
+
+### Breaking
+
+- **`CompactedTopicConsumerBuilder` is removed**, replaced by
+  `CompactedTopicConsumer::from_consumer_builder(ConsumerBuilder, topic)`.
+
+  The old builder owned a hand-picked subset of nine consumer settings, and
+  every setting it omitted was unreachable through it. Two of the omissions
+  mattered: `isolation_level`, so the type most likely to be pointed at
+  transactional data could not ask for `read_committed` and could materialise a
+  table from records that were later aborted; and `connect_timeout`, which
+  `build()` validates `request_timeout` against, so a caller wanting a tight
+  request budget was refused with an error naming a value they had no way to
+  change.
+
+  Taking the real `ConsumerBuilder` removes the class rather than the two
+  instances. The constructor imposes three settings, which are requirements of
+  materialising a table rather than preferences: `auto_offset_reset = Earliest`,
+  `enable_auto_commit = false`, and — new — **`isolation_level = ReadCommitted`**.
+  That last one is a behaviour change for existing callers, and deliberately so:
+  anyone relying on the old default was reading aborted records into a table.
+  It costs nothing on a topic with no transactions, where the last stable offset
+  equals the high watermark in the same fetch response. Use `from_consumer` with
+  a hand-built `Consumer` to read uncommitted state on purpose.
+
+- **The SOCKS5 proxy moved onto `TransportConfig`.** `ProducerConfig::proxy`,
+  `ConsumerConfig::proxy`, `AdminConfig::proxy`, `ShareConsumerConfig::proxy`
+  and their accessors are gone; `TransportConfig::proxy` replaces them. Every
+  client builder keeps its `.proxy(..)` shorthand, which now writes into the
+  builder's transport config, so there is exactly one storage location and no
+  precedence rule.
+
+  Reported by a downstream project that mapped its own transport settings onto
+  `TransportConfig` — the obvious thing to do with a type of that name — and
+  shipped a producer that silently bypassed the proxy its deployment required.
+  Where the brokers were reachable directly, traffic left by the wrong egress
+  path and nothing said so. What made it a trap rather than an omission is that
+  this module's own documentation described a `TransportConfig` as carrying
+  "the SOCKS5 route", and warned that a client left on the default transport
+  gets "no proxy" — describing a capability the type did not have.
+
+- **`ProducerConfig::max_in_flight` / `ProducerBuilder::max_in_flight` removed**
+  from both the plain and the transactional producer, along with the
+  `max_in_flight()` accessor and the automatic "cap to 5 when idempotent"
+  normalisation.
+
+  The knob existed to bound a concurrency the accumulator does not have: it
+  keeps exactly one batch per partition on the wire, in the order batches were
+  sealed, so sequence order and wire order cannot diverge and KIP-679's
+  `max.in.flight ≤ 5` rule has nothing to protect. The per-connection ceiling
+  is `TransportConfig::max_in_flight_requests`, which is where a per-connection
+  setting belongs. Delete the call; there is no replacement.
+
+  It was also doing real harm: the accumulator gated *global* batch dispatch on
+  it, so a producer writing to 100 partitions could have at most five Produce
+  requests outstanding across the whole cluster.
+
+- **`ShareConsumerBuilder::fetch_max_wait_ms(i32)` is now
+  `fetch_max_wait(Duration)`**, and `ShareConsumerConfig::fetch_max_wait_ms`
+  is `fetch_max_wait: Duration`. It was the only timeout in the crate taking
+  raw milliseconds.
+
+- **`TransactionalProducerConfig::transaction_timeout_ms` is now
+  `transaction_timeout: Duration`** internally. The public setter and accessor
+  were already `Duration`-based and are unchanged; only the field name and the
+  struct's `Debug` output differ.
+
+- **`KrafkaError::RecordDeserialization { topic, partition, offset, part,
+  message }`** is a new variant. Exhaustive matches over `KrafkaError` need a
+  new arm. It replaces the generic error a failing key/value deserializer used
+  to surface and carries the coordinates needed to seek past a poison record —
+  the Java client's `RecordDeserializationException`.
+
+- **Consumer deserialization now runs before the consumer interceptor**, so
+  `ConsumerInterceptor::on_consume` observes deserialized values rather than
+  wire bytes. This mirrors the producer, where `on_send` runs before
+  serialization, and matches the Java client. An interceptor that parsed the
+  raw framing itself must move that logic into a `Deserializer`.
+
+### Added
+
+- **`Producer::enqueue` and `TransactionalProducer::enqueue`**, returning a
+  `DeliveryHandle` / `TransactionalDeliveryHandle` instead of fusing the append
+  and the acknowledgement into one future — the shape of Java's
+  `Producer.send()`.
+
+  **Produce order is enqueue order.** If `enqueue(a)` returns before
+  `enqueue(b)` is called, `a` reaches its partition first, whatever order the
+  handles are polled in or whether they are polled at all. `send_record` cannot
+  offer that: it does its append somewhere inside its own polling, so N of them
+  polled concurrently append in *poll* order — and under buffer-memory
+  backpressure the two diverge, because a send that cannot get its permit
+  yields and lets a later one append first.
+
+  Pipelining on top of the fused future was therefore possible but delicate: it
+  required polling every outstanding future in submission order on every wake,
+  which is O(window) per wake and where the sweep *is* the ordering guarantee.
+  Reported by a downstream project that had built exactly that, and measured
+  35× on the alternative of awaiting each acknowledgement.
+
+  `send_record` remains, and is now `enqueue(record).await?.await`.
+
+- **KIP-939 two-phase commit** (`unstable-protocol`), the largest remaining
+  functional gap the previous review named. Kafka transactions are atomic
+  within Kafka and with nothing else, so a service that must write to Kafka
+  **and** a database — either both or neither — could not express that.
+
+  - `TransactionalProducerBuilder::two_phase_commit(true)` sends `enable2Pc` on
+    `InitProducerId`, which stops the coordinator applying
+    `transaction.max.timeout.ms`. Without it "prepared" is a promise krafka
+    cannot keep, because the broker would abort the transaction out from under
+    the external coordinator. Combining it with an explicit
+    `transaction_timeout` is a configuration error rather than a silently
+    ignored setting.
+  - `prepare_transaction() -> PreparedTxnState` flushes every buffered record
+    and closes the transaction to new ones. It sends **no request**: there is no
+    prepare in the Kafka protocol, and the prepare *is* the flush — once every
+    record is durably written with no commit marker following, the transaction
+    is in doubt exactly as a prepared one should be.
+  - `init_transactions_keeping_prepared() -> Option<PreparedTxnState>` is the
+    recovery entry point. Where `init_transactions()` tells the coordinator to
+    abort whatever the previous incarnation left open, this tells it to hold.
+  - `complete_transaction(stored) -> TransactionOutcome` resolves it: if the
+    stored state matches the transaction the coordinator still holds, the
+    prepare was durably recorded externally and this side commits to match;
+    otherwise the stored value names an older transaction, the external side
+    rolled back, and this side aborts. A mismatch is the *normal* outcome of a
+    crash in that window, not an error.
+  - `PreparedTxnState` renders as `producer_id:epoch` through `Display` and
+    parses back through `FromStr`, so storing it in the external coordinator
+    needs no bespoke serialisation.
+
+  `EndTxn` for a recovered transaction carries the *ongoing* producer ID and
+  epoch the coordinator reported, not the fresh pair `InitProducerId` just
+  issued — sending the fresh pair would fence the very transaction the call is
+  resolving.
+
+  `TransactionVersion::V3` was added alongside it, and this is the part worth
+  reading twice. `from_feature_level` collapsed every level ≥ 2 to `V2`, and
+  `is_v2()` was an equality test — so adding `V3` without changing `is_v2()`
+  would have sent a TV3 cluster back to TV1 semantics: `AddPartitionsToTxn` per
+  partition and the wrong epoch handling, both perfectly legal requests, so the
+  regression would have been silent. `is_v2()` now means *at least* TV2, which
+  is what the name always described.
+
+  TV3 also requires the same kind of evidence TV2 does: the finalized feature
+  level **and** an `InitProducerId` that can actually carry `enable2Pc` (v6). A
+  broker too old for the field does not reject it — the field is simply absent,
+  and the coordinator applies `transaction.max.timeout.ms` to a transaction the
+  caller believes is exempt. The cluster level is the minimum across brokers, so
+  a rolling upgrade cannot enable 2PC before every broker can honour it.
+
+  `two_phase_commit(true)` on a cluster below TV3 now fails at
+  `init_transactions()` naming the feature level, the API version and the ACL
+  required, instead of surfacing the broker's bare `UNSUPPORTED_VERSION` behind
+  "failed to initialize producer ID".
+
+  This retires the two `ongoing_txn_producer_*` entries from
+  `protocol-reachability`'s exemption list, leaving two.
+
+- **`NewTopic::with_replica_assignment`.** Manual replica placement —
+  partition index → broker IDs, first entry the preferred leader — was
+  unreachable: `NewTopic` could not express it and `create_topics` sent
+  `assignments: Vec::new()` unconditionally. That rules out rack-aware
+  placement the controller's own rule cannot produce, and mirroring an existing
+  topic's layout. A ragged replication factor is rejected here, where the error
+  can name the partition; the broker answers `INVALID_REPLICA_ASSIGNMENT`
+  without saying which one disagreed.
+
+- **`AdminClient::list_consumer_groups` takes a `GroupListing` filter.** The
+  `states_filter` (KIP-518) and `types_filter` (KIP-848) fields were sent
+  empty, so there was no way to ask the broker for only the `Empty` groups or
+  only the KIP-848 ones. On a cluster with tens of thousands of groups that is
+  the difference between transferring the entire group registry on every call
+  and transferring the handful you asked about — filtering client-side is
+  correct and does not scale. Older brokers ignore the filter and return a
+  superset rather than failing.
+
+- **`AdminClient::create_delegation_token` takes an `owner`.** KIP-373's
+  on-behalf-of half was missing: the previous release surfaced the *requester*
+  fields the broker sends back, while the request could not name an owner, so
+  the distinction was observable and not producible. A superuser can now
+  provision a token for a service account that never authenticates
+  interactively.
+
+- **`ShareConsumer::acquisition_lock_timeout()`.** The broker reports how long
+  an acquisition lock lasts on every `ShareFetch` (KIP-1222), and krafka
+  decoded the field and dropped it. `AcknowledgeType::Renew` exists to extend
+  that lock and its own documentation says to renew before the deadline — while
+  the deadline comes from `group.share.record.lock.duration.ms`, a broker-side
+  setting no client can read from its own configuration. `Renew` was therefore
+  documented, reachable, and impossible to schedule correctly; the only
+  workable strategy was a timer tuned by guesswork.
+
+- **`DelegationToken::token_requester_principal_type` / `_name`.** KIP-373 lets
+  one principal request a delegation token *on behalf of* another — how a
+  superuser provisions a token for a service account. The owner is who the
+  token authenticates as; the requester is who asked for it, and that is the
+  field an audit trail needs. Both were decoded from the response and dropped
+  before reaching the caller, so the distinction the KIP exists to record was
+  invisible.
+
+- **`just protocol-reachability`** (`xtask/protocol_reachability.py`), a new CI
+  gate and the mirror image of `config-reachability`: every `pub` field of every
+  response struct must be read by client code outside the protocol layer and
+  outside tests, or carry a documented reason for being decode-only. 103 fields,
+  4 documented exceptions.
+
+  This is the shape of the two most severe defects in this project's history.
+  `FetchResponsePartition::last_stable_offset` was decoded for every Fetch
+  version from v4 up, asserted in the codec's own tests, and read by not one
+  line of consumer code — so `read_committed` consumers reported permanent
+  phantom lag. `acquisition_lock_timeout_ms` above is the same. Both look
+  finished from the codec's side; from the client's side the information simply
+  never arrives, and nothing in the type system can tell the difference.
+
+- **`OffsetSpec::MaxTimestamp`, `EarliestLocal` and `LatestTiered`.** krafka
+  negotiates `ListOffsets` v11 but `OffsetSpec` exposed only three of the five
+  specs Java has, so three questions the wire could already answer were
+  unreachable:
+
+  - `MaxTimestamp` (`-3`, KIP-734) — the offset of the record with the largest
+    timestamp. Not the same as `Latest` on any topic whose producers write out
+    of order, which is any topic with application-clock timestamps or more than
+    one producer. This is the spec a staleness alert actually wants.
+  - `EarliestLocal` (`-4`, KIP-405) and `LatestTiered` (`-5`, KIP-1005) — the
+    boundary between local and remote storage. Without them a client cannot
+    tell whether a scan from the log start is about to pull from object
+    storage.
+
+  All three are negative timestamps on the wire, so a broker too old to know
+  one does not reject it — it answers as though the value were an ordinary
+  timestamp, i.e. the log start. krafka checks the negotiated version before
+  sending and names the version required, rather than returning a
+  plausible-looking wrong answer.
+
+- **`AdminClient::describe_consumer_group_offsets` takes an
+  `OffsetVisibility`.** The admin counterpart of the KIP-447 fix above:
+  `StableOnly` refuses to report an offset an in-flight transaction can still
+  retract, `IncludeUnstable` reports the freshest value. `consumer_group_lag`
+  uses `IncludeUnstable`, because lag is a monitoring signal and a number that
+  dips when a transaction aborts is the honest shape of the data.
+
+- **`AdminClientBuilder::retries` / `retry_backoff` / `retry_backoff_policy`.**
+  The admin client's controller- and coordinator-routing retries were
+  compile-time constants: five attempts spaced by a flat 100 ms. Two problems.
+  The budget is about a second of real time, which is short for a KRaft
+  controller election — `create_topics` during a rolling controller restart
+  failed with "the controller did not stabilise" when waiting longer would have
+  worked. And the flat sleep had **no jitter**, so every admin client watching
+  one election retried in lockstep and arrived at the newly elected controller
+  as a single wave, which is the thundering herd `ClusterMetadata`'s rebootstrap
+  jitter already exists to prevent.
+
+  Both are now configurable and routed through the crate's shared
+  `BackoffPolicy` — exponential with jitter, like every other retry here. The
+  docstring claimed the gap was `retry.backoff.ms`, a setting that did not
+  exist; the failure message now names the setting that does.
+
+- **`FakeBroker::committed_records` / `all_records`.** Every record on a topic
+  as a `read_committed` consumer would see it, and as a `read_uncommitted` one
+  would — read from the broker's own log, so no consumer, no bounded poll loop
+  and no iteration count that becomes flaky when someone tunes it. The
+  *difference* between the two is what an exactly-once test is actually
+  asserting.
+
+- **Five `ShareConsumer` settings that existed but could not be set.**
+  `fetch_min_bytes`, `fetch_max_bytes`, `max_records` and `batch_size` — the
+  four knobs KIP-932 exposes for tuning a share fetch — were declared on
+  `ShareConsumerConfig` and read when the `ShareFetch` request was built, with
+  no builder setter anywhere. Every krafka share consumer in existence sent the
+  same four numbers. `metadata_recovery_rebootstrap_trigger` was the fifth.
+
+- **`ShareConsumerConfig` gained 17 accessors.** It had 6 where `ConsumerConfig`
+  has 34, so `build_config()` — documented as the way to validate a
+  configuration without a broker — handed back something largely unreadable.
+
+- **`ShareConsumer` accepts `key_deserializer` / `value_deserializer`.** It
+  returns the same `ConsumerRecord` as the subscription consumer, so it now
+  takes the same `Deserializer` hook; a share-group application previously had
+  to decode schema framing by hand. Deserialization runs *after* the record is
+  registered for acknowledgement, because a share consumer's remedy for a
+  poison record is `acknowledge_by_offset(.., Reject)` and that call requires
+  the offset to be pending — there is no `seek()` to skip it with.
+
+- **`TransportConfig::socket_send_buffer` / `socket_receive_buffer`** —
+  `SO_SNDBUF` and `SO_RCVBUF` for every broker socket, the Java client's
+  `send.buffer.bytes` / `receive.buffer.bytes`. They were already declared on
+  `ConnectionConfig`, already had public accessors, and were already applied to
+  the real socket by `happy_eyeballs.rs` via `socket2` — with no setter
+  anywhere, so every krafka connection took the OS default. On a high
+  bandwidth-delay-product link that is the throughput ceiling. Found by the new
+  reachability gate below, on its first extension to the transport configs.
+
+- **`just config-reachability`** (`xtask/config_reachability.py`), a new CI
+  gate: every field of every config struct must have a builder setter and a
+  public accessor, or an entry in an exception list with a reason. It walks the
+  *fields*, so unlike `tests/builder_surface.rs` it can prove nothing was
+  forgotten. 151 fields across 8 configs, 25 documented exceptions.
+
+- **`rustdoc::broken_intra_doc_links` and `private_intra_doc_links` are
+  denied**, and `just doc` now runs a second pass with
+  `--document-private-items`. Fifteen documentation links resolved to nothing
+  and rendered as plain text — including one to `ProducerConfigBuilder`, a type
+  deleted several releases ago. The lint is allow-by-default for items rustdoc
+  does not render, so `RUSTDOCFLAGS: -Dwarnings` alone never saw them.
+
+### Fixed
+
+- **`OffsetFetch` never asked for stable offsets (KIP-447).** `require_stable`
+  was hardcoded `false`, so a `read_committed` consumer resuming after a crash
+  could read a committed offset that a transaction had *staged but not
+  committed*. If that transaction then aborted, the offset it staged was
+  retracted — but the consumer had already resumed past those records, and they
+  were never reprocessed. Silent data loss on the exactly-once recovery path,
+  in the window a crash is most likely to land in.
+
+  The flag now follows the isolation level. `read_uncommitted` consumers keep
+  asking for the unstable value deliberately: they already read uncommitted
+  data, and blocking their startup on an unrelated producer's open transaction
+  would be worse.
+
+  The second half was more dangerous and only becomes reachable once the flag
+  is set: a partition answering `UNSTABLE_OFFSET_COMMIT` fell through the
+  result-building loop, which keeps partitions whose `error_code.is_ok()`. The
+  partition was simply absent from the map, and every caller reads a missing
+  entry as "this group has never committed here" — which means
+  `auto.offset.reset`. A few hundred milliseconds of waiting would have become
+  a rewind to the start of the topic, or a jump to its end. It is now surfaced
+  and retried, with jittered backoff (a rebalancing group calls this from every
+  member against one coordinator at the same instant).
+
+- **Three KIP-219 unit tests could not fail.** They built their own
+  `parking_lot::Mutex<Instant>` and asserted over `checked_duration_since` —
+  exercising `std::time` arithmetic while never touching `BrokerConnection`,
+  which is why they were green throughout the defect above. Replaced by
+  `broker_throttle_is_honoured_and_counted`, which drives a real connection and
+  covers what they claimed to: the deadline is recorded, a shorter later
+  throttle does not cut a longer window short, waiting both sleeps and counts,
+  and an un-throttled connection does neither.
+
+- **The producer's throttle wait was never counted.** `throttle_delays` and
+  `throttle_delay_ms` (KIP-219) are recorded where the client sleeps out a
+  broker-imposed throttle — but the producer pre-emptively slept on
+  `conn.throttle_remaining()` one layer above the request path, to avoid
+  negotiating an API version inside the quota window. That sleep consumed the
+  window, so the request path's own check then found nothing left to wait for
+  and recorded nothing.
+
+  The single metric that answers "is the broker throttling us" therefore read
+  **zero on the path most likely to be throttled** — produce quotas being the
+  common case. A zero that means "not measured" is worse than a missing metric:
+  an operator looking at the dashboard concludes throttling is not the problem.
+
+  Both sites now go through `BrokerConnection::await_throttle`, which sleeps
+  *and* records, so it is no longer possible to wait without counting.
+
+- **KIP-814 `skip_assignment` was decoded and ignored.** When a static member
+  rejoins and the coordinator still holds a valid assignment, it sets
+  `skip_assignment` on the leader's `JoinGroup` response and sends no member
+  metadata; the leader must send an empty assignment and let the coordinator's
+  stand. krafka ran its assignor whenever it was the leader.
+
+  Ignoring the flag happened to be harmless only because the member list
+  arrives empty in that case, so the assignor produced nothing to send. That is
+  obedience by accident: a leader that assigns whenever it is the leader has
+  taken authority the coordinator explicitly reclaimed, and any response
+  pairing `skip_assignment` with a non-empty member list would have it overwrite
+  the coordinator's decision.
+
+- **`ProxyConfig`'s rustdoc example led to a type no client accepts.** It built
+  a `ConnectionConfig`, which no builder takes. Replaced with the two paths that
+  work, both compile-checked.
+
+- **`CompactedTopicConsumer::from_consumer` did not say how to find the
+  partitions to assign.** It named `Consumer::assign` and stopped, so a reader
+  could reasonably build a second `AdminClient` — a second connection, a second
+  auth handshake — to enumerate what the consumer already knew. It now shows
+  `Consumer::fetch_metadata`, and says that a partial assignment silently
+  materialises a partial table.
+
+- **`bootstrap_servers` was reported under two different names.** Six error
+  sites said `bootstrap.servers is required`, three said `bootstrap_servers
+  must not be empty`; a user grepping logs saw two spellings for one setting.
+  All nine now name the builder method.
+
+- **The share-consumer guide documented three wrong defaults.** `max_records`
+  was listed as `-1` (actually `5000`), `batch_size` as `0` (actually `500`)
+  and `client_id` as `"krafka-share-consumer"` (actually `"krafka"`), and the
+  table omitted eight settings entirely.
+
+- **A deserializer error silently dropped the records it rejected.** The fetch
+  position is advanced before records are handed to the deserializers, so
+  failing the poll there skipped the whole batch permanently — no commit, lag
+  metric or log line would show it. The batch is now put back at the front of
+  the receive buffer, where the commit clamp holds the committed offset behind
+  it, and the error names the exact record.
+
+- **`recv()` could deliver a partition's records out of order.** `poll()` parks
+  its undelivered surplus at the *back* of the receive buffer. `recv()` took
+  one record and appended the rest to the back as well — behind records from
+  higher offsets in the same partitions. A fetch yielding more than
+  `max_poll_records` for one partition therefore delivered offsets 501+ before
+  offsets 2–500. The remainder is now reinserted at the front, which is what
+  `batch_recv()` already did.
+
+- **Concurrent sends to one partition could permanently fail an idempotent
+  producer.** At the default `linger = 0` the removed direct-send path allowed
+  up to `max_in_flight` produce requests to race onto the wire with no
+  per-partition serialization, while sequence numbers were allocated in a
+  different order. The broker answered `OUT_OF_ORDER_SEQUENCE_NUMBER`, which
+  krafka correctly refuses to paper over, so the producer failed with
+  "recreate the producer to resume". Reachable from the documented
+  `Arc<Producer>`-across-tasks pattern with no configuration at all.
+
+- **A Fetch v13+ response carrying an unresolvable topic UUID was logged as
+  discarded but processed anyway.** Its partitions kept an empty topic name, so
+  the high watermark, log-start offset, last-stable offset and preferred
+  replica were all recorded under `("", partition)` — state that belongs to no
+  topic, is never read back, and collides across topics.
+
+- **A producer-ID reset racing a batch could disable idempotence silently.**
+  The accumulator allocated sequences through the unchecked path, so a reset
+  landing between the caller's initialisation check and the allocation left the
+  batch stamped with producer ID `-1`: a non-idempotent write, with no error
+  raised anywhere. It now allocates through `checked_allocate_sequence`, which
+  verifies the identity under the same lock, and re-initialises once on a race.
+
+- **`delivery_timeout` no longer excludes backpressure.** The budget is charged
+  from `send()` entry — including the up-to-`max_block` wait for buffer memory
+  — by pulling a batch's deadline back to its earliest record's entry time. The
+  batched path previously started the clock when the batch was created, after
+  that wait.
+
+- **Steady-state logging demoted from `info!` to `debug!`**: every
+  `ConsumerGroupHeartbeat`, every offset commit, every committed-offset fetch
+  and every `SyncGroup`. An idle consumer group emitted a line every few
+  seconds per member at the default subscriber level.
+
+### Performance
+
+- **`linger = 0` batches.** It always meant "do not *wait* for more records",
+  not "do not batch" — the reading the deleted send path implemented. The
+  accumulator dispatches immediately when a partition has nothing on the wire,
+  and coalesces the records that arrive during that round trip into the next
+  batch, dispatched the instant the acknowledgement lands (a completion wakes
+  the dispatch loop directly; it does not wait for a timer tick). Latency for
+  an idle producer is unchanged, because the first record never waits.
+
+  Measured against the in-process fake broker: 200 concurrent sends to one
+  partition, default configuration → **3** Produce requests, down from 200.
+  Pinned by `the_default_producer_batches_concurrent_sends_to_one_partition`.
+
+- **An idle producer no longer wakes the runtime 1 000 times a second.** The
+  accumulator's run loop drove a fixed 1 ms `interval`, which was affordable
+  while only `linger > 0` producers had an accumulator. Now that every producer
+  has one, the loop sleeps until something is actually due — the earliest open
+  batch's linger deadline, or a 1 s housekeeping floor when nothing is open.
+  Dispatch is event-driven either way, so the timer is a deadline rather than a
+  poll.
+
+- **No per-record `String` allocation on the delivery hot path.** `pause()`
+  filtering, the stale-response filter and receive-buffer purges probed a
+  `HashSet<(String, PartitionId)>`, which cannot be keyed by a borrowed name,
+  by allocating an owned key for every record. They now scan borrowed names
+  over a set that is empty in the common case.
+
+### Removed
+
+- ~560 lines of duplicated producer send logic: `Producer::send_to_partition`,
+  `do_send`, `build_produce_request`, `release_failed_sequence`,
+  `reserve_send_memory` and the second memory-permit pool that shadowed the
+  accumulator's. Retries, sequence recovery, KIP-951 leader hints, the DLQ and
+  the interceptor callbacks now exist in exactly one place, so they cannot
+  drift apart again — which is how `compression_level` and `dead_letter_queue`
+  each came to work on only one of the two paths.
+
 ## [0.17.0] — 2026-08-07
 
 Ten defects fixed in the consumer's fetch-to-delivery path, the read path turned
@@ -481,7 +969,8 @@ Initial development: wire protocol, producer, consumer, admin client,
 authentication (SASL PLAIN / SCRAM / OAUTHBEARER / AWS MSK IAM), TLS,
 compression codecs, schema registry integration and the metrics layer.
 
-[Unreleased]: https://github.com/hupe1980/krafka/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/hupe1980/krafka/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/hupe1980/krafka/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/hupe1980/krafka/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/hupe1980/krafka/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/hupe1980/krafka/compare/v0.14.0...v0.15.0

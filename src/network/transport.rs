@@ -211,6 +211,46 @@ pub struct TransportConfig {
     /// exhausts the process's file descriptors.
     pub(crate) max_connections: Option<usize>,
 
+    /// SOCKS5 route every broker connection is tunnelled through, or `None`
+    /// for a direct connection. Default: `None`.
+    ///
+    /// This belongs here rather than only on the client builders because it is
+    /// the most path-shaped setting there is: a broker reachable only through a
+    /// bastion is reachable only through a bastion for *every* client in the
+    /// process. Leaving it off `TransportConfig` meant a caller who mapped
+    /// their own transport settings onto this type — which is what the type
+    /// invites — silently produced a direct connection, while this module's own
+    /// documentation described `TransportConfig` as carrying "the SOCKS5 route".
+    ///
+    /// `ProducerBuilder::proxy` and its siblings remain as a shorthand for the
+    /// single-client case; setting both is an error at build time rather than a
+    /// silent precedence rule.
+    #[cfg(feature = "socks5")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "socks5")))]
+    pub(crate) proxy: Option<crate::network::ProxyConfig>,
+
+    /// `SO_SNDBUF` for every broker socket, or `None` to leave the OS default.
+    /// Default: `None`.
+    ///
+    /// Equivalent to the Java client's `send.buffer.bytes` and librdkafka's
+    /// `socket.send.buffer.bytes`. The kernel may round or cap the request; on
+    /// Linux the effective value is roughly double what is asked for, and
+    /// `net.core.wmem_max` is the ceiling.
+    ///
+    /// Worth setting on a high bandwidth-delay-product link — cross-region
+    /// replication, a producer writing across availability zones — where the
+    /// default socket buffer, not the network, is the throughput ceiling.
+    pub(crate) socket_send_buffer: Option<usize>,
+
+    /// `SO_RCVBUF` for every broker socket, or `None` to leave the OS default.
+    /// Default: `None`.
+    ///
+    /// Equivalent to the Java client's `receive.buffer.bytes` and librdkafka's
+    /// `socket.receive.buffer.bytes`. The consumer side of
+    /// [`socket_send_buffer`](Self::socket_send_buffer), and the one that
+    /// matters for a fetch-heavy client on a long link.
+    pub(crate) socket_receive_buffer: Option<usize>,
+
     /// Interval at which TLS certificate and key files are re-read from disk,
     /// or `None` to never reload automatically. Default: `None`.
     ///
@@ -243,6 +283,10 @@ impl Default for TransportConfig {
             connection_attempt_delay: Duration::from_millis(250),
             connections_max_idle: Some(DEFAULT_MAX_IDLE),
             max_connections: None,
+            #[cfg(feature = "socks5")]
+            proxy: None,
+            socket_send_buffer: None,
+            socket_receive_buffer: None,
             tls_reload_interval: None,
         }
     }
@@ -280,6 +324,29 @@ impl TransportConfig {
     #[must_use]
     pub fn max_in_flight_requests(&self) -> usize {
         self.max_in_flight_requests
+    }
+
+    /// The SOCKS5 route, or `None` for a direct connection.
+    #[cfg(feature = "socks5")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "socks5")))]
+    #[inline]
+    #[must_use]
+    pub fn proxy(&self) -> Option<&crate::network::ProxyConfig> {
+        self.proxy.as_ref()
+    }
+
+    /// The configured `SO_SNDBUF`, or `None` for the OS default.
+    #[inline]
+    #[must_use]
+    pub fn socket_send_buffer(&self) -> Option<usize> {
+        self.socket_send_buffer
+    }
+
+    /// The configured `SO_RCVBUF`, or `None` for the OS default.
+    #[inline]
+    #[must_use]
+    pub fn socket_receive_buffer(&self) -> Option<usize> {
+        self.socket_receive_buffer
     }
 
     /// The high-priority channel depth.
@@ -338,7 +405,7 @@ impl TransportConfig {
     /// [`tls_reload_interval`](Self::tls_reload_interval)) are applied by
     /// [`Self::build_pool`] instead — they belong to the pool, not the socket.
     pub(crate) fn apply(&self, builder: ConnectionConfigBuilder) -> ConnectionConfigBuilder {
-        builder
+        let builder = builder
             .nodelay(self.tcp_nodelay)
             .tcp_keepalive(self.tcp_keepalive)
             .max_response_size(self.max_response_size)
@@ -347,6 +414,14 @@ impl TransportConfig {
             .normal_priority_channel_capacity(self.normal_priority_channel_capacity)
             .max_high_priority_bypasses_per_round(self.max_high_priority_bypasses_per_round)
             .connection_attempt_delay(self.connection_attempt_delay)
+            .socket_send_buffer(self.socket_send_buffer)
+            .socket_receive_buffer(self.socket_receive_buffer);
+        #[cfg(feature = "socks5")]
+        let builder = match self.proxy.clone() {
+            Some(proxy) => builder.proxy(proxy),
+            None => builder,
+        };
+        builder
     }
 
     /// Build a fully configured, running [`ConnectionPool`] from `config`.
@@ -411,6 +486,26 @@ impl TransportConfigBuilder {
     /// See [`TransportConfig::max_in_flight_requests`].
     pub fn max_in_flight_requests(mut self, max: usize) -> Self {
         self.0.max_in_flight_requests = max;
+        self
+    }
+
+    /// See [`TransportConfig::proxy`].
+    #[cfg(feature = "socks5")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "socks5")))]
+    pub fn proxy(mut self, proxy: crate::network::ProxyConfig) -> Self {
+        self.0.proxy = Some(proxy);
+        self
+    }
+
+    /// See [`TransportConfig::socket_send_buffer`].
+    pub fn socket_send_buffer(mut self, bytes: Option<usize>) -> Self {
+        self.0.socket_send_buffer = bytes;
+        self
+    }
+
+    /// See [`TransportConfig::socket_receive_buffer`].
+    pub fn socket_receive_buffer(mut self, bytes: Option<usize>) -> Self {
+        self.0.socket_receive_buffer = bytes;
         self
     }
 
@@ -542,6 +637,90 @@ mod tests {
     }
 
     /// Applying the defaults to a fresh builder must be a no-op, so
+    /// Socket buffer sizes must survive the journey from a client builder to
+    /// the `ConnectionConfig` the socket is opened from.
+    ///
+    /// `SO_SNDBUF` / `SO_RCVBUF` were declared on `ConnectionConfig`, had public
+    /// accessors, and were applied to the real socket by `happy_eyeballs.rs` —
+    /// with no setter anywhere in the crate. Every krafka connection therefore
+    /// took the OS default, which on a high bandwidth-delay-product link is the
+    /// throughput ceiling. The gap survived because the only test that touched
+    /// the fields assigned them directly, which crate-internal code can do and a
+    /// user cannot.
+    #[test]
+    fn socket_buffer_sizes_reach_the_connection_config() {
+        let transport = TransportConfig::builder()
+            .socket_send_buffer(Some(4 * 1024 * 1024))
+            .socket_receive_buffer(Some(2 * 1024 * 1024))
+            .build()
+            .expect("socket buffer sizes are always valid");
+
+        assert_eq!(transport.socket_send_buffer(), Some(4 * 1024 * 1024));
+        assert_eq!(transport.socket_receive_buffer(), Some(2 * 1024 * 1024));
+
+        let applied = transport
+            .apply(ConnectionConfig::builder())
+            .build()
+            .expect("a valid transport config yields a valid connection config");
+
+        assert_eq!(
+            applied.send_buffer_size(),
+            Some(4 * 1024 * 1024),
+            "SO_SNDBUF must reach the socket, not stop at the transport config"
+        );
+        assert_eq!(applied.recv_buffer_size(), Some(2 * 1024 * 1024));
+    }
+
+    /// A SOCKS5 route set on the transport config must reach the socket.
+    ///
+    /// Reported by a downstream project that mapped its own transport settings
+    /// onto `TransportConfig` — the obvious thing to do with a type of that
+    /// name — and shipped a producer that silently bypassed the proxy its
+    /// deployment required. In the topology the setting exists for (brokers
+    /// behind a bastion that also resolves their hostnames) the connection
+    /// simply failed and looked like a broker outage; where the brokers were
+    /// directly reachable, traffic left by the wrong egress path and nothing
+    /// said so.
+    ///
+    /// What made it a trap rather than an omission is that this module's own
+    /// documentation described a `TransportConfig` as carrying "the SOCKS5
+    /// route", and warned that a client left on the default transport gets
+    /// "no proxy" — describing a capability the type did not have.
+    #[cfg(feature = "socks5")]
+    #[test]
+    fn a_proxy_on_the_transport_config_reaches_the_connection() {
+        use crate::network::ProxyConfig;
+
+        let transport = TransportConfig::builder()
+            .proxy(ProxyConfig::new("bastion:1080"))
+            .build()
+            .expect("a proxy address is not validated at build time");
+
+        assert_eq!(transport.proxy().map(|p| p.address()), Some("bastion:1080"));
+
+        let applied = transport
+            .apply(ConnectionConfig::builder())
+            .build()
+            .expect("a valid transport config yields a valid connection config");
+
+        assert_eq!(
+            applied.proxy().map(|p| p.address()),
+            Some("bastion:1080"),
+            "the SOCKS5 route must survive TransportConfig -> ConnectionConfig"
+        );
+    }
+
+    /// Leaving them unset must keep the OS default rather than forcing a size.
+    #[test]
+    fn socket_buffer_sizes_default_to_the_os() {
+        let applied = TransportConfig::default()
+            .apply(ConnectionConfig::builder())
+            .build()
+            .unwrap();
+        assert_eq!(applied.send_buffer_size(), None);
+        assert_eq!(applied.recv_buffer_size(), None);
+    }
+
     /// `.transport(TransportConfig::default())` and omitting it entirely
     /// produce the same connection config.
     #[test]
@@ -586,6 +765,8 @@ mod tests {
             .normal_priority_channel_capacity(512)
             .max_high_priority_bypasses_per_round(9)
             .connection_attempt_delay(Duration::from_millis(400))
+            .socket_send_buffer(Some(1024 * 1024))
+            .socket_receive_buffer(Some(512 * 1024))
             .build()
             .unwrap();
 
@@ -603,6 +784,8 @@ mod tests {
             config.connection_attempt_delay(),
             Duration::from_millis(400)
         );
+        assert_eq!(config.send_buffer_size(), Some(1024 * 1024));
+        assert_eq!(config.recv_buffer_size(), Some(512 * 1024));
     }
 
     #[test]

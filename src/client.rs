@@ -338,7 +338,7 @@ impl KrafkaClientBuilder {
     /// - The initial metadata fetch fails
     pub async fn build(self) -> Result<KrafkaClient> {
         if self.bootstrap_servers.is_empty() {
-            return Err(KrafkaError::config("bootstrap_servers must not be empty"));
+            return Err(KrafkaError::config("bootstrap_servers is required"));
         }
 
         let mut pool_config_builder: ConnectionConfigBuilder = self.transport.apply(

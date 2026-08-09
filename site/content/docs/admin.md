@@ -325,6 +325,90 @@ if let Some(count) = admin.partition_count("my-topic").await? {
 }
 ```
 
+## Offsets
+
+### Listing partition offsets
+
+`list_offsets` takes an [`OffsetSpec`] naming *which* offset you want. Five
+exist, and three of them answer questions `Latest` cannot:
+
+| Spec | Wire | Needs | Answers |
+|---|---|---|---|
+| `Earliest` | `-2` | v1 | Log start — the oldest offset still retained anywhere |
+| `Latest` | `-1` | v1 | High watermark — where the next record will land |
+| `Timestamp(ms)` | `ms` | v1 | First offset at or after a wall-clock time |
+| `MaxTimestamp` | `-3` | v7 | Offset of the record with the **largest timestamp** (KIP-734) |
+| `EarliestLocal` | `-4` | v8 | Where **local** storage begins; everything below is remote (KIP-405) |
+| `LatestTiered` | `-5` | v9 | The tiering frontier — the last offset copied to remote storage (KIP-1005) |
+
+```rust,compile
+use krafka::admin::OffsetSpec;
+
+// Is a scan from the log start going to pull from object storage?
+let local = admin
+    .list_offsets(&[("events", &[0][..])], OffsetSpec::EarliestLocal)
+    .await?;
+let earliest = admin
+    .list_offsets(&[("events", &[0][..])], OffsetSpec::Earliest)
+    .await?;
+
+for (local, earliest) in local.iter().zip(&earliest) {
+    let remote_records = local.offset - earliest.offset;
+    if remote_records > 0 {
+        println!(
+            "partition {}: {remote_records} records live in remote storage",
+            local.partition
+        );
+    }
+}
+```
+
+`MaxTimestamp` is not `Latest`. They diverge whenever producers write out of
+order — which is any topic whose `CreateTime` timestamps come from application
+clocks, or any topic fed by more than one producer. `Latest` tells you where the
+log ends; `MaxTimestamp` tells you when it was last genuinely written to, which
+is the question a staleness alert is really asking.
+
+**Version enforcement.** The three newer specs are negative timestamps on the
+wire. A broker too old to know one does not reject it — it answers as though you
+had asked for the first offset at or after a negative timestamp, i.e. the log
+start. krafka checks the negotiated version *before* sending and fails with a
+message naming the version required, rather than handing back a plausible wrong
+number.
+
+### Reading a group's committed offsets
+
+`describe_consumer_group_offsets` takes an [`OffsetVisibility`], because a group
+fed by a transactional producer can have an offset that is *written but not yet
+committed*:
+
+```rust,compile
+use krafka::admin::OffsetVisibility;
+
+// A dashboard wants the freshest number, and can tolerate it moving backwards
+// if a transaction aborts.
+let live = admin
+    .describe_consumer_group_offsets("my-group", None, OffsetVisibility::IncludeUnstable)
+    .await?;
+
+// A tool that *acts* on the value must not read an offset an abort can retract.
+let settled = admin
+    .describe_consumer_group_offsets("my-group", None, OffsetVisibility::StableOnly)
+    .await?;
+```
+
+With `StableOnly` the broker reports `UNSTABLE_OFFSET_COMMIT` for any partition
+staged inside an unresolved transaction, and krafka surfaces that as an error
+rather than omitting the partition — an omitted partition is indistinguishable
+from one the group never committed to, and that difference is the one that
+matters.
+
+On a group with no transactional producer the two are identical, because nothing
+can stage an offset.
+
+[`OffsetSpec`]: https://docs.rs/krafka/latest/krafka/admin/enum.OffsetSpec.html
+[`OffsetVisibility`]: https://docs.rs/krafka/latest/krafka/admin/enum.OffsetVisibility.html
+
 ## Error Handling
 
 ```rust
@@ -591,16 +675,44 @@ for group in &descriptions {
 
 ### Listing Consumer Groups
 
-List all consumer groups across the cluster:
-
 ```rust,compile
-let groups = admin.list_consumer_groups().await?;
+use krafka::admin::GroupListing;
+
+let groups = admin.list_consumer_groups(&GroupListing::all()).await?;
 
 println!("Consumer groups:");
 for group in &groups {
     println!("  {} (type: {:?}, protocol: {})", group.group_id, group.group_type, group.protocol_type);
 }
 ```
+
+**Filter on the broker, not in your loop.** A cluster can hold tens of
+thousands of consumer groups, and listing all of them to keep the three that
+are `Empty` transfers the entire group registry on every call:
+
+```rust,compile
+use krafka::admin::GroupListing;
+
+// Candidates for cleanup, without pulling the rest.
+let empty = admin
+    .list_consumer_groups(&GroupListing::all().in_states(["Empty"]))
+    .await?;
+
+// Only groups on the KIP-848 protocol.
+let modern = admin
+    .list_consumer_groups(&GroupListing::all().of_types(["consumer"]))
+    .await?;
+```
+
+State names are Kafka's own — `PreparingRebalance`, `CompletingRebalance`,
+`Stable`, `Dead`, `Empty` — and types are `classic`, `consumer`, `share`,
+`streams`. Both are passed through verbatim, so a value a future broker adds
+needs no krafka release.
+
+`states_filter` needs `ListGroups` v4 (KIP-518) and `types_filter` v5
+(KIP-848). An older broker ignores the filter and returns more than asked for
+rather than failing, so treat the result as a superset when broker versions are
+mixed.
 
 > **Note:** `list_consumer_groups()` queries all brokers in the cluster and deduplicates results, since consumer groups are managed by their respective group coordinators.
 
@@ -726,9 +838,10 @@ SASL/SCRAM authentication.
 ```rust,compile
 use std::time::Duration;
 
-// Create a token that "alice" can renew, with a 24-hour lifetime
+// A token for the authenticated caller that "alice" can renew, 24-hour lifetime.
 let result = admin
     .create_delegation_token(
+        None,
         &[("User", "alice")],
         Some(Duration::from_secs(86_400)),
     )
@@ -737,6 +850,37 @@ let result = admin
 match result.token {
     Some(token) => println!("Created token: {} (HMAC {} bytes)", token.token_id, token.hmac.len()),
     None => println!("Error: {}", result.error.unwrap()),
+}
+```
+
+### Tokens on behalf of another principal (KIP-373)
+
+Pass an `owner` to issue a token *for* someone else — how a superuser
+provisions a token for a service account that never authenticates
+interactively. It needs `CreateDelegationToken` v3+ and `CreateTokens`
+authorisation on that principal.
+
+```rust,compile
+use std::time::Duration;
+
+let result = admin
+    .create_delegation_token(
+        Some(("User", "svc-ingest")),          // who the token authenticates as
+        &[("User", "platform-admin")],         // who may renew it
+        Some(Duration::from_secs(86_400)),
+    )
+    .await?;
+
+if let Some(token) = result.token {
+    // The owner is who the token authenticates as; the requester is who asked
+    // for it. That distinction is what an audit trail needs, and it is only
+    // present on v3+.
+    println!(
+        "owner {}:{}, requested by {:?}",
+        token.principal_type,
+        token.principal_name,
+        token.token_requester_principal_name,
+    );
 }
 ```
 
@@ -772,7 +916,7 @@ use std::time::Duration;
 
 // Obtain a token (e.g., from a prior create call)
 let result = admin
-    .create_delegation_token(&[("User", "alice")], Some(Duration::from_secs(86_400)))
+    .create_delegation_token(None, &[("User", "alice")], Some(Duration::from_secs(86_400)))
     .await?;
 let token = result.token.expect("token created");
 

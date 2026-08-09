@@ -72,7 +72,7 @@ pub mod compacted;
 pub use builder::ConsumerBuilder;
 pub use compacted::{
     CompactedEntry, CompactedTable, CompactedTableClearListener, CompactedTableSnapshot,
-    CompactedTopicConsumer, CompactedTopicConsumerBuilder, TableChange,
+    CompactedTopicConsumer, TableChange,
 };
 pub use config::{
     AutoOffsetReset, ConsumerConfig, GroupProtocol, IsolationLevel, PartitionAssignmentStrategy,
@@ -814,8 +814,30 @@ fn purge_buffered_records(
         return 0;
     }
     let before = buffer.len();
-    buffer.retain(|r| !repositioned.contains(&(r.topic.clone(), r.partition)));
+    buffer.retain(|r| !contains_partition(repositioned, &r.topic, r.partition));
     before - buffer.len()
+}
+
+/// Whether a `(topic, partition)` set contains this partition, without
+/// allocating.
+///
+/// `HashSet<(String, PartitionId)>` cannot be probed with a borrowed name:
+/// `Borrow` does not reach inside a tuple, so the obvious
+/// `set.contains(&(topic.to_string(), partition))` allocates a `String` **per
+/// record** — on `poll()`'s delivery split, on the stale-response filter and on
+/// every buffer purge. These sets hold at most the assigned-partition count and
+/// are empty in the common case, so a linear scan over borrowed names is both
+/// allocation-free and, at these sizes, faster than hashing.
+#[inline]
+fn contains_partition(
+    set: &HashSet<(String, PartitionId)>,
+    topic: &str,
+    partition: PartitionId,
+) -> bool {
+    !set.is_empty()
+        && set
+            .iter()
+            .any(|(t, p)| *p == partition && t.as_str() == topic)
 }
 
 /// Forget what the consumer knew about the leader epoch at a partition's
@@ -920,7 +942,7 @@ fn drain_buffered_records(
     while batch.len() < max_records && index < buffer.len() {
         let is_paused = {
             let record = &buffer[index];
-            paused.contains(&(record.topic.clone(), record.partition))
+            contains_partition(paused, &record.topic, record.partition)
         };
         if is_paused {
             index += 1;
@@ -1261,11 +1283,6 @@ impl Consumer {
 
             if let Some(ref auth) = config.auth {
                 pool_config_builder = pool_config_builder.auth(auth.clone());
-            }
-
-            #[cfg(feature = "socks5")]
-            if let Some(ref proxy) = config.proxy {
-                pool_config_builder = pool_config_builder.proxy(proxy.clone());
             }
 
             let mut pool_config = pool_config_builder.build()?;
@@ -3860,8 +3877,7 @@ impl Consumer {
                 Vec::with_capacity(all_records.len().min(max_records));
             let mut held: Vec<ConsumerRecord> = Vec::new();
             for record in all_records {
-                let is_paused = !paused.is_empty()
-                    && paused.contains(&(record.topic.clone(), record.partition));
+                let is_paused = contains_partition(&paused, &record.topic, record.partition);
                 if !is_paused && delivered.len() < max_records {
                     delivered.push(record);
                 } else {
@@ -3951,8 +3967,8 @@ impl Consumer {
                         "Discarding fetch response: position changed while the fetch was in flight"
                     );
                 }
-                delivered.retain(|r| !stale.contains(&(r.topic.clone(), r.partition)));
-                held.retain(|r| !stale.contains(&(r.topic.clone(), r.partition)));
+                delivered.retain(|r| !contains_partition(&stale, &r.topic, r.partition));
+                held.retain(|r| !contains_partition(&stale, &r.topic, r.partition));
             }
 
             buffer.extend(held);
@@ -3963,12 +3979,32 @@ impl Consumer {
     }
 
     /// Apply everything that happens to a batch of records on its way out of
-    /// `poll()`: metrics, the consumer interceptor, and schema decoding.
+    /// `poll()`: deserialization, metrics, and the consumer interceptor.
     ///
     /// Shared by both delivery paths — records served straight from the
     /// prefetch buffer and records just fetched — so a record is counted,
-    /// intercepted and decoded exactly once, at the moment it reaches the
+    /// intercepted and deserialized exactly once, at the moment it reaches the
     /// application, regardless of which poll actually fetched it.
+    ///
+    /// # Ordering
+    ///
+    /// Deserialization runs **before** the interceptor and the metrics, which
+    /// is the order the Java client uses (`Fetcher` deserializes, then
+    /// `ConsumerInterceptor::onConsume` sees the result) and the mirror image
+    /// of the producer, where the interceptor sees the record before
+    /// serialization. An interceptor therefore always observes
+    /// application-level values on both sides, not wire bytes on one and
+    /// values on the other.
+    ///
+    /// # Failure
+    ///
+    /// A deserializer that rejects a record is *not* allowed to lose it. The
+    /// fetch position was advanced before this function was called, so
+    /// dropping the batch here would skip every record in it permanently.
+    /// Instead the whole batch is pushed back to the front of the receive
+    /// buffer — where [`committable_positions`] holds the committed offset
+    /// behind it — and the error names the exact record, so the caller can
+    /// `seek()` one past it to make progress.
     async fn finish_delivery(
         &self,
         mut records: Vec<ConsumerRecord>,
@@ -3976,6 +4012,16 @@ impl Consumer {
         if records.is_empty() {
             self.metrics.empty_polls.inc();
             return Ok(records);
+        }
+
+        if self.key_deserializer.is_some() || self.value_deserializer.is_some() {
+            for index in 0..records.len() {
+                if let Err(error) = self.deserialize_in_place(&mut records[index]).await {
+                    self.requeue_undelivered(records);
+                    self.metrics.record_error();
+                    return Err(error);
+                }
+            }
         }
 
         let bytes: u64 = records
@@ -3986,20 +4032,63 @@ impl Consumer {
 
         crate::interceptor::safe_on_consume(&*self.interceptor, &records);
 
-        // Schema decoding runs after the interceptor (which may rewrite key or
-        // value) and immediately before the records are handed back.
-        if self.key_deserializer.is_some() || self.value_deserializer.is_some() {
-            for record in &mut records {
-                if let (Some(dec), Some(value)) = (&self.value_deserializer, record.value.take()) {
-                    record.value = Some(dec.deserialize(value, &record.topic, false).await?);
-                }
-                if let (Some(dec), Some(key)) = (&self.key_deserializer, record.key.take()) {
-                    record.key = Some(dec.deserialize(key, &record.topic, true).await?);
-                }
-            }
-        }
-
         Ok(records)
+    }
+
+    /// Run the configured deserializers over one record, in place.
+    ///
+    /// The record is left untouched when either half fails, so the caller can
+    /// put the batch back exactly as it was fetched and a later retry sees the
+    /// same bytes rather than a half-decoded record.
+    async fn deserialize_in_place(&self, record: &mut ConsumerRecord) -> Result<()> {
+        if let (Some(decoder), Some(value)) = (&self.value_deserializer, record.value.as_ref()) {
+            let decoded = decoder
+                .deserialize(value.clone(), &record.topic, false)
+                .await
+                .map_err(|e| {
+                    KrafkaError::record_deserialization(
+                        &record.topic,
+                        record.partition,
+                        record.offset,
+                        "value",
+                        e.to_string(),
+                    )
+                })?;
+            record.value = Some(decoded);
+        }
+        if let (Some(decoder), Some(key)) = (&self.key_deserializer, record.key.as_ref()) {
+            let decoded = decoder
+                .deserialize(key.clone(), &record.topic, true)
+                .await
+                .map_err(|e| {
+                    KrafkaError::record_deserialization(
+                        &record.topic,
+                        record.partition,
+                        record.offset,
+                        "key",
+                        e.to_string(),
+                    )
+                })?;
+            record.key = Some(decoded);
+        }
+        Ok(())
+    }
+
+    /// Put records that were taken out of the pipeline but never handed to the
+    /// application back at the **front** of the receive buffer.
+    ///
+    /// The front matters: these offsets are lower than anything the same poll
+    /// parked at the back, so appending them would deliver a partition's
+    /// records out of order on the next drain.
+    fn requeue_undelivered(&self, records: Vec<ConsumerRecord>) {
+        if records.is_empty() {
+            return;
+        }
+        let mut buffer = self.recv_buffer.lock();
+        for record in records.into_iter().rev() {
+            buffer.push_front(record);
+        }
+        self.metrics.buffered_records.set(buffer.len() as u64);
     }
 
     /// Batch fetch from a single broker for multiple topic-partitions.
@@ -4282,22 +4371,35 @@ impl Consumer {
         // Resolve each UUID back to the topic name so the rest of the pipeline
         // can treat all versions uniformly.
         if fetch_version >= 13 {
-            for topic_response in &mut fetch_response.responses {
-                if topic_response.topic.is_empty() {
-                    let Some(id) = topic_response.topic_id else {
-                        continue;
-                    };
-                    if let Some(name) = self.metadata.topic_name_for_id(&id) {
+            // A response whose UUID cannot be mapped back to a name is
+            // *removed*, not merely logged. Leaving it in place kept an empty
+            // topic name on every downstream key, so a partition's watermark,
+            // log-start offset and preferred replica were recorded under
+            // `("", partition)` — state that belongs to no topic, is never
+            // read back, and collides across topics.
+            fetch_response.responses.retain_mut(|topic_response| {
+                if !topic_response.topic.is_empty() {
+                    return true;
+                }
+                let Some(id) = topic_response.topic_id else {
+                    warn!("Received FetchResponse v13+ with neither a topic name nor a topic_id");
+                    return false;
+                };
+                match self.metadata.topic_name_for_id(&id) {
+                    Some(name) => {
                         topic_response.topic = name;
-                    } else {
+                        true
+                    }
+                    None => {
                         warn!(
                             "Received FetchResponse v13+ with unknown topic_id {:?}; \
-                             discarding partitions (metadata will refresh)",
+                             discarding its partitions (metadata will refresh)",
                             id
                         );
+                        false
                     }
                 }
-            }
+            });
         }
 
         // Handle top-level session errors (v7+)
@@ -5255,18 +5357,23 @@ impl Consumer {
             }
 
             match self.poll(Duration::from_secs(1)).await {
-                Ok(records) if !records.is_empty() => {
-                    let mut iter = records.into_iter();
+                Ok(mut records) if !records.is_empty() => {
+                    // Everything after the first record goes back to the
+                    // *front* of the buffer, not the back.
+                    //
+                    // The poll that produced these records may have parked its
+                    // own surplus at the back — records from the same fetch,
+                    // and therefore from higher offsets in the same partitions.
+                    // Appending here would put offsets 2..N behind offsets
+                    // N+1.., so the next `recv()` would hand the application a
+                    // partition's records out of order. Reinserting at the
+                    // front restores fetch order for every partition at once.
+                    let rest = records.split_off(1);
+                    self.requeue_undelivered(rest);
                     // Infallible: `!records.is_empty()` guard above guarantees ≥1 element.
-                    let Some(first) = iter.next() else {
+                    let Some(first) = records.pop() else {
                         unreachable!("non-empty ConsumerRecords yields at least one element");
                     };
-                    // Buffer any remaining records for subsequent recv() calls
-                    if iter.len() > 0 {
-                        let mut buffer = self.recv_buffer.lock();
-                        buffer.extend(iter);
-                        self.metrics.buffered_records.set(buffer.len() as u64);
-                    }
                     return Ok(first);
                 }
                 Ok(_) => continue,
@@ -8628,6 +8735,105 @@ mod tests {
 
         let metrics = consumer.metrics().snapshot();
         assert_eq!(metrics.buffered_records, 1);
+    }
+
+    /// Records `recv()` did not hand out go back **in front of** the poll's
+    /// parked surplus, not behind it.
+    ///
+    /// `poll()` parks what it could not deliver at the back of the buffer, so
+    /// the buffer already holds *higher* offsets by the time `recv()` returns.
+    /// Appending the undelivered remainder would order offsets 2..N after
+    /// N+1.., and the application would see a partition's records out of order
+    /// — the one thing a Kafka consumer must never do.
+    #[test]
+    fn requeued_records_are_ordered_ahead_of_the_parked_surplus() {
+        let consumer = make_test_consumer();
+
+        // What a poll parked because it exceeded the delivery cap.
+        {
+            let mut buffer = consumer.recv_buffer.lock();
+            buffer.push_back(make_record("orders", 0, 3));
+            buffer.push_back(make_record("orders", 0, 4));
+        }
+
+        // What the same poll returned but the caller did not take.
+        consumer.requeue_undelivered(vec![
+            make_record("orders", 0, 1),
+            make_record("orders", 0, 2),
+        ]);
+
+        let buffer = consumer.recv_buffer.lock();
+        let offsets: Vec<Offset> = buffer.iter().map(|r| r.offset).collect();
+        assert_eq!(
+            offsets,
+            vec![1, 2, 3, 4],
+            "requeued records must precede the parked surplus"
+        );
+    }
+
+    /// A deserializer failure must not consume the records it rejected.
+    ///
+    /// The fetch position is advanced before `finish_delivery` runs, so a
+    /// batch dropped here is skipped permanently — silent data loss that no
+    /// commit, lag metric or log line would reveal. The batch is put back
+    /// instead, and the error names the record so the caller can seek past it.
+    #[tokio::test]
+    async fn a_deserializer_failure_puts_the_batch_back_and_names_the_record() {
+        struct AlwaysFails;
+
+        impl crate::serdes::Deserializer for AlwaysFails {
+            fn deserialize(
+                &self,
+                _payload: bytes::Bytes,
+                _topic: &str,
+                _is_key: bool,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<bytes::Bytes>> + Send + '_>,
+            > {
+                Box::pin(async { Err(KrafkaError::serialization("bad magic byte")) })
+            }
+        }
+
+        let with_value = |offset: Offset| {
+            let mut record = make_record("orders", 2, offset);
+            record.value = Some(bytes::Bytes::from_static(b"payload"));
+            record
+        };
+
+        let mut consumer = make_test_consumer();
+        consumer.value_deserializer = Some(Arc::new(AlwaysFails));
+
+        let error = consumer
+            .finish_delivery(vec![with_value(40), with_value(41)])
+            .await
+            .expect_err("a failing deserializer must fail the poll");
+
+        match error {
+            KrafkaError::RecordDeserialization {
+                ref topic,
+                partition,
+                offset,
+                part,
+                ..
+            } => {
+                assert_eq!(topic, "orders");
+                assert_eq!(partition, 2);
+                assert_eq!(
+                    offset, 40,
+                    "the *first* failing record is the one to seek past"
+                );
+                assert_eq!(part, "value");
+            }
+            other => panic!("expected RecordDeserialization, got {other:?}"),
+        }
+
+        let buffer = consumer.recv_buffer.lock();
+        let offsets: Vec<Offset> = buffer.iter().map(|r| r.offset).collect();
+        assert_eq!(
+            offsets,
+            vec![40, 41],
+            "no record may be lost to a deserialization failure"
+        );
     }
 
     #[tokio::test]

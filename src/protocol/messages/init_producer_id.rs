@@ -52,6 +52,32 @@ impl InitProducerIdRequest {
         }
     }
 
+    /// Create a request for a transactional producer participating in an
+    /// external two-phase commit (KIP-939).
+    ///
+    /// `enable_2pc` tells the coordinator this transaction is governed by an
+    /// external coordinator, so it must never be aborted by
+    /// `transaction.max.timeout.ms` — the timeout field is therefore sent as
+    /// `i32::MAX` and the broker ignores it. `keep_prepared_txn` tells the
+    /// coordinator **not** to abort a transaction left open by a previous
+    /// incarnation of this `transactional.id`, and to report its producer ID
+    /// and epoch instead so the caller can finish it.
+    ///
+    /// Requires `transaction.version` 3 on the broker, plus `WRITE` and
+    /// `TWO_PHASE_COMMIT` on the transactional-id resource.
+    pub fn two_phase_commit(transactional_id: &str, keep_prepared_txn: bool) -> Self {
+        Self {
+            transactional_id: Some(transactional_id.to_string()),
+            // The broker ignores this under 2PC; sending the maximum makes the
+            // intent explicit to anyone reading a packet capture.
+            transaction_timeout_ms: i32::MAX,
+            producer_id: -1,
+            producer_epoch: -1,
+            enable_2pc: true,
+            keep_prepared_txn,
+        }
+    }
+
     /// Encode as version 0–1.
     pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
         KafkaString(self.transactional_id.clone()).try_encode(buf)?;

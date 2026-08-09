@@ -364,9 +364,6 @@ pub struct ConsumerConfig {
     /// Maximum decompressed size for record batches (compression bomb protection).
     /// Defaults to [`RecordBatch::MAX_DECOMPRESSED_SIZE`](crate::protocol::RecordBatch::MAX_DECOMPRESSED_SIZE) (128 MiB).
     pub(crate) max_decompressed_size: usize,
-    /// SOCKS5 proxy configuration (optional).
-    #[cfg(feature = "socks5")]
-    pub(crate) proxy: Option<crate::network::ProxyConfig>,
     /// Socket- and pool-level transport tuning.
     ///
     /// Defaults reproduce krafka's historical behaviour; see
@@ -394,10 +391,10 @@ pub struct ConsumerConfig {
     /// is sufficient for all but the most extreme churning groups.
     pub(crate) max_cooperative_rebalance_rounds: usize,
     /// Duration after which a partition's cached high watermark is considered
-    /// stale by [`Consumer::lag`].
+    /// stale by [`Consumer::lag`](crate::consumer::Consumer::lag).
     ///
     /// If a partition's watermark has not been refreshed within this window it
-    /// appears in [`LagResult::stale_partitions`]. The lag value is still
+    /// appears in [`LagResult::stale_partitions`](crate::consumer::LagResult::stale_partitions). The lag value is still
     /// returned but may be inaccurate.
     ///
     /// Default: 60 s. Set to `Duration::MAX` to disable staleness reporting.
@@ -411,7 +408,7 @@ pub struct ConsumerConfig {
     /// which limits the no-data retry rate to ~100 iterations/second.
     /// Latency-sensitive callers may reduce this toward `Duration::ZERO`.
     pub(crate) idle_poll_backoff: Duration,
-    /// Maximum time allowed for the [`RebalanceListener::on_partitions_revoked`]
+    /// Maximum time allowed for the [`ConsumerRebalanceListener::on_partitions_revoked`](crate::consumer::ConsumerRebalanceListener::on_partitions_revoked)
     /// callback to complete before the consumer proceeds with revocation.
     ///
     /// If the callback exceeds this duration, the consumer logs a warning and
@@ -463,8 +460,6 @@ impl Default for ConsumerConfig {
             metadata_topic_cache_ttl: Some(Duration::from_secs(300)),
             auth: None,
             max_decompressed_size: crate::protocol::RecordBatch::MAX_DECOMPRESSED_SIZE,
-            #[cfg(feature = "socks5")]
-            proxy: None,
             transport: crate::network::TransportConfig::default(),
             initial_offsets: HashMap::new(),
             max_cooperative_rebalance_rounds: 10,
@@ -652,13 +647,6 @@ impl ConsumerConfig {
         self.max_decompressed_size
     }
 
-    /// Returns the SOCKS5 proxy configuration, if set.
-    #[cfg(feature = "socks5")]
-    #[inline]
-    pub fn proxy(&self) -> Option<&crate::network::ProxyConfig> {
-        self.proxy.as_ref()
-    }
-
     /// Returns the maximum idle-poll backoff duration.
     #[inline]
     pub fn idle_poll_backoff(&self) -> Duration {
@@ -696,7 +684,7 @@ impl ConsumerConfig {
 pub(crate) fn validate(config: &ConsumerConfig) -> crate::Result<()> {
     if config.bootstrap_servers.is_empty() {
         return Err(crate::error::KrafkaError::config(
-            "bootstrap_servers must not be empty",
+            "bootstrap_servers is required",
         ));
     }
     if config.group_id.as_deref() == Some("") {
@@ -968,7 +956,10 @@ mod tests {
             .proxy(crate::network::ProxyConfig::new("proxy:1080"))
             .build_config()
             .unwrap();
-        let proxy = config.proxy().expect("proxy should be set");
+        let proxy = config
+            .transport
+            .proxy()
+            .expect("proxy should reach the transport config");
         assert_eq!(proxy.address(), "proxy:1080");
     }
 

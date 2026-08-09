@@ -36,32 +36,37 @@ state machine that refuses the KAFKA-17754 abort-after-commit-timeout hazard.
 `OUT_OF_ORDER_SEQUENCE_NUMBER` verified head-of-line before any rewind, so a
 silent gap raises a fatal error instead of reporting success.
 
+**Per-partition ordering is structural, not a setting you can get wrong.** The
+producer has exactly one send path, and it keeps exactly one batch per
+partition on the wire, dispatched in the order batches were sealed. Sequence
+order and wire order cannot diverge, so there is no
+`max.in.flight.requests.per.connection ≤ 5` rule to remember, a retry cannot
+reorder a partition, and `Arc<Producer>` shared across a hundred tasks is
+simply correct. Different partitions still proceed concurrently.
+
 ### What is in the box
 
 | | |
 |---|---|
-| **Clients** | Producer (batching, compression, idempotence, transactions) · Consumer (classic **and** KIP-848 server-side assignment with validated revoke-before-assign reconciliation) · `ShareConsumer` (KIP-932 at Kafka 4.2 parity, incl. KIP-1222 `Renew` and KIP-1206 `ShareAcquireMode`) · full `AdminClient` |
+| **Clients** | Producer — one send path that batches at every `linger` setting including `0`, with compression, idempotence and transactions · Consumer (classic **and** KIP-848 server-side assignment with validated revoke-before-assign reconciliation) · `ShareConsumer` (KIP-932 at Kafka 4.2 parity, incl. KIP-1222 `Renew` and KIP-1206 `ShareAcquireMode`) · full `AdminClient` |
 | **Security** | rustls TLS/mTLS with **hot certificate reload** (KIP-1288) · SASL PLAIN, SCRAM-SHA-256/512, OAUTHBEARER · built-in OIDC provider for `client_credentials` (KIP-768) and RFC 7523 client assertions (KIP-1258), with no cryptography dependency added · AWS MSK IAM · every mechanism composes with TLS through one `with_tls`, asserted reachable over both `SASL_PLAINTEXT` and `SASL_SSL` at compile time |
 | **Consistency** | Every client shares one configuration surface and one operational surface (`close`, `rebootstrap`, `update_seed_brokers`, `refresh_tls`, `metrics`) — asserted at compile time, builders included. One builder per client, with `build_config()` to validate without a broker and `build()` to validate and connect, both through the same validator. The transactional producer mirrors the plain one setter for setter, minus the two settings transactions fix (`acks`, `idempotent`) |
-| **Tuning** | Per-codec compression levels (Gzip 0–9, Zstd through 22) validated against the selected codec at build time, so a level set on a codec that has none is rejected rather than ignored — on both send paths and on the transactional producer |
+| **Tuning** | Per-codec compression levels (Gzip 0–9, Zstd through 22) validated against the selected codec at build time, so a level set on a codec that has none is rejected rather than ignored — on the plain and the transactional producer alike |
 | **Transport** | One `TransportConfig` on every builder — pass the same instance to every client that shares a network path: TCP keepalive, response ceiling, in-flight cap, idle eviction, file-descriptor cap · KIP-227 incremental fetch sessions · SOCKS5 |
-| **Observability** | Lock-free counters, gauges and latency histograms with bounded per-topic cardinality · Prometheus export · producer interceptors and dead-letter queues on **both** producers and both send paths · OAUTHBEARER token-fetch counters and expiry gauge · OpenTelemetry semantic conventions |
+| **Observability** | Lock-free counters, gauges and latency histograms with bounded per-topic cardinality · Prometheus export · producer interceptors and dead-letter queues on **both** producers, over the single send path · OAUTHBEARER token-fetch counters and expiry gauge · OpenTelemetry semantic conventions |
 | **Hardening** | Secret zeroization · constant-time comparison (`subtle`) · decompression-bomb limits · decode-loop bounds · RFC 3986 path encoding on every outbound HTTP target · CI forbids any credential-bearing type from deriving `Debug` |
-| **Testing** | 2 440+ tests · 6 cargo-fuzz targets · proptest round-trips across the protocol layer · an in-process fake broker with fault injection that serves the **full transaction protocol** — KIP-360 fencing, commit/abort markers, `read_committed` isolation, TV1 and KIP-890 TV2 — so even exactly-once tests need no Docker |
+| **Testing** | 2 350+ tests · 6 cargo-fuzz targets · proptest round-trips across the protocol layer · an in-process fake broker with fault injection that serves the **full transaction protocol** — KIP-360 fencing, commit/abort markers, `read_committed` isolation, TV1 and KIP-890 TV2 — so even exactly-once tests need no Docker |
 
 > **Broker versions:** krafka requires **Apache Kafka 3.9+**; protocol versions below that baseline have been removed. Features needing a newer broker (KIP-848 consumer groups, KIP-932 share groups, KIP-1066 cordoned log dirs) say so where they are documented and fail with a clear `UnknownApiVersion` rather than silently degrading.
 
 ## 🚀 Quick Start
 
-Add krafka to your `Cargo.toml`:
+```sh
+cargo add krafka
+cargo add tokio --features full
 
-```toml
-[dependencies]
-krafka = "0.17.0"
-tokio = { version = "1", features = ["full"] }
-
-# For AWS MSK IAM authentication with full SDK support:
-# krafka = { version = "0.17.0", features = ["aws-msk"] }
+# For AWS MSK IAM authentication with the full SDK credential chain:
+cargo add krafka --features aws-msk
 ```
 
 ### Producer
@@ -281,14 +286,13 @@ and LZ4. Zstd remains available through the explicit `zstd` or
 `compression-all` feature because it requires a C toolchain via `zstd-sys`.
 To select only what you need:
 
-```toml
-# Option 1: enable only the codecs you need
-# `default-features = false` also drops the default `ring` TLS backend, so a
-# crypto backend must be named explicitly.
-krafka = { version = "0.17.0", default-features = false, features = ["lz4", "snappy", "ring"] }
+```sh
+# Only the codecs you need. `--no-default-features` also drops the default
+# `ring` TLS backend, so a crypto backend must be named explicitly.
+cargo add krafka --no-default-features --features lz4,snappy,ring
 
-# Option 2: enable all compression codecs, including zstd
-# krafka = { version = "0.17.0", features = ["compression-all"] }
+# Or every codec, including zstd:
+cargo add krafka --features compression-all
 ```
 
 ### TLS crypto backend
@@ -297,8 +301,8 @@ krafka uses `rustls` and needs exactly one crypto backend. `ring` is the
 default; `rustls-aws-lc-rs` selects aws-lc-rs instead, which is the better
 choice on AWS Graviton and in FIPS-oriented deployments:
 
-```toml
-krafka = { version = "0.17.0", default-features = false, features = ["rustls-aws-lc-rs", "compression"] }
+```sh
+cargo add krafka --no-default-features --features rustls-aws-lc-rs,compression
 ```
 
 The two backends are **additive**, not mutually exclusive — a transitive
@@ -646,6 +650,255 @@ what it does and, just as importantly, what it deliberately does not model.
 ## ⬆️ Upgrading
 
 Release-by-release detail lives in **[CHANGELOG.md](CHANGELOG.md)**.
+
+### Upgrading to 0.18
+
+#### Breaking — the producer has one send path
+
+`ProducerConfig::max_in_flight` and `ProducerBuilder::max_in_flight` are gone,
+on both the plain and the transactional producer. Delete the call; there is
+nothing to replace it with, and the guarantee it was supposed to buy is now
+structural.
+
+krafka had two send paths. `linger > 0` used the record accumulator; `linger =
+0` — **the default** — used a second, unbatched implementation that duplicated
+the retry, sequence-recovery, leader-hint and dead-letter logic. That path is
+deleted. Every send now goes through the accumulator, at every `linger`
+setting, which fixes two things at once:
+
+- **`linger = 0` batches.** It always meant "do not *wait* for more records",
+  never "do not batch". The accumulator dispatches immediately when the
+  partition's wire is free and coalesces whatever arrives during the round trip
+  into the next batch, dispatched the instant the acknowledgement lands. 200
+  concurrent sends to one partition now leave as **3** Produce requests instead
+  of 200 — with no added latency, because the first record never waits.
+- **Concurrent sends to one partition can no longer break an idempotent
+  producer.** The old path let up to `max_in_flight` requests race onto the wire
+  with no per-partition ordering, so sequences could arrive out of order and the
+  broker's `OUT_OF_ORDER_SEQUENCE_NUMBER` would fail the producer permanently
+  with a "recreate the producer" error. Since idempotence is on by default and
+  `Arc<Producer>` shared across tasks is the documented pattern, that was
+  reachable from the default configuration. The accumulator keeps exactly one
+  batch per partition on the wire, in seal order, so sequence order and wire
+  order cannot diverge.
+
+That per-partition guarantee is why there is no `max.in.flight ≤ 5` rule to
+observe. The per-connection ceiling that remains is a transport concern:
+`TransportConfig::max_in_flight_requests`.
+
+#### Breaking — the compacted-topic builder is gone, and reads committed
+
+`CompactedTopicConsumerBuilder` is replaced by
+`CompactedTopicConsumer::from_consumer_builder(ConsumerBuilder, topic)`. The old
+builder owned a hand-picked subset of nine consumer settings, and every setting
+it omitted was unreachable through it — including `isolation_level`, so the type
+most likely to be pointed at transactional data could not ask for
+`read_committed` and could materialise a table from records that were later
+aborted.
+
+The new constructor imposes three settings as requirements of materialising a
+table: `auto_offset_reset = Earliest`, `enable_auto_commit = false`, and
+**`isolation_level = ReadCommitted`**. The last is a behaviour change, and
+deliberate: anyone relying on the old default was reading aborted records into a
+table. It costs nothing on a topic with no transactions. Use `from_consumer`
+with a hand-built `Consumer` to read uncommitted state on purpose.
+
+#### Breaking — the SOCKS5 proxy lives on `TransportConfig`
+
+`ProducerConfig::proxy` and its four siblings are gone; `TransportConfig::proxy`
+replaces them. Every client builder keeps `.proxy(..)` as a shorthand that
+writes into its transport config, so there is one storage location and no
+precedence rule.
+
+This was a trap, not an omission: `TransportConfig`'s own documentation
+described it as carrying "the SOCKS5 route" and warned that a client left on the
+default transport gets "no proxy" — describing a capability the type did not
+have. A downstream project mapped its transport settings onto the type, which is
+what the name invites, and shipped a producer that silently bypassed the proxy
+its deployment required.
+
+#### Breaking — share-consumer settings take `Duration`
+
+`ShareConsumerBuilder::fetch_max_wait_ms(i32)` is now
+`fetch_max_wait(Duration)` — it was the only timeout in the crate taking raw
+milliseconds. `TransactionalProducerConfig` stores `transaction_timeout` as a
+`Duration` internally too; its public setter and accessor are unchanged.
+
+#### Breaking — deserialization failures are typed and no longer lose records
+
+A key or value deserializer that returned an error used to fail the poll
+*after* the fetch position had advanced, so the records in that batch were
+skipped permanently — silent loss with nothing in the logs. Now the batch is
+put back in the receive buffer (where the commit clamp holds the committed
+offset behind it) and the poll fails with a new variant:
+
+```rust
+match consumer.poll(timeout).await {
+    Err(KrafkaError::RecordDeserialization { topic, partition, offset, .. }) => {
+        // Nothing was consumed; skip the poison record explicitly.
+        consumer.seek(&topic, partition, offset + 1).await?;
+    }
+    other => { other?; }
+}
+```
+
+`KrafkaError` gained `RecordDeserialization { topic, partition, offset, part,
+message }`. Match arms over `KrafkaError` may need a new branch. Equivalent to
+the Java client's `RecordDeserializationException`.
+
+Deserialization also now runs **before** the consumer interceptor, so
+`on_consume` sees application-level values — the mirror image of the producer,
+where `on_send` sees the record before serialization, and the same order the
+Java client uses.
+
+#### New — `enqueue()`: separate ordering from durability
+
+```rust
+// Ordering is fixed by these calls returning, not by how the handles are awaited.
+let mut acks = FuturesUnordered::new();
+for record in batch {
+    acks.push(producer.enqueue(record).await?);
+}
+while let Some(metadata) = acks.next().await { metadata?; }
+```
+
+`Producer::enqueue` and `TransactionalProducer::enqueue` return a
+`DeliveryHandle` — Java's `Producer.send()` shape. **Produce order is enqueue
+order**, whatever order the handles are polled in.
+
+`send_record` cannot offer that, because it does its append somewhere inside its
+own polling: N of them polled concurrently append in *poll* order, and under
+buffer-memory backpressure the two diverge. Pipelining on top of it was possible
+but required polling every outstanding future in submission order on every wake
+— O(window) per wake, with the sweep itself being the ordering guarantee.
+`send_record` remains, and is now `enqueue(record).await?.await`.
+
+`FakeBroker` gained `committed_records()` / `all_records()`, read straight from
+the broker's log — no consumer, no bounded poll loop. The difference between the
+two is what an exactly-once test is actually asserting.
+
+**KIP-939 two-phase commit** (`unstable-protocol`) closes the gap the previous
+review named as the largest remaining one. Kafka transactions are atomic within
+Kafka and with nothing else; a service that must write to Kafka *and* a database
+— either both or neither — now can. `two_phase_commit(true)` stops the
+coordinator applying `transaction.max.timeout.ms`, `prepare_transaction()`
+flushes and freezes the transaction, and after a crash
+`init_transactions_keeping_prepared()` + `complete_transaction(stored)` resolves
+it against the state the external coordinator recorded.
+
+`NewTopic::with_replica_assignment` makes manual replica placement expressible
+— it was sent as an empty list unconditionally, ruling out rack-aware placement
+and layout mirroring. `list_consumer_groups` takes a `GroupListing` so state and
+type filters are applied by the *broker* rather than by your loop, and
+`create_delegation_token` takes an `owner`, completing KIP-373's on-behalf-of
+half.
+
+`ShareConsumer::acquisition_lock_timeout()` surfaces the KIP-1222 lock duration
+the broker reports on every `ShareFetch`. Without it `AcknowledgeType::Renew`
+was documented, reachable, and impossible to schedule: the deadline it extends
+is a broker-side setting no client can read from its own configuration.
+
+`OffsetSpec` gained `MaxTimestamp`, `EarliestLocal` and `LatestTiered`
+(KIP-734, KIP-405, KIP-1005). krafka already negotiated `ListOffsets` v11, so
+these were questions the wire could answer and the API could not ask — including
+"where does local storage end", which is how you find out whether a scan is
+about to pull from object storage. `describe_consumer_group_offsets` gained an
+`OffsetVisibility` for the same KIP-447 reason as the consumer fix above.
+
+`AdminClient` gained `retries` / `retry_backoff`. Its controller-routing retries
+were compile-time constants — five attempts, flat 100 ms, no jitter — while the
+docstring claimed they were `retry.backoff.ms`. A second of budget is short for
+a KRaft election, and a flat sleep means every admin client watching one
+election arrives at the new controller as a single wave.
+
+#### New — the share consumer catches up with the subscription consumer
+
+Five `ShareConsumer` settings were declared, documented, and sent on the wire
+with **no builder setter**: `fetch_min_bytes`, `fetch_max_bytes`, `max_records`
+and `batch_size` — the four knobs KIP-932 exposes for tuning a share fetch —
+plus `metadata_recovery_rebootstrap_trigger`. Every krafka share consumer in
+existence sent the same four numbers. They are settable now, and
+`ShareConsumerConfig` gained 17 accessors (it had 6 where `ConsumerConfig` has
+34, which made `build_config()` largely unreadable).
+
+`ShareConsumer` also accepts `key_deserializer` / `value_deserializer` now. It
+returns the same `ConsumerRecord` as the subscription consumer, so it takes the
+same hook; previously a share-group application had to decode schema framing by
+hand. Because a share consumer cannot `seek()` past a poison record, its remedy
+is `acknowledge_by_offset(topic, partition, offset, AcknowledgeType::Reject)` —
+so deserialization deliberately runs *after* the record is registered, which is
+what makes that call legal.
+
+`TransportConfig` gained `socket_send_buffer` / `socket_receive_buffer`
+(`SO_SNDBUF` / `SO_RCVBUF`) for the same reason: declared on
+`ConnectionConfig`, readable, applied to the real socket via `socket2` — and
+settable by nobody, so every krafka connection took the OS default. On a
+high bandwidth-delay-product link that is the throughput ceiling.
+
+Three new CI gates exist so this class of defect cannot recur:
+
+- **`just config-reachability`** walks every config struct's *fields* and
+  requires each to have a builder setter and a public accessor, or a documented
+  exception. `tests/builder_surface.rs` proves named methods exist; only a
+  field-driven check can prove nothing was forgotten. It covers 149 fields
+  across 8 configs and found the socket-buffer gap above the moment it was
+  pointed at the transport layer.
+- **`just protocol-reachability`** is its mirror image on the wire: every `pub`
+  field of every response struct must be read by client code outside the
+  protocol layer, or carry a documented reason for being decode-only. This is
+  the shape of the two most severe defects in the crate's history —
+  `last_stable_offset` and KIP-1222's `acquisition_lock_timeout_ms` were both
+  decoded correctly, round-tripped in the codec's own tests, and read by
+  nobody. From the codec's side they look finished; from the client's side the
+  information never arrives.
+- **`rustdoc::broken_intra_doc_links` is denied**, with a second `just doc`
+  pass over private items. Fifteen links resolved to nothing and rendered as
+  plain text, one of them to a type deleted several releases ago.
+
+#### Fixed
+
+- **`OffsetFetch` never asked for stable offsets (KIP-447).** A
+  `read_committed` consumer resuming after a crash could read a committed
+  offset that a transaction had staged but not committed. If that transaction
+  then aborted, the consumer had already resumed past records it was supposed
+  to reprocess — silent data loss on the exactly-once recovery path. The flag
+  now follows the isolation level, and the `UNSTABLE_OFFSET_COMMIT` answer it
+  unlocks is retried rather than silently dropped (a dropped partition reads as
+  "never committed", i.e. `auto.offset.reset`).
+- **`recv()` could deliver a partition's records out of order.** `poll()` parks
+  its undelivered surplus at the back of the receive buffer; `recv()` appended
+  *its* undelivered remainder there too, behind records from higher offsets in
+  the same partitions. A fetch yielding more than `max_poll_records` for one
+  partition therefore handed the application offsets 501+ before offsets 2–500.
+  The remainder is now reinserted at the front.
+- **A Fetch v13+ response naming an unknown topic UUID was logged as discarded
+  but not discarded.** Its partitions kept an empty topic name, so watermarks,
+  log-start offsets and preferred replicas were recorded under `("", partition)`
+  — state belonging to no topic and colliding across topics.
+- **A producer-ID reset racing a batch could silently disable idempotence.**
+  Sequence allocation now goes through the checked path that verifies the
+  identity under the same lock, so a batch can no longer be stamped with
+  producer ID `-1` and written non-idempotently with no error anywhere.
+- **`delivery_timeout` excluded backpressure again.** The clock is charged from
+  `send()` entry — including the up-to-`max_block` wait for buffer memory — by
+  pulling the batch's deadline back to its earliest record's entry time.
+- **Steady-state logging dropped from `info!` to `debug!`.** Every
+  `ConsumerGroupHeartbeat`, every auto-commit and every committed-offset fetch
+  logged at `info!`, so an idle consumer group produced a line every few seconds
+  per member at the default subscriber level.
+
+#### Performance
+
+- Batching at the default configuration (above) is the large one.
+- An idle producer no longer wakes the runtime 1 000 times a second. The
+  accumulator's loop drove a fixed 1 ms tick, affordable when only `linger > 0`
+  producers had one; now every producer does, so it sleeps until the earliest
+  open batch's linger deadline instead.
+- The delivery hot path no longer allocates a `String` per record. `pause()`
+  checks, the stale-response filter and buffer purges probed a
+  `HashSet<(String, PartitionId)>` by building an owned key for every record;
+  they now compare borrowed names against a set that is empty in the common
+  case.
 
 ### Upgrading to 0.17
 

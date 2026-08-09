@@ -45,7 +45,7 @@ default:
 # Ordered cheapest-first so a formatting slip fails in seconds rather than
 # after a full test run.
 [doc("Everything CI runs (no Docker suites)")]
-ci: fmt-check clippy check protocol-parity secret-debug test-reachability version-check site-check docs-test test-ring test minimal-features doc
+ci: fmt-check clippy check protocol-parity protocol-reachability secret-debug test-reachability config-reachability version-check site-check docs-test test-ring test minimal-features doc
     @echo ""
     @echo "✓ ci passed — Docker suites not included, run 'just integration' for those"
 
@@ -142,6 +142,27 @@ secret-debug:
 test-reachability:
     python3 xtask/test_reachability.py
 
+# Every configuration field is settable from its builder and readable back.
+#
+# This crate has shipped the same defect three times: a field declared,
+# documented, wired to the wire protocol — and reachable from no public
+# builder. `tests/builder_surface.rs` proves named methods exist; only a
+# field-driven check can prove nothing was forgotten.
+[doc("Every config field is settable and readable")]
+config-reachability:
+    python3 xtask/config_reachability.py
+
+# Every decoded response field is read by client code.
+#
+# The mirror image of `config-reachability`, and the shape of this project's
+# two most severe defects: `last_stable_offset` and KIP-1222's
+# `acquisition_lock_timeout_ms` were both decoded correctly, round-tripped in
+# the codec's own tests, and read by nobody — so the information the broker
+# sent never reached the application.
+[doc("Every decoded response field is read")]
+protocol-reachability:
+    python3 xtask/protocol_reachability.py
+
 # Every place that names krafka's own version must agree with Cargo.toml.
 #
 # A bump is a search-and-replace, and search-and-replace is blind to anywhere
@@ -215,6 +236,16 @@ refresh-protocol-snapshot ref="4.3":
 # Build the docs with warnings denied, matching CI.
 doc:
     RUSTDOCFLAGS="-Dwarnings" cargo doc --no-deps --all-features
+    # Again over the private items. `broken_intra_doc_links` is allow-by-default
+    # for anything rustdoc does not render, so the public pass alone let a link
+    # to a deleted `ProducerConfigBuilder` sit in the transport docs for several
+    # releases. This crate leans on its internal comments — the second pass is
+    # what keeps the links in them real.
+    # `redundant_explicit_links` is allowed here only: documenting private items
+    # makes more paths resolvable, so a link written with an explicit target for
+    # the public reader's benefit becomes "redundant" in this pass alone. The
+    # correctness lints stay denied.
+    RUSTDOCFLAGS="-Dwarnings -A rustdoc::redundant_explicit_links" cargo doc --no-deps --all-features --document-private-items
 
 # Open the docs in a browser.
 doc-open:

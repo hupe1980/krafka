@@ -1560,14 +1560,14 @@ Key behaviors:
 For the common case of scanning an entire compacted topic from the beginning, `CompactedTopicConsumer` bundles a `Consumer` and `CompactedTable` together with built-in caught-up detection:
 
 ```rust,compile
-use krafka::consumer::CompactedTopicConsumer;
+use krafka::consumer::{CompactedTopicConsumer, Consumer};
 use std::time::Duration;
 
-let mut ctc = CompactedTopicConsumer::builder()
-    .bootstrap_servers("localhost:9092")
-    .topic("user-profiles")
-    .build()
-    .await?;
+let mut ctc = CompactedTopicConsumer::from_consumer_builder(
+    Consumer::builder().bootstrap_servers("localhost:9092"),
+    "user-profiles",
+)
+.await?;
 
 // Build the initial snapshot (blocks until caught up)
 ctc.scan(Duration::from_secs(1)).await?;
@@ -1637,12 +1637,13 @@ Pass an `AuthConfig` to connect to secured clusters:
 ```rust
 use krafka::auth::AuthConfig;
 
-let mut ctc = CompactedTopicConsumer::builder()
-    .bootstrap_servers("broker:9093")
-    .topic("config-topic")
-    .auth(AuthConfig::sasl_scram_sha256("user", "password"))
-    .build()
-    .await?;
+let mut ctc = CompactedTopicConsumer::from_consumer_builder(
+    Consumer::builder()
+        .bootstrap_servers("broker:9093")
+        .auth(AuthConfig::sasl_scram_sha256("user", "password")),
+    "config-topic",
+)
+.await?;
 ```
 
 ## Offset Lag Tracking

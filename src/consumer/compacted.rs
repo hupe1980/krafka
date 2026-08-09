@@ -35,14 +35,14 @@
 //! [`CompactedTable`] together with built-in caught-up detection:
 //!
 //! ```rust,ignore
-//! use krafka::consumer::CompactedTopicConsumer;
+//! use krafka::consumer::{CompactedTopicConsumer, Consumer};
 //! use std::time::Duration;
 //!
-//! let mut ctc = CompactedTopicConsumer::builder()
-//!     .bootstrap_servers("localhost:9092")
-//!     .topic("user-profiles")
-//!     .build()
-//!     .await?;
+//! let mut ctc = CompactedTopicConsumer::from_consumer_builder(
+//!     Consumer::builder().bootstrap_servers("localhost:9092"),
+//!     "user-profiles",
+//! )
+//! .await?;
 //!
 //! ctc.scan(Duration::from_secs(1)).await?;
 //!
@@ -61,8 +61,10 @@ use tokio::sync::Mutex;
 use tracing::{debug, info};
 
 use super::record::ConsumerRecord;
-use super::{AutoOffsetReset, Consumer, ConsumerRebalanceListener, TopicPartition};
-use crate::auth::AuthConfig;
+use super::{
+    AutoOffsetReset, Consumer, ConsumerBuilder, ConsumerRebalanceListener, IsolationLevel,
+    TopicPartition,
+};
 use crate::error::{KrafkaError, Result};
 use crate::{Offset, PartitionId, Timestamp};
 
@@ -997,13 +999,14 @@ async fn run_scan<S: ScanSource>(
 /// Convenience wrapper that pairs a [`Consumer`] with a [`CompactedTable`]
 /// for the common pattern of scanning an entire compacted topic.
 ///
-/// When constructed via [`builder()`](Self::builder), it creates a
-/// standalone (no group) consumer, assigns all partitions from the earliest
-/// offset, and provides [`scan()`](Self::scan) to block until the table is
-/// fully populated.
+/// When constructed via
+/// [`from_consumer_builder()`](Self::from_consumer_builder), it creates a
+/// standalone (no group) consumer, assigns every partition, reads from the
+/// earliest offset at `read_committed` isolation, and provides
+/// [`scan()`](Self::scan) to block until the table is fully populated.
 ///
-/// Other constructors, such as [`from_consumer()`](Self::from_consumer),
-/// use the caller-provided consumer configuration and assignment as-is.
+/// [`from_consumer()`](Self::from_consumer) uses the caller-provided consumer
+/// configuration and assignment as-is.
 ///
 /// For fully custom consumer setups, you can also use [`CompactedTable`]
 /// directly with your own [`Consumer`].
@@ -1011,14 +1014,14 @@ async fn run_scan<S: ScanSource>(
 /// # Example
 ///
 /// ```rust,ignore
-/// use krafka::consumer::CompactedTopicConsumer;
+/// use krafka::consumer::{CompactedTopicConsumer, Consumer};
 /// use std::time::Duration;
 ///
-/// let mut ctc = CompactedTopicConsumer::builder()
-///     .bootstrap_servers("localhost:9092")
-///     .topic("user-profiles")
-///     .build()
-///     .await?;
+/// let mut ctc = CompactedTopicConsumer::from_consumer_builder(
+///     Consumer::builder().bootstrap_servers("localhost:9092"),
+///     "user-profiles",
+/// )
+/// .await?;
 ///
 /// // Build the initial snapshot
 /// ctc.scan(Duration::from_secs(1)).await?;
@@ -1058,11 +1061,6 @@ impl fmt::Debug for CompactedTopicConsumer {
 }
 
 impl CompactedTopicConsumer {
-    /// Create a new builder.
-    pub fn builder() -> CompactedTopicConsumerBuilder {
-        CompactedTopicConsumerBuilder::default()
-    }
-
     /// Create a `CompactedTopicConsumer` from an already-configured [`Consumer`].
     ///
     /// The consumer should already have partitions assigned for the given
@@ -1085,8 +1083,38 @@ impl CompactedTopicConsumer {
     /// [`CompactedTableClearListener`], which does that bookkeeping (and the
     /// matching rewind of newly assigned partitions) for you.
     ///
-    /// Use this when you need full control over the consumer configuration
-    /// (TLS, auth, timeouts, etc.) beyond what the builder exposes.
+    /// # Finding the partitions to assign
+    ///
+    /// [`Consumer::fetch_metadata`] answers exactly this, and refreshes first —
+    /// there is no need for a second `AdminClient` and a second auth handshake
+    /// to enumerate them:
+    ///
+    /// ```rust,no_run
+    /// use krafka::consumer::{CompactedTopicConsumer, Consumer};
+    ///
+    /// # async fn example(consumer: Consumer, topic: &str) -> Result<(), krafka::error::KrafkaError> {
+    /// let metadata = consumer.fetch_metadata(Some(topic)).await?;
+    /// let partitions: Vec<i32> = metadata
+    ///     .topics
+    ///     .iter()
+    ///     .find(|t| t.name == topic)
+    ///     .map(|t| t.partitions.keys().copied().collect())
+    ///     .unwrap_or_default();
+    /// consumer.assign(topic, partitions).await?;
+    /// let compacted = CompactedTopicConsumer::from_consumer(consumer, topic);
+    /// # let _ = compacted;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Assign **every** partition, or the table is silently partial.
+    /// [`from_consumer_builder`](Self::from_consumer_builder) does this step
+    /// for you and is the better choice unless you need a `Consumer` you have
+    /// already built for other reasons.
+    ///
+    /// Use this when you need full control over the consumer configuration —
+    /// including an isolation level other than the `ReadCommitted` that
+    /// `from_consumer_builder` imposes.
     pub fn from_consumer(consumer: Consumer, topic: impl Into<String>) -> Self {
         Self {
             consumer,
@@ -1298,127 +1326,89 @@ impl CompactedTopicConsumer {
     }
 }
 
-/// Builder for [`CompactedTopicConsumer`].
-#[derive(Default)]
-pub struct CompactedTopicConsumerBuilder {
-    bootstrap_servers: Option<String>,
-    topic: Option<String>,
-    client_id: Option<String>,
-    request_timeout: Option<Duration>,
-    fetch_max_bytes: Option<i32>,
-    max_partition_fetch_bytes: Option<i32>,
-    max_poll_records: Option<i32>,
-    auth: Option<AuthConfig>,
-    #[cfg(feature = "socks5")]
-    proxy: Option<crate::network::ProxyConfig>,
-}
-
-impl CompactedTopicConsumerBuilder {
-    /// Set the Kafka bootstrap servers (required).
-    pub fn bootstrap_servers(mut self, servers: impl Into<String>) -> Self {
-        self.bootstrap_servers = Some(servers.into());
-        self
-    }
-
-    /// Set the compacted topic to consume (required).
-    pub fn topic(mut self, topic: impl Into<String>) -> Self {
-        self.topic = Some(topic.into());
-        self
-    }
-
-    /// Set the client ID sent to the broker.
-    pub fn client_id(mut self, client_id: impl Into<String>) -> Self {
-        self.client_id = Some(client_id.into());
-        self
-    }
-
-    /// Set the request timeout for broker RPCs.
-    pub fn request_timeout(mut self, timeout: Duration) -> Self {
-        self.request_timeout = Some(timeout);
-        self
-    }
-
-    /// Set the maximum bytes to fetch per request.
-    pub fn fetch_max_bytes(mut self, bytes: i32) -> Self {
-        self.fetch_max_bytes = Some(bytes);
-        self
-    }
-
-    /// Set the maximum bytes to fetch per partition per request.
-    pub fn max_partition_fetch_bytes(mut self, bytes: i32) -> Self {
-        self.max_partition_fetch_bytes = Some(bytes);
-        self
-    }
-
-    /// Set the maximum number of records returned per poll.
-    pub fn max_poll_records(mut self, max: i32) -> Self {
-        self.max_poll_records = Some(max);
-        self
-    }
-
-    /// Set authentication configuration.
-    pub fn auth(mut self, auth: AuthConfig) -> Self {
-        self.auth = Some(auth);
-        self
-    }
-
-    /// Set SOCKS5 proxy configuration.
+impl CompactedTopicConsumer {
+    /// Build from a configured [`ConsumerBuilder`], discovering and assigning
+    /// every partition of `topic`.
     ///
-    /// Routes all broker connections through the specified SOCKS5 proxy.
-    #[cfg(feature = "socks5")]
-    pub fn proxy(mut self, proxy: crate::network::ProxyConfig) -> Self {
-        self.proxy = Some(proxy);
-        self
-    }
-
-    /// Build the [`CompactedTopicConsumer`].
+    /// This replaces the curated `CompactedTopicConsumerBuilder` that used to
+    /// live here. That builder owned a hand-picked subset of the consumer's
+    /// settings — nine of them — and every setting it omitted was unreachable
+    /// through it. Two of the omissions mattered:
     ///
-    /// Creates an internal [`Consumer`] in standalone mode (no consumer group),
-    /// discovers all partitions for the topic, and assigns them starting from
-    /// the earliest available offset.
+    /// - **`isolation_level`.** The type most likely to be pointed at
+    ///   transactional data was the one whose builder could not ask for
+    ///   `read_committed`, so a table could be materialised from records that
+    ///   were later aborted — wrong in a way the caller cannot see. This
+    ///   constructor sets `ReadCommitted` (see below).
+    /// - **`connect_timeout`.** `build()` rejects `request_timeout <
+    ///   connect_timeout`, so a caller wanting a tight request budget was
+    ///   refused with an error naming a value the builder gave them no way to
+    ///   change.
+    ///
+    /// Taking the real `ConsumerBuilder` removes the whole class: everything a
+    /// consumer can be configured with is available, and nothing has to be
+    /// mirrored here as the consumer grows settings.
+    ///
+    /// # Settings this constructor imposes
+    ///
+    /// Three, and they are requirements of materialising a table rather than
+    /// preferences, so they override whatever the builder carried:
+    ///
+    /// | Setting | Value | Why |
+    /// |---|---|---|
+    /// | `auto_offset_reset` | `Earliest` | A table built from anything later is a partial table. |
+    /// | `enable_auto_commit` | `false` | A scan is a materialisation, not group progress. |
+    /// | `isolation_level` | `ReadCommitted` | A table must not contain records that were aborted. |
+    ///
+    /// `ReadCommitted` costs nothing on a topic with no transactions — the last
+    /// stable offset equals the high watermark, in the same fetch response, so
+    /// there is no extra round trip — and is the difference between a correct
+    /// and a corrupt table on one that has them.
+    ///
+    /// Use [`from_consumer`](Self::from_consumer) with a `Consumer` you built
+    /// and assigned yourself if you need different values, including reading
+    /// uncommitted state deliberately.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use krafka::consumer::{CompactedTopicConsumer, Consumer};
+    /// use std::time::Duration;
+    ///
+    /// # async fn example() -> Result<(), krafka::error::KrafkaError> {
+    /// let compacted = CompactedTopicConsumer::from_consumer_builder(
+    ///     Consumer::builder()
+    ///         .bootstrap_servers("localhost:9092")
+    ///         .client_id("state-reader")
+    ///         // The whole consumer surface is available here, including the
+    ///         // settings the old builder could not express.
+    ///         .connect_timeout(Duration::from_secs(2))
+    ///         .request_timeout(Duration::from_secs(5)),
+    ///     "state-topic",
+    /// )
+    /// .await?;
+    /// # let _ = compacted;
+    /// # Ok(())
+    /// # }
+    /// ```
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - `bootstrap_servers` or `topic` is not set.
-    /// - The broker is unreachable or the topic does not exist.
-    pub async fn build(self) -> Result<CompactedTopicConsumer> {
-        let bootstrap_servers = self
-            .bootstrap_servers
-            .ok_or_else(|| KrafkaError::config("bootstrap_servers is required"))?;
-        let topic = self
-            .topic
-            .ok_or_else(|| KrafkaError::config("topic is required for CompactedTopicConsumer"))?;
+    /// Fails if the consumer cannot be built, if `topic` is not present in
+    /// cluster metadata, or if its partition count does not fit in a
+    /// [`PartitionId`].
+    pub async fn from_consumer_builder(
+        builder: ConsumerBuilder,
+        topic: impl Into<String>,
+    ) -> Result<Self> {
+        let topic = topic.into();
 
-        let mut consumer_builder = Consumer::builder()
-            .bootstrap_servers(&bootstrap_servers)
+        let consumer = builder
             .auto_offset_reset(AutoOffsetReset::Earliest)
-            .enable_auto_commit(false);
-
-        if let Some(client_id) = self.client_id {
-            consumer_builder = consumer_builder.client_id(client_id);
-        }
-        if let Some(timeout) = self.request_timeout {
-            consumer_builder = consumer_builder.request_timeout(timeout);
-        }
-        if let Some(bytes) = self.fetch_max_bytes {
-            consumer_builder = consumer_builder.fetch_max_bytes(bytes);
-        }
-        if let Some(bytes) = self.max_partition_fetch_bytes {
-            consumer_builder = consumer_builder.max_partition_fetch_bytes(bytes);
-        }
-        if let Some(max) = self.max_poll_records {
-            consumer_builder = consumer_builder.max_poll_records(max);
-        }
-        if let Some(auth) = self.auth {
-            consumer_builder = consumer_builder.auth(auth);
-        }
-        #[cfg(feature = "socks5")]
-        if let Some(proxy) = self.proxy {
-            consumer_builder = consumer_builder.proxy(proxy);
-        }
-
-        let consumer = consumer_builder.build().await?;
+            .enable_auto_commit(false)
+            .isolation_level(IsolationLevel::ReadCommitted)
+            .build()
+            .await?;
 
         // Refresh metadata to get the latest partition count for the topic.
         // Consumer::build() fetches an initial snapshot, but it may already
@@ -1428,7 +1418,6 @@ impl CompactedTopicConsumerBuilder {
             .refresh_for_topics(Some(&[&topic]))
             .await?;
 
-        // Discover partitions and assign all of them
         let partition_count = consumer.metadata.partition_count(&topic).ok_or_else(|| {
             KrafkaError::config(format!("topic '{topic}' not found in cluster metadata"))
         })?;
@@ -1439,10 +1428,13 @@ impl CompactedTopicConsumerBuilder {
             ))
         })?;
 
+        // Assigning every partition is the point: a partial assignment
+        // silently materialises a partial table, which is the mistake
+        // `run_scan`'s empty-assignment guard exists to catch one step later.
         let partitions: Vec<PartitionId> = (0..partition_count).collect();
         consumer.assign(&topic, partitions).await?;
 
-        info!(
+        debug!(
             "CompactedTopicConsumer initialized for '{}' with {} partitions",
             topic, partition_count
         );
@@ -1914,21 +1906,19 @@ mod tests {
         assert_send_sync::<CompactedTable>();
         assert_send_sync::<TableChange>();
         assert_send_sync::<CompactedTopicConsumer>();
-        assert_send_sync::<CompactedTopicConsumerBuilder>();
     }
 
+    /// Required-field validation now comes from `ConsumerBuilder` itself
+    /// rather than being duplicated by a second builder, which is the point of
+    /// taking one.
     #[tokio::test]
-    async fn test_builder_missing_bootstrap_servers() {
-        let result = CompactedTopicConsumerBuilder::default()
-            .topic("test")
-            .build()
-            .await;
-        assert!(result.is_err());
+    async fn from_consumer_builder_inherits_consumer_validation() {
+        let result =
+            CompactedTopicConsumer::from_consumer_builder(Consumer::builder(), "test").await;
+        let err = result.expect_err("a builder with no brokers cannot build");
         assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("bootstrap_servers")
+            err.to_string().contains("bootstrap_servers"),
+            "expected the consumer's own validation, got: {err}"
         );
     }
 
@@ -2285,15 +2275,5 @@ mod tests {
         assert!(msg.contains("cfg"));
         assert!(msg.contains("partition 3 (position 7, target 42)"));
         assert!(msg.contains("partition 4 (position unknown, target 1)"));
-    }
-
-    #[tokio::test]
-    async fn test_builder_missing_topic() {
-        let result = CompactedTopicConsumerBuilder::default()
-            .bootstrap_servers("localhost:9092")
-            .build()
-            .await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("topic"));
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "krafka"
-version = "0.17.0"
+version = "0.18.0"
 edition = "2024"
 rust-version = "1.88"
 authors = ["hupe1980"]
@@ -191,6 +191,17 @@ unsafe_code = "deny"
 missing_docs = "deny"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(docsrs)'] }
 rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.rustdoc]
+# A documentation link that resolves to nothing renders as plain text, so the
+# reader sees a name with no way to reach it and the author sees nothing at all.
+# `[crate::producer::ProducerConfigBuilder::max_in_flight]` sat in
+# `ConnectionConfigBuilder`'s docs for several releases after that builder was
+# deleted, pointing at a type the crate no longer had — and CI's
+# `RUSTDOCFLAGS: -Dwarnings` did not catch it, because this lint is
+# allow-by-default for private items.
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "deny"
 
 [lints.clippy]
 # The crate advertises a no-panic posture on every non-test path: broker

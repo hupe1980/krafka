@@ -1614,7 +1614,7 @@ async fn test_admin_list_consumer_groups() {
         .expect("Failed to create admin client");
 
     let groups = admin
-        .list_consumer_groups()
+        .list_consumer_groups(&krafka::admin::GroupListing::all())
         .await
         .expect("Failed to list groups");
 
@@ -1982,7 +1982,10 @@ async fn test_admin_describe_consumer_group() {
         .await
         .unwrap();
 
-    let listed = admin.list_consumer_groups().await.unwrap();
+    let listed = admin
+        .list_consumer_groups(&krafka::admin::GroupListing::all())
+        .await
+        .unwrap();
     eprintln!(
         "list_consumer_groups: [{}]",
         listed

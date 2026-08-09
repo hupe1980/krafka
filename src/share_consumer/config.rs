@@ -99,8 +99,9 @@ pub struct ShareConsumerConfig {
     pub(crate) max_records: i32,
     /// Optimal batch size for acquired records.
     pub(crate) batch_size: i32,
-    /// Maximum wait time for fetch requests.
-    pub(crate) fetch_max_wait_ms: i32,
+    /// How long a broker may hold a `ShareFetch` waiting for
+    /// [`fetch_min_bytes`](Self::fetch_min_bytes) to accumulate.
+    pub(crate) fetch_max_wait: Duration,
     /// Request timeout.
     pub(crate) request_timeout: Duration,
     /// How long TCP establishment to one broker may take.
@@ -133,9 +134,6 @@ pub struct ShareConsumerConfig {
     /// Maximum decompressed size for record batches (compression bomb protection).
     /// Defaults to [`RecordBatch::MAX_DECOMPRESSED_SIZE`](crate::protocol::RecordBatch::MAX_DECOMPRESSED_SIZE) (128 MiB).
     pub(crate) max_decompressed_size: usize,
-    /// SOCKS5 proxy configuration.
-    #[cfg(feature = "socks5")]
-    pub(crate) proxy: Option<crate::network::ProxyConfig>,
     /// Socket- and pool-level transport tuning.
     ///
     /// Defaults reproduce krafka's historical behaviour; see
@@ -156,7 +154,7 @@ impl Default for ShareConsumerConfig {
             max_buffered_records: 500,
             max_records: 5000,
             batch_size: 500,
-            fetch_max_wait_ms: 500,
+            fetch_max_wait: Duration::from_millis(500),
             request_timeout: Duration::from_secs(30),
             connect_timeout: crate::network::DEFAULT_CONNECT_TIMEOUT,
             session_timeout: Duration::from_secs(45),
@@ -168,8 +166,6 @@ impl Default for ShareConsumerConfig {
             metadata_topic_cache_ttl: Some(Duration::from_secs(300)),
             auth: None,
             max_decompressed_size: crate::protocol::RecordBatch::MAX_DECOMPRESSED_SIZE,
-            #[cfg(feature = "socks5")]
-            proxy: None,
             transport: crate::network::TransportConfig::default(),
         }
     }
@@ -210,5 +206,103 @@ impl ShareConsumerConfig {
     #[inline]
     pub fn heartbeat_interval(&self) -> Duration {
         self.heartbeat_interval
+    }
+
+    /// Returns the minimum bytes a broker must have before answering a `ShareFetch`.
+    #[inline]
+    pub fn fetch_min_bytes(&self) -> i32 {
+        self.fetch_min_bytes
+    }
+
+    /// Returns the maximum bytes one `ShareFetch` response may carry.
+    #[inline]
+    pub fn fetch_max_bytes(&self) -> i32 {
+        self.fetch_max_bytes
+    }
+
+    /// Returns the maximum records handed to the application per `poll()`.
+    #[inline]
+    pub fn max_poll_records(&self) -> i32 {
+        self.max_poll_records
+    }
+
+    /// Returns the internal receive-buffer threshold, or `0` when unlimited.
+    #[inline]
+    pub fn max_buffered_records(&self) -> i32 {
+        self.max_buffered_records
+    }
+
+    /// Returns the maximum records the broker may acquire per `ShareFetch`.
+    #[inline]
+    pub fn max_records(&self) -> i32 {
+        self.max_records
+    }
+
+    /// Returns the acquisition batch-size hint sent to the broker.
+    #[inline]
+    pub fn batch_size(&self) -> i32 {
+        self.batch_size
+    }
+
+    /// Returns how long a broker may hold a `ShareFetch` waiting for
+    /// [`fetch_min_bytes`](Self::fetch_min_bytes).
+    #[inline]
+    pub fn fetch_max_wait(&self) -> Duration {
+        self.fetch_max_wait
+    }
+
+    /// Returns the per-request timeout.
+    #[inline]
+    pub fn request_timeout(&self) -> Duration {
+        self.request_timeout
+    }
+
+    /// Returns how long TCP establishment to one broker may take.
+    #[inline]
+    pub fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
+    }
+
+    /// Returns the client rack ID used for closest-replica fetching (KIP-392).
+    #[inline]
+    pub fn client_rack(&self) -> Option<&str> {
+        self.client_rack.as_deref()
+    }
+
+    /// Returns the maximum age of cached metadata before a refresh.
+    #[inline]
+    pub fn metadata_max_age(&self) -> Duration {
+        self.metadata_max_age
+    }
+
+    /// Returns the metadata recovery strategy (KIP-899).
+    #[inline]
+    pub fn metadata_recovery_strategy(&self) -> MetadataRecoveryStrategy {
+        self.metadata_recovery_strategy
+    }
+
+    /// Returns how long refreshes may keep failing before a rebootstrap (KIP-899).
+    #[inline]
+    pub fn metadata_recovery_rebootstrap_trigger(&self) -> Duration {
+        self.metadata_recovery_rebootstrap_trigger
+    }
+
+    /// Returns the topic-cache TTL for partial metadata refreshes, or `None`
+    /// when eviction is disabled.
+    #[inline]
+    pub fn metadata_topic_cache_ttl(&self) -> Option<Duration> {
+        self.metadata_topic_cache_ttl
+    }
+
+    /// Returns the authentication configuration, if any.
+    #[inline]
+    pub fn auth(&self) -> Option<&AuthConfig> {
+        self.auth.as_ref()
+    }
+
+    /// Returns the decompression-bomb ceiling for record batches.
+    #[inline]
+    pub fn max_decompressed_size(&self) -> usize {
+        self.max_decompressed_size
     }
 }

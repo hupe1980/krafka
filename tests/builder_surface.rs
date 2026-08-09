@@ -261,7 +261,6 @@ fn both_producer_builders_share_one_configuration_surface() {
             let _ = |n: usize| $make.batch_size(n);
             let _ = |n: usize| $make.buffer_memory(n);
             let _ = |d: Duration| $make.max_block(d);
-            let _ = |n: usize| $make.max_in_flight(n);
             let _ = |n: usize| $make.max_request_size(n);
             let _ = |n: u32| $make.retries(n);
             let _ = |d: Duration| $make.retry_backoff(d);
@@ -453,6 +452,52 @@ fn client_builders_share_one_configuration_surface() {
 
     #[cfg(feature = "unstable-protocol")]
     assert_common_setters!(krafka::share_consumer::ShareConsumer::builder());
+}
+
+/// Both consuming clients must accept the same read-side hooks and express
+/// their fetch tuning in the same units.
+///
+/// A `ShareConsumer` hands back the same `ConsumerRecord` as a `Consumer` and
+/// speaks a fetch protocol with the same four tuning dimensions, so a reader
+/// who has configured one should not discover that the other simply lacks the
+/// setting. It did:
+///
+///   - `fetch_min_bytes`, `fetch_max_bytes`, `max_records` and `batch_size` —
+///     KIP-932's fetch knobs — were declared on `ShareConsumerConfig` and read
+///     when the `ShareFetch` request was built, with no builder setter. Every
+///     krafka share consumer sent the same four numbers.
+///   - `key_deserializer` / `value_deserializer` existed only on `Consumer`, so
+///     a share-group application had to decode schema framing by hand.
+///   - `fetch_max_wait_ms(i32)` took raw milliseconds where every other timeout
+///     in the crate takes a `Duration`.
+///
+/// `xtask/config_reachability.py` now catches the first class automatically by
+/// walking the config structs. This test pins the cross-client half, which is a
+/// judgement about which settings *should* exist on both.
+#[cfg(feature = "unstable-protocol")]
+#[test]
+fn both_consumers_share_the_read_side_surface() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    macro_rules! assert_consumer_read_surface {
+        ($make:expr) => {{
+            let _ = |d: Duration| $make.fetch_max_wait(d);
+            let _ = |n: i32| $make.fetch_min_bytes(n);
+            let _ = |n: i32| $make.fetch_max_bytes(n);
+            let _ = |n: i32| $make.max_poll_records(n);
+            let _ = |n: i32| $make.max_buffered_records(n);
+            let _ = |d: Arc<dyn krafka::serdes::Deserializer>| $make.key_deserializer(d);
+            let _ = |d: Arc<dyn krafka::serdes::Deserializer>| $make.value_deserializer(d);
+        }};
+    }
+    assert_consumer_read_surface!(krafka::consumer::Consumer::builder());
+    assert_consumer_read_surface!(krafka::share_consumer::ShareConsumer::builder());
+
+    // Share-group-specific acquisition tuning, which the classic consumer has
+    // no analogue for.
+    let _ = |n: i32| krafka::share_consumer::ShareConsumer::builder().max_records(n);
+    let _ = |n: i32| krafka::share_consumer::ShareConsumer::builder().batch_size(n);
 }
 
 /// Every long-lived client must offer the same operational surface.

@@ -97,6 +97,49 @@ consumer.commit_sync_with_timeout(Duration::from_secs(5)).await?;
 | `Accept` | 1 | Record processed successfully |
 | `Release` | 2 | Record released for redelivery to another consumer |
 | `Reject` | 3 | Record rejected (moved to dead-letter after max retries) |
+| `Renew` | 4 | Extend the acquisition lock without completing the record (KIP-1222, Kafka 4.2+) |
+
+### Renewing an acquisition lock
+
+A record you have been given is *acquired*, not consumed: the broker holds a
+lock on it for `group.share.record.lock.duration.ms` and redelivers it to
+another member if that expires. `Renew` extends the lock for work that takes
+longer than the lock lasts.
+
+That requires knowing when the lock expires — and the duration is a
+**broker-side** setting, so it cannot be read from the client's own
+configuration. The broker reports it on every `ShareFetch`, and
+`acquisition_lock_timeout()` is where it surfaces:
+
+```rust,ignore
+use krafka::share_consumer::AcknowledgeType;
+use std::time::{Duration, Instant};
+
+// `None` before the first fetch, and on brokers older than Kafka 4.2.
+let lock = consumer
+    .acquisition_lock_timeout()
+    .unwrap_or(Duration::from_secs(30));
+// Renew once a record is halfway to losing its lock.
+let renew_after = lock / 2;
+
+for record in consumer.poll(Duration::from_secs(1)).await? {
+    let started = Instant::now();
+    // ... long-running work, renewing as it goes ...
+    if started.elapsed() >= renew_after {
+        consumer.acknowledge(&record, AcknowledgeType::Renew).await?;
+    }
+    consumer.acknowledge(&record, AcknowledgeType::Accept).await?;
+}
+```
+
+The lock starts when the broker *acquires* the record — when it builds the
+fetch response — not when `poll()` returns. Treat the value as an upper bound
+on the time remaining and renew with margin.
+
+Brokers older than Kafka 4.2 reject an entire acknowledgement batch containing
+an unknown type, so krafka drops `Renew` acknowledgements when the negotiated
+`ShareFetch`/`ShareAcknowledge` version is below 2 and logs a warning. The lock
+then simply expires, which is the same outcome as not renewing.
 
 ## Delivery Count
 
@@ -146,24 +189,109 @@ while let Some(record) = stream.next().await {
 
 ## Configuration
 
-| Option | Default | Description |
-|---|---|---|
-| `bootstrap_servers` | (required) | Comma-separated broker addresses |
-| `group_id` | (required) | Share group identifier |
-| `client_id` | `"krafka-share-consumer"` | Client identifier |
-| `acknowledgement_mode` | `Implicit` | `Implicit` or `Explicit` |
-| `fetch_min_bytes` | `1` | Minimum bytes per fetch |
-| `fetch_max_bytes` | `52_428_800` | Maximum bytes per fetch |
-| `max_poll_records` | `500` | Maximum records per poll |
-| `max_records` | `-1` | Server-side max records (`-1` = no limit) |
-| `batch_size` | `0` | Server-side batch size hint (`0` = default) |
-| `fetch_max_wait_ms` | `500` | Maximum wait time for fetch responses |
-| `request_timeout` | `30s` | Request timeout |
-| `session_timeout` | `45s` | Session timeout for group membership |
-| `heartbeat_interval` | `5s` | Heartbeat interval (must be < session_timeout) |
-| `metadata_max_age` | `5min` | Metadata cache TTL |
-| `metadata_topic_cache_ttl` | `Some(5min)` | TTL for topic entries in the partial-refresh cache. `None` disables eviction. Use `disable_metadata_topic_cache_ttl()` to opt out. |
-| `client_rack` | `None` | Rack ID for rack-aware fetching |
+Every option below has a builder setter and a matching accessor on
+`ShareConsumerConfig`, checked in CI by `just config-reachability` — four of
+the fetch knobs were previously declared, sent on the wire, and settable by
+nobody.
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `bootstrap_servers` | String | (required) | Comma-separated broker addresses |
+| `group_id` | String | (required) | Share group identifier |
+| `client_id` | String | `"krafka"` | Client identifier sent with requests |
+| `acknowledgement_mode` | AcknowledgementMode | `Implicit` | `Implicit` or `Explicit` |
+| `fetch_min_bytes` | i32 | `1` | Minimum bytes a broker must have before answering a `ShareFetch` |
+| `fetch_max_bytes` | i32 | `52_428_800` | Maximum bytes one `ShareFetch` response may carry (50 MiB) |
+| `fetch_max_wait` | Duration | `500ms` | How long a broker may hold a `ShareFetch` waiting for `fetch_min_bytes`. Capped by the `poll()` timeout |
+| `max_poll_records` | i32 | `500` | Maximum records handed to the application per `poll()` (must be ≥ 1) |
+| `max_buffered_records` | i32 | `500` | Soft threshold on the internal receive buffer; `0` disables the cap |
+| `max_records` | i32 | `5000` | Maximum records the broker may **acquire** for this member per `ShareFetch` (KIP-932 `MaxRecords`) |
+| `batch_size` | i32 | `500` | Acquisition batch-size hint sent to the broker (KIP-932 `BatchSize`) |
+| `request_timeout` | Duration | `30s` | Per-request timeout |
+| `connect_timeout` | Duration | `10s` | How long TCP establishment to one broker may take; also the floor on `request_timeout` |
+| `session_timeout` | Duration | `45s` | Session timeout for group membership |
+| `heartbeat_interval` | Duration | `5s` | Heartbeat interval (must be < `session_timeout`) |
+| `metadata_max_age` | Duration | `5min` | Metadata cache TTL |
+| `metadata_topic_cache_ttl` | `Option<Duration>` | `Some(5min)` | TTL for topic entries in the partial-refresh cache. `None` disables eviction; use `disable_metadata_topic_cache_ttl()` to opt out |
+| `metadata_recovery_strategy` | MetadataRecoveryStrategy | `Rebootstrap` | What to do when every known broker becomes unreachable (KIP-899) |
+| `metadata_recovery_rebootstrap_trigger` | Duration | `5min` | How long refreshes may keep failing before re-bootstrapping |
+| `client_rack` | `Option<String>` | `None` | Rack ID for closest-replica fetching (KIP-392) |
+| `max_decompressed_size` | usize | 128 MiB | Decompression-bomb ceiling for record batches |
+| `key_deserializer` / `value_deserializer` | `Arc<dyn Deserializer>` | `None` | Applied to every consumed record — the same hook as the subscription consumer |
+
+### `max_records` is not `max_poll_records`
+
+They bound different things and it matters here more than on a subscription
+consumer:
+
+- **`max_poll_records`** caps what one `poll()` call hands *the application*.
+  Surplus stays in the client's receive buffer.
+- **`max_records`** caps what the broker *acquires* for this member. An acquired
+  record holds an acquisition lock until it is acknowledged or the lock expires,
+  so this bounds how much of the share group's backlog one member can hold
+  hostage — and therefore how much work is stalled if the member dies.
+
+Lower `max_records` for faster failover between members; raise it for
+throughput when members are long-lived.
+
+### Deserializers
+
+A share consumer hands back the same `ConsumerRecord` as a subscription
+consumer, so it takes the same
+[`Deserializer`](https://docs.rs/krafka/latest/krafka/serdes/trait.Deserializer.html)
+hook:
+
+```rust,compile
+use bytes::Bytes;
+use krafka::serdes::Deserializer;
+use krafka::share_consumer::ShareConsumer;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
+/// Strips a 5-byte Confluent-style framing header.
+struct StripHeader;
+
+impl Deserializer for StripHeader {
+    fn deserialize(
+        &self,
+        payload: Bytes,
+        _topic: &str,
+        _is_key: bool,
+    ) -> Pin<Box<dyn Future<Output = krafka::Result<Bytes>> + Send + '_>> {
+        Box::pin(async move {
+            if payload.len() < 5 {
+                return Err(krafka::KrafkaError::serialization("payload is not framed"));
+            }
+            Ok(payload.slice(5..))
+        })
+    }
+}
+
+let consumer = ShareConsumer::builder()
+    .bootstrap_servers("localhost:9092")
+    .group_id("my-share-group")
+    .value_deserializer(Arc::new(StripHeader))
+    .build()
+    .await?;
+```
+
+A record the decoder rejects fails the `poll()` with
+`KrafkaError::RecordDeserialization { topic, partition, offset, .. }`. Unlike a
+subscription consumer there is no `seek()` to skip it — the share-group remedy
+is to reject the offset so the broker stops redelivering it:
+
+```rust
+consumer
+    .acknowledge_by_offset(&topic, partition, offset, AcknowledgeType::Reject)
+    .await?;
+```
+
+That call needs the record to be registered as pending, so deserialization runs
+*after* registration. The consequence is worth knowing: in `Implicit` mode the
+batch has already been queued for `Accept` by the time the failure surfaces,
+because that is what implicit mode means. Use `Explicit` mode when the
+application needs to arbitrate poison records.
 
 ### Metadata Topic Cache TTL
 

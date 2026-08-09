@@ -46,6 +46,45 @@ use crate::protocol::{
 /// instead of racing the client-side deadline.
 const JOIN_GROUP_TIMEOUT_SLACK: Duration = Duration::from_secs(5);
 
+/// How many times `OffsetFetch` is re-issued while the coordinator reports that
+/// a partition's committed offset is staged inside an unresolved transaction
+/// (`UNSTABLE_OFFSET_COMMIT`, KIP-447).
+///
+/// Sized to absorb a normal transaction round trip — a few hundred
+/// milliseconds — not a transaction that is genuinely stuck. Beyond it the
+/// error is surfaced and the poll loop's offset-resolution retry becomes the
+/// outer loop, which is unbounded and already backs off.
+const UNSTABLE_OFFSET_MAX_ATTEMPTS: u32 = 5;
+
+/// Whether `OffsetFetch` must ask the coordinator for **stable** offsets
+/// (KIP-447), given the consumer's isolation level.
+///
+/// Only `read_committed` needs it. Asking for it under `read_uncommitted`
+/// would block a consumer's startup on an unrelated producer's open
+/// transaction while it is already, by configuration, willing to read
+/// uncommitted data.
+fn require_stable_for(isolation_level: i8) -> bool {
+    isolation_level == crate::consumer::IsolationLevel::ReadCommitted.to_i8()
+}
+
+/// The first partition whose committed offset is staged inside an unresolved
+/// transaction, if any.
+///
+/// Separated from the fetch so the decision can be tested: the dangerous
+/// failure here is *not* noticing, because an unnoticed
+/// `UNSTABLE_OFFSET_COMMIT` leaves the partition out of the result map and
+/// every caller reads a missing entry as "never committed" — which means
+/// `auto.offset.reset`.
+fn first_unstable_offset(response: &OffsetFetchResponse) -> Option<(&str, crate::PartitionId)> {
+    response.topics.iter().find_map(|topic| {
+        topic
+            .partitions
+            .iter()
+            .find(|p| p.error_code == ErrorCode::UnstableOffsetCommit)
+            .map(|p| (topic.name.as_str(), p.partition_index))
+    })
+}
+
 /// Callback interface for partition rebalance events.
 /// Async callback interface for partition rebalance events.
 ///
@@ -2134,10 +2173,31 @@ impl GroupCoordinator {
         };
         let topics = self.subscribed_topics.read().await.clone();
 
-        // If we're the leader, compute assignments
-        let assignments = if join_response.is_leader() {
+        // If we're the leader, compute assignments — unless the coordinator
+        // told us not to.
+        //
+        // KIP-814: when a static member rejoins and the coordinator still holds
+        // a valid assignment for the group, it sets `skip_assignment` on the
+        // leader's JoinGroup response and sends no member metadata. The leader
+        // must then send an *empty* assignment and let the coordinator's
+        // persisted one stand.
+        //
+        // Ignoring the flag happened to be harmless only because the member
+        // list arrives empty in that case, so the assignor produced nothing to
+        // send. That is obedience by accident: a leader that computes an
+        // assignment whenever it is the leader has taken assignment authority
+        // the coordinator explicitly reclaimed, and any future response that
+        // pairs `skip_assignment` with a non-empty member list would have it
+        // overwrite the coordinator's decision.
+        let assignments = if join_response.is_leader() && !join_response.skip_assignment {
             self.compute_assignments(&topics, &join_response.members)?
         } else {
+            if join_response.skip_assignment {
+                debug!(
+                    group = %self.group_id,
+                    "Coordinator set skip_assignment (KIP-814); deferring to its                      existing assignment"
+                );
+            }
             Vec::new()
         };
 
@@ -2216,7 +2276,7 @@ impl GroupCoordinator {
             inner.state = GroupState::Stable;
         }
 
-        info!(
+        debug!(
             "Synced group '{}': received {} topic assignments",
             self.group_id,
             assignment.partitions.len()
@@ -3081,7 +3141,7 @@ impl GroupCoordinator {
             }
         }
 
-        info!(
+        debug!(
             "ConsumerGroupHeartbeat OK for group '{}': member_id='{}', epoch={}, interval={}ms",
             self.group_id,
             hb_response.member_id.as_deref().unwrap_or(""),
@@ -3944,7 +4004,7 @@ impl GroupCoordinator {
             }
         }
 
-        info!(
+        debug!(
             "Committed {} offsets for group '{}'",
             offsets.len(),
             self.group_id
@@ -3956,7 +4016,66 @@ impl GroupCoordinator {
     ///
     /// Returns the committed offset for each topic-partition, or `None` if
     /// no offset has been committed for that partition.
+    /// Fetch the group's committed offsets, absorbing an in-flight
+    /// transactional commit.
+    ///
+    /// A `read_committed` consumer asks for **stable** offsets (KIP-447), and
+    /// the coordinator answers `UNSTABLE_OFFSET_COMMIT` for any partition whose
+    /// offset is staged inside a transaction that has not resolved. That is a
+    /// wait, not a failure: the transaction commits or aborts within its own
+    /// timeout, and the answer changes.
+    ///
+    /// The retry lives here rather than at the call sites because those are
+    /// `subscribe()` and the rebalance's assignment step — failing either
+    /// because some unrelated producer happened to have a transaction open is
+    /// not a useful error. Backoff is jittered: a rebalancing group has every
+    /// member calling this against the same coordinator at the same moment.
+    ///
+    /// Bounded, not unbounded. A transaction may legitimately stay open for
+    /// `transaction.timeout.ms` (60 s by default), which is longer than the
+    /// session timeout — so past this budget the error is surfaced, and the
+    /// poll loop's own offset-resolution retry takes over as the outer loop.
     pub async fn fetch_committed_offsets(
+        &self,
+        partitions: &HashMap<String, Vec<crate::PartitionId>>,
+    ) -> Result<HashMap<(String, crate::PartitionId), crate::consumer::CommittedPosition>> {
+        let backoff = crate::util::BackoffPolicy::default();
+        let mut last_error = None;
+
+        for attempt in 0..UNSTABLE_OFFSET_MAX_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(backoff.calculate_backoff(attempt)).await;
+            }
+            match self.fetch_committed_offsets_once(partitions).await {
+                Err(error)
+                    if matches!(
+                        error,
+                        KrafkaError::Broker {
+                            code: ErrorCode::UnstableOffsetCommit,
+                            ..
+                        }
+                    ) =>
+                {
+                    debug!(
+                        group = %self.group_id,
+                        attempt = attempt + 1,
+                        "committed offsets are staged inside an in-flight transaction; retrying"
+                    );
+                    last_error = Some(error);
+                }
+                other => return other,
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            KrafkaError::broker(
+                ErrorCode::UnstableOffsetCommit,
+                "committed offsets did not stabilise",
+            )
+        }))
+    }
+
+    async fn fetch_committed_offsets_once(
         &self,
         partitions: &HashMap<String, Vec<crate::PartitionId>>,
     ) -> Result<HashMap<(String, crate::PartitionId), crate::consumer::CommittedPosition>> {
@@ -4022,10 +4141,25 @@ impl GroupCoordinator {
                 (None, -1)
             };
 
+        // KIP-447: a `read_committed` consumer must ask for **stable** offsets.
+        //
+        // Without this the coordinator returns the latest offset written to
+        // `__consumer_offsets`, including one written by a `TxnOffsetCommit`
+        // whose transaction has not completed. If that transaction later
+        // aborts, the offset it staged is retracted — but a consumer that read
+        // it has already resumed past those records, and they are never
+        // reprocessed. Silent data loss on the exactly-once recovery path, in
+        // the window a crash is most likely to land in.
+        //
+        // `read_uncommitted` consumers ask for the unstable value deliberately:
+        // they are already reading uncommitted data, and blocking their
+        // startup on an unrelated producer's open transaction would be worse.
+        let require_stable = require_stable_for(self.isolation_level);
+
         let request = OffsetFetchRequest {
             group_id: self.group_id.clone(),
             topics: Some(topics),
-            require_stable: false,
+            require_stable,
             member_id: offset_fetch_member_id,
             member_epoch: offset_fetch_member_epoch,
         };
@@ -4080,6 +4214,28 @@ impl GroupCoordinator {
             ));
         }
 
+        // A partition whose offset is staged inside an in-flight transaction
+        // answers `UNSTABLE_OFFSET_COMMIT` when `require_stable` is set. That
+        // is a *retry*, not an absent offset.
+        //
+        // Falling through to the loop below would drop the partition from the
+        // result, and every caller reads a missing entry as "this group has
+        // never committed here" — which sends the partition through
+        // `auto.offset.reset`. On an exactly-once pipeline that turns a
+        // 200 ms wait for a transaction to resolve into a rewind to the start
+        // of the topic, or a jump to its end. The silent-drop is the more
+        // dangerous half of this defect: it only bites once `require_stable`
+        // is set, so fixing the flag without this would have made things worse.
+        if let Some((topic, partition)) = first_unstable_offset(&offset_response) {
+            return Err(KrafkaError::broker(
+                ErrorCode::UnstableOffsetCommit,
+                format!(
+                    "committed offset for {topic}-{partition} is staged inside an \
+                     in-flight transaction; retry once it commits or aborts"
+                ),
+            ));
+        }
+
         let mut result = HashMap::new();
         for topic in &offset_response.topics {
             for partition in &topic.partitions {
@@ -4099,7 +4255,7 @@ impl GroupCoordinator {
             }
         }
 
-        info!(
+        debug!(
             "Fetched {} committed offsets for group '{}'",
             result.len(),
             self.group_id
@@ -4550,7 +4706,7 @@ impl GroupCoordinator {
     /// Reset group state for KIP-848 fencing errors (FencedMemberEpoch,
     /// UnknownMemberId, UnreleasedInstanceId).
     ///
-    /// Unlike [`reset_member_identity`], this preserves `member_id`:
+    /// Unlike `reset_member_identity`, this preserves `member_id`:
     /// KIP-848 requires fenced members to "rejoin with the same member id
     /// and epoch 0". Sticky assignor, assignment, and target state are
     /// cleared because the coordinator revoked all partitions on fencing.
@@ -4999,6 +5155,104 @@ impl std::fmt::Debug for GroupCoordinator {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+
+    // ── KIP-447: stable committed offsets ─────────────────────────────────
+    //
+    // A `read_committed` consumer that resumes from an offset staged inside a
+    // transaction which later *aborts* has skipped records the abort was
+    // supposed to make it reprocess. Silent data loss on the exactly-once
+    // recovery path, in the window a crash is most likely to land in.
+
+    /// `require_stable` follows the isolation level, and only that.
+    #[test]
+    fn require_stable_is_asked_for_only_under_read_committed() {
+        use crate::consumer::IsolationLevel;
+
+        assert!(
+            require_stable_for(IsolationLevel::ReadCommitted.to_i8()),
+            "a read_committed consumer must not resume from an unresolved \
+             transactional offset"
+        );
+        assert!(
+            !require_stable_for(IsolationLevel::ReadUncommitted.to_i8()),
+            "a read_uncommitted consumer must not be blocked on someone \
+             else's open transaction"
+        );
+    }
+
+    fn offset_fetch_partition(
+        partition_index: crate::PartitionId,
+        error_code: ErrorCode,
+    ) -> crate::protocol::OffsetFetchResponsePartition {
+        crate::protocol::OffsetFetchResponsePartition {
+            partition_index,
+            committed_offset: 42,
+            committed_leader_epoch: 7,
+            metadata: None,
+            error_code,
+        }
+    }
+
+    fn offset_fetch_response(
+        partitions: Vec<crate::protocol::OffsetFetchResponsePartition>,
+    ) -> OffsetFetchResponse {
+        OffsetFetchResponse {
+            throttle_time_ms: 0,
+            topics: vec![crate::protocol::OffsetFetchResponseTopic {
+                name: "orders".to_string(),
+                topic_id: None,
+                partitions,
+            }],
+            error_code: ErrorCode::None,
+        }
+    }
+
+    /// An `UNSTABLE_OFFSET_COMMIT` partition must be *noticed*.
+    ///
+    /// This is the more dangerous half of the defect, and it only becomes
+    /// reachable once `require_stable` is set — so fixing the flag without
+    /// this would have made things worse than leaving both alone. The
+    /// result-building loop keeps partitions whose `error_code.is_ok()`, so an
+    /// unnoticed unstable partition is simply absent from the map, and every
+    /// caller reads a missing entry as "this group never committed here":
+    /// `auto.offset.reset`, i.e. a rewind to the start of the topic or a jump
+    /// to its end, in place of a few hundred milliseconds of waiting.
+    #[test]
+    fn an_unstable_offset_is_reported_rather_than_dropped() {
+        let response = offset_fetch_response(vec![
+            offset_fetch_partition(0, ErrorCode::None),
+            offset_fetch_partition(1, ErrorCode::UnstableOffsetCommit),
+        ]);
+
+        assert_eq!(
+            first_unstable_offset(&response),
+            Some(("orders", 1)),
+            "a partition staged inside an in-flight transaction must be surfaced"
+        );
+    }
+
+    /// A clean response reports nothing, so the common path pays no penalty.
+    #[test]
+    fn a_stable_response_reports_no_unstable_partition() {
+        let response = offset_fetch_response(vec![
+            offset_fetch_partition(0, ErrorCode::None),
+            // An unrelated per-partition error must not be mistaken for one.
+            offset_fetch_partition(1, ErrorCode::UnknownTopicOrPartition),
+        ]);
+        assert_eq!(first_unstable_offset(&response), None);
+    }
+
+    /// The retry must be able to end, and `UNSTABLE_OFFSET_COMMIT` must be
+    /// classified retriable or the outer poll loop would give up on it.
+    #[test]
+    fn the_unstable_offset_retry_is_bounded_and_the_error_is_retriable() {
+        assert!((2..=10).contains(&UNSTABLE_OFFSET_MAX_ATTEMPTS));
+        assert!(
+            ErrorCode::UnstableOffsetCommit.is_retriable(),
+            "the poll loop's offset-resolution retry is the outer loop here"
+        );
+    }
+
     use super::*;
 
     fn test_coordinator(

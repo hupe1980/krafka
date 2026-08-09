@@ -128,14 +128,13 @@ gzip, snappy, and LZ4. Zstd remains available through the explicit `zstd` or
 
 To trim binary size further, disable defaults and select only the codecs you need:
 
-```toml
-# Option 1: enable only the codecs you need
-# `default-features = false` also drops the default `ring` TLS backend, so a
-# crypto backend must be named explicitly.
-krafka = { version = "0.17.0", default-features = false, features = ["lz4", "ring"] }
+```sh
+# Only the codecs you need. `--no-default-features` also drops the default
+# `ring` TLS backend, so a crypto backend must be named explicitly.
+cargo add krafka --no-default-features --features lz4,ring
 
-# Option 2: enable all compression codecs, including zstd
-# krafka = { version = "0.17.0", features = ["compression-all"] }
+# Or every codec, including zstd:
+cargo add krafka --features compression-all
 ```
 
 #### Compression level
@@ -163,10 +162,9 @@ time**, as is a level outside the codec's range, and per-topic codec overrides
 are validated against it too. Neither case is silently ignored: a tuning knob
 that quietly does nothing is how a deployment ships believing it was tuned.
 
-The level applies on both send paths — batched (`linger > 0`) and direct
-(`linger = 0`) — and on the `TransactionalProducer`, which always batches. The
-same rules are enforced by one shared validator, so a codec check cannot exist
-on one producer and not the other.
+The level applies to the plain producer and to the `TransactionalProducer`
+alike, enforced by one shared validator, so a codec check cannot exist on one
+producer and not the other.
 
 Higher is not better. zstd's output size is **not monotonic** in level — the
 match-finding strategy changes as levels rise, and on realistic record payloads
@@ -190,17 +188,41 @@ let producer = Producer::builder()
     .await?;
 ```
 
-### Linger Timer
+### What `linger` actually controls
 
-When `linger` is set (> 0ms), the producer uses a background accumulator to batch records:
+Every send goes through the record accumulator — there is no separate
+unbatched path, at any `linger` setting. Records are accumulated per
+partition and a batch is dispatched when:
 
-- Records are accumulated per partition
-- Batches are sent when either:
-  - The batch reaches `batch_size` bytes, or
-  - The `linger` timer expires
-- This reduces the number of requests, improving throughput
+- it reaches `batch_size` bytes, **or**
+- the `linger` window expires, **or**
+- the partition has no batch in flight (this is the `linger = 0` case).
 
-For ultra-low latency (linger = 0), records are sent immediately without batching.
+`linger` is therefore "how long may a batch *wait* for company", not "may this
+producer batch at all". At `linger = 0` the first record goes out immediately —
+nothing is on the wire, so there is nothing to wait for — and the records that
+arrive during that round trip coalesce into the next batch, which is dispatched
+the instant the acknowledgement lands. You pay no added latency and still get
+batching under load. This is what `linger.ms = 0` means in the Java client, and
+it is worth an order of magnitude: 200 concurrent sends to one partition leave
+krafka as **3** Produce requests, not 200.
+
+Raise `linger` when you want to trade a bounded amount of latency for larger
+batches even when the producer is *not* saturated — a bursty, low-rate
+publisher will not fill a batch on its own.
+
+### One batch per partition on the wire
+
+krafka keeps exactly **one** batch per partition in flight, and batches take
+their turn in the order the accumulator sealed them. Different partitions
+proceed concurrently and are never serialised against each other.
+
+That is a stronger guarantee than the Java client's, and it is why krafka has
+no `max.in.flight.requests.per.connection` knob to get wrong: sequence order
+and wire order cannot diverge, so idempotent production needs no
+"≤ 5 in flight" rule, and a retry cannot reorder a partition. The per-connection
+in-flight ceiling that *does* exist is a transport concern — see
+[`TransportConfig::max_in_flight_requests`](@/docs/configuration.md).
 
 > **Note:** `batch_size` must be at least 1. Setting `batch_size` to 0 will cause the builder to return a configuration error.
 
@@ -230,10 +252,10 @@ let producer = Producer::builder()
     .build()
     .await?;
 
-// Low-latency configuration
+// Low-latency configuration (this is also the default)
 let producer = Producer::builder()
     .bootstrap_servers("localhost:9092")
-    .linger(Duration::from_millis(0))       // No batching, send immediately
+    .linger(Duration::ZERO)                 // Never wait; still coalesces under load
     .build()
     .await?;
 ```
@@ -259,11 +281,19 @@ let producer = Producer::builder()
 | `buffer_memory` | 32 MB | Maximum total memory for buffering records |
 | `max_block` | 60s | Maximum time to block when buffer is full |
 
-The `buffer_memory` and `max_block` settings apply to both batching (`linger > 0`) and direct-send mode (`linger = 0`). Once a record is admitted, it holds a share of the producer memory budget until it is acknowledged or fails, so direct sends and accumulator batches obey the same backpressure contract. If memory is unavailable, `send()` blocks the caller for up to `max_block` before returning an error. This matches the Kafka Java client's `max.block.ms` behavior and prevents both OOM conditions and unnecessary record loss under bursty load.
+Once a record is admitted it holds a share of the producer memory budget until
+it is acknowledged or fails. If memory is unavailable, `send()` blocks the
+caller for up to `max_block` before returning an error — the Kafka Java
+client's `max.block.ms` behaviour, which prevents both OOM conditions and
+unnecessary record loss under bursty load.
+
+That wait is charged against `delivery_timeout`: the clock starts when you call
+`send()`, not when the record reaches a batch, so a record that spent 30 s
+blocked on backpressure does not then get a full fresh delivery budget.
 
 ## Flushing
 
-Call `flush()` whenever you need a durability barrier over records that have already been handed to the producer. This now covers both linger-based batching and direct-send mode (`linger = 0`):
+Call `flush()` whenever you need a durability barrier over records that have already been handed to the producer:
 
 ```rust,compile
 // Send multiple records
@@ -423,7 +453,9 @@ let producer = Producer::builder()
 
 The producer defaults to `delivery_timeout = 120s` and `retries = u32::MAX`, so transient failures are retried until the delivery budget is exhausted. Backoff durations are clamped to the remaining budget so the producer does not overshoot. If the budget is exhausted, the send fails immediately regardless of the remaining retry count.
 
-> **Note:** By default `linger` is `0` (no batching delay), so the delivery timeout is nearly equivalent to network time + retry time. With `linger > 0`, add the maximum linger window to your delivery timeout budget.
+> **Note:** By default `linger` is `0`, so a record never waits for a batching
+> window and the delivery timeout is essentially backpressure + network + retry
+> time. With `linger > 0`, add the maximum linger window to the budget.
 
 ### Manual Retry
 
@@ -565,9 +597,10 @@ let producer = Producer::builder()
 > **Idempotent by default (KIP-679):** Since Kafka 3.0, idempotent production is the default.
 > The regular `Producer` now obtains a Producer ID via `InitProducerId` at startup,
 > tracks sequence numbers per partition, and de-duplicates retries automatically.
-> `acks = All` is required when idempotent is enabled. If `max_in_flight` is set
-> above 5, it is **automatically capped to 5** (matching Java client and librdkafka
-> behaviour), with an `info!` log so operators can see the adjustment.
+> `acks = All` is required when idempotent is enabled. Unlike the Java client
+> and librdkafka there is no in-flight-request limit to observe: krafka keeps
+> exactly one batch per partition on the wire, so sequence order and wire order
+> cannot diverge and KIP-679's "≤ 5 in flight" rule has nothing to protect.
 > The `InitProducerId` call retries on retriable errors (e.g. `CoordinatorLoadInProgress`)
 > with exponential backoff, rotating through available brokers on each attempt.
 >
@@ -581,21 +614,22 @@ let producer = Producer::builder()
 >
 > For cross-session exactly-once semantics (transactions), use `TransactionalProducer`.
 
-### Concurrency Control
+### Concurrency control
 
-The producer enforces `max_in_flight` to limit concurrent in-flight produce requests.
-This is critical for ordering guarantees and is implemented via a semaphore:
+There is nothing to configure for per-partition ordering: the accumulator's
+dispatch FIFO already permits exactly one batch per partition on the wire, and
+batches take their turn in seal order. A retry cannot reorder a partition, and
+an idempotent producer's sequence order always matches its wire order.
 
-```rust,compile
-use krafka::producer::{Producer, Acks};
+Concurrency across partitions is bounded in two independent places:
 
-let producer = Producer::builder()
-    .bootstrap_servers("localhost:9092")
-    .acks(Acks::All)
-    .max_in_flight(1)    // Strict ordering (at most 1 concurrent send)
-    .build()
-    .await?;
-```
+- **Per connection** — [`TransportConfig::max_in_flight_requests`](@/docs/configuration.md)
+  caps how many requests may be outstanding on a single broker socket.
+- **Per producer** — the accumulator caps how many batch-send tasks run at
+  once, so an overlapping burst of linger waves cannot spawn unboundedly.
+
+Both are transport concerns. Neither affects ordering, because ordering is not
+bought with concurrency limits here.
 
 ## Graceful Shutdown
 
@@ -904,6 +938,35 @@ them to the local identity, so subsequent `AddPartitionsToTxn` requests use the 
 For brokers that do not support `EndTxn` v4+ (Kafka < 3.7), the response omits these fields and
 krafka continues with the unchanged epoch — the pre-KIP-890 protocol is used transparently.
 
+#### Negotiated transaction version
+
+krafka negotiates one protocol level for the cluster and reports it at
+`init_transactions()`:
+
+| Level | `transaction.version` | What changes |
+|---|---|---|
+| `TV1` | 0 or 1 | Classic. `AddPartitionsToTxn` per partition; the epoch bumps only on `InitProducerId` |
+| `TV2` | 2 | KIP-890. Partitions register implicitly via `Produce`; the epoch bumps on every `EndTxn` |
+| `TV3` | 3 | KIP-939. Everything TV2 does, plus the coordinator honours `enable2Pc` |
+
+Two rules govern the negotiation, and both exist because getting them wrong is
+silent:
+
+- **The level alone is not evidence.** Finalized features are cluster-wide
+  metadata and can be observed before every broker has restarted into a build
+  that serves the matching API versions. krafka additionally requires the API
+  versions each level depends on — `Produce`, `TxnOffsetCommit` and `EndTxn`
+  for TV2, `InitProducerId` v6 for TV3. A broker that cannot encode `enable2Pc`
+  does not *reject* it; the field is simply absent, and the coordinator applies
+  `transaction.max.timeout.ms` to a transaction the caller believes is exempt.
+- **The cluster level is the minimum across brokers.** One lagging broker
+  during a rolling upgrade holds the whole cluster at the level it can serve,
+  so 2PC never turns on before every broker can honour it.
+
+`two_phase_commit(true)` on a cluster below TV3 fails at `init_transactions()`
+with a message naming the feature level, the API version and the ACL required
+— rather than surfacing the broker's bare `UNSUPPORTED_VERSION`.
+
 ### Persisting Producer State
 
 `ProducerStateStore` is a hook for saving and restoring the producer's identity
@@ -1004,9 +1067,97 @@ The producer maintains a state machine with atomic CAS (compare-and-swap) transi
 | `InTransaction` | Transaction in progress |
 | `Committing` | Transaction being committed |
 | `Aborting` | Transaction being aborted |
+| `Prepared` | Prepared under two-phase commit; awaiting an external decision |
+| `CommitIndeterminate` | `EndTxn(commit)` was dispatched and its outcome is unknown |
 | `FatalError` | Unrecoverable error, producer must be recreated |
 
 > **Note:** State transitions are protected by atomic compare-and-swap operations, preventing race conditions when multiple tasks interact with the transactional producer concurrently.
+
+### Two-phase commit (KIP-939)
+
+*Requires the `unstable-protocol` feature (`InitProducerId` v6), broker
+`transaction.version` 3, and both `WRITE` and `TWO_PHASE_COMMIT` on the
+transactional-id resource.*
+
+Kafka transactions are atomic within Kafka. They are not atomic with anything
+*else* — so a service that must write to Kafka **and** a database, either both
+or neither, has no way to express that with `commit_transaction()` alone.
+KIP-939 supplies the missing half: an external coordinator (a database, an XA
+manager, a workflow engine) owns the commit decision, and Kafka's side is held
+in doubt until that decision arrives.
+
+The obstacle is `transaction.max.timeout.ms`. Ordinarily the coordinator aborts
+a transaction that stays open too long — which is exactly right when Kafka owns
+the decision, and exactly wrong when it does not. `two_phase_commit(true)` sends
+`enable2Pc` on `InitProducerId`, and the broker then never times these
+transactions out.
+
+```rust,ignore
+use krafka::producer::{PreparedTxnState, TransactionOutcome, TransactionalProducer};
+
+let producer = TransactionalProducer::builder()
+    .bootstrap_servers("localhost:9092")
+    .transactional_id("orders-sink")
+    .two_phase_commit(true)   // contradicts transaction_timeout; setting both is an error
+    .build()
+    .await?;
+
+producer.init_transactions().await?;
+producer.begin_transaction()?;
+producer.send("orders", None, b"...").await?;
+
+// Prepare: flush everything, then stop accepting records. Sends no request —
+// the prepare *is* the flush, and the coordinator was already told to hold.
+let prepared: PreparedTxnState = producer.prepare_transaction().await?;
+
+// Store it in the SAME external transaction as the rest of your work.
+db.execute("INSERT INTO kafka_prepared (id, state) VALUES ($1, $2)",
+           &[&"orders-sink", &prepared.to_string()])?;
+db.commit()?;
+
+producer.commit_transaction().await?;
+```
+
+**Recovery is the point of all this.** If the process dies between the flush and
+the database commit, the replacement asks the coordinator what it is still
+holding and compares:
+
+```rust,ignore
+let producer = TransactionalProducer::builder()
+    .bootstrap_servers("localhost:9092")
+    .transactional_id("orders-sink")
+    .two_phase_commit(true)
+    .build()
+    .await?;
+
+// Unlike init_transactions(), this does NOT abort what the previous
+// incarnation left open.
+if let Some(_ongoing) = producer.init_transactions_keeping_prepared().await? {
+    let stored: PreparedTxnState = db
+        .query_one("SELECT state FROM kafka_prepared WHERE id = $1", &[&"orders-sink"])?
+        .get::<_, String>(0)
+        .parse()?;
+
+    match producer.complete_transaction(stored).await? {
+        // The stored state names the transaction still open: the prepare was
+        // durably recorded, so the external side committed and this must match.
+        TransactionOutcome::Committed => println!("recovered and committed"),
+        // It names an older one: the prepare never got recorded, the external
+        // side rolled back, and this must abort. A *normal* outcome of a crash
+        // in the window, not an error.
+        TransactionOutcome::Aborted => println!("recovered and aborted"),
+    }
+}
+```
+
+`PreparedTxnState` renders as `producer_id:epoch` through `Display` and parses
+back through `FromStr`, so storing it needs no bespoke serialisation.
+
+> **A prepared transaction with no stored state cannot be resolved by anything
+> except a human.** It sits in doubt indefinitely — that is what disabling the
+> timeout buys — and blocks `read_committed` consumers on its partitions the
+> whole time. Write the state durably *before* you report the prepare as
+> successful, and treat a prepared transaction you cannot match as an incident.
 
 ## Producer Interceptors
 

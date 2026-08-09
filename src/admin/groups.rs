@@ -17,6 +17,62 @@ use crate::protocol::{
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+/// Server-side filter for [`AdminClient::list_consumer_groups`].
+///
+/// Both filters are applied by the broker, which is the point: a cluster can
+/// hold tens of thousands of consumer groups, and listing all of them to keep
+/// the three that are `Empty` transfers the entire group registry over the
+/// network on every call. Filtering client-side is correct and does not scale.
+///
+/// An empty filter means "no restriction". Brokers that predate the filter
+/// ignore it — `states_filter` needs `ListGroups` v4 (KIP-518) and
+/// `types_filter` needs v5 (KIP-848) — so a filtered call against an old
+/// broker returns more than asked for rather than failing.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default)]
+pub struct GroupListing {
+    /// Group states to include, e.g. `"Empty"`, `"Stable"`, `"Dead"`.
+    pub states: Vec<String>,
+    /// Group types to include, e.g. `"consumer"`, `"classic"`, `"share"`.
+    pub types: Vec<String>,
+}
+
+impl GroupListing {
+    /// No restriction — every group the broker knows about.
+    #[must_use]
+    pub fn all() -> Self {
+        Self::default()
+    }
+
+    /// Restrict to the given group states.
+    ///
+    /// The canonical spellings are Kafka's own: `PreparingRebalance`,
+    /// `CompletingRebalance`, `Stable`, `Dead`, `Empty`. They are passed
+    /// through verbatim, so a state a future broker adds needs no crate
+    /// release.
+    #[must_use]
+    pub fn in_states<I, S>(mut self, states: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.states = states.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Restrict to the given group types (KIP-848): `classic`, `consumer`,
+    /// `share`, `streams`.
+    #[must_use]
+    pub fn of_types<I, S>(mut self, types: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.types = types.into_iter().map(Into::into).collect();
+        self
+    }
+}
+
 impl AdminClient {
     /// Describe consumer groups.
     ///
@@ -308,12 +364,19 @@ impl AdminClient {
     ///
     /// # Example
     /// ```ignore
-    /// let groups = admin.list_consumer_groups().await?;
+    /// let groups = admin.list_consumer_groups(&GroupListing::all()).await?;
     /// for group in &groups {
     ///     println!("{} ({})", group.group_id, group.protocol_type);
     /// }
     /// ```
-    pub async fn list_consumer_groups(&self) -> Result<Vec<ConsumerGroupListing>> {
+    ///
+    /// `filter` is applied by the **broker**. On a cluster with thousands of
+    /// groups that is the difference between transferring the whole registry
+    /// and transferring the handful you asked about — see [`GroupListing`].
+    pub async fn list_consumer_groups(
+        &self,
+        filter: &GroupListing,
+    ) -> Result<Vec<ConsumerGroupListing>> {
         self.check_not_closed()?;
         let brokers = self.metadata.brokers();
         if brokers.is_empty() {
@@ -348,8 +411,8 @@ impl AdminClient {
             };
 
             let request = ListGroupsRequest {
-                states_filter: Vec::new(),
-                types_filter: Vec::new(),
+                states_filter: filter.states.clone(),
+                types_filter: filter.types.clone(),
             };
 
             let version = match conn.negotiate_api_version(

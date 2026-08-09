@@ -112,6 +112,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
+use crate::consumer::ConsumerRecord;
+
 use crate::error::{ErrorCode, KrafkaError, Result};
 use crate::protocol::ApiKey;
 use crate::protocol::{Decode, KafkaString, TaggedFields};
@@ -707,6 +709,127 @@ impl FakeBroker {
             .lock()
             .partition(topic, partition)
             .map(|p| p.last_stable_offset())
+    }
+
+    /// Every record on `topic` that a `read_committed` consumer would see.
+    ///
+    /// Reads the broker's own log directly: no consumer, no polling, no
+    /// timeout. A test asserting exactly-once behaviour previously had to build
+    /// a consumer with the right isolation level, subscribe, poll in a bounded
+    /// loop and collect — twenty-five lines whose iteration count is the sort
+    /// of thing that becomes flaky when someone tunes it.
+    ///
+    /// Excludes records inside a transaction that aborted, and records inside a
+    /// transaction that is still open (they sit at or past the last stable
+    /// offset). Control batches — the commit and abort markers themselves —
+    /// are never included, as they are never delivered to an application.
+    ///
+    /// Records are ordered by partition, then by offset. Returns an empty
+    /// vector for a topic that does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if a stored batch cannot be decoded, which means
+    /// the fake broker's own log is corrupt.
+    ///
+    /// # Example
+    ///
+    /// The difference between the two accessors *is* the assertion:
+    ///
+    /// ```rust,ignore
+    /// assert_eq!(broker.committed_records("events")?.len(), 3);
+    /// assert_eq!(broker.all_records("events")?.len(), 8); // 5 were aborted
+    /// ```
+    pub fn committed_records(&self, topic: &str) -> Result<Vec<ConsumerRecord>> {
+        self.read_records(topic, true)
+    }
+
+    /// Every record on `topic`, including those in aborted and still-open
+    /// transactions.
+    ///
+    /// The `read_uncommitted` view. See
+    /// [`committed_records`](Self::committed_records).
+    ///
+    /// # Errors
+    ///
+    /// As [`committed_records`](Self::committed_records).
+    pub fn all_records(&self, topic: &str) -> Result<Vec<ConsumerRecord>> {
+        self.read_records(topic, false)
+    }
+
+    /// Shared implementation of the two record accessors.
+    ///
+    /// `committed_only` applies the two filters a `read_committed` fetch does:
+    /// stop at the last stable offset, and drop batches belonging to a
+    /// transaction that aborted. A batch is part of an aborted transaction when
+    /// its producer ID matches an entry and its base offset falls between that
+    /// transaction's first offset and its marker — which is exact here, where
+    /// the broker knows both, and simpler than the marker-scanning state
+    /// machine a client has to run.
+    fn read_records(&self, topic: &str, committed_only: bool) -> Result<Vec<ConsumerRecord>> {
+        use crate::protocol::RecordBatch;
+
+        let cluster = self.shared.cluster.lock();
+        let Some(topic_state) = cluster.topics.get(topic) else {
+            return Ok(Vec::new());
+        };
+
+        let mut out = Vec::new();
+        for (index, partition) in topic_state.partitions.iter().enumerate() {
+            let partition_id = i32::try_from(index).unwrap_or(i32::MAX);
+            let limit = if committed_only {
+                partition.last_stable_offset()
+            } else {
+                i64::MAX
+            };
+
+            for stored in &partition.log {
+                let mut buf = stored.clone();
+                let batch = RecordBatch::decode(&mut buf)?;
+                let base = batch.base_offset;
+                let last = base.saturating_add(i64::from(batch.last_offset_delta));
+
+                if last >= limit {
+                    continue;
+                }
+                if batch.attributes.is_control_batch {
+                    continue;
+                }
+                if committed_only
+                    && batch.attributes.is_transactional
+                    && partition.aborted_transactions.iter().any(
+                        |(producer_id, first_offset, marker_offset)| {
+                            *producer_id == batch.producer_id
+                                && base >= *first_offset
+                                && base < *marker_offset
+                        },
+                    )
+                {
+                    continue;
+                }
+
+                for record in batch.records {
+                    out.push(ConsumerRecord {
+                        topic: topic.to_string(),
+                        partition: partition_id,
+                        offset: base.saturating_add(i64::from(record.offset_delta)),
+                        timestamp: batch.base_timestamp.saturating_add(record.timestamp_delta),
+                        timestamp_type: batch.attributes.timestamp_type as i8,
+                        key: record.key,
+                        value: record.value,
+                        headers: record
+                            .headers
+                            .into_iter()
+                            .map(|h| (h.key, h.value))
+                            .collect(),
+                        leader_epoch: Some(batch.partition_leader_epoch),
+                        delivery_count: None,
+                    });
+                }
+            }
+        }
+
+        Ok(out)
     }
 
     /// Aborted transactions recorded on a partition, as
