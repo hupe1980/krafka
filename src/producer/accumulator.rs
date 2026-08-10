@@ -258,14 +258,22 @@ type ExtractedBatches = Vec<((TopicHandle, PartitionId), ExtractedBatch)>;
 /// Covers both the broker-side rejections (`MESSAGE_TOO_LARGE` when the batch
 /// exceeds the topic's `max.message.bytes`, `RECORD_LIST_TOO_LARGE`) and the
 /// local frame-size guard in
-/// [`encode_and_validate_produce_request`](super::encode_and_validate_produce_request).
+/// [`encode_and_validate_produce_request`](super::encode_and_validate_produce_request),
+/// which raises the dedicated [`ProtocolErrorKind::FrameTooLarge`].
+///
+/// The match is deliberately exact. An earlier version matched every
+/// `ProtocolErrorKind::InvalidLength`, which is also what dozens of *response
+/// decode* paths raise — so a truncated or corrupt `ProduceResponse` counted
+/// as "batch too large" and triggered a split-and-resend of records the
+/// broker may already have committed (duplicates for a plain producer, a
+/// wedged sequence space for an idempotent one).
 fn is_batch_too_large(error: &KrafkaError) -> bool {
     match error {
         KrafkaError::Broker { code, .. } => matches!(
             code,
             ErrorCode::MessageTooLarge | ErrorCode::RecordListTooLarge
         ),
-        KrafkaError::Protocol { kind, .. } => *kind == ProtocolErrorKind::InvalidLength,
+        KrafkaError::Protocol { kind, .. } => *kind == ProtocolErrorKind::FrameTooLarge,
         _ => false,
     }
 }
@@ -1301,32 +1309,26 @@ impl RecordAccumulator {
                 .on_new_batch(key.0.as_ref(), partition, partition_count);
             self.flush_batch(&key);
 
-            // Create new batch and add record
+            // Create a new batch and add the record. An empty batch accepts
+            // any first record, so a record larger than `batch_size` simply
+            // forms an oversized batch of one — matching the Java client,
+            // where `batch.size` is a batching target, not a per-record
+            // limit. (`max_request_size` admission already happened in
+            // `enqueue_routed_with_guard`.)
             let mut new_batch = AccumulatorBatch::new(batch_size);
             new_batch.charge_from(send_started_at);
-
-            if new_batch.would_fit(record_size) {
-                new_batch.track(record_size);
-                new_batch.pending.push(PendingRecord {
-                    record,
-                    response_tx,
-                    offset_in_batch: 0,
-                    estimated_size: record_size,
-                    _buffered_record_guard: buffered_record_guard,
-                    _operation_guard: operation_guard,
-                });
-                self.batches.insert(key, new_batch);
-                // Release is now owned by the eventual `InFlightGuard`.
-                permit_reservation.forget();
-            } else {
-                // Record too large for batch size — drop the reservation,
-                // which returns the permits to the pool so another
-                // producer can make progress, then surface the error.
-                drop(permit_reservation);
-                let _ = response_tx.send(AppendResponse::Done(Err(KrafkaError::config(
-                    "record too large for batch size",
-                ))));
-            }
+            new_batch.track(record_size);
+            new_batch.pending.push(PendingRecord {
+                record,
+                response_tx,
+                offset_in_batch: 0,
+                estimated_size: record_size,
+                _buffered_record_guard: buffered_record_guard,
+                _operation_guard: operation_guard,
+            });
+            self.batches.insert(key, new_batch);
+            // Release is now owned by the eventual `InFlightGuard`.
+            permit_reservation.forget();
         }
     }
 
@@ -3382,7 +3384,7 @@ mod tests {
             "too big"
         )));
         assert!(is_batch_too_large(&KrafkaError::protocol_kind(
-            ProtocolErrorKind::InvalidLength,
+            ProtocolErrorKind::FrameTooLarge,
             "produce request size 2000000 exceeds max_request_size 1000000"
         )));
     }
@@ -3404,6 +3406,23 @@ mod tests {
         assert!(!is_batch_too_large(&KrafkaError::protocol_kind(
             ProtocolErrorKind::Malformed,
             "bad response"
+        )));
+    }
+
+    /// A response that failed to *decode* must never be classified as "batch
+    /// too large" — the batch may already be committed on the broker, and a
+    /// split-and-resend would duplicate it (or wedge an idempotent producer's
+    /// sequence space). `InvalidLength` is what the decode paths raise for
+    /// truncated or oversized inbound data, so it specifically must not match.
+    #[test]
+    fn test_is_batch_too_large_ignores_response_decode_errors() {
+        assert!(!is_batch_too_large(&KrafkaError::protocol_kind(
+            ProtocolErrorKind::InvalidLength,
+            "array length 9999999 exceeds MAX_DECODE_ARRAY_LEN"
+        )));
+        assert!(!is_batch_too_large(&KrafkaError::protocol_kind(
+            ProtocolErrorKind::TruncatedFrame,
+            "buffer exhausted decoding ProduceResponse"
         )));
     }
 

@@ -385,6 +385,55 @@ krafka uses `bytes::Bytes` throughout for zero-copy buffer management:
 - Record payloads share underlying buffers
 - Memory is released when last reference drops
 
+## Broker Compatibility
+
+krafka negotiates every API version rather than pinning them, so it works
+against any broker that speaks the Kafka wire protocol at the negotiated
+range — Apache Kafka 3.9+, and Kafka-compatible systems whose advertised
+versions overlap krafka's floors.
+
+### Apache Kafka 3.9 → 4.3
+
+Apache Kafka is the reference target: the version table above is diffed
+against Kafka's own message schemas in CI (`just protocol-parity`), and the
+Docker integration suite can be run against every supported minor in one
+command:
+
+```sh
+just integration-matrix                  # Kafka 3.9.0 → 4.3.0
+just integration-matrix "4.2.0 4.3.0"    # a subset
+KAFKA_VERSION=4.3.0 just integration     # a single version
+```
+
+### Redpanda
+
+Redpanda works out of the box — no configuration, no feature flag:
+
+- **Version negotiation** lands inside Redpanda's advertised ranges for every
+  API krafka's clients need (krafka's floors — Produce v3, Fetch v4,
+  Metadata v1 — sit well below what current Redpanda advertises).
+- **Transactions fall back to TV1 automatically.** Redpanda does not
+  implement server-side KIP-890 transaction version 2; krafka's
+  `TransactionalProducer` probes the cluster's finalized
+  `transaction.version` feature at `init_transactions()` and uses the
+  classic explicit-`AddPartitionsToTxn` protocol when the feature is absent —
+  the same fallback the Java 4.x client performs.
+- **KIP-848 consumer groups** are implemented by current Redpanda, so the
+  next-generation group protocol works there too; the classic protocol is
+  the fallback either way.
+- **What does not apply:** APIs Redpanda does not implement — KIP-932 share
+  groups (`ShareConsumer`), log-dir administration, `DescribeQuorum` — fail
+  fast with a clear `UnknownApiVersion` error rather than degrading
+  silently, exactly as they do against an older Apache Kafka.
+
+A dedicated smoke suite pins this against a real Redpanda container,
+including the TV1 fallback and `read_committed` visibility:
+
+```sh
+just integration-redpanda
+REDPANDA_VERSION=v25.1.1 just integration-redpanda   # pin a tag
+```
+
 ## Next Steps
 
 - [Producer Guide](@/docs/producer.md) - Sending messages

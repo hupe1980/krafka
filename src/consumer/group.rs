@@ -3696,11 +3696,22 @@ impl GroupCoordinator {
                                 // layer processes revocations, send an immediate
                                 // heartbeat with the updated owned partitions so
                                 // the coordinator can proceed.
+                                //
+                                // A *fresh* interval is installed because its
+                                // first tick completes immediately — which is
+                                // the whole point. `Interval::reset()` does the
+                                // opposite: it schedules the next tick one full
+                                // period from now, so the ack heartbeat the
+                                // coordinator is waiting on would sit out up to
+                                // an entire heartbeat interval per revocation
+                                // round.
                                 send_full_heartbeat = true;
-                                tick.reset();
-                                // The next tick fires immediately because we
-                                // just reset the interval, which means the
-                                // loop will go around and send the full HB.
+                                tick = tokio::time::interval(Duration::from_millis(
+                                    current_interval_ms as u64,
+                                ));
+                                tick.set_missed_tick_behavior(
+                                    tokio::time::MissedTickBehavior::Delay,
+                                );
                             }
                         }
                     }
@@ -5035,12 +5046,27 @@ impl GroupCoordinator {
         // For cooperative protocol, decode member metadata to extract owned partitions
         // and feed them into the sticky assignor before computing new assignments.
         // Prune stale members first to prevent unbounded growth of previous_assignments.
+        //
+        // The same decoded claims also build the `previous_owner` map used to
+        // withhold transferring partitions below, so each member's metadata is
+        // decoded exactly once.
+        let mut previous_owner: HashMap<(String, PartitionId), String> = HashMap::new();
         if self.is_cooperative() {
             let current_member_ids: HashSet<&str> =
                 members.iter().map(|m| m.member_id.as_str()).collect();
             self.sticky_assignor.retain_members(&current_member_ids);
             for m in members {
                 let (_member_topics, owned) = Self::decode_consumer_metadata(&m.metadata);
+                for (topic, parts) in &owned {
+                    for &p in parts {
+                        // Two members claiming the same partition would mean the
+                        // group is already split-brained; keep the first claim and
+                        // let the withholding below resolve it conservatively.
+                        previous_owner
+                            .entry((topic.clone(), p))
+                            .or_insert_with(|| m.member_id.clone());
+                    }
+                }
                 let assignment = MemberAssignment { partitions: owned };
                 self.sticky_assignor
                     .record_assignment(&m.member_id, &assignment);
@@ -5063,7 +5089,8 @@ impl GroupCoordinator {
         // not this member's preference — as leader we are computing the
         // assignment on behalf of every member, so it must match the protocol
         // they all agreed on.
-        let assignments = match self.negotiated_strategy() {
+        let negotiated = self.negotiated_strategy();
+        let mut assignments = match negotiated {
             crate::consumer::config::PartitionAssignmentStrategy::Range => {
                 let assignor = RangeAssignor;
                 assignor.assign(topics, &topic_partitions, &group_members)
@@ -5082,6 +5109,24 @@ impl GroupCoordinator {
                 .assign(topics, &topic_partitions, &group_members),
         };
 
+        // Cooperative protocol only: withhold partitions that are *moving*
+        // between two live members for one generation. The previous owner is
+        // still consuming them — members keep consuming through a cooperative
+        // rebalance — so handing them to the new owner in the same generation
+        // opens a window where two members of one group consume the same
+        // partition, and the new owner can fetch committed offsets *before*
+        // the old owner's pre-revocation commit lands. Withheld partitions are
+        // assigned to nobody this round; the old owner sees them missing from
+        // its assignment, revokes, and triggers the follow-up rebalance that
+        // delivers them (the Java client's
+        // `CooperativeStickyAssignor#adjustAssignment` does exactly this).
+        //
+        // Eager protocols are exempt by construction: every member revokes its
+        // entire assignment before SyncGroup, so there is nothing to overlap.
+        if negotiated == crate::consumer::config::PartitionAssignmentStrategy::CooperativeSticky {
+            Self::withhold_transferring_partitions(&mut assignments, &previous_owner);
+        }
+
         // Encode assignments
         let mut result = Vec::with_capacity(members.len());
         for member in members {
@@ -5099,6 +5144,45 @@ impl GroupCoordinator {
         }
 
         Ok(result)
+    }
+
+    /// Remove every partition that is transferring between two live members
+    /// from its *new* owner's assignment (cooperative protocol, KIP-429).
+    ///
+    /// `previous_owner` maps each partition to the member that reported owning
+    /// it in this generation's JoinGroup metadata. A partition whose new owner
+    /// differs from its previous owner is withheld — deleted from the new
+    /// owner's assignment — so it is owned by nobody until the previous owner
+    /// has revoked it and the follow-up rebalance re-assigns it. Partitions
+    /// that stay with their owner, and partitions whose previous owner left
+    /// the group (no live claim), pass through untouched.
+    fn withhold_transferring_partitions(
+        assignments: &mut HashMap<String, MemberAssignment>,
+        previous_owner: &HashMap<(String, PartitionId), String>,
+    ) {
+        for (member_id, assignment) in assignments.iter_mut() {
+            assignment.partitions.retain(|topic, partitions| {
+                partitions.retain(|&p| {
+                    match previous_owner.get(&(topic.clone(), p)) {
+                        // Moving between two live members — withhold.
+                        Some(owner) if owner != member_id => {
+                            debug!(
+                                topic,
+                                partition = p,
+                                from = %owner,
+                                to = %member_id,
+                                "Withholding transferring partition for one \
+                                 generation (cooperative rebalance)"
+                            );
+                            false
+                        }
+                        // Staying put, or previously unowned — assign now.
+                        _ => true,
+                    }
+                });
+                !partitions.is_empty()
+            });
+        }
     }
 
     /// Encode consumer assignment for SyncGroup request.
@@ -5992,6 +6076,114 @@ mod tests {
         // Each member should have 2 partitions (4 total / 2 members)
         assert_eq!(member1_parts.len(), 2);
         assert_eq!(member2_parts.len(), 2);
+    }
+
+    /// A partition moving between two live members must be withheld from its
+    /// new owner for one generation (KIP-429 / Java `adjustAssignment`).
+    ///
+    /// Without this, the new owner — whose own revocation diff is empty —
+    /// finalizes the assignment immediately and consumes the partition while
+    /// the previous owner is still consuming it: two members of one group on
+    /// one partition, and a committed-offset fetch that can race the previous
+    /// owner's pre-revocation commit.
+    ///
+    /// Negative control: deleting the `withhold_transferring_partitions` call
+    /// from `compute_assignments` leaves the transfer in place and the
+    /// "assigned to nobody this round" assertion fails.
+    #[test]
+    fn withholding_removes_only_partitions_moving_between_live_members() {
+        let mut assignments: HashMap<String, MemberAssignment> = HashMap::new();
+        // New target: A keeps p0, B gets p1 (moving from A) and p2 (unowned).
+        let mut a = MemberAssignment::empty();
+        a.add("topic1", vec![0]);
+        assignments.insert("member-a".to_string(), a);
+        let mut b = MemberAssignment::empty();
+        b.add("topic1", vec![1, 2]);
+        assignments.insert("member-b".to_string(), b);
+
+        // Current owners as reported in this generation's JoinGroup metadata:
+        // A owns p0 and p1; p2 is owned by nobody (its owner left).
+        let mut previous_owner = HashMap::new();
+        previous_owner.insert(("topic1".to_string(), 0), "member-a".to_string());
+        previous_owner.insert(("topic1".to_string(), 1), "member-a".to_string());
+
+        GroupCoordinator::withhold_transferring_partitions(&mut assignments, &previous_owner);
+
+        assert_eq!(
+            assignments.get("member-a").unwrap().get("topic1"),
+            Some(&[0][..]),
+            "a partition staying with its owner passes through"
+        );
+        assert_eq!(
+            assignments.get("member-b").unwrap().get("topic1"),
+            Some(&[2][..]),
+            "the transferring partition is withheld; the unowned one is not"
+        );
+        let all: Vec<_> = assignments
+            .values()
+            .flat_map(|a| a.all_partitions())
+            .collect();
+        assert!(
+            !all.contains(&("topic1", 1)),
+            "a transferring partition is assigned to nobody this round"
+        );
+    }
+
+    /// The withheld partition is delivered by the follow-up rebalance: once
+    /// the previous owner has revoked it (and so no longer claims it), the
+    /// next generation assigns it to the new owner and withholding is a no-op.
+    #[test]
+    fn withholding_converges_in_the_follow_up_generation() {
+        let assignor = CooperativeStickyAssignor::new();
+        let topics = vec!["t".to_string()];
+        let mut partitions = HashMap::new();
+        partitions.insert("t".to_string(), vec![0, 1]);
+        let member = |id: &str| GroupMember {
+            member_id: id.to_string(),
+            client_id: String::new(),
+            client_host: String::new(),
+            metadata: bytes::Bytes::new(),
+            assignment: bytes::Bytes::new(),
+        };
+        let members = vec![member("a"), member("b")];
+
+        // Generation 1: A owned everything; B just joined.
+        let mut gen1_owned = MemberAssignment::empty();
+        gen1_owned.add("t", vec![0, 1]);
+        assignor.record_assignment("a", &gen1_owned);
+        let mut previous_owner = HashMap::new();
+        previous_owner.insert(("t".to_string(), 0), "a".to_string());
+        previous_owner.insert(("t".to_string(), 1), "a".to_string());
+
+        let mut gen1 = assignor.assign(&topics, &partitions, &members);
+        GroupCoordinator::withhold_transferring_partitions(&mut gen1, &previous_owner);
+
+        let a_gen1: Vec<_> = gen1.get("a").unwrap().all_partitions().collect();
+        let b_gen1: Vec<_> = gen1.get("b").unwrap().all_partitions().collect();
+        assert_eq!(a_gen1.len(), 1, "A keeps exactly its sticky share");
+        assert!(b_gen1.is_empty(), "B's share is withheld this generation");
+
+        // A revokes the missing partition and rejoins claiming only its share.
+        let moved = if a_gen1[0].1 == 0 { 1 } else { 0 };
+        let mut gen2_owned = MemberAssignment::empty();
+        gen2_owned.add("t", vec![a_gen1[0].1]);
+        assignor.record_assignment("a", &gen2_owned);
+        let mut previous_owner = HashMap::new();
+        previous_owner.insert(("t".to_string(), a_gen1[0].1), "a".to_string());
+
+        let mut gen2 = assignor.assign(&topics, &partitions, &members);
+        GroupCoordinator::withhold_transferring_partitions(&mut gen2, &previous_owner);
+
+        assert_eq!(
+            gen2.get("a").unwrap().all_partitions().collect::<Vec<_>>(),
+            a_gen1,
+            "A's share is stable across the follow-up rebalance"
+        );
+        assert_eq!(
+            gen2.get("b").unwrap().all_partitions().collect::<Vec<_>>(),
+            vec![("t", moved)],
+            "the previously withheld partition reaches its new owner"
+        );
     }
 
     #[test]

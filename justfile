@@ -286,6 +286,44 @@ integration-sasl:
     fi
     cargo test --test sasl_integration_tests -- --ignored --test-threads=1
 
+# Integration tests against a real Redpanda in Docker.
+#
+# Redpanda speaks the Kafka wire protocol; krafka negotiates every API version,
+# so this suite pins the compatibility that negotiation is supposed to buy —
+# including the KIP-890 TV1 fallback (Redpanda has no server-side TV2).
+#
+#   REDPANDA_VERSION=v25.1.1 just integration-redpanda   # pin a tag
+[doc("Integration tests against a real Redpanda in Docker")]
+integration-redpanda:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! docker info >/dev/null 2>&1; then
+        echo "✗ Docker is not available; integration tests need it." >&2
+        exit 1
+    fi
+    cargo test --test redpanda_integration_tests -- --ignored --test-threads=1
+
+# Run the Docker integration suite against every supported Kafka minor.
+#
+# The harness reads `KAFKA_VERSION` (image tag), so a version matrix is one
+# loop. 3.9 is the supported floor; 4.3 is the protocol-parity target.
+#
+#   just integration-matrix                    # the default matrix
+#   just integration-matrix "4.2.0 4.3.0"      # a subset
+[doc("Integration tests across Kafka 3.9 → 4.3")]
+integration-matrix versions="3.9.0 4.0.0 4.1.0 4.2.0 4.3.0":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! docker info >/dev/null 2>&1; then
+        echo "✗ Docker is not available; integration tests need it." >&2
+        exit 1
+    fi
+    for v in {{versions}}; do
+        echo "▶ Kafka $v"
+        KAFKA_VERSION="$v" cargo test --test integration_tests -- --ignored --test-threads=1
+    done
+    echo "✓ integration-matrix passed for: {{versions}}"
+
 # Check that the crate still builds on its declared MSRV.
 msrv:
     #!/usr/bin/env bash

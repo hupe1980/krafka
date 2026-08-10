@@ -426,8 +426,11 @@ fn encode_and_validate_produce_request(
     request.encode_versioned(api_version, &mut body)?;
     let frame_size = 4 + request_header_size(ApiKey::Produce, api_version, client_id)? + body.len();
     if frame_size > max_request_size {
+        // `FrameTooLarge`, not `InvalidLength`: the accumulator's
+        // split-and-resend recovery keys off this kind, and it must never be
+        // triggered by a response that merely failed to decode.
         return Err(KrafkaError::protocol_kind(
-            ProtocolErrorKind::InvalidLength,
+            ProtocolErrorKind::FrameTooLarge,
             format!(
                 "produce request size {frame_size} exceeds max_request_size {max_request_size}"
             ),

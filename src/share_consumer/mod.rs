@@ -2365,6 +2365,10 @@ impl ShareConsumer {
                 continue;
             };
             offsets.sort_unstable();
+            // A duplicate offset would otherwise produce two overlapping
+            // single-offset ranges, which the broker rejects for the whole
+            // partition.
+            offsets.dedup();
 
             let broker_id = metadata
                 .leader(topic, partition)
@@ -2398,7 +2402,24 @@ impl ShareConsumer {
     }
 
     /// Build `ShareAcknowledgeTopic` list from pending acks. Groups by
-    /// topic UUID and partition, coalescing ack batches per partition.
+    /// topic UUID and partition, sorting and coalescing ack batches per
+    /// partition.
+    ///
+    /// Explicit acks arrive here in *application call order*, and
+    /// acknowledging out of order is perfectly legal at the API surface. The
+    /// batches are sorted by `first_offset` and merged when contiguous and of
+    /// one type, for three reasons:
+    ///
+    /// - it is the wire form the Java client always produces (its
+    ///   `Acknowledgements` map is a `TreeMap`), so brokers only ever see
+    ///   ordered batches from the reference client and unordered input is
+    ///   untested territory;
+    /// - duplicate or overlapping ranges reference record state a preceding
+    ///   batch already transitioned, which fails the partition with
+    ///   `INVALID_RECORD_STATE` — sorting makes the merge that prevents this
+    ///   possible;
+    /// - N sequential `acknowledge()` calls collapse to one wire batch
+    ///   instead of N.
     fn build_acknowledge_topics(acks: &[PendingAck]) -> Vec<ShareAcknowledgeTopic> {
         let mut topics_map: HashMap<
             [u8; 16],
@@ -2423,12 +2444,34 @@ impl ShareConsumer {
                 topic_id,
                 partitions: partitions_map
                     .into_iter()
-                    .map(
-                        |(partition_index, acknowledgement_batches)| ShareAcknowledgePartition {
+                    .map(|(partition_index, mut batches)| {
+                        batches.sort_unstable_by_key(|b| b.first_offset);
+                        let mut merged: Vec<ShareAcknowledgementBatch> =
+                            Vec::with_capacity(batches.len());
+                        for batch in batches {
+                            match merged.last_mut() {
+                                // Contiguous and uniformly of the same type —
+                                // extend rather than append. Only single-type
+                                // batches merge: a multi-type batch enumerates
+                                // one type per offset and must keep its exact
+                                // span.
+                                Some(prev)
+                                    if prev.last_offset + 1 == batch.first_offset
+                                        && prev.acknowledge_types.len() == 1
+                                        && batch.acknowledge_types.len() == 1
+                                        && prev.acknowledge_types[0]
+                                            == batch.acknowledge_types[0] =>
+                                {
+                                    prev.last_offset = batch.last_offset;
+                                }
+                                _ => merged.push(batch),
+                            }
+                        }
+                        ShareAcknowledgePartition {
                             partition_index,
-                            acknowledgement_batches,
-                        },
-                    )
+                            acknowledgement_batches: merged,
+                        }
+                    })
                     .collect(),
             })
             .collect()
@@ -3782,6 +3825,82 @@ mod tests {
         // Verify partition counts.
         let total_partitions: usize = topics.iter().map(|t| t.partitions.len()).sum();
         assert_eq!(total_partitions, 3);
+    }
+
+    /// A partition's acknowledgement batches are sorted by `first_offset`.
+    ///
+    /// This is the wire form the Java client always produces (its ack map is
+    /// a `TreeMap`), and it is what makes the contiguous-range merge — which
+    /// prevents overlapping batches from failing the partition with
+    /// `INVALID_RECORD_STATE` — possible at all. Explicit acks arrive in
+    /// application call order, and acknowledging out of order is legal at the
+    /// API surface — so the ordering must be imposed when the wire request is
+    /// built, not assumed.
+    ///
+    /// Negative control: removing the `sort_unstable_by_key` from
+    /// `build_acknowledge_topics` replays the call order (7, 3, 5) and fails.
+    #[test]
+    fn acknowledge_batches_are_sorted_regardless_of_call_order() {
+        let ack = |first: i64, last: i64, ack_type: AcknowledgeType| PendingAck {
+            topic: "t".into(),
+            topic_id: [1; 16],
+            partition: 0,
+            first_offset: first,
+            last_offset: last,
+            ack_type: ack_type.to_i8(),
+        };
+        // Application acked 7, then 3, then 5 — with a gap at 4 and 6, so
+        // nothing merges and the order alone is under test.
+        let acks = vec![
+            ack(7, 7, AcknowledgeType::Accept),
+            ack(3, 3, AcknowledgeType::Reject),
+            ack(5, 5, AcknowledgeType::Accept),
+        ];
+
+        let topics = ShareConsumer::build_acknowledge_topics(&acks);
+        let batches = &topics[0].partitions[0].acknowledgement_batches;
+        let firsts: Vec<i64> = batches.iter().map(|b| b.first_offset).collect();
+        assert_eq!(firsts, vec![3, 5, 7], "batches must ascend by first_offset");
+    }
+
+    /// Adjacent single-type batches of the same type merge into one range, so
+    /// N sequential `acknowledge()` calls cost one wire batch — and a
+    /// different type, or a gap, starts a new batch.
+    #[test]
+    fn acknowledge_batches_merge_contiguous_same_type_ranges() {
+        let ack = |first: i64, last: i64, ack_type: AcknowledgeType| PendingAck {
+            topic: "t".into(),
+            topic_id: [1; 16],
+            partition: 0,
+            first_offset: first,
+            last_offset: last,
+            ack_type: ack_type.to_i8(),
+        };
+        let acks = vec![
+            // Acked out of order, all Accept, offsets 0..=2: one batch.
+            ack(1, 1, AcknowledgeType::Accept),
+            ack(0, 0, AcknowledgeType::Accept),
+            ack(2, 2, AcknowledgeType::Accept),
+            // Contiguous but a different type: its own batch.
+            ack(3, 3, AcknowledgeType::Release),
+            // Same type again but after a gap: its own batch.
+            ack(5, 6, AcknowledgeType::Release),
+        ];
+
+        let topics = ShareConsumer::build_acknowledge_topics(&acks);
+        let batches = &topics[0].partitions[0].acknowledgement_batches;
+        let spans: Vec<(i64, i64, i8)> = batches
+            .iter()
+            .map(|b| (b.first_offset, b.last_offset, b.acknowledge_types[0]))
+            .collect();
+        assert_eq!(
+            spans,
+            vec![
+                (0, 2, AcknowledgeType::Accept.to_i8()),
+                (3, 3, AcknowledgeType::Release.to_i8()),
+                (5, 6, AcknowledgeType::Release.to_i8()),
+            ],
+        );
     }
 
     #[test]

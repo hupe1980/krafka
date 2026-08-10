@@ -15,6 +15,98 @@ not a complete record.
 
 Nothing yet.
 
+## [0.19.0] — 2026-08-10
+
+A correctness release from a three-round deep audit against the reference
+implementations (Java client, librdkafka, franz-go) and the broker source.
+Six real defects fixed — three in the transactional producer, one in
+cooperative rebalancing, two in the share consumer / KIP-848 paths — plus a
+Redpanda integration suite and a Kafka 3.9 → 4.3 version-matrix recipe.
+Validated against real brokers: 46/46 Apache Kafka and 3/3 Redpanda Docker
+integration tests.
+
+### Fixed
+
+- **Cooperative rebalancing now withholds transferring partitions for one
+  generation** (KIP-429), closing a double-consumption window. The leader
+  used to hand a partition moving from member A to member B directly to B in
+  the same generation; B — whose own revocation diff is empty — finalized
+  immediately and began consuming while A was still consuming the same
+  partition, and B's committed-offset fetch could race A's pre-revocation
+  commit (re-processing from a stale offset). The leader now removes any
+  partition whose previous owner is a *different live member* from the new
+  owner's assignment, exactly as the Java client's
+  `CooperativeStickyAssignor#adjustAssignment` does; the previous owner
+  revokes it and the follow-up rebalance delivers it. Verified against the
+  member-side flow: the withheld partition reaches its new owner in the next
+  generation and the assignment is stable from there.
+
+- **The KIP-848 revocation-ack heartbeat now fires immediately.** After the
+  consumer finished its revocation callbacks, the heartbeat task called
+  `Interval::reset()` under a comment claiming the next tick fires
+  immediately — but `reset()` schedules the next tick one *full period* from
+  now, so the acknowledgement the coordinator waits for before continuing
+  reconciliation sat out up to an entire heartbeat interval per revocation
+  round. The task now installs a fresh interval, whose first tick completes
+  immediately.
+
+- **KIP-932 acknowledgement batches are now sorted, merged, and
+  deduplicated per partition.** Explicit acks were sent in application call
+  order, and duplicate offsets in the implicit path produced overlapping
+  single-offset ranges — which reference record state a preceding batch
+  already transitioned and fail the partition with `INVALID_RECORD_STATE`.
+  Batches are now ascending by first offset (the wire form the Java client
+  always produces), contiguous same-type ranges collapse into one batch, and
+  implicit-ack offsets are deduplicated — so N sequential `acknowledge()`
+  calls cost one wire batch instead of N.
+
+- **A produce response that failed to decode can no longer trigger a batch
+  split-and-resend.** `is_batch_too_large` matched every
+  `ProtocolErrorKind::InvalidLength`, which is also what dozens of *response
+  decode* paths raise — so a truncated or corrupt `ProduceResponse` counted as
+  "batch too large" and resubmitted (as two halves, with reallocated
+  sequences) a batch the broker may already have committed: duplicates for a
+  plain producer, a wedged sequence space for an idempotent one. The local
+  frame-size guard now raises the new dedicated
+  `ProtocolErrorKind::FrameTooLarge`, and the split path matches exactly that
+  plus the two broker size rejections.
+
+- **A failed transactional commit or abort now reverts to the state it was
+  entered from**, instead of unconditionally to `InTransaction`. Two origins
+  were mishandled:
+  - a **`Prepared`** transaction (KIP-939 two-phase commit) whose completion
+    failed retriably was reopened as `InTransaction`, re-admitting `send()`
+    into content whose `(producer_id, epoch)` had already been handed to the
+    external coordinator;
+  - a **`CommitIndeterminate`** commit retry that failed again (flush
+    failure, or a definitive-looking broker error on the *retry*) reverted to
+    `InTransaction`, re-enabling `abort_transaction` — the exact
+    abort-after-possible-commit tear (KAFKA-17754) the state exists to
+    prevent. An indeterminate commit now stays indeterminate until a commit
+    succeeds or the coordinator answers `TransactionAbortable`.
+
+### Added
+
+- `ProtocolErrorKind::FrameTooLarge` — raised only by the client's own
+  pre-send frame-size guard, never by inbound decoding. (`ProtocolErrorKind`
+  is `#[non_exhaustive]`, so this is not a breaking change.)
+- **Redpanda integration suite** (`just integration-redpanda`): pins
+  produce/consume, admin, and the KIP-890 TV1 transaction fallback against a
+  real Redpanda container. Redpanda works with krafka out of the box via API
+  version negotiation; the docs' new *Broker Compatibility* section spells
+  out what applies and what fails fast (`ShareConsumer`, log-dir admin).
+- **Kafka version-matrix recipe** (`just integration-matrix`): runs the
+  Docker integration suite against every supported Kafka minor (3.9.0 →
+  4.3.0), or any subset (`just integration-matrix "4.2.0 4.3.0"`).
+
+### Removed
+
+- The unreachable `"record too large for batch size"` accumulator error
+  path. An empty batch accepts any first record by design (oversized records
+  form a single-record batch, as in the Java client), so the branch could
+  never execute; `max_request_size` admission already rejects genuinely
+  oversized records at enqueue time.
+
 ## [0.18.0] — 2026-08-08
 
 The producer's second, unbatched send path is deleted. It was the **default**
