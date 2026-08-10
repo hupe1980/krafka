@@ -98,6 +98,11 @@ integration tests.
 - **Kafka version-matrix recipe** (`just integration-matrix`): runs the
   Docker integration suite against every supported Kafka minor (3.9.0 →
   4.3.0), or any subset (`just integration-matrix "4.2.0 4.3.0"`).
+- **CI now runs all of it.** The integration matrix covers Kafka 3.9.0
+  through 4.3.0 (previously 3.9.0 and 4.0.0 only), the Redpanda suite has
+  its own job, and the SASL suite — runnable locally since it was written but
+  never wired into a workflow — finally runs in CI too. `just ci-full`, the
+  release gate, includes the same three suites.
 
 ### Removed
 
