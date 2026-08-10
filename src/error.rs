@@ -412,6 +412,20 @@ pub enum ProtocolErrorKind {
     ///
     /// Not retriable — indicates a malformed response or a misconfigured cap.
     InvalidLength,
+    /// A locally encoded request frame exceeds the configured
+    /// `max_request_size` before it ever reaches the wire.
+    ///
+    /// Distinct from [`InvalidLength`](Self::InvalidLength), which covers
+    /// malformed *inbound* data: this kind is raised only by the client's own
+    /// pre-send frame-size guard, so the producer can treat it as "the batch
+    /// is too large — split it and resend" without ever confusing it with a
+    /// response that failed to decode. (Conflating the two once meant a
+    /// truncated `ProduceResponse` could trigger a batch split-and-resend for
+    /// records the broker may already have committed.)
+    ///
+    /// Not retriable as-is — the same frame will be rejected again; the
+    /// producer's recovery is to split the batch, not to retry it.
+    FrameTooLarge,
     /// Bytes decoded as a UTF-8 string were not valid UTF-8.
     ///
     /// Not retriable.

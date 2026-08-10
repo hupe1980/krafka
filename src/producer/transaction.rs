@@ -2787,29 +2787,44 @@ impl TransactionalProducer {
         // application was told had been committed could disappear when a later
         // transaction aborted. `abort_transaction` already transitioned first;
         // this is the same discipline.
-        if let Err(actual) = self
+        // The state this commit was entered from decides where a *failed*
+        // commit may legally return to. Reverting unconditionally to
+        // `InTransaction` (as an earlier version did) was wrong for the other
+        // two origins: a `Prepared` transaction reopened to new sends would no
+        // longer match the state handed to the external 2PC coordinator
+        // (KIP-939), and a `CommitIndeterminate` one reverted to
+        // `InTransaction` would re-enable `abort_transaction` — exactly the
+        // KAFKA-17754 tear this state exists to prevent.
+        let entered_from = if self
             .try_transition(
                 TransactionState::InTransaction,
                 TransactionState::Committing,
             )
-            .or_else(|_| {
-                // KIP-939: a prepared transaction is committed by the external
-                // coordinator's decision, so `Prepared` is a legal starting
-                // point for exactly this transition.
-                self.try_transition(TransactionState::Prepared, TransactionState::Committing)
-            })
-            .or_else(|_| {
-                self.try_transition(
-                    TransactionState::CommitIndeterminate,
-                    TransactionState::Committing,
-                )
-            })
+            .is_ok()
         {
+            TransactionState::InTransaction
+        } else if self
+            // KIP-939: a prepared transaction is committed by the external
+            // coordinator's decision, so `Prepared` is a legal starting
+            // point for exactly this transition.
+            .try_transition(TransactionState::Prepared, TransactionState::Committing)
+            .is_ok()
+        {
+            TransactionState::Prepared
+        } else if self
+            .try_transition(
+                TransactionState::CommitIndeterminate,
+                TransactionState::Committing,
+            )
+            .is_ok()
+        {
+            TransactionState::CommitIndeterminate
+        } else {
             return Err(KrafkaError::invalid_state(format!(
                 "cannot commit in state {:?}",
-                actual
+                self.state()
             )));
-        }
+        };
 
         // Every buffered record must reach the broker before `EndTxn`, or it
         // would be committed into a transaction the coordinator has already
@@ -2826,12 +2841,11 @@ impl TransactionalProducer {
             .wait_for(self.in_flight_barrier.snapshot())
             .await;
         if let Err(error) = self.accumulator.flush().await {
-            // Nothing was sent to the coordinator, so the transaction is still
-            // open. Hand the state back so the caller can abort it.
-            let _ = self.try_transition(
-                TransactionState::Committing,
-                TransactionState::InTransaction,
-            );
+            // Nothing was sent to the coordinator this attempt, so whatever
+            // was true on entry is still true — hand back the exact state the
+            // commit started from (`Prepared` stays frozen, an indeterminate
+            // commit stays commit-only).
+            let _ = self.try_transition(TransactionState::Committing, entered_from);
             return Err(error);
         }
 
@@ -2849,10 +2863,19 @@ impl TransactionalProducer {
                 info!("Transaction committed");
             }
             Err(e) if Self::is_abortable_transaction_error(e, self.transaction_version()) => {
-                match self.try_transition(
-                    TransactionState::Committing,
-                    TransactionState::InTransaction,
-                ) {
+                // `TransactionAbortable` is the coordinator's explicit answer
+                // that this transaction is still open and must be aborted, so
+                // it resolves an indeterminate commit. A `Prepared`
+                // transaction stays `Prepared` — `abort_transaction` accepts
+                // that state directly, and reverting to `InTransaction` would
+                // re-admit sends into content already handed to the external
+                // 2PC coordinator.
+                let revert_to = if entered_from == TransactionState::Prepared {
+                    TransactionState::Prepared
+                } else {
+                    TransactionState::InTransaction
+                };
+                match self.try_transition(TransactionState::Committing, revert_to) {
                     Ok(()) => {
                         warn!("Transaction commit failed (abort required): {}", e);
                     }
@@ -2886,10 +2909,17 @@ impl TransactionalProducer {
                     // from which the only permitted move is another commit.
                     let outcome_unknown =
                         matches!(e, KrafkaError::Timeout { .. } | KrafkaError::Network(_));
-                    let revert_to = if outcome_unknown {
+                    // A definitive broker answer for *this* attempt does not
+                    // resolve an *earlier* lost commit: when the commit was
+                    // entered from `CommitIndeterminate`, only a success does.
+                    // Likewise a `Prepared` transaction reverts to `Prepared`,
+                    // never to `InTransaction`, so its content stays frozen.
+                    let revert_to = if outcome_unknown
+                        || entered_from == TransactionState::CommitIndeterminate
+                    {
                         TransactionState::CommitIndeterminate
                     } else {
-                        TransactionState::InTransaction
+                        entered_from
                     };
                     // Use CAS so a concurrent abort that already moved the
                     // state is not overwritten.
@@ -2954,22 +2984,35 @@ impl TransactionalProducer {
             ));
         }
 
-        // Atomic CAS: try InTransaction → Aborting first, then Committing → Aborting
-        let transition = self
+        // Atomic CAS: try InTransaction → Aborting first, then Prepared, then
+        // Committing. The entry state is remembered so a *failed* abort can
+        // return to it: a `Prepared` transaction must stay `Prepared` (its
+        // content is frozen for the external 2PC coordinator — KIP-939), not
+        // reopen as `InTransaction`.
+        let entered_from = if self
             .try_transition(TransactionState::InTransaction, TransactionState::Aborting)
-            .or_else(|_| {
-                self.try_transition(TransactionState::Prepared, TransactionState::Aborting)
-            })
-            .or_else(|_| {
-                self.try_transition(TransactionState::Committing, TransactionState::Aborting)
-            });
-
-        if let Err(actual) = transition {
+            .is_ok()
+        {
+            TransactionState::InTransaction
+        } else if self
+            .try_transition(TransactionState::Prepared, TransactionState::Aborting)
+            .is_ok()
+        {
+            TransactionState::Prepared
+        } else if self
+            .try_transition(TransactionState::Committing, TransactionState::Aborting)
+            .is_ok()
+        {
+            // A commit is being raced; after this abort fails retriably there
+            // is no commit to resume, so the retry target is `InTransaction`,
+            // from which `abort_transaction` can simply be called again.
+            TransactionState::InTransaction
+        } else {
             return Err(KrafkaError::invalid_state(format!(
                 "cannot abort in state {:?}",
-                actual
+                self.state()
             )));
-        }
+        };
 
         // Drain buffered records first so their send futures resolve rather
         // than hanging once the transaction is torn down. Errors are expected
@@ -3013,13 +3056,13 @@ impl TransactionalProducer {
             // Mirror `commit_transaction`. A retriable failure (coordinator
             // unavailable, network blip) says nothing about the transaction's
             // fate, so escalating to FatalError destroyed the caller's only way
-            // to finish aborting. CAS back to InTransaction so `abort_transaction`
-            // can simply be called again. The CAS may fail if a concurrent
-            // operation already moved the state, in which case leave it alone.
+            // to finish aborting. CAS back to the state the abort entered from
+            // so `abort_transaction` can simply be called again (both
+            // `InTransaction` and `Prepared` re-admit it). The CAS may fail if
+            // a concurrent operation already moved the state, in which case
+            // leave it alone.
             Err(e) if e.is_retriable() => {
-                match self
-                    .try_transition(TransactionState::Aborting, TransactionState::InTransaction)
-                {
+                match self.try_transition(TransactionState::Aborting, entered_from) {
                     Ok(()) => {
                         // Restore the abort requirement consumed above so the
                         // retry re-initialises the identity if it needs to.
@@ -5256,17 +5299,29 @@ mod tests {
     }
     /// Build a producer pinned to `version` with retries disabled, so tests
     /// that exercise the network paths fail fast instead of backing off.
-    fn test_producer(version: TransactionVersion) -> TransactionalProducer {
+    pub(super) fn test_producer(version: TransactionVersion) -> TransactionalProducer {
+        test_producer_at(version, "localhost:9092")
+    }
+
+    /// [`test_producer`] with an explicit bootstrap address.
+    ///
+    /// Tests that need a *guaranteed* connection failure use `127.0.0.1:9`
+    /// (the discard port, closed on loopback) rather than `localhost:9092`,
+    /// which may be a real broker on a developer machine.
+    pub(super) fn test_producer_at(
+        version: TransactionVersion,
+        address: &str,
+    ) -> TransactionalProducer {
         let pool = Arc::new(ConnectionPool::new(ConnectionConfig::default()));
         let metadata = Arc::new(ClusterMetadata::new(
-            vec!["localhost:9092".to_string()],
+            vec![address.to_string()],
             pool.clone(),
             Duration::from_secs(300),
         ));
 
         TransactionalProducer {
             config: TransactionalProducerConfig {
-                bootstrap_servers: "localhost:9092".to_string(),
+                bootstrap_servers: address.to_string(),
                 transactional_id: "txn-test".to_string(),
                 ..TransactionalProducerConfig::default()
             },
@@ -5917,5 +5972,127 @@ mod commit_indeterminate_tests {
             TransactionState::CommitIndeterminate.to_string(),
             "CommitIndeterminate"
         );
+    }
+}
+
+/// A failed commit or abort must return the state machine to the state it was
+/// *entered from* — never unconditionally to `InTransaction`.
+///
+/// The two origins this protects:
+///
+/// - **`Prepared` (KIP-939).** A prepared transaction's content is frozen and
+///   its `(producer_id, epoch)` handed to an external 2PC coordinator.
+///   Reverting to `InTransaction` re-admits `send()`, so records written after
+///   the prepare would be committed by the external decision — data the other
+///   participant never saw.
+/// - **`CommitIndeterminate` (KAFKA-17754).** A retried commit that fails again
+///   has not resolved whether the *original* commit landed. Reverting to
+///   `InTransaction` re-enables `abort_transaction`, which is exactly the
+///   abort-after-possible-commit tear this state exists to prevent.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod failed_completion_revert_tests {
+    use super::tests::{test_producer, test_producer_at};
+    use super::*;
+
+    /// A commit whose accumulator flush fails (nothing reached the
+    /// coordinator) must hand back exactly the state it started from.
+    ///
+    /// Negative control: reverting to a hard-coded `InTransaction` fails the
+    /// `Prepared` and `CommitIndeterminate` cases.
+    #[tokio::test]
+    async fn a_failed_flush_returns_the_commit_to_the_state_it_entered_from() {
+        for entered_from in [
+            TransactionState::InTransaction,
+            TransactionState::Prepared,
+            TransactionState::CommitIndeterminate,
+        ] {
+            let producer = test_producer(TransactionVersion::V2);
+            producer.set_state(entered_from);
+
+            // Kill the accumulator so `flush()` fails before any network I/O.
+            producer
+                .accumulator
+                .shutdown()
+                .await
+                .expect("accumulator shutdown succeeds");
+
+            let err = producer
+                .commit_transaction()
+                .await
+                .expect_err("flush against a shut-down accumulator must fail");
+            assert!(
+                !err.is_retriable(),
+                "an accumulator-closed error is invalid_state: {err}"
+            );
+            assert_eq!(
+                producer.state(),
+                entered_from,
+                "a commit that never reached the coordinator must return to \
+                 the state it was entered from"
+            );
+        }
+    }
+
+    /// After a flush-failed commit retry from `CommitIndeterminate`, an abort
+    /// must still be refused — the original commit may have landed.
+    #[tokio::test]
+    async fn an_indeterminate_commit_stays_abort_proof_across_a_failed_retry() {
+        let producer = test_producer(TransactionVersion::V2);
+        producer.set_state(TransactionState::CommitIndeterminate);
+        producer
+            .accumulator
+            .shutdown()
+            .await
+            .expect("accumulator shutdown succeeds");
+
+        let _ = producer
+            .commit_transaction()
+            .await
+            .expect_err("the retried commit fails on flush");
+
+        let err = producer
+            .abort_transaction()
+            .await
+            .expect_err("abort must still be refused after the failed retry");
+        assert!(
+            err.to_string().contains("KAFKA-17754"),
+            "the refusal must explain the hazard, got: {err}"
+        );
+    }
+
+    /// A retriable abort failure from `Prepared` must leave the transaction
+    /// `Prepared` — not reopen it as `InTransaction`.
+    ///
+    /// `127.0.0.1:9` (discard port) guarantees the coordinator lookup fails
+    /// with a connection error, which is retriable.
+    #[tokio::test]
+    async fn a_retriable_abort_failure_returns_a_prepared_transaction_to_prepared() {
+        let producer = test_producer_at(TransactionVersion::V1, "127.0.0.1:9");
+        // A valid identity so the abort reaches the network path.
+        producer.identity.initialize(7, 0);
+        producer.set_state(TransactionState::Prepared);
+
+        let err = producer
+            .abort_transaction()
+            .await
+            .expect_err("no coordinator is reachable");
+        assert!(
+            err.is_retriable(),
+            "a connection failure is retriable: {err}"
+        );
+        assert_eq!(
+            producer.state(),
+            TransactionState::Prepared,
+            "a failed abort must not reopen a prepared transaction to sends"
+        );
+
+        // And the retry is still admitted from `Prepared`.
+        let err = producer
+            .abort_transaction()
+            .await
+            .expect_err("still unreachable");
+        assert!(err.is_retriable());
+        assert_eq!(producer.state(), TransactionState::Prepared);
     }
 }

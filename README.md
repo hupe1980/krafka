@@ -57,7 +57,9 @@ simply correct. Different partitions still proceed concurrently.
 | **Hardening** | Secret zeroization · constant-time comparison (`subtle`) · decompression-bomb limits · decode-loop bounds · RFC 3986 path encoding on every outbound HTTP target · CI forbids any credential-bearing type from deriving `Debug` |
 | **Testing** | 2 350+ tests · 6 cargo-fuzz targets · proptest round-trips across the protocol layer · an in-process fake broker with fault injection that serves the **full transaction protocol** — KIP-360 fencing, commit/abort markers, `read_committed` isolation, TV1 and KIP-890 TV2 — so even exactly-once tests need no Docker |
 
-> **Broker versions:** krafka requires **Apache Kafka 3.9+**; protocol versions below that baseline have been removed. Features needing a newer broker (KIP-848 consumer groups, KIP-932 share groups, KIP-1066 cordoned log dirs) say so where they are documented and fail with a clear `UnknownApiVersion` rather than silently degrading.
+> **Broker versions:** krafka requires **Apache Kafka 3.9+**; protocol versions below that baseline have been removed. Features needing a newer broker (KIP-848 consumer groups, KIP-932 share groups, KIP-1066 cordoned log dirs) say so where they are documented and fail with a clear `UnknownApiVersion` rather than silently degrading. The Docker integration suite runs against every supported minor in one command (`just integration-matrix`, Kafka 3.9 → 4.3).
+>
+> **Redpanda** works out of the box: every API version is negotiated, and transactions fall back to KIP-890 TV1 automatically (Redpanda has no server-side TV2) — pinned by a dedicated smoke suite (`just integration-redpanda`). APIs Redpanda does not implement (share groups, log-dir admin) fail fast with `UnknownApiVersion`, same as against an older Kafka.
 
 ## 🚀 Quick Start
 
@@ -545,6 +547,13 @@ Four assignors ship: `Range`, `RoundRobin`, `Sticky` (eager), and
 both, so a group moves from eager to cooperative rebalancing in a single rolling
 bounce rather than a full stop-the-world restart.
 
+Cooperative rebalances enforce revoke-before-assign structurally: a partition
+moving between two live members is withheld from its new owner for one
+generation — the previous owner revokes it, then the follow-up rebalance
+delivers it — so two members of one group can never consume the same partition
+concurrently, and the new owner's committed-offset fetch cannot race the old
+owner's final commit.
+
 Rebalances do not wait on your poll loop. The background group task keeps
 heartbeating through a rebalance and sends `JoinGroup`/`SyncGroup` itself, so a
 consumer that is idle or busy between `poll()` calls does not hold the rest of
@@ -650,6 +659,25 @@ what it does and, just as importantly, what it deliberately does not model.
 ## ⬆️ Upgrading
 
 Release-by-release detail lives in **[CHANGELOG.md](CHANGELOG.md)**.
+
+### Upgrading to 0.19
+
+No code changes required — 0.19 is a correctness release and every public
+signature is unchanged. Behaviour differs in ways you may notice:
+
+- A cooperative rebalance that moves a partition between two live members now
+  takes **two generations** (revoke, then assign) instead of one, matching the
+  Java client. The extra round is what closes a window where both members
+  briefly consumed the same partition.
+- A transactional `commit_transaction()`/`abort_transaction()` that fails no
+  longer reverts a `Prepared` or `CommitIndeterminate` transaction to
+  `InTransaction` — each failure now returns to the state it entered from, so
+  a 2PC-prepared transaction stays frozen and an indeterminate commit stays
+  commit-only.
+- A `ProduceResponse` that fails to decode is reported as the decode error it
+  is, rather than triggering a batch split-and-resend.
+- `ProtocolErrorKind` has a new `FrameTooLarge` variant (the enum is
+  `#[non_exhaustive]`, so `match` arms with a wildcard are unaffected).
 
 ### Upgrading to 0.18
 
