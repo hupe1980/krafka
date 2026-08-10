@@ -50,9 +50,11 @@ ci: fmt-check clippy check protocol-parity protocol-reachability secret-debug te
     @echo "✓ ci passed — Docker suites not included, run 'just integration' for those"
 
 # Everything, including the Docker-backed integration suites. This is what a
-# release should be gated on.
+# release should be gated on. Mirrors CI's Docker jobs: the plain suite (CI
+# additionally runs it across Kafka 3.9 → 4.3 — `just integration-matrix`
+# locally), the SASL suite, and the Redpanda suite.
 [doc("ci + supply chain + Docker integration suites")]
-ci-full: ci deny integration
+ci-full: ci deny integration integration-sasl integration-redpanda
     @echo ""
     @echo "✓ ci-full passed"
 

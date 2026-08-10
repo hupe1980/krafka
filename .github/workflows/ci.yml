@@ -189,9 +189,19 @@ jobs:
           # some CI environments; use it only where it is known to be stable.
           - kafka-version: "3.9.0"
             kafka-image: "apache/kafka-native"
-          # Kafka 4.0.0 native image consistently segfaults on GitHub Actions
+          # Kafka 4.x native images consistently segfault on GitHub Actions
           # (GraalVM Pwd.getpwuid bug); use the JVM image instead.
+          #
+          # 3.9 is the supported floor and 4.3 the protocol-parity target;
+          # every minor between them runs so a version-specific regression
+          # names the exact broker line that broke.
           - kafka-version: "4.0.0"
+            kafka-image: "apache/kafka"
+          - kafka-version: "4.1.0"
+            kafka-image: "apache/kafka"
+          - kafka-version: "4.2.0"
+            kafka-image: "apache/kafka"
+          - kafka-version: "4.3.0"
             kafka-image: "apache/kafka"
     steps:
       - uses: actions/checkout@v4
@@ -210,6 +220,52 @@ jobs:
         env:
           KAFKA_VERSION: ${{ matrix.kafka-version }}
           KAFKA_IMAGE: ${{ matrix.kafka-image }}
+
+  # The SASL suite existed before this job did — it was runnable locally via
+  # `just integration-sasl` but never ran in CI, so a SASL handshake
+  # regression could only be caught by hand. Its harness uses the Confluent
+  # image (the apache images do not ship the JAAS entrypoint hooks it needs).
+  integration-sasl:
+    name: Integration Tests (SASL)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: extractions/setup-just@v3
+      - name: Pre-pull Kafka image
+        run: |
+          for i in 1 2 3; do
+            docker pull confluentinc/cp-kafka:7.5.0 && break
+            echo "Retry $i failed, waiting..."
+            sleep 10
+          done
+      - run: just integration-sasl
+        timeout-minutes: 45
+
+  # Redpanda speaks the Kafka wire protocol; krafka negotiates every API
+  # version, so this suite pins the compatibility that negotiation is supposed
+  # to buy — including the KIP-890 TV1 fallback (Redpanda has no server-side
+  # TV2). `latest` rather than a pinned tag: the claim under test is "current
+  # Redpanda works", and a pin would quietly narrow it to "one old Redpanda
+  # once worked".
+  integration-redpanda:
+    name: Integration Tests (Redpanda)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: extractions/setup-just@v3
+      - name: Pre-pull Redpanda image
+        run: |
+          for i in 1 2 3; do
+            docker pull redpandadata/redpanda:latest && break
+            echo "Retry $i failed, waiting..."
+            sleep 10
+          done
+      - run: just integration-redpanda
+        timeout-minutes: 30
 
   msrv:
     name: MSRV (1.88)
