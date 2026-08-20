@@ -275,7 +275,7 @@ dependencies = [
 
 [[package]]
 name = "krafka"
-version = "0.19.0"
+version = "0.19.1"
 dependencies = [
  "ahash",
  "arc-swap",
