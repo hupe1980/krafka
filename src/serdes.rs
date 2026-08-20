@@ -97,6 +97,10 @@ pub trait Serializer: Send + Sync {
     ///
     /// Takes `Bytes` rather than `&[u8]` so an implementation can move the
     /// buffer into the returned future without copying.
+    ///
+    /// The producer skips a `None` key or value rather than passing an empty
+    /// buffer, so an implementation never sees one — that is what keeps a
+    /// tombstone null on the wire.
     fn serialize(
         &self,
         payload: Bytes,

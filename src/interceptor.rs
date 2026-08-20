@@ -136,6 +136,11 @@ pub trait ProducerInterceptor: Send + Sync + fmt::Debug {
     ///
     /// The record can be mutated (e.g. adding headers, modifying the key).
     /// This is invoked on the calling thread before partitioning.
+    ///
+    /// A `None` value is a **tombstone**, which on a compacted topic deletes
+    /// the record's key; `Some(Bytes::new())` looks similar and does the
+    /// opposite. An interceptor that rewrites values should leave `None` alone
+    /// unless it means to cancel the deletion. Header values likewise.
     fn on_send(&self, _record: &mut ProducerRecord) -> InterceptorResult {
         Ok(())
     }
@@ -223,7 +228,7 @@ impl ConsumerInterceptor for NoOpConsumerInterceptor {}
 struct CheapRecordSnapshot {
     partition: Option<PartitionId>,
     key: Option<Bytes>,
-    value: Bytes,
+    value: Option<Bytes>,
     timestamp: Option<Timestamp>,
     /// Number of headers present before the interceptor ran.
     header_len: usize,
@@ -273,14 +278,15 @@ impl CheapRecordSnapshot {
 /// interceptor N+1 receives the record from the last *successful* interceptor.
 /// In Rust, `on_send` mutates in-place (`&mut`), so a full rollback would
 /// require cloning the record before *every* interceptor call. That clone is
-/// deep (`topic: String`, `headers: Vec<(String, Bytes)>`) and sits on the
+/// deep (`topic: String`, `headers: Vec<(String, Option<Bytes>)>`) and sits on the
 /// producer's per-record hot path, so it is deliberately **not** taken.
 ///
 /// Instead, a panic triggers a cheap, allocation-free rollback of exactly the
 /// fields that can be restored in O(1) (see [`CheapRecordSnapshot`]):
 ///
 /// - `partition`, `timestamp` — `Copy`, restored exactly.
-/// - `key`, `value` — `Bytes`, restored via refcount bump (no data copy).
+/// - `key`, `value` — `Option<Bytes>`, restored via refcount bump (no data
+///   copy), nullness included.
 /// - `headers` — truncated back to its pre-call length, undoing any headers
 ///   the panicking interceptor appended. Values it mutated *in place*, and any
 ///   headers it removed, are **not** restored.
@@ -674,7 +680,7 @@ mod tests {
             // Add a tracing header
             record.headers.push((
                 "x-intercepted".to_string(),
-                bytes::Bytes::from_static(b"true"),
+                Some(bytes::Bytes::from_static(b"true")),
             ));
             Ok(())
         }
@@ -744,7 +750,10 @@ mod tests {
         assert_eq!(interceptor.send_count(), 1);
         assert_eq!(record.headers.len(), 1);
         assert_eq!(record.headers[0].0, "x-intercepted");
-        assert_eq!(record.headers[0].1, bytes::Bytes::from_static(b"true"));
+        assert_eq!(
+            record.headers[0].1,
+            Some(bytes::Bytes::from_static(b"true"))
+        );
     }
 
     #[test]
@@ -997,7 +1006,7 @@ mod tests {
             fn on_send(&self, record: &mut ProducerRecord) -> InterceptorResult {
                 record.headers.push((
                     self.0.to_string(),
-                    bytes::Bytes::copy_from_slice(self.0.as_bytes()),
+                    Some(bytes::Bytes::copy_from_slice(self.0.as_bytes())),
                 ));
                 Ok(())
             }
@@ -1071,10 +1080,10 @@ mod tests {
             record.partition = Some(99);
             record.timestamp = Some(1234);
             record.key = Some(bytes::Bytes::from_static(b"clobbered-key"));
-            record.value = bytes::Bytes::from_static(b"clobbered-value");
+            record.value = Some(bytes::Bytes::from_static(b"clobbered-value"));
             record
                 .headers
-                .push(("added-before-panic".to_string(), bytes::Bytes::new()));
+                .push(("added-before-panic".to_string(), Some(bytes::Bytes::new())));
             record.topic = "clobbered-topic".to_string();
             panic!("mutate then panic");
         }
@@ -1088,9 +1097,10 @@ mod tests {
         record.key = Some(bytes::Bytes::from_static(b"original-key"));
         record.partition = Some(1);
         record.timestamp = Some(7);
-        record
-            .headers
-            .push(("pre-existing".to_string(), bytes::Bytes::from_static(b"h")));
+        record.headers.push((
+            "pre-existing".to_string(),
+            Some(bytes::Bytes::from_static(b"h")),
+        ));
 
         chain.on_send(&mut record).unwrap();
 
@@ -1098,7 +1108,7 @@ mod tests {
         assert_eq!(record.partition, Some(1));
         assert_eq!(record.timestamp, Some(7));
         assert_eq!(record.key, Some(bytes::Bytes::from_static(b"original-key")));
-        assert_eq!(record.value, bytes::Bytes::from("original-value"));
+        assert_eq!(record.value, Some(bytes::Bytes::from("original-value")));
         // Headers appended by the panicking interceptor are dropped; the
         // pre-existing header survives.
         assert_eq!(record.headers.len(), 1);
@@ -1132,7 +1142,7 @@ mod tests {
             fn on_send(&self, record: &mut ProducerRecord) -> InterceptorResult {
                 self.0.lock().unwrap().push(format!(
                     "value={} headers={}",
-                    String::from_utf8_lossy(&record.value),
+                    record.value_str().unwrap_or("<null>"),
                     record.headers.len()
                 ));
                 Ok(())
@@ -1161,10 +1171,10 @@ mod tests {
         impl ProducerInterceptor for Mutator {
             fn on_send(&self, record: &mut ProducerRecord) -> InterceptorResult {
                 record.partition = Some(5);
-                record.value = bytes::Bytes::from_static(b"new");
+                record.value = Some(bytes::Bytes::from_static(b"new"));
                 record
                     .headers
-                    .push(("added".to_string(), bytes::Bytes::new()));
+                    .push(("added".to_string(), Some(bytes::Bytes::new())));
                 Ok(())
             }
         }
@@ -1174,7 +1184,7 @@ mod tests {
         chain.on_send(&mut record).unwrap();
 
         assert_eq!(record.partition, Some(5));
-        assert_eq!(record.value, bytes::Bytes::from_static(b"new"));
+        assert_eq!(record.value, Some(bytes::Bytes::from_static(b"new")));
         assert_eq!(record.headers.len(), 1);
     }
 

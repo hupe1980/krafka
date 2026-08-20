@@ -18,13 +18,26 @@ pub struct ProducerRecord {
     /// Target partition (optional, will be computed if not set).
     pub partition: Option<PartitionId>,
     /// Record key (optional, zero-copy via `Bytes`).
+    ///
+    /// `None` is Kafka's *null key*: the record is keyless, so the default
+    /// partitioner spreads it instead of hashing. `Some(Bytes::new())` is a
+    /// zero-length key, which hashes like any other.
     pub key: Option<Bytes>,
-    /// Record value (zero-copy via `Bytes`).
-    pub value: Bytes,
+    /// Record value (zero-copy via `Bytes`), or `None` for a **tombstone**.
+    ///
+    /// `None` encodes Kafka's *null value* (a `-1` length prefix on the wire),
+    /// which on a `cleanup.policy=compact` topic marks the key for deletion.
+    /// `Some(Bytes::new())` is a zero-length value — an ordinary record that
+    /// compaction preserves. See [`tombstone`](Self::tombstone).
+    pub value: Option<Bytes>,
     /// Record timestamp (optional, will use current time if not set).
     pub timestamp: Option<Timestamp>,
     /// Record headers.
-    pub headers: Vec<(String, Bytes)>,
+    ///
+    /// Duplicate keys are permitted and preserved in order, matching the Kafka
+    /// record format. A `None` value is a *null* header value, which the wire
+    /// format distinguishes from a zero-length one.
+    pub headers: Vec<(String, Option<Bytes>)>,
     /// Optional type name forwarded to the
     /// [`Serializer`](crate::serdes::Serializer).
     ///
@@ -36,13 +49,57 @@ pub struct ProducerRecord {
 }
 
 impl ProducerRecord {
-    /// Create a new producer record.
+    /// Create a new producer record carrying `value`.
+    ///
+    /// For a record with a *null* value — a tombstone — use
+    /// [`tombstone`](Self::tombstone), or [`without_value`](Self::without_value)
+    /// on a record built here.
     pub fn new(topic: impl Into<String>, value: impl Into<Bytes>) -> Self {
         Self {
             topic: topic.into(),
             partition: None,
             key: None,
-            value: value.into(),
+            value: Some(value.into()),
+            timestamp: None,
+            headers: Vec::new(),
+            record_name: None,
+        }
+    }
+
+    /// Create a **tombstone**: a record with `key` and a null value.
+    ///
+    /// On a topic configured with `cleanup.policy=compact`, a tombstone marks
+    /// the key for deletion. Log compaction then removes every earlier record
+    /// for that key, and finally the tombstone itself once
+    /// `delete.retention.ms` has elapsed.
+    ///
+    /// The key is required, because a tombstone is a statement *about a key* —
+    /// a null value on a keyless record deletes nothing. Build that with
+    /// [`without_value`](Self::without_value) if you need it.
+    ///
+    /// A configured
+    /// [`value_serializer`](crate::producer::ProducerBuilder::value_serializer)
+    /// is **not** applied here; see its documentation.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use krafka::producer::ProducerRecord;
+    ///
+    /// # async fn example(producer: &krafka::producer::Producer) -> krafka::Result<()> {
+    /// let record = ProducerRecord::tombstone("users", "user-42")
+    ///     .with_header("X-Reason", &b"gdpr-erasure"[..]);
+    /// assert!(record.is_tombstone());
+    /// producer.send_record(record).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn tombstone(topic: impl Into<String>, key: impl Into<Bytes>) -> Self {
+        Self {
+            topic: topic.into(),
+            partition: None,
+            key: Some(key.into()),
+            value: None,
             timestamp: None,
             headers: Vec::new(),
             record_name: None,
@@ -67,6 +124,21 @@ impl ProducerRecord {
         self
     }
 
+    /// Set the value.
+    pub fn with_value(mut self, value: impl Into<Bytes>) -> Self {
+        self.value = Some(value.into());
+        self
+    }
+
+    /// Clear the value, turning this record into a **tombstone**.
+    ///
+    /// See [`tombstone`](Self::tombstone) for what that means on a compacted
+    /// topic. Note that a tombstone with no key deletes nothing.
+    pub fn without_value(mut self) -> Self {
+        self.value = None;
+        self
+    }
+
     /// Set the timestamp.
     pub fn with_timestamp(mut self, timestamp: Timestamp) -> Self {
         self.timestamp = Some(timestamp);
@@ -74,8 +146,23 @@ impl ProducerRecord {
     }
 
     /// Add a header.
+    ///
+    /// Duplicate keys are allowed and preserved in insertion order. Use
+    /// [`with_null_header`](Self::with_null_header) for a header whose value is
+    /// *null* rather than zero-length.
     pub fn with_header(mut self, key: impl Into<String>, value: impl Into<Bytes>) -> Self {
-        self.headers.push((key.into(), value.into()));
+        self.headers.push((key.into(), Some(value.into())));
+        self
+    }
+
+    /// Add a header with a **null** value.
+    ///
+    /// The Kafka record format distinguishes a null header value from a
+    /// zero-length one, and some ecosystems use a null-valued header as a bare
+    /// flag. `with_header(k, Bytes::new())` produces the zero-length form
+    /// instead.
+    pub fn with_null_header(mut self, key: impl Into<String>) -> Self {
+        self.headers.push((key.into(), None));
         self
     }
 
@@ -96,10 +183,27 @@ impl ProducerRecord {
         self.key.as_ref().and_then(|k| std::str::from_utf8(k).ok())
     }
 
-    /// Get the value as a string (if valid UTF-8).
+    /// Get the value as a string (if present and valid UTF-8).
+    ///
+    /// Returns `None` both for a tombstone and for a non-UTF-8 value; use
+    /// [`is_tombstone`](Self::is_tombstone) or inspect
+    /// [`value`](Self::value) directly to tell the two apart.
     #[inline]
     pub fn value_str(&self) -> Option<&str> {
-        std::str::from_utf8(&self.value).ok()
+        self.value
+            .as_ref()
+            .and_then(|v| std::str::from_utf8(v).ok())
+    }
+
+    /// Returns `true` if this record is a tombstone (a delete marker).
+    ///
+    /// A tombstone has a key and a null value. A record with neither key nor
+    /// value is *not* a tombstone — it has no key to delete. This mirrors
+    /// [`ConsumerRecord::is_tombstone`](crate::consumer::ConsumerRecord::is_tombstone)
+    /// so a record can be classified identically on both sides of the wire.
+    #[inline]
+    pub fn is_tombstone(&self) -> bool {
+        self.key.is_some() && self.value.is_none()
     }
 
     /// Get the estimated size in bytes.
@@ -117,10 +221,10 @@ impl ProducerRecord {
     /// i8 attributes                 — 1 byte (fixed)
     /// signed_varlong(ts_delta)      — ≤ 5 bytes (conservative for typical batch windows)
     /// signed_varint(off_delta)      — ≤ 2 bytes (covers batches up to ~16 k records)
-    /// signed_varint(key_len) + key  — exact varint + bytes
-    /// signed_varint(val_len) + val  — exact varint + bytes
+    /// signed_varint(key_len) + key  — exact varint + bytes; -1 when null
+    /// signed_varint(val_len) + val  — exact varint + bytes; -1 for a tombstone
     /// signed_varint(hdr_count)      — exact varint
-    ///   per header: varint(k_len) + k + varint(v_len) + v
+    ///   per header: varint(k_len) + k + varint(v_len) + v; v_len -1 when null
     /// ```
     ///
     /// An additional per-record batch-overhead allowance is added to amortise
@@ -137,23 +241,27 @@ impl ProducerRecord {
         const OFFSET_DELTA_BYTES: usize = 2;
 
         let key_bytes = self.key.as_ref().map_or(0, |k| k.len());
-        let val_bytes = self.value.len();
+        let val_bytes = self.value.as_ref().map_or(0, |v| v.len());
 
         let key_varint = match &self.key {
             Some(k) => varint::signed_varint_size(k.len() as i32),
             None => varint::signed_varint_size(-1), // null sentinel
         };
-        let val_varint = varint::signed_varint_size(val_bytes as i32);
+        let val_varint = match &self.value {
+            Some(v) => varint::signed_varint_size(v.len() as i32),
+            None => varint::signed_varint_size(-1), // null sentinel (tombstone)
+        };
         let hdr_count_varint = varint::signed_varint_size(self.headers.len() as i32);
 
         let headers_wire: usize = self
             .headers
             .iter()
             .map(|(k, v)| {
-                varint::signed_varint_size(k.len() as i32)
-                    + k.len()
-                    + varint::signed_varint_size(v.len() as i32)
-                    + v.len()
+                let value_wire = match v {
+                    Some(v) => varint::signed_varint_size(v.len() as i32) + v.len(),
+                    None => varint::signed_varint_size(-1), // null sentinel
+                };
+                varint::signed_varint_size(k.len() as i32) + k.len() + value_wire
             })
             .sum();
 
@@ -205,13 +313,16 @@ impl ProducerRecord {
             ));
         }
 
-        // Value is encoded as KafkaBytes (i32 length prefix)
-        if self.value.len() > i32::MAX as usize {
+        // Value is encoded as KafkaBytes (i32 length prefix). A tombstone
+        // (`None`) is encoded as the -1 sentinel and has no length to check.
+        if let Some(ref value) = self.value
+            && value.len() > i32::MAX as usize
+        {
             return Err(KrafkaError::protocol_kind(
                 ProtocolErrorKind::InvalidLength,
                 format!(
                     "record value length {} exceeds protocol limit of {}",
-                    self.value.len(),
+                    value.len(),
                     i32::MAX
                 ),
             ));
@@ -241,7 +352,9 @@ impl ProducerRecord {
                     ),
                 ));
             }
-            if value.len() > i32::MAX as usize {
+            if let Some(value) = value
+                && value.len() > i32::MAX as usize
+            {
                 return Err(KrafkaError::protocol_kind(
                     ProtocolErrorKind::InvalidLength,
                     format!(
@@ -289,9 +402,10 @@ pub(crate) type TopicHandle = Arc<str>;
 #[derive(Debug, Clone)]
 pub(crate) struct RoutedRecord {
     pub key: Option<Bytes>,
-    pub value: Bytes,
+    /// `None` is the Kafka null value — a tombstone.
+    pub value: Option<Bytes>,
     pub timestamp: Option<Timestamp>,
-    pub headers: Vec<(String, Bytes)>,
+    pub headers: Vec<(String, Option<Bytes>)>,
 }
 
 impl RoutedRecord {
@@ -305,11 +419,11 @@ impl RoutedRecord {
         batch_builder: RecordBatchBuilder,
     ) -> RecordBatchBuilder {
         if self.headers.is_empty() {
-            batch_builder.add_record(self.key.clone(), Some(self.value.clone()))
+            batch_builder.add_record(self.key.clone(), self.value.clone())
         } else {
             batch_builder.add_record_with_headers(
                 self.key.clone(),
-                Some(self.value.clone()),
+                self.value.clone(),
                 self.headers.clone(),
             )
         }
@@ -436,7 +550,7 @@ mod tests {
     fn test_producer_record_new() {
         let record = ProducerRecord::new("test-topic", b"hello".to_vec());
         assert_eq!(record.topic, "test-topic");
-        assert_eq!(record.value.as_ref(), b"hello");
+        assert_eq!(record.value.as_deref(), Some(&b"hello"[..]));
         assert!(record.key.is_none());
         assert!(record.partition.is_none());
     }
@@ -510,10 +624,157 @@ mod tests {
         assert_eq!(routed.topic.as_ref(), "test-topic");
         assert_eq!(routed.partition, Some(2));
         assert_eq!(routed.record.key, Some(Bytes::from_static(b"key")));
-        assert_eq!(routed.record.value, Bytes::from_static(b"hello"));
+        assert_eq!(routed.record.value, Some(Bytes::from_static(b"hello")));
         assert_eq!(routed.record.timestamp, Some(1234));
         assert_eq!(routed.record.headers.len(), 1);
         assert_eq!(routed.record.headers[0].0, "h1");
+    }
+
+    // ── Tombstones: null value is not empty value ────────────────
+
+    /// `tombstone()` produces a keyed record with a null value, which is what
+    /// log compaction reads as "delete this key".
+    #[test]
+    fn tombstone_has_key_and_null_value() {
+        let record = ProducerRecord::tombstone("users", "user-42");
+
+        assert_eq!(record.topic, "users");
+        assert_eq!(record.key, Some(Bytes::from_static(b"user-42")));
+        assert_eq!(record.value, None);
+        assert!(record.is_tombstone());
+        assert_eq!(record.value_str(), None);
+    }
+
+    /// A zero-length value is an ordinary record that compaction *keeps*;
+    /// only a null value deletes. Collapsing the two loses the difference.
+    #[test]
+    fn empty_value_is_not_a_tombstone() {
+        let empty = ProducerRecord::new("users", Bytes::new()).with_key("user-42");
+
+        assert_eq!(empty.value, Some(Bytes::new()));
+        assert!(!empty.is_tombstone());
+        assert_ne!(
+            empty.value,
+            ProducerRecord::tombstone("users", "user-42").value
+        );
+    }
+
+    /// A null value without a key deletes nothing, so it is not a tombstone —
+    /// matching `ConsumerRecord::is_tombstone`, so a record classifies the same
+    /// on both sides of the wire.
+    #[test]
+    fn keyless_null_value_is_not_a_tombstone() {
+        let record = ProducerRecord::new("t", b"v".to_vec()).without_value();
+
+        assert_eq!(record.value, None);
+        assert!(!record.is_tombstone(), "no key means nothing to delete");
+    }
+
+    #[test]
+    fn with_value_and_without_value_round_trip() {
+        let record = ProducerRecord::tombstone("t", "k").with_value(b"back".to_vec());
+        assert_eq!(record.value, Some(Bytes::from_static(b"back")));
+        assert!(!record.is_tombstone());
+
+        let record = record.without_value();
+        assert_eq!(record.value, None);
+        assert!(record.is_tombstone());
+    }
+
+    /// A null value costs the `-1` sentinel varint and no payload bytes, so a
+    /// tombstone must estimate *smaller* than the same record with an empty
+    /// value — which occupies a `0` varint plus nothing. Both are one byte, so
+    /// the meaningful assertion is that neither over-counts and both stay
+    /// under the batch budget.
+    #[test]
+    fn tombstone_estimated_size_accounts_for_the_null_sentinel() {
+        let tombstone = ProducerRecord::tombstone("test-topic", "key");
+        let valued = ProducerRecord::new("test-topic", b"hello world".to_vec()).with_key("key");
+
+        assert!(
+            tombstone.estimated_size() < valued.estimated_size(),
+            "a tombstone carries no value bytes"
+        );
+        // The estimate must still cover the fixed framing and the key.
+        assert!(tombstone.estimated_size() > 3);
+    }
+
+    /// A null header value is also a `-1` sentinel, not a zero-length payload.
+    #[test]
+    fn null_header_value_is_distinct_from_empty() {
+        let record = ProducerRecord::new("t", b"v".to_vec())
+            .with_null_header("flag")
+            .with_header("empty", Bytes::new());
+
+        assert_eq!(record.headers[0], ("flag".to_string(), None));
+        assert_eq!(record.headers[1], ("empty".to_string(), Some(Bytes::new())));
+        assert_ne!(record.headers[0].1, record.headers[1].1);
+    }
+
+    /// A tombstone must survive validation — it is a legal record, and an
+    /// over-eager length check on an absent value would reject it.
+    #[test]
+    fn tombstone_validates() {
+        ProducerRecord::tombstone("t", "k")
+            .with_null_header("h")
+            .validate()
+            .expect("a tombstone is a legal record");
+    }
+
+    /// Routing must not resurrect the null: the value that reaches the batch
+    /// builder is still `None`.
+    #[test]
+    fn tombstone_survives_routing() {
+        let routed = ProducerRecord::tombstone("t", "k")
+            .with_null_header("h")
+            .into_routed_parts();
+
+        assert_eq!(routed.record.value, None);
+        assert_eq!(routed.record.key, Some(Bytes::from_static(b"k")));
+        assert_eq!(routed.record.headers[0].1, None);
+    }
+
+    /// The end of the produce path: a routed tombstone must encode as a `-1`
+    /// value length and decode back to `None`, not to an empty buffer.
+    #[test]
+    fn tombstone_encodes_as_null_on_the_wire() {
+        use crate::protocol::{RecordBatch, RecordBatchBuilder};
+
+        let routed = ProducerRecord::tombstone("t", "k")
+            .with_null_header("flag")
+            .with_header("kept", b"1".to_vec())
+            .into_routed_parts();
+
+        let builder = RecordBatchBuilder::new();
+        let batch = routed.record.append_to_batch_builder(builder).build();
+        let mut encoded = batch.encode().expect("batch should encode");
+
+        let decoded = RecordBatch::decode(&mut encoded).expect("batch should decode");
+        let record = &decoded.records[0];
+
+        assert_eq!(record.key, Some(Bytes::from_static(b"k")));
+        assert_eq!(record.value, None, "the tombstone must stay null");
+        assert_eq!(record.headers[0].value, None, "null header stays null");
+        assert_eq!(record.headers[1].value, Some(Bytes::from_static(b"1")));
+    }
+
+    /// The negative control for the test above: an empty value must *not*
+    /// decode as null, or the two would be indistinguishable on the wire and
+    /// compaction would delete keys their producer meant to keep.
+    #[test]
+    fn empty_value_encodes_as_zero_length_not_null() {
+        use crate::protocol::{RecordBatch, RecordBatchBuilder};
+
+        let routed = ProducerRecord::new("t", Bytes::new())
+            .with_key("k")
+            .into_routed_parts();
+
+        let builder = RecordBatchBuilder::new();
+        let batch = routed.record.append_to_batch_builder(builder).build();
+        let mut encoded = batch.encode().expect("batch should encode");
+
+        let decoded = RecordBatch::decode(&mut encoded).expect("batch should decode");
+        assert_eq!(decoded.records[0].value, Some(Bytes::new()));
     }
 
     #[test]

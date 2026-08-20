@@ -56,7 +56,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 
-use bytes::Bytes;
 use tokio::sync::{Notify, RwLock};
 use tracing::{debug, info, warn};
 
@@ -1898,17 +1897,17 @@ impl TransactionalProducer {
     }
 
     /// Send a record within the current transaction.
+    ///
+    /// `value` is `Option` for the same reason `key` is: `None` is Kafka's
+    /// null value, a **tombstone**. See [`Producer::send`](super::Producer::send).
     pub async fn send(
         &self,
         topic: &str,
         key: Option<&[u8]>,
-        value: &[u8],
+        value: Option<&[u8]>,
     ) -> Result<RecordMetadata> {
-        let mut record = ProducerRecord::new(topic, Bytes::copy_from_slice(value));
-        if let Some(k) = key {
-            record = record.with_key(Bytes::copy_from_slice(k));
-        }
-        self.send_record(record).await
+        self.send_record(super::build_record(topic, key, value))
+            .await
     }
 
     /// Send a producer record within the current transaction and wait for the
@@ -1976,23 +1975,14 @@ impl TransactionalProducer {
         crate::interceptor::safe_on_send(&*self.interceptor, &mut record);
 
         // Transparently apply producer-level schema encoders if configured.
-        if let Some(enc) = &self.value_serializer {
-            record.value = enc
-                .serialize(
-                    record.value.clone(),
-                    &record.topic,
-                    record.record_name.as_deref(),
-                    false,
-                )
-                .await?;
-        }
-        if let Some(enc) = &self.key_serializer {
-            let key = record.key.clone().unwrap_or_default();
-            record.key = Some(
-                enc.serialize(key, &record.topic, record.record_name.as_deref(), true)
-                    .await?,
-            );
-        }
+        // Shared with the plain producer so the two paths cannot drift; null
+        // keys and tombstone values are passed through unserialized.
+        super::apply_serializers(
+            &mut record,
+            self.key_serializer.as_deref(),
+            self.value_serializer.as_deref(),
+        )
+        .await?;
 
         // Validate record fields against Kafka protocol wire-format limits.
         record.validate()?;
@@ -3967,6 +3957,9 @@ impl TransactionalProducerBuilder {
     ///
     /// Equivalent to `key.serializer` in the Java `KafkaProducer`. Configure
     /// it once here and encoding is transparent on every send.
+    ///
+    /// A null key is passed through unencoded, exactly as on
+    /// [`ProducerBuilder::key_serializer`](super::ProducerBuilder::key_serializer).
     pub fn key_serializer(mut self, encoder: Arc<dyn Serializer>) -> Self {
         self.key_serializer = Some(encoder);
         self
@@ -3975,6 +3968,9 @@ impl TransactionalProducerBuilder {
     /// Attach a value encoder applied automatically on every [`send_record`](TransactionalProducer::send_record) call.
     ///
     /// Equivalent to `value.serializer` in the Java `KafkaProducer`.
+    ///
+    /// A tombstone is passed through unencoded, exactly as on
+    /// [`ProducerBuilder::value_serializer`](super::ProducerBuilder::value_serializer).
     pub fn value_serializer(mut self, encoder: Arc<dyn Serializer>) -> Self {
         self.value_serializer = Some(encoder);
         self
@@ -4190,6 +4186,8 @@ impl TransactionalProducerBuilder {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    use bytes::Bytes;
 
     use crate::metadata::ClusterMetadata;
     use crate::network::ConnectionPool;
@@ -5754,9 +5752,10 @@ mod tests {
                 record: &mut ProducerRecord,
             ) -> crate::interceptor::InterceptorResult {
                 self.sends.fetch_add(1, Ordering::SeqCst);
-                record
-                    .headers
-                    .push(("seen-by".to_string(), Bytes::from_static(b"interceptor")));
+                record.headers.push((
+                    "seen-by".to_string(),
+                    Some(Bytes::from_static(b"interceptor")),
+                ));
                 Ok(())
             }
         }

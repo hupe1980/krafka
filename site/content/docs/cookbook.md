@@ -74,7 +74,7 @@ loop {
     producer.begin_transaction()?;
     for record in &records {
         let transformed = transform(record);
-        producer.send("orders-enriched", record.key.clone(), &transformed).await?;
+        producer.send("orders-enriched", record.key.clone(), Some(&transformed)).await?;
     }
 
     // Offsets go to the *group coordinator* as part of this transaction.
@@ -228,6 +228,34 @@ loop {
 Tombstones (null values) delete the key. On an actively written topic `scan()`
 is best-effort rather than a bounded snapshot — see
 [Compacted Topics](@/docs/consumer.md).
+
+---
+
+## Delete a key from a compacted topic
+
+A record with a **null value** — a tombstone — retires a key from a
+`cleanup.policy=compact` topic. Compaction removes every earlier record for the
+key, then the tombstone itself after `delete.retention.ms`.
+
+```rust,compile
+use krafka::producer::ProducerRecord;
+
+producer
+    .send_record(
+        ProducerRecord::tombstone("users", "user-42")
+            .with_header("X-Reason", &b"gdpr-erasure"[..]),
+    )
+    .await?;
+
+// Or, without building a record:
+producer.send("users", Some(b"user-42"), None).await?;
+```
+
+`Some(b"")` is **not** a deletion — a zero-length value is ordinary data that
+compaction preserves. Only `None` deletes. Details, including partition
+co-location and serializer behaviour, are in
+[Tombstones and Compacted Topics](@/docs/producer.md#tombstones-and-compacted-topics);
+the read side is [Build an in-memory table from a compacted topic](#build-an-in-memory-table-from-a-compacted-topic).
 
 ---
 

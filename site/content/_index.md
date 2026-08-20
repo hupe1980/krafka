@@ -98,7 +98,7 @@ async fn main() -> krafka::error::Result<()> {
         .build()
         .await?;
 
-    producer.send("orders", Some(b"key"), b"hello").await?;
+    producer.send("orders", Some(b"key"), Some(b"hello")).await?;
     producer.close().await;
     Ok(())
 }

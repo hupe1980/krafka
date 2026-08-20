@@ -39,7 +39,7 @@ async fn records_reach_the_broker() {
         .await
         .unwrap();
 
-    producer.send("orders", None, b"payload").await.unwrap();
+    producer.send("orders", None, Some(b"payload")).await.unwrap();
 
     assert_eq!(broker.next_offset("orders", 0), Some(1));
 }
@@ -122,7 +122,7 @@ let producer = TransactionalProducer::builder()
 
 producer.init_transactions().await?;
 producer.begin_transaction()?;
-producer.send("orders", None, b"payload").await?;
+producer.send("orders", None, Some(b"payload")).await?;
 producer.flush().await?;
 
 // Until the commit lands, a read_committed consumer may not read past the

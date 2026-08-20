@@ -58,6 +58,61 @@ use crate::serdes::Serializer;
 use self::idempotent::ErasedProducerStateStore;
 use crate::barrier::InFlightBarrier;
 
+/// Build a [`ProducerRecord`] from the borrowed `(topic, key, value)` triple
+/// the `send` convenience methods take.
+///
+/// Shared by [`Producer::send`] and
+/// [`TransactionalProducer::send`](transaction::TransactionalProducer::send).
+/// `None` is preserved as Kafka's null, never widened to an empty slice.
+pub(crate) fn build_record(
+    topic: &str,
+    key: Option<&[u8]>,
+    value: Option<&[u8]>,
+) -> ProducerRecord {
+    let mut record = ProducerRecord::new(topic, Bytes::new());
+    record.value = value.map(Bytes::copy_from_slice);
+    record.key = key.map(Bytes::copy_from_slice);
+    record
+}
+
+/// Apply the configured key/value serializers to a record, in place.
+///
+/// Shared by [`Producer::enqueue`] and
+/// [`TransactionalProducer::enqueue`](transaction::TransactionalProducer::enqueue)
+/// so the two send paths cannot drift apart.
+///
+/// A `None` key or value is passed through untouched — see
+/// [`ProducerBuilder::value_serializer`] for why.
+pub(crate) async fn apply_serializers(
+    record: &mut ProducerRecord,
+    key_serializer: Option<&dyn Serializer>,
+    value_serializer: Option<&dyn Serializer>,
+) -> Result<()> {
+    if let (Some(enc), Some(value)) = (value_serializer, record.value.as_ref()) {
+        record.value = Some(
+            enc.serialize(
+                value.clone(),
+                &record.topic,
+                record.record_name.as_deref(),
+                false,
+            )
+            .await?,
+        );
+    }
+    if let (Some(enc), Some(key)) = (key_serializer, record.key.as_ref()) {
+        record.key = Some(
+            enc.serialize(
+                key.clone(),
+                &record.topic,
+                record.record_name.as_deref(),
+                true,
+            )
+            .await?,
+        );
+    }
+    Ok(())
+}
+
 /// A Kafka producer.
 pub struct Producer {
     /// Producer configuration.
@@ -702,36 +757,41 @@ impl Producer {
     ///     .build()
     ///     .await?;
     ///
-    /// let metadata = producer.send("my-topic", Some(b"key"), b"value").await?;
+    /// let metadata = producer.send("my-topic", Some(b"key"), Some(b"value")).await?;
     /// println!("Sent to partition {} at offset {}", metadata.partition, metadata.offset);
+    ///
+    /// // A null value is a tombstone: on a compacted topic it deletes the key.
+    /// producer.send("my-topic", Some(b"key"), None).await?;
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// Both arguments are `Option` because Kafka distinguishes *absent* from
+    /// *empty*: a `None` key is keyless (the default partitioner spreads it
+    /// rather than hashing), and a `None` value is a
+    /// [tombstone](ProducerRecord::tombstone). `Some(&[])` is a zero-length
+    /// field, which is ordinary data.
     pub async fn send(
         &self,
         topic: &str,
         key: Option<&[u8]>,
-        value: &[u8],
+        value: Option<&[u8]>,
     ) -> Result<RecordMetadata> {
-        let mut record = ProducerRecord::new(topic, Bytes::copy_from_slice(value));
-        if let Some(k) = key {
-            record = record.with_key(Bytes::copy_from_slice(k));
-        }
-        self.send_record(record).await
+        self.send_record(build_record(topic, key, value)).await
     }
 
     /// Send a record with headers.
+    ///
+    /// `key`, `value` and each header value are `Option` so that Kafka's
+    /// null-versus-empty distinction survives; see [`send`](Self::send).
     pub async fn send_with_headers(
         &self,
         topic: &str,
         key: Option<&[u8]>,
-        value: &[u8],
-        headers: Vec<(String, Bytes)>,
+        value: Option<&[u8]>,
+        headers: Vec<(String, Option<Bytes>)>,
     ) -> Result<RecordMetadata> {
-        let mut record = ProducerRecord::new(topic, Bytes::copy_from_slice(value));
-        if let Some(k) = key {
-            record = record.with_key(Bytes::copy_from_slice(k));
-        }
+        let mut record = build_record(topic, key, value);
         record.headers = headers;
         self.send_record(record).await
     }
@@ -812,23 +872,12 @@ impl Producer {
         // Transparently apply producer-level schema encoders if configured.
         // Runs after the interceptor (which may set topic/key/value) but before
         // validation, so oversized encoded payloads are still caught.
-        if let Some(enc) = &self.value_serializer {
-            record.value = enc
-                .serialize(
-                    record.value.clone(),
-                    &record.topic,
-                    record.record_name.as_deref(),
-                    false,
-                )
-                .await?;
-        }
-        if let Some(enc) = &self.key_serializer {
-            let key = record.key.clone().unwrap_or_default();
-            record.key = Some(
-                enc.serialize(key, &record.topic, record.record_name.as_deref(), true)
-                    .await?,
-            );
-        }
+        apply_serializers(
+            &mut record,
+            self.key_serializer.as_deref(),
+            self.value_serializer.as_deref(),
+        )
+        .await?;
 
         // Validate record fields against Kafka protocol wire-format limits.
         // Runs after the interceptor since interceptors can mutate the record.
@@ -1519,6 +1568,9 @@ impl ProducerBuilder {
     /// set [`ProducerRecord::record_name`] (via
     /// [`with_record_name`](ProducerRecord::with_record_name)) on each record
     /// before sending.
+    ///
+    /// A **null key is not encoded** — it is passed through as `None`, for the
+    /// reason given on [`value_serializer`](Self::value_serializer).
     pub fn key_serializer(mut self, encoder: Arc<dyn Serializer>) -> Self {
         self.key_serializer = Some(encoder);
         self
@@ -1529,6 +1581,11 @@ impl ProducerBuilder {
     /// This is the Rust equivalent of `value.serializer` in the Java
     /// `KafkaProducer`. Configure it once here and encoding is transparent
     /// on every send.
+    ///
+    /// A **tombstone is not encoded** — a `None` value is passed through as
+    /// `None`, since framing it would emit a short record that log compaction
+    /// keeps, and the key would never be deleted. The same applies to a null
+    /// key, which would otherwise move onto the partitioner's hash path.
     pub fn value_serializer(mut self, encoder: Arc<dyn Serializer>) -> Self {
         self.value_serializer = Some(encoder);
         self
@@ -2125,5 +2182,110 @@ mod tests {
     fn test_transaction_version_is_publicly_nameable() {
         let version: crate::producer::TransactionVersion = TransactionVersion::V2;
         assert_eq!(version, TransactionVersion::V2);
+    }
+
+    // ── Serializers must not resurrect a null ─────────────────────
+
+    /// A serializer that frames its input the way a schema-registry serializer
+    /// does: five bytes of envelope in front of the payload.
+    #[derive(Debug)]
+    struct Framing;
+
+    impl crate::serdes::Serializer for Framing {
+        fn serialize(
+            &self,
+            payload: Bytes,
+            _topic: &str,
+            _record_name: Option<&str>,
+            _is_key: bool,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Bytes>> + Send + '_>>
+        {
+            Box::pin(async move {
+                let mut out = Vec::with_capacity(5 + payload.len());
+                out.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x01]);
+                out.extend_from_slice(&payload);
+                Ok(Bytes::from(out))
+            })
+        }
+    }
+
+    /// A tombstone must reach the wire null. Framing it would produce a
+    /// five-byte record, which compaction treats as ordinary data — the key
+    /// would never be deleted, and the caller would have no way to tell.
+    #[tokio::test]
+    async fn value_serializer_skips_a_tombstone() {
+        let framing = Framing;
+        let mut record = ProducerRecord::tombstone("users", "user-42");
+
+        apply_serializers(&mut record, None, Some(&framing))
+            .await
+            .expect("serialization should succeed");
+
+        assert_eq!(record.value, None, "a tombstone must not be framed");
+        assert!(record.is_tombstone());
+    }
+
+    /// The negative control: an ordinary value *is* framed, so the skip above
+    /// is about nullness and not about the serializer being inert.
+    #[tokio::test]
+    async fn value_serializer_runs_on_a_present_value() {
+        let framing = Framing;
+        let mut record = ProducerRecord::new("users", b"v".to_vec());
+
+        apply_serializers(&mut record, None, Some(&framing))
+            .await
+            .expect("serialization should succeed");
+
+        assert_eq!(
+            record.value,
+            Some(Bytes::from_static(&[0x00, 0x00, 0x00, 0x00, 0x01, b'v']))
+        );
+    }
+
+    /// A null key must stay null. Serializing it into an empty key moves the
+    /// record off the partitioner's keyless path — every keyless record would
+    /// hash to the same partition instead of being spread.
+    #[tokio::test]
+    async fn key_serializer_skips_a_null_key() {
+        let framing = Framing;
+        let mut record = ProducerRecord::new("users", b"v".to_vec());
+
+        apply_serializers(&mut record, Some(&framing), None)
+            .await
+            .expect("serialization should succeed");
+
+        assert_eq!(record.key, None, "a null key must not become an empty key");
+    }
+
+    /// The negative control for the key path.
+    #[tokio::test]
+    async fn key_serializer_runs_on_a_present_key() {
+        let framing = Framing;
+        let mut record = ProducerRecord::new("users", b"v".to_vec()).with_key(b"k".to_vec());
+
+        apply_serializers(&mut record, Some(&framing), None)
+            .await
+            .expect("serialization should succeed");
+
+        assert_eq!(
+            record.key,
+            Some(Bytes::from_static(&[0x00, 0x00, 0x00, 0x00, 0x01, b'k']))
+        );
+    }
+
+    /// `build_record` must carry `None` through as Kafka's null rather than
+    /// widening it to an empty slice.
+    #[test]
+    fn build_record_preserves_null_key_and_value() {
+        let tombstone = build_record("t", Some(b"k"), None);
+        assert_eq!(tombstone.value, None);
+        assert!(tombstone.is_tombstone());
+
+        let keyless = build_record("t", None, Some(b"v"));
+        assert_eq!(keyless.key, None);
+
+        let empty = build_record("t", Some(b"k"), Some(b""));
+        assert_eq!(empty.value, Some(Bytes::new()), "empty is not null");
+        assert!(!empty.is_tombstone());
     }
 }

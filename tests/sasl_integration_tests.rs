@@ -300,7 +300,7 @@ async fn test_sasl_producer_consumer() {
             .send(
                 topic,
                 Some(format!("key-{i}").as_bytes()),
-                format!("value-{i}").as_bytes(),
+                Some(format!("value-{i}").as_bytes()),
             )
             .await
             .expect("Failed to send message via SASL");

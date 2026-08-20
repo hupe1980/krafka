@@ -48,7 +48,7 @@ simply correct. Different partitions still proceed concurrently.
 
 | | |
 |---|---|
-| **Clients** | Producer — one send path that batches at every `linger` setting including `0`, with compression, idempotence and transactions · Consumer (classic **and** KIP-848 server-side assignment with validated revoke-before-assign reconciliation) · `ShareConsumer` (KIP-932 at Kafka 4.2 parity, incl. KIP-1222 `Renew` and KIP-1206 `ShareAcquireMode`) · full `AdminClient` |
+| **Clients** | Producer — one send path that batches at every `linger` setting including `0`, with compression, idempotence, transactions and tombstones (null keys and values are `Option` end to end) · Consumer (classic **and** KIP-848 server-side assignment with validated revoke-before-assign reconciliation) · `ShareConsumer` (KIP-932 at Kafka 4.2 parity, incl. KIP-1222 `Renew` and KIP-1206 `ShareAcquireMode`) · full `AdminClient` |
 | **Security** | rustls TLS/mTLS with **hot certificate reload** (KIP-1288) · SASL PLAIN, SCRAM-SHA-256/512, OAUTHBEARER · built-in OIDC provider for `client_credentials` (KIP-768) and RFC 7523 client assertions (KIP-1258), with no cryptography dependency added · AWS MSK IAM · every mechanism composes with TLS through one `with_tls`, asserted reachable over both `SASL_PLAINTEXT` and `SASL_SSL` at compile time |
 | **Consistency** | Every client shares one configuration surface and one operational surface (`close`, `rebootstrap`, `update_seed_brokers`, `refresh_tls`, `metrics`) — asserted at compile time, builders included. One builder per client, with `build_config()` to validate without a broker and `build()` to validate and connect, both through the same validator. The transactional producer mirrors the plain one setter for setter, minus the two settings transactions fix (`acks`, `idempotent`) |
 | **Tuning** | Per-codec compression levels (Gzip 0–9, Zstd through 22) validated against the selected codec at build time, so a level set on a codec that has none is rejected rather than ignored — on the plain and the transactional producer alike |
@@ -87,8 +87,11 @@ async fn main() -> Result<()> {
 
     // Send a message
     let metadata = producer
-        .send("my-topic", Some(b"key"), b"Hello, Kafka!")
+        .send("my-topic", Some(b"key"), Some(b"Hello, Kafka!"))
         .await?;
+
+    // A null value is a tombstone: on a compacted topic it deletes the key.
+    producer.send("my-topic", Some(b"key"), None).await?;
     
     println!("Sent to partition {} at offset {}", 
              metadata.partition, metadata.offset);
@@ -183,8 +186,8 @@ async fn main() -> Result<()> {
 
     // Atomic transaction
     producer.begin_transaction()?;
-    producer.send("topic-a", Some(b"key"), b"value1").await?;
-    producer.send("topic-b", Some(b"key"), b"value2").await?;
+    producer.send("topic-a", Some(b"key"), Some(b"value1")).await?;
+    producer.send("topic-b", Some(b"key"), Some(b"value2")).await?;
     producer.commit_transaction().await?;
 
     Ok(())
@@ -503,7 +506,7 @@ let group_metadata = consumer
     .ok_or("consumer has not joined the group yet")?;
 
 producer.begin_transaction()?;
-producer.send("out-topic", Some(b"key"), b"value").await?;
+producer.send("out-topic", Some(b"key"), Some(b"value")).await?;
 producer.send_offsets_to_transaction(&offsets, &group_metadata).await?;
 producer.commit_transaction().await?;
 ```
@@ -659,6 +662,22 @@ what it does and, just as importantly, what it deliberately does not model.
 ## ⬆️ Upgrading
 
 Release-by-release detail lives in **[CHANGELOG.md](CHANGELOG.md)**.
+
+### Upgrading to 0.20
+
+Null is now representable on the produce path, so krafka can write tombstones.
+Three public shapes changed:
+
+| Before | After |
+|---|---|
+| `ProducerRecord::value: Bytes` | `ProducerRecord::value: Option<Bytes>` |
+| `ProducerRecord::headers: Vec<(String, Bytes)>` | `Vec<(String, Option<Bytes>)>` |
+| `send(topic, key, value: &[u8])` | `send(topic, key, value: Option<&[u8]>)` |
+
+Wrap the value you pass in `Some(...)` (`send`, `send_with_headers`,
+`TransactionalProducer::send`), and header values likewise —
+`ProducerRecord::with_header` still takes a plain value. `None` is a tombstone:
+see [Tombstones and Compacted Topics](https://hupe1980.github.io/krafka/docs/producer/#tombstones-and-compacted-topics).
 
 ### Upgrading to 0.19
 
