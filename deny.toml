@@ -77,14 +77,7 @@ yanked = "deny"
 #
 # which must produce no output. Re-audit this list whenever dev-dependencies
 # change; anything reachable via `-e normal` must be fixed, not ignored.
-ignore = [
-    # astral-tokio-tar <- bollard <- testcontainers (integration tests only)
-    "RUSTSEC-2026-0112", # PAX header desynchronization
-    "RUSTSEC-2026-0113", # unpack_in can chmod arbitrary dirs via symlinks
-    "RUSTSEC-2026-0145", # PAX header desynchronization
-    # crossbeam-epoch <- criterion (benchmarks only)
-    "RUSTSEC-2026-0204", # invalid pointer deref in fmt::Pointer
-]
+ignore = []
 
 # ---------------------------------------------------------------------------
 # Source allowlist
