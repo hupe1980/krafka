@@ -32,10 +32,10 @@ async fn main() -> Result<()> {
         .await?;
 
     // Simple send
-    producer.send("topic", None, b"value").await?;
+    producer.send("topic", None, Some(b"value")).await?;
 
     // Send with key (for partitioning)
-    producer.send("topic", Some(b"key"), b"value").await?;
+    producer.send("topic", Some(b"key"), Some(b"value")).await?;
 
     producer.close().await;
     Ok(())
@@ -298,13 +298,67 @@ Call `flush()` whenever you need a durability barrier over records that have alr
 ```rust,compile
 // Send multiple records
 for i in 0..100 {
-    producer.send("topic", Some(format!("key-{}", i).as_bytes()), b"value").await?;
+    producer.send("topic", Some(format!("key-{}", i).as_bytes()), Some(b"value")).await?;
 }
 
 // Ensure all records are sent before closing
 producer.flush().await?;
 producer.close().await;
 ```
+
+## Tombstones and Compacted Topics
+
+On a `cleanup.policy=compact` topic, a record with a **null value** is a
+*tombstone*: it marks its key for deletion. A null value is not an empty one —
+the record format encodes null as a `-1` length prefix and zero-length as `0`,
+and compaction deletes on the first while keeping the second. krafka models the
+distinction as `Option<Bytes>` on both sides of the wire.
+
+```rust,compile
+use krafka::producer::ProducerRecord;
+
+// A tombstone needs a key: a null value on a keyless record deletes nothing.
+producer
+    .send_record(ProducerRecord::tombstone("users", "user-42"))
+    .await?;
+
+// The same thing, without building a record.
+producer.send("users", Some(b"user-42"), None).await?;
+
+// A zero-length value is NOT a tombstone — compaction keeps this record.
+producer.send("users", Some(b"user-42"), Some(b"")).await?;
+```
+
+`without_value()` turns an existing record into one, keeping its key and
+headers; `with_value()` reverses that. `is_tombstone()` reports whether a
+record has a key and no value, using the same rule as
+`ConsumerRecord::is_tombstone()`.
+
+Two things worth knowing:
+
+- **A configured `value_serializer` is skipped for a tombstone**, and a
+  `key_serializer` for a null key. Framing a null value would emit a short
+  record that compaction reads as ordinary data. See
+  [`Serializer`](https://docs.rs/krafka/latest/krafka/serdes/trait.Serializer.html).
+- **The tombstone must share a partition with the records it retires**, since
+  compaction runs per partition. The default partitioner hashes the key, so
+  reusing the key is enough — do not pin `partition` on one and not the other.
+
+### Null header values
+
+Header values carry the same distinction, as `Vec<(String, Option<Bytes>)>`:
+
+```rust,compile
+use krafka::producer::ProducerRecord;
+
+let record = ProducerRecord::new("events", b"payload".to_vec())
+    .with_header("X-Source", &b"api"[..])   // an ordinary header value
+    .with_null_header("X-Flag");            // null, not zero-length
+```
+
+On the read side, `ConsumerRecord::is_tombstone()` classifies a record and
+[`CompactedTable`](@/docs/consumer.md) applies the semantics — the key is
+removed from the table and reported as a `TableChange` with `is_delete()`.
 
 ## Partitioning
 
@@ -314,11 +368,11 @@ The default partitioner uses murmur2 hashing (Java-compatible) for keyed message
 
 ```rust,compile
 // Messages with the same key go to the same partition
-producer.send("topic", Some(b"user-123"), b"event1").await?;
-producer.send("topic", Some(b"user-123"), b"event2").await?;  // Same partition
+producer.send("topic", Some(b"user-123"), Some(b"event1")).await?;
+producer.send("topic", Some(b"user-123"), Some(b"event2")).await?;  // Same partition
 
 // Messages without keys are distributed round-robin
-producer.send("topic", None, b"event").await?;
+producer.send("topic", None, Some(b"event")).await?;
 ```
 
 ### Custom Partitioners
@@ -431,7 +485,7 @@ let producer = Producer::builder()
     .await?;
 
 // send() automatically retries on transient failures
-producer.send("topic", None, b"value").await?;
+producer.send("topic", None, Some(b"value")).await?;
 ```
 
 ### Delivery Timeout
@@ -475,7 +529,7 @@ async fn send_with_retry(
     let mut attempts = 0;
     
     loop {
-        match producer.send(topic, key, value).await {
+        match producer.send(topic, key, Some(value)).await {
             Ok(metadata) => {
                 println!("Sent to {}:{}", metadata.partition, metadata.offset);
                 return Ok(());
@@ -514,7 +568,7 @@ async fn send_with_policy(
     let mut ctx = RetryContext::new(policy, "send_message");
     
     loop {
-        match producer.send(topic, None, value).await {
+        match producer.send(topic, None, Some(value)).await {
             Ok(metadata) => {
                 ctx.record_success();
                 return Ok(());
@@ -691,8 +745,8 @@ async fn main() -> Result<()> {
     producer.begin_transaction()?;
 
     // Send messages atomically
-    producer.send("topic-a", Some(b"key1"), b"value1").await?;
-    producer.send("topic-b", Some(b"key2"), b"value2").await?;
+    producer.send("topic-a", Some(b"key1"), Some(b"value1")).await?;
+    producer.send("topic-b", Some(b"key2"), Some(b"value2")).await?;
 
     // Commit transaction (all or nothing)
     producer.commit_transaction().await?;
@@ -1040,7 +1094,7 @@ producer.begin_transaction()?;
 // Process records and produce output
 for record in consumer_records {
     let output = transform(&record)?;
-    producer.send("output-topic", record.key, &output).await?;
+    producer.send("output-topic", record.key, Some(&output)).await?;
 }
 
 // Commit offsets as part of the transaction.
@@ -1104,7 +1158,7 @@ let producer = TransactionalProducer::builder()
 
 producer.init_transactions().await?;
 producer.begin_transaction()?;
-producer.send("orders", None, b"...").await?;
+producer.send("orders", None, Some(b"...")).await?;
 
 // Prepare: flush everything, then stop accepting records. Sends no request —
 // the prepare *is* the flush, and the coordinator was already told to hold.
@@ -1177,7 +1231,7 @@ struct AuditInterceptor;
 impl ProducerInterceptor for AuditInterceptor {
     fn on_send(&self, record: &mut ProducerRecord) -> InterceptorResult {
         // Add a tracing header to every record
-        record.headers.push(("x-trace-id".to_string(), b"abc123".to_vec()));
+        record.headers.push(("x-trace-id".to_string(), Some(b"abc123".to_vec().into())));
         Ok(())
     }
 

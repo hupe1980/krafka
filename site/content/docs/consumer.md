@@ -1511,6 +1511,12 @@ for record in &records {
 }
 ```
 
+A tombstone is a **null** value, not an empty one: `record.value` is `None`
+rather than `Some(Bytes::new())`. The wire format distinguishes the two and
+compaction treats them as opposites — a null deletes the key, a zero-length
+value is ordinary data it preserves. To *write* one, see
+[Tombstones and Compacted Topics](@/docs/producer.md).
+
 ### CompactedTable
 
 `CompactedTable` is a standalone, Kafka-agnostic data structure that maintains an in-memory key→value snapshot from consumer records. It handles tombstones automatically and tracks changes via `TableChange`. Because it is decoupled from the consumer, it composes with **any** consumer setup — group-coordinated, standalone, or manually assigned:

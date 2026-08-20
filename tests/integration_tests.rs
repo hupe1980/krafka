@@ -318,6 +318,17 @@ async fn poll_for_records(
 
 /// Helper to create a topic using the admin client.
 async fn create_topic(bootstrap_servers: &str, topic: &str, partitions: i32) {
+    create_topic_with_configs(bootstrap_servers, topic, partitions, &[]).await;
+}
+
+/// Helper to create a topic with configuration overrides, e.g.
+/// `cleanup.policy=compact` for a topic that tombstones are meaningful on.
+async fn create_topic_with_configs(
+    bootstrap_servers: &str,
+    topic: &str,
+    partitions: i32,
+    configs: &[(&str, &str)],
+) {
     use krafka::admin::{AdminClient, NewTopic};
 
     let admin = AdminClient::builder()
@@ -326,12 +337,13 @@ async fn create_topic(bootstrap_servers: &str, topic: &str, partitions: i32) {
         .await
         .expect("Failed to create admin client");
 
+    let mut new_topic = NewTopic::new(topic, partitions, 1).unwrap();
+    for (key, value) in configs {
+        new_topic = new_topic.with_config(*key, *value);
+    }
+
     admin
-        .create_topics(
-            vec![NewTopic::new(topic, partitions, 1).unwrap()],
-            Duration::from_secs(10),
-            false,
-        )
+        .create_topics(vec![new_topic], Duration::from_secs(10), false)
         .await
         .expect("Failed to create topic");
 
@@ -360,7 +372,7 @@ async fn test_producer_send_receive() {
         .expect("Failed to create producer");
 
     let metadata = producer
-        .send(topic, Some(b"test-key"), b"test-value")
+        .send(topic, Some(b"test-key"), Some(b"test-value"))
         .await
         .expect("Failed to send message");
 
@@ -473,7 +485,7 @@ async fn test_compression_roundtrip() {
             .expect("Failed to create producer");
 
         let metadata = producer
-            .send(&topic, None, value.as_bytes())
+            .send(&topic, None, Some(value.as_bytes()))
             .await
             .expect("Failed to send message");
 
@@ -548,7 +560,7 @@ async fn test_multiple_partitions() {
     for i in 0..100 {
         let key = format!("key-{}", i);
         let metadata = producer
-            .send(topic_name, Some(key.as_bytes()), b"value")
+            .send(topic_name, Some(key.as_bytes()), Some(b"value"))
             .await
             .expect("Failed to send message");
         partition_set.insert(metadata.partition);
@@ -604,7 +616,7 @@ async fn test_consumer_group_rebalance() {
             .send(
                 topic_name,
                 Some(key.as_bytes()),
-                format!("value-{}", i).as_bytes(),
+                Some(format!("value-{}", i).as_bytes()),
             )
             .await
             .expect("Failed to send message");
@@ -695,7 +707,7 @@ async fn test_producer_continues_after_metadata_refresh() {
             .send(
                 topic,
                 Some(format!("key-{}", i).as_bytes()),
-                format!("value-{}", i).as_bytes(),
+                Some(format!("value-{}", i).as_bytes()),
             )
             .await;
 
@@ -728,7 +740,7 @@ async fn test_consumer_handles_no_messages_gracefully() {
         .expect("Failed to create producer");
 
     let _ = producer
-        .send(topic, None, b"setup")
+        .send(topic, None, Some(b"setup"))
         .await
         .expect("Failed to send setup message");
     producer.close().await;
@@ -783,12 +795,12 @@ async fn test_multiple_producers_same_topic() {
     // Send from both producers
     for i in 0..3 {
         let _ = producer1
-            .send(topic, Some(b"p1"), format!("p1-msg-{}", i).as_bytes())
+            .send(topic, Some(b"p1"), Some(format!("p1-msg-{}", i).as_bytes()))
             .await
             .expect("Producer 1 failed");
 
         let _ = producer2
-            .send(topic, Some(b"p2"), format!("p2-msg-{}", i).as_bytes())
+            .send(topic, Some(b"p2"), Some(format!("p2-msg-{}", i).as_bytes()))
             .await
             .expect("Producer 2 failed");
     }
@@ -838,7 +850,7 @@ async fn test_large_message_handling() {
     let large_value = vec![b'X'; 100 * 1024];
 
     let metadata = producer
-        .send(topic, Some(b"large-key"), &large_value)
+        .send(topic, Some(b"large-key"), Some(&large_value))
         .await
         .expect("Failed to send large message");
 
@@ -890,18 +902,22 @@ async fn test_message_headers() {
         .await
         .expect("Failed to create producer");
 
-    // Create headers as Vec<(String, Bytes)>
+    // Create headers as Vec<(String, Option<Bytes>)>: `None` would be a null
+    // header value, which the wire format distinguishes from zero-length.
     let headers = vec![
-        ("trace-id".to_string(), bytes::Bytes::from_static(b"abc123")),
+        (
+            "trace-id".to_string(),
+            Some(bytes::Bytes::from_static(b"abc123")),
+        ),
         (
             "content-type".to_string(),
-            bytes::Bytes::from_static(b"application/json"),
+            Some(bytes::Bytes::from_static(b"application/json")),
         ),
     ];
 
     // Send message with headers
     let metadata = producer
-        .send_with_headers(topic, Some(b"header-key"), b"header-value", headers)
+        .send_with_headers(topic, Some(b"header-key"), Some(b"header-value"), headers)
         .await
         .expect("Failed to send message with headers");
 
@@ -955,7 +971,7 @@ async fn test_idempotent_producer() {
             .send(
                 topic,
                 Some(format!("key-{}", i).as_bytes()),
-                format!("value-{}", i).as_bytes(),
+                Some(format!("value-{}", i).as_bytes()),
             )
             .await
             .expect("Failed to send message");
@@ -987,9 +1003,23 @@ async fn test_null_key_and_value() {
 
     // Send message with null key
     let metadata = producer
-        .send(topic, None, b"value-with-null-key")
+        .send(topic, None, Some(b"value-with-null-key"))
         .await
         .expect("Failed to send message with null key");
+    assert!(metadata.offset >= 0);
+
+    // Send a null value (a tombstone) and a zero-length value, which the wire
+    // format distinguishes from each other and from the record above.
+    let metadata = producer
+        .send(topic, Some(b"key-with-null-value"), None)
+        .await
+        .expect("Failed to send tombstone");
+    assert!(metadata.offset >= 0);
+
+    let metadata = producer
+        .send(topic, Some(b"key-with-empty-value"), Some(b""))
+        .await
+        .expect("Failed to send empty value");
     assert!(metadata.offset >= 0);
 
     producer.close().await;
@@ -1007,14 +1037,125 @@ async fn test_null_key_and_value() {
         .await
         .expect("Failed to subscribe");
 
-    let records = poll_for_records(&consumer, 1, Duration::from_secs(5), 5).await;
+    let records = poll_for_records(&consumer, 3, Duration::from_secs(10), 5).await;
 
-    assert!(!records.is_empty());
-    let record = &records[0];
+    assert_eq!(records.len(), 3, "all three records should come back");
 
     // Verify null key is received as None
-    assert!(record.key.is_none());
-    assert!(record.value.is_some());
+    assert!(records[0].key.is_none());
+    assert!(records[0].value.is_some());
+
+    // The tombstone must come back null, not zero-length.
+    assert!(
+        records[1].value.is_none(),
+        "a tombstone must decode as null"
+    );
+    assert!(records[1].is_tombstone());
+
+    // The zero-length value must come back present-but-empty. If the broker
+    // round trip collapsed the two, this assertion and the one above cannot
+    // both hold.
+    assert_eq!(records[2].value.as_deref(), Some(&b""[..]));
+    assert!(!records[2].is_tombstone());
+
+    consumer.close().await.expect("consumer close");
+}
+
+/// A tombstone written to a real `cleanup.policy=compact` topic must survive
+/// the broker round trip as a null value.
+///
+/// Compaction itself runs on the broker's own schedule, so this asserts the
+/// part that is the client's contract: what krafka wrote is what a consumer
+/// reads back, null and all. If the null collapsed to zero-length anywhere on
+/// the produce path the broker would store an ordinary record and never delete
+/// the key — which is exactly the defect this test guards.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_tombstone_round_trip_on_compacted_topic() {
+    use krafka::consumer::{AutoOffsetReset, Consumer};
+    use krafka::producer::{Producer, ProducerRecord};
+
+    let (_container, bootstrap_servers) = kafka_container().await;
+
+    let topic = "compacted-tombstone-topic";
+    create_topic_with_configs(
+        &bootstrap_servers,
+        topic,
+        1,
+        &[
+            ("cleanup.policy", "compact"),
+            // Make the active segment eligible immediately, so a broker that
+            // does compact during the test still behaves correctly.
+            ("min.cleanable.dirty.ratio", "0.01"),
+            ("segment.ms", "100"),
+            ("delete.retention.ms", "60000"),
+        ],
+    )
+    .await;
+
+    let producer = Producer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .client_id("tombstone-producer")
+        .build()
+        .await
+        .expect("Failed to create producer");
+
+    let value_meta = producer
+        .send(topic, Some(b"user-42"), Some(b"alice"))
+        .await
+        .expect("Failed to send valued record");
+
+    let tombstone_meta = producer
+        .send_record(
+            ProducerRecord::tombstone(topic, "user-42")
+                .with_header("X-Reason", &b"gdpr-erasure"[..])
+                .with_null_header("X-Flag"),
+        )
+        .await
+        .expect("Failed to send tombstone");
+
+    assert_eq!(
+        value_meta.partition, tombstone_meta.partition,
+        "the tombstone must share a partition with the key it deletes"
+    );
+
+    producer.close().await;
+
+    let consumer = Consumer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .group_id("tombstone-consumer")
+        .auto_offset_reset(AutoOffsetReset::Earliest)
+        .build()
+        .await
+        .expect("Failed to create consumer");
+
+    subscribe_with_retry(&consumer, &[topic], 5)
+        .await
+        .expect("Failed to subscribe");
+
+    let records = poll_for_records(&consumer, 2, Duration::from_secs(10), 5).await;
+    assert_eq!(records.len(), 2, "both records should come back");
+
+    assert_eq!(records[0].value.as_deref(), Some(&b"alice"[..]));
+    assert!(!records[0].is_tombstone());
+
+    let tombstone = &records[1];
+    assert_eq!(tombstone.key.as_deref(), Some(&b"user-42"[..]));
+    assert_eq!(
+        tombstone.value, None,
+        "the broker must return the tombstone as a null value"
+    );
+    assert!(tombstone.is_tombstone());
+
+    // Header nullness survives the broker too.
+    assert_eq!(tombstone.headers[0].0.as_ref(), b"X-Reason");
+    assert_eq!(
+        tombstone.headers[0].1.as_deref(),
+        Some(&b"gdpr-erasure"[..])
+    );
+    assert_eq!(tombstone.headers[1].0.as_ref(), b"X-Flag");
+    assert_eq!(tombstone.headers[1].1, None);
+
     consumer.close().await.expect("consumer close");
 }
 
@@ -1040,11 +1181,11 @@ async fn test_multiple_topics_subscription() {
 
     // Send messages to both topics
     let _ = producer
-        .send(topic1, Some(b"key1"), b"value1")
+        .send(topic1, Some(b"key1"), Some(b"value1"))
         .await
         .expect("send failed");
     let _ = producer
-        .send(topic2, Some(b"key2"), b"value2")
+        .send(topic2, Some(b"key2"), Some(b"value2"))
         .await
         .expect("send failed");
     producer.close().await;
@@ -1148,7 +1289,7 @@ async fn test_concurrent_producers() {
                         .send(
                             "concurrent-producer-topic",
                             Some(format!("key-{}-{}", i, j).as_bytes()),
-                            format!("value-{}-{}", i, j).as_bytes(),
+                            Some(format!("value-{}-{}", i, j).as_bytes()),
                         )
                         .await
                         .expect("Failed to send");
@@ -1213,7 +1354,7 @@ async fn test_producer_with_batching() {
             .send(
                 topic,
                 Some(format!("key-{}", i).as_bytes()),
-                format!("value-{}", i).as_bytes(),
+                Some(format!("value-{}", i).as_bytes()),
             )
             .await
             .expect("Failed to send");
@@ -1701,7 +1842,7 @@ async fn test_producer_metrics() {
     // Send some messages
     for i in 0..5 {
         let _ = producer
-            .send(topic, Some(format!("k-{}", i).as_bytes()), b"value")
+            .send(topic, Some(format!("k-{}", i).as_bytes()), Some(b"value"))
             .await
             .expect("send failed");
     }
@@ -1735,7 +1876,7 @@ async fn test_send_after_producer_close() {
     producer.close().await;
     assert!(producer.is_closed());
 
-    let result = producer.send(topic, None, b"should-fail").await;
+    let result = producer.send(topic, None, Some(b"should-fail")).await;
     assert!(result.is_err(), "Send after close should return an error");
 }
 
@@ -1760,7 +1901,7 @@ async fn test_consumer_commit_and_resume_verified() {
 
     for i in 0..10 {
         let _ = producer
-            .send(topic, None, format!("msg-{}", i).as_bytes())
+            .send(topic, None, Some(format!("msg-{}", i).as_bytes()))
             .await
             .expect("send failed");
     }
@@ -1833,7 +1974,7 @@ async fn test_consumer_recv() {
 
     for i in 0..3 {
         let _ = producer
-            .send(topic, None, format!("recv-msg-{}", i).as_bytes())
+            .send(topic, None, Some(format!("recv-msg-{}", i).as_bytes()))
             .await
             .unwrap();
     }
@@ -1894,7 +2035,7 @@ async fn test_producer_flush() {
         let t = topic.to_string();
         handles.push(tokio::spawn(async move {
             let _ = p
-                .send(&t, None, format!("flush-{}", i).as_bytes())
+                .send(&t, None, Some(format!("flush-{}", i).as_bytes()))
                 .await
                 .unwrap();
         }));
@@ -2106,7 +2247,7 @@ async fn test_empty_value_message() {
         .await
         .unwrap();
 
-    let metadata = producer.send(topic, Some(b"key"), b"").await.unwrap();
+    let metadata = producer.send(topic, Some(b"key"), Some(b"")).await.unwrap();
     assert!(metadata.offset >= 0);
     producer.close().await;
 
@@ -2199,7 +2340,7 @@ async fn test_many_partitions_topic() {
     // Send 60 messages with keys to distribute across partitions
     for i in 0..60 {
         let _ = producer
-            .send(topic, Some(format!("k-{}", i).as_bytes()), b"v")
+            .send(topic, Some(format!("k-{}", i).as_bytes()), Some(b"v"))
             .await
             .unwrap();
     }
@@ -2248,7 +2389,7 @@ async fn test_consumer_pause_resume_verified() {
 
     for i in 0..10 {
         let _ = producer
-            .send(topic, None, format!("pv-{}", i).as_bytes())
+            .send(topic, None, Some(format!("pv-{}", i).as_bytes()))
             .await
             .unwrap();
     }
@@ -2308,7 +2449,7 @@ async fn test_consumer_seek_verified() {
 
     for i in 0..10 {
         let _ = producer
-            .send(topic, None, format!("msg-{}", i).as_bytes())
+            .send(topic, None, Some(format!("msg-{}", i).as_bytes()))
             .await
             .unwrap();
     }
@@ -2402,7 +2543,7 @@ async fn test_consumer_metrics() {
 
     for i in 0..5 {
         let _ = producer
-            .send(topic, None, format!("m-{}", i).as_bytes())
+            .send(topic, None, Some(format!("m-{}", i).as_bytes()))
             .await
             .unwrap();
     }
@@ -2455,7 +2596,11 @@ async fn test_offsets_for_times_and_watermarks_and_metadata() {
     for i in 0..N {
         let key = format!("k-{}", i);
         let _ = producer
-            .send(topic, Some(key.as_bytes()), format!("v-{}", i).as_bytes())
+            .send(
+                topic,
+                Some(key.as_bytes()),
+                Some(format!("v-{}", i).as_bytes()),
+            )
             .await
             .expect("Failed to send message");
     }
@@ -2582,7 +2727,7 @@ async fn test_transactional_producer_commit() {
         .expect("begin_transaction failed");
 
     let metadata = producer
-        .send(topic, Some(b"key"), b"committed-value")
+        .send(topic, Some(b"key"), Some(b"committed-value"))
         .await
         .expect("send failed");
     assert!(
@@ -2656,7 +2801,7 @@ async fn test_transactional_producer_abort() {
         .begin_transaction()
         .expect("begin_transaction failed");
     let _ = producer
-        .send(topic, Some(b"key-aborted"), b"aborted-value")
+        .send(topic, Some(b"key-aborted"), Some(b"aborted-value"))
         .await
         .expect("send (to-be-aborted) failed");
     producer
@@ -2669,7 +2814,7 @@ async fn test_transactional_producer_abort() {
         .begin_transaction()
         .expect("begin_transaction failed");
     let _ = producer
-        .send(topic, Some(b"key-committed"), b"committed-value")
+        .send(topic, Some(b"key-committed"), Some(b"committed-value"))
         .await
         .expect("send failed");
     producer
@@ -2749,11 +2894,11 @@ async fn test_transactional_producer_multi_partition() {
         .expect("begin_transaction failed");
 
     let _ = producer
-        .send(topic, Some(b"key-alpha"), b"value-alpha")
+        .send(topic, Some(b"key-alpha"), Some(b"value-alpha"))
         .await
         .expect("send alpha failed");
     let _ = producer
-        .send(topic, Some(b"key-beta"), b"value-beta")
+        .send(topic, Some(b"key-beta"), Some(b"value-beta"))
         .await
         .expect("send beta failed");
 
@@ -2826,7 +2971,7 @@ async fn test_transactional_producer_multiple_transactions() {
     // Txn 1: commit.
     producer.begin_transaction().expect("begin 1 failed");
     let _ = producer
-        .send(topic, Some(b"k1"), b"v1")
+        .send(topic, Some(b"k1"), Some(b"v1"))
         .await
         .expect("send 1 failed");
     producer
@@ -2837,7 +2982,7 @@ async fn test_transactional_producer_multiple_transactions() {
     // Txn 2: abort.
     producer.begin_transaction().expect("begin 2 failed");
     let _ = producer
-        .send(topic, Some(b"k2"), b"v2-aborted")
+        .send(topic, Some(b"k2"), Some(b"v2-aborted"))
         .await
         .expect("send 2 failed");
     producer.abort_transaction().await.expect("abort 2 failed");
@@ -2845,7 +2990,7 @@ async fn test_transactional_producer_multiple_transactions() {
     // Txn 3: commit.
     producer.begin_transaction().expect("begin 3 failed");
     let _ = producer
-        .send(topic, Some(b"k3"), b"v3")
+        .send(topic, Some(b"k3"), Some(b"v3"))
         .await
         .expect("send 3 failed");
     producer
@@ -2925,7 +3070,7 @@ async fn test_transactional_producer_epoch_fencing() {
 
     producer1.begin_transaction().expect("begin 1 failed");
     let _ = producer1
-        .send(topic, Some(b"k1"), b"v1")
+        .send(topic, Some(b"k1"), Some(b"v1"))
         .await
         .expect("send 1 failed");
     producer1
@@ -2954,7 +3099,7 @@ async fn test_transactional_producer_epoch_fencing() {
 
     producer2.begin_transaction().expect("begin 2 failed");
     let _ = producer2
-        .send(topic, Some(b"k2"), b"v2")
+        .send(topic, Some(b"k2"), Some(b"v2"))
         .await
         .expect("send 2 failed");
     producer2
@@ -3020,7 +3165,7 @@ async fn test_transactional_send_offsets_to_transaction() {
             .send(
                 src_topic,
                 Some(format!("k{i}").as_bytes()),
-                format!("src-{i}").as_bytes(),
+                Some(format!("src-{i}").as_bytes()),
             )
             .await
             .expect("send to src failed");
@@ -3072,7 +3217,7 @@ async fn test_transactional_send_offsets_to_transaction() {
             .send(
                 dst_topic,
                 record.key.as_deref(),
-                transformed_value.as_bytes(),
+                Some(transformed_value.as_bytes()),
             )
             .await
             .expect("send to dst failed");

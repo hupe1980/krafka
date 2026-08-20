@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let topic = "test-topic";
 
     // Simple send (with key and value as bytes)
-    let metadata = producer.send(topic, None, b"Hello, Kafka!").await?;
+    let metadata = producer.send(topic, None, Some(b"Hello, Kafka!")).await?;
     println!(
         "Sent message to partition {} at offset {}",
         metadata.partition, metadata.offset
@@ -43,7 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Send with key
     let metadata = producer
-        .send(topic, Some(b"key-1"), b"Message with key")
+        .send(topic, Some(b"key-1"), Some(b"Message with key"))
         .await?;
     println!(
         "Sent keyed message to partition {} at offset {}",
@@ -52,15 +52,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Send with headers
     let headers = vec![
-        ("trace-id".to_string(), bytes::Bytes::from_static(b"abc123")),
+        (
+            "trace-id".to_string(),
+            Some(bytes::Bytes::from_static(b"abc123")),
+        ),
         (
             "source".to_string(),
-            bytes::Bytes::from_static(b"producer-example"),
+            Some(bytes::Bytes::from_static(b"producer-example")),
         ),
     ];
 
     let metadata = producer
-        .send_with_headers(topic, Some(b"key-2"), b"Message with headers", headers)
+        .send_with_headers(
+            topic,
+            Some(b"key-2"),
+            Some(b"Message with headers"),
+            headers,
+        )
         .await?;
     println!(
         "Sent message with headers to partition {} at offset {}",

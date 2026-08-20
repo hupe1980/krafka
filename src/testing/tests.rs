@@ -92,7 +92,7 @@ async fn a_real_producer_appends_records_at_broker_assigned_offsets() {
 
     for i in 0..3u8 {
         let _ = producer
-            .send("events", None, &[b'v', i])
+            .send("events", None, Some(&[b'v', i]))
             .await
             .expect("send should be acknowledged");
     }
@@ -387,7 +387,7 @@ async fn a_producer_follows_a_partition_leader_to_another_broker() {
         .expect("producer should connect");
 
     let _ = producer
-        .send("events", None, b"before-the-move")
+        .send("events", None, Some(b"before-the-move"))
         .await
         .expect("the first send should land on the original leader");
 
@@ -395,7 +395,7 @@ async fn a_producer_follows_a_partition_leader_to_another_broker() {
     assert!(broker.set_leader("events", 0, 1));
 
     let _ = producer
-        .send("events", None, b"after-the-move")
+        .send("events", None, Some(b"after-the-move"))
         .await
         .expect("the producer should follow the leader rather than fail");
 
@@ -446,13 +446,16 @@ async fn a_leader_move_is_followed_without_waiting_for_the_cache_to_age() {
         .await
         .expect("producer should connect");
 
-    let _ = producer.send("events", None, b"before").await.unwrap();
+    let _ = producer
+        .send("events", None, Some(b"before"))
+        .await
+        .unwrap();
 
     broker.clear_requests();
     assert!(broker.set_leader("events", 0, 1));
 
     let _ = producer
-        .send("events", None, b"after")
+        .send("events", None, Some(b"after"))
         .await
         .expect("a leader move must be followed without waiting out metadata_max_age");
 
@@ -491,7 +494,10 @@ async fn an_error_without_a_leader_hint_still_forces_a_metadata_refresh() {
         .await
         .expect("producer should connect");
 
-    let _ = producer.send("events", None, b"before").await.unwrap();
+    let _ = producer
+        .send("events", None, Some(b"before"))
+        .await
+        .unwrap();
 
     broker.clear_requests();
     broker.on_once(ApiKey::Produce, |_| {
@@ -499,7 +505,7 @@ async fn an_error_without_a_leader_hint_still_forces_a_metadata_refresh() {
     });
 
     let _ = producer
-        .send("events", None, b"after")
+        .send("events", None, Some(b"after"))
         .await
         .expect("the retry should succeed once the injected error is spent");
 
@@ -855,7 +861,7 @@ async fn a_corrupt_record_batch_surfaces_from_poll_instead_of_stalling() {
 
     let producer = producer_for(&broker).await;
     let _ = producer
-        .send("events", None, b"payload")
+        .send("events", None, Some(b"payload"))
         .await
         .expect("produce should succeed");
 
@@ -1042,7 +1048,7 @@ async fn a_commit_carries_the_leader_epoch_it_was_read_at() {
 
     let producer = producer_for(&broker).await;
     let _ = producer
-        .send("events", None, b"payload")
+        .send("events", None, Some(b"payload"))
         .await
         .expect("produce should succeed");
 
@@ -1106,7 +1112,7 @@ async fn a_stale_leader_epoch_on_list_offsets_recovers_after_a_refresh() {
 
     let producer = producer_for(&broker).await;
     let _ = producer
-        .send("events", None, b"payload")
+        .send("events", None, Some(b"payload"))
         .await
         .expect("produce should succeed");
 
@@ -1165,7 +1171,7 @@ async fn a_kip848_consumer_joins_and_receives_a_server_side_assignment() {
 
     let producer = producer_for(&broker).await;
     let _ = producer
-        .send("events", None, b"payload")
+        .send("events", None, Some(b"payload"))
         .await
         .expect("produce should succeed");
 
@@ -1840,7 +1846,7 @@ async fn a_throttle_the_producer_waits_out_is_counted() {
 
     // One send establishes the connection to the leader.
     let _ = producer
-        .send("events", None, b"warm-up")
+        .send("events", None, Some(b"warm-up"))
         .await
         .expect("send should be acknowledged");
 
@@ -1861,7 +1867,7 @@ async fn a_throttle_the_producer_waits_out_is_counted() {
     conn.notify_throttle(40);
 
     let _ = producer
-        .send("events", None, b"throttled")
+        .send("events", None, Some(b"throttled"))
         .await
         .expect("a throttled send still succeeds, just later");
 
@@ -2635,7 +2641,7 @@ async fn a_share_consumer_receives_records_and_counts_them() {
     let producer = producer_for(&broker).await;
     for i in 0..5u8 {
         let _ = producer
-            .send("events", None, &[b'v', i])
+            .send("events", None, Some(&[b'v', i]))
             .await
             .expect("send should be acknowledged");
     }
@@ -2699,7 +2705,7 @@ async fn accepting_retires_a_record_and_releasing_redelivers_it() {
 
     let producer = producer_for(&broker).await;
     for i in 0..2u8 {
-        let _ = producer.send("events", None, &[i]).await.unwrap();
+        let _ = producer.send("events", None, Some(&[i])).await.unwrap();
     }
     producer.close().await;
 
@@ -2772,7 +2778,7 @@ async fn an_accepted_record_is_not_redelivered_to_the_next_member() {
 
     let producer = producer_for(&broker).await;
     for i in 0..2u8 {
-        let _ = producer.send("events", None, &[i]).await.unwrap();
+        let _ = producer.send("events", None, Some(&[i])).await.unwrap();
     }
     producer.close().await;
 
@@ -3025,7 +3031,7 @@ async fn committed_transaction_becomes_visible_to_read_committed() {
     producer.init_transactions().await.expect("init");
     producer.begin_transaction().expect("begin");
     let _ = producer
-        .send("orders", None, b"committed-1")
+        .send("orders", None, Some(b"committed-1"))
         .await
         .expect("send");
 
@@ -3070,7 +3076,7 @@ async fn aborted_transaction_is_filtered_only_for_read_committed() {
     producer.init_transactions().await.expect("init");
     producer.begin_transaction().expect("begin");
     let _ = producer
-        .send("orders", None, b"doomed")
+        .send("orders", None, Some(b"doomed"))
         .await
         .expect("send");
     producer.abort_transaction().await.expect("abort");
@@ -3120,14 +3126,14 @@ async fn an_abort_does_not_poison_the_next_transaction() {
 
     producer.begin_transaction().expect("begin 1");
     let _ = producer
-        .send("orders", None, b"aborted")
+        .send("orders", None, Some(b"aborted"))
         .await
         .expect("send");
     producer.abort_transaction().await.expect("abort");
 
     producer.begin_transaction().expect("begin 2");
     let _ = producer
-        .send("orders", None, b"committed")
+        .send("orders", None, Some(b"committed"))
         .await
         .expect("send");
     producer.commit_transaction().await.expect("commit");
@@ -3164,7 +3170,7 @@ async fn the_fake_brokers_two_record_views_differ_by_the_aborted_records() {
     producer.begin_transaction().expect("begin 1");
     for i in 0..3 {
         let _ = producer
-            .send("orders", None, format!("aborted-{i}").as_bytes())
+            .send("orders", None, Some(format!("aborted-{i}").as_bytes()))
             .await
             .expect("send");
     }
@@ -3173,7 +3179,7 @@ async fn the_fake_brokers_two_record_views_differ_by_the_aborted_records() {
     producer.begin_transaction().expect("begin 2");
     for i in 0..2 {
         let _ = producer
-            .send("orders", None, format!("committed-{i}").as_bytes())
+            .send("orders", None, Some(format!("committed-{i}").as_bytes()))
             .await
             .expect("send");
     }
@@ -3238,7 +3244,10 @@ async fn transactional_offsets_move_only_on_commit() {
 
     // Aborted: the group must not move.
     producer.begin_transaction().expect("begin 1");
-    let _ = producer.send("orders", None, b"x").await.expect("send");
+    let _ = producer
+        .send("orders", None, Some(b"x"))
+        .await
+        .expect("send");
     producer
         .send_offsets_to_transaction(&offsets, &group)
         .await
@@ -3252,7 +3261,10 @@ async fn transactional_offsets_move_only_on_commit() {
 
     // Committed: the group moves to the staged position.
     producer.begin_transaction().expect("begin 2");
-    let _ = producer.send("orders", None, b"y").await.expect("send");
+    let _ = producer
+        .send("orders", None, Some(b"y"))
+        .await
+        .expect("send");
     producer
         .send_offsets_to_transaction(&offsets, &group)
         .await
@@ -3297,7 +3309,7 @@ async fn re_initialising_fences_the_previous_producer() {
     // The zombie is now writing with a stale epoch. Its next transactional
     // operation must fail fatally rather than silently interleaving.
     zombie.begin_transaction().expect("begin");
-    let outcome = zombie.send("orders", None, b"zombie").await;
+    let outcome = zombie.send("orders", None, Some(b"zombie")).await;
     let outcome = match outcome {
         Err(e) => Err(e),
         // The send may be accepted into the accumulator; the commit is where
@@ -3332,7 +3344,10 @@ async fn tv1_registers_partitions_with_add_partitions_to_txn() {
     );
 
     producer.begin_transaction().expect("begin");
-    let _ = producer.send("orders", None, b"v1").await.expect("send");
+    let _ = producer
+        .send("orders", None, Some(b"v1"))
+        .await
+        .expect("send");
     producer.commit_transaction().await.expect("commit");
 
     assert!(
@@ -3369,7 +3384,10 @@ async fn tv2_commits_without_add_partitions_to_txn() {
     let (_, epoch_before) = broker.transactional_producer("txn-tv2").unwrap();
 
     producer.begin_transaction().expect("begin");
-    let _ = producer.send("orders", None, b"v2").await.expect("send");
+    let _ = producer
+        .send("orders", None, Some(b"v2"))
+        .await
+        .expect("send");
     producer.commit_transaction().await.expect("commit");
 
     assert_eq!(
@@ -3451,14 +3469,14 @@ async fn an_old_abort_is_not_reported_to_a_consumer_that_has_read_past_it() {
 
     producer.begin_transaction().expect("begin 1");
     let _ = producer
-        .send("orders", None, b"aborted")
+        .send("orders", None, Some(b"aborted"))
         .await
         .expect("send");
     producer.abort_transaction().await.expect("abort");
 
     producer.begin_transaction().expect("begin 2");
     let _ = producer
-        .send("orders", None, b"committed")
+        .send("orders", None, Some(b"committed"))
         .await
         .expect("send");
     producer.commit_transaction().await.expect("commit");
@@ -3528,7 +3546,7 @@ async fn a_second_poll_is_served_from_the_prefetch_buffer_without_a_fetch() {
         .expect("producer should connect");
     for i in 0..20u32 {
         let _ = producer
-            .send("events", None, format!("v{i}").as_bytes())
+            .send("events", None, Some(format!("v{i}").as_bytes()))
             .await
             .expect("send");
     }
@@ -3606,7 +3624,7 @@ async fn a_commit_never_acknowledges_records_still_parked_in_the_buffer() {
         .expect("producer should connect");
     for i in 0..20u32 {
         let _ = producer
-            .send("events", None, format!("v{i}").as_bytes())
+            .send("events", None, Some(format!("v{i}").as_bytes()))
             .await
             .expect("send");
     }
@@ -3722,7 +3740,7 @@ async fn a_commit_stops_admitting_records_before_it_drains() {
 
     // One record, buffered by the linger window.
     let buffered = Arc::clone(&producer);
-    let send = tokio::spawn(async move { buffered.send("orders", None, b"first").await });
+    let send = tokio::spawn(async move { buffered.send("orders", None, Some(b"first")).await });
 
     // Hold the commit inside its flush.
     broker.on(ApiKey::Produce, |_| {
@@ -3742,7 +3760,7 @@ async fn a_commit_stops_admitting_records_before_it_drains() {
          can be admitted into a transaction that is already closing"
     );
 
-    let refused = producer.send("orders", None, b"too-late").await;
+    let refused = producer.send("orders", None, Some(b"too-late")).await;
     let error = refused.expect_err("a send during the commit's drain must be refused");
     assert!(
         error.to_string().contains("Committing"),
@@ -3803,7 +3821,7 @@ async fn a_commit_waits_for_an_in_flight_offset_commit() {
     producer.init_transactions().await.expect("init");
     producer.begin_transaction().expect("begin");
     let _ = producer
-        .send("orders", None, b"payload")
+        .send("orders", None, Some(b"payload"))
         .await
         .expect("send");
 
@@ -3910,4 +3928,170 @@ async fn a_flush_waits_for_a_poll_holding_the_acknowledgements() {
     broker.clear_hooks();
     let _ = poll.await.expect("poll task should not panic");
     let _ = consumer.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// Tombstones: a null value must survive the whole produce path
+// ---------------------------------------------------------------------------
+
+/// The end-to-end proof that krafka can write a Kafka tombstone.
+///
+/// Everything between `ProducerRecord::tombstone` and the log is exercised for
+/// real here — interceptors, validation, size estimation, batch encoding, the
+/// Produce request — and the record is read back off the broker's log through
+/// the same decoder a consumer uses. The three records pin the distinction the
+/// wire format makes: a null value, a zero-length value, and an ordinary value
+/// must come back as three different things.
+#[tokio::test]
+async fn a_tombstone_reaches_the_log_as_a_null_value() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("users", 1);
+
+    let producer = Producer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .build()
+        .await
+        .expect("producer should connect");
+
+    // 1. An ordinary record.
+    let _ = producer
+        .send("users", Some(b"user-42"), Some(b"alice"))
+        .await
+        .expect("valued send should be acknowledged");
+
+    // 2. A zero-length value — compaction keeps this one.
+    let _ = producer
+        .send("users", Some(b"user-42"), Some(b""))
+        .await
+        .expect("empty send should be acknowledged");
+
+    // 3. The tombstone — compaction deletes the key for this one.
+    let _ = producer
+        .send_record(
+            crate::producer::ProducerRecord::tombstone("users", "user-42")
+                .with_header("X-Reason", &b"gdpr-erasure"[..])
+                .with_null_header("X-Flag"),
+        )
+        .await
+        .expect("tombstone send should be acknowledged");
+
+    let stored = broker.all_records("users").expect("log should be readable");
+    assert_eq!(stored.len(), 3, "all three records should be in the log");
+
+    assert_eq!(stored[0].value.as_deref(), Some(&b"alice"[..]));
+    assert!(!stored[0].is_tombstone());
+
+    assert_eq!(
+        stored[1].value.as_deref(),
+        Some(&b""[..]),
+        "an empty value must not decode as null"
+    );
+    assert!(
+        !stored[1].is_tombstone(),
+        "a zero-length value is an ordinary record"
+    );
+
+    assert_eq!(stored[2].value, None, "the tombstone must decode as null");
+    assert!(stored[2].is_tombstone());
+    assert_eq!(stored[2].key.as_deref(), Some(&b"user-42"[..]));
+
+    // Header nullness survives the same round trip.
+    let headers = &stored[2].headers;
+    assert_eq!(headers[0].0.as_ref(), b"X-Reason");
+    assert_eq!(headers[0].1.as_deref(), Some(&b"gdpr-erasure"[..]));
+    assert_eq!(headers[1].0.as_ref(), b"X-Flag");
+    assert_eq!(headers[1].1, None, "a null header value must stay null");
+}
+
+/// A tombstone must land on the **same partition** as the records it deletes,
+/// or compaction — which is per-partition — never sees the two together.
+///
+/// The default partitioner hashes the key, and a tombstone carries the same
+/// key as the record it retires, so this holds without the caller pinning a
+/// partition by hand. That is worth an assertion rather than an argument.
+#[tokio::test]
+async fn a_tombstone_routes_to_the_same_partition_as_its_key() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("users", 8);
+
+    let producer = Producer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .build()
+        .await
+        .expect("producer should connect");
+
+    for key in ["user-1", "user-2", "user-3", "user-4"] {
+        let valued = producer
+            .send("users", Some(key.as_bytes()), Some(b"payload"))
+            .await
+            .expect("valued send should be acknowledged");
+        let tombstone = producer
+            .send("users", Some(key.as_bytes()), None)
+            .await
+            .expect("tombstone send should be acknowledged");
+
+        assert_eq!(
+            valued.partition, tombstone.partition,
+            "the tombstone for {key} must share its record's partition"
+        );
+    }
+}
+
+/// Close the loop: records produced by krafka, read back off the log, and fed
+/// to krafka's own `CompactedTable` must delete the key.
+///
+/// The table's own unit tests build `ConsumerRecord`s by hand. This one starts
+/// from `ProducerRecord::tombstone` and goes through encoding and decoding, so
+/// a null that collapsed anywhere on the produce path would leave the key in
+/// the table instead of removing it.
+#[tokio::test]
+async fn a_produced_tombstone_deletes_a_key_from_a_compacted_table() {
+    use crate::consumer::CompactedTable;
+
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("users", 1);
+
+    let producer = Producer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .build()
+        .await
+        .expect("producer should connect");
+
+    let _ = producer
+        .send("users", Some(b"keep-me"), Some(b"v"))
+        .await
+        .expect("send should be acknowledged");
+    let _ = producer
+        .send("users", Some(b"delete-me"), Some(b"v"))
+        .await
+        .expect("send should be acknowledged");
+
+    let mut table = CompactedTable::new();
+    table.ingest(&broker.all_records("users").expect("log should be readable"));
+    assert_eq!(table.len(), 2, "both keys should be present");
+
+    let _ = producer
+        .send_record(crate::producer::ProducerRecord::tombstone(
+            "users",
+            "delete-me",
+        ))
+        .await
+        .expect("tombstone send should be acknowledged");
+
+    let mut table = CompactedTable::new();
+    let changes = table.apply(&broker.all_records("users").expect("log should be readable"));
+
+    assert_eq!(table.len(), 1, "the tombstoned key should be gone");
+    assert!(table.get_value(b"keep-me").is_some());
+    assert!(table.get_value(b"delete-me").is_none());
+    assert!(
+        changes.iter().any(|c| c.is_delete()),
+        "the tombstone should be reported as a deletion"
+    );
 }

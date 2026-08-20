@@ -102,7 +102,7 @@ use krafka::error::{KrafkaError, Result};
 use krafka::producer::Producer;
 
 async fn send_message(producer: &Producer) -> Result<()> {
-    match producer.send("topic", Some(b"key"), b"value").await {
+    match producer.send("topic", Some(b"key"), Some(b"value")).await {
         Ok(metadata) => {
             println!("Sent to partition {} offset {}", 
                      metadata.partition, metadata.offset);
@@ -246,7 +246,7 @@ use krafka::error::{KrafkaError, Result};
 
 async fn process_topic(producer: &Producer, topic: &str) -> Result<()> {
     producer
-        .send(topic, None, b"message")
+        .send(topic, None, Some(b"message"))
         .await
         .map_err(|e| {
             eprintln!("Failed to send to topic {}: {}", topic, e);
@@ -355,7 +355,7 @@ async fn send_critical_message(
     const MAX_RETRIES: u32 = 3;
     
     for attempt in 1..=MAX_RETRIES {
-        match producer.send(topic, Some(key), value).await {
+        match producer.send(topic, Some(key), Some(value)).await {
             Ok(metadata) => {
                 println!("Message sent to {}:{}", metadata.partition, metadata.offset);
                 return Ok(());
@@ -423,10 +423,10 @@ async fn ensure_topic_exists(
 
 ```rust
 // ❌ Bad: ignoring errors
-let _ = producer.send("topic", None, b"value").await;
+let _ = producer.send("topic", None, Some(b"value")).await;
 
 // ✅ Good: handling errors
-if let Err(e) = producer.send("topic", None, b"value").await {
+if let Err(e) = producer.send("topic", None, Some(b"value")).await {
     log::error!("Send failed: {}", e);
 }
 ```
@@ -571,7 +571,7 @@ impl DeadLetterQueue for KafkaDlq {
         record.topic = self.dlq_topic.clone();
         record.headers.push((
             "__krafka.dlq.exception.message".to_string(),
-            bytes::Bytes::from(error),
+            Some(bytes::Bytes::from(error)),
         ));
         Box::pin(async move {
             if let Err(e) = self.producer.send_record(record).await {
@@ -644,6 +644,14 @@ async fn process_record(
     }
 }
 ```
+
+`build_dlq_record` preserves nulls: a tombstone stays a tombstone and a null
+header value stays null, which matters when the dead-letter topic is itself
+compacted — the alternative would append a zero-length record instead of
+deleting the key. The one translation that is not verbatim is the header
+**key**: Kafka header keys are raw bytes while `ProducerRecord` uses `String`,
+so a non-UTF-8 key is hex-encoded behind a `hex:` prefix. See
+[Tombstones and Compacted Topics](@/docs/producer.md#tombstones-and-compacted-topics).
 
 ### Header Convention
 

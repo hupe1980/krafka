@@ -38,7 +38,7 @@
 //! for i in 0..10 {
 //!     let producer = producer.clone();
 //!     tokio::spawn(async move {
-//!         let _ = producer.send("topic", None, b"message").await;
+//!         let _ = producer.send("topic", None, Some(b"message")).await;
 //!     });
 //! }
 //! # Ok(())
@@ -58,7 +58,10 @@
 //!     .build()
 //!     .await?;
 //!
-//! producer.send("my-topic", Some(b"key"), b"value").await?;
+//! producer.send("my-topic", Some(b"key"), Some(b"value")).await?;
+//!
+//! // A `None` value is a tombstone: on a compacted topic it deletes the key.
+//! producer.send("my-topic", Some(b"key"), None).await?;
 //! # Ok(())
 //! # }
 //! ```

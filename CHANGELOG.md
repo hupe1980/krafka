@@ -15,6 +15,98 @@ not a complete record.
 
 Nothing yet.
 
+## [0.20.0] — 2026-08-20
+
+krafka could read a Kafka tombstone but not write one. `ProducerRecord::value`
+was `Bytes`, with no way to express the protocol's **null** — so an empty value
+encoded as a zero-length payload, which log compaction treats as ordinary data
+rather than as a delete marker. This release makes null representable
+end to end on the produce path, and fixes the three places the missing
+representation was already causing silent damage.
+
+### Breaking
+
+- **`ProducerRecord::value` is now `Option<Bytes>`.** `None` is Kafka's null
+  value — a tombstone. `ProducerRecord::new(topic, value)` is unchanged and
+  stores `Some(value)`; the new `ProducerRecord::tombstone(topic, key)`,
+  `with_value()` and `without_value()` build and clear the null.
+- **`ProducerRecord::headers` is now `Vec<(String, Option<Bytes>)>`**, matching
+  `ConsumerRecord`. The record format distinguishes a null header value from a
+  zero-length one. `with_header(key, value)` still takes a plain value;
+  `with_null_header(key)` is new. Pushing to the field directly now needs
+  `Some(...)`.
+- **`Producer::send`, `Producer::send_with_headers` and
+  `TransactionalProducer::send` take `value: Option<&[u8]>`**, mirroring `key`.
+  Wrap existing values in `Some(...)`; pass `None` to write a tombstone.
+- **`RecordBatchBuilder::add_record_with_headers`** takes
+  `Vec<(impl Into<Bytes>, Option<impl Into<Bytes>>)>` for headers.
+  `RecordHeader::null(key)` builds a null-valued header.
+- `build_dlq_record` returns a record whose `value` and header values are
+  `Option<Bytes>`.
+
+### Fixed
+
+- **A tombstone routed through a dead-letter queue is no longer flattened.**
+  `build_dlq_record` collapsed a null value, and a null header value, to
+  zero-length — documented at the time as unfixable without this type change.
+  A tombstone reaching a compacted DLQ topic therefore arrived as an ordinary
+  empty record and never deleted its key.
+- **A configured `value_serializer` no longer runs on a tombstone.** A
+  schema-registry serializer prepends a magic byte and schema ID; applied to a
+  null value it produced a five-byte record that compaction preserves, so the
+  key was never deleted and the caller had no way to see it. Null values are
+  now passed through unserialized, matching the Confluent serializers and the
+  consumer's deserializers, which already skipped absent fields.
+- **A configured `key_serializer` no longer invents a key for a keyless
+  record.** It serialized `Bytes::new()` and stored the result, moving the
+  record off the default partitioner's keyless path — every keyless record on
+  that producer hashed to a single partition instead of being spread.
+- The plain and transactional producers now share one serializer application
+  path (`apply_serializers`) instead of two copies that had already drifted.
+
+### Added
+
+- `ProducerRecord::tombstone`, `with_value`, `without_value`, `is_tombstone`
+  and `with_null_header`. `is_tombstone` uses the same rule as
+  `ConsumerRecord::is_tombstone` — a key and no value — so a record classifies
+  identically on both sides of the wire.
+- `RecordHeader::null`.
+- Tests covering the whole path: wire-level encode/decode of a null value and a
+  null header (with a zero-length negative control), serializer skipping,
+  DLQ preservation, a fake-broker round trip through a real producer, tombstone
+  partition co-location with its key, a produced tombstone deleting a key from
+  `CompactedTable`, and a Docker integration test against a real
+  `cleanup.policy=compact` topic.
+- Guide coverage: **Tombstones and Compacted Topics** in the producer guide,
+  a *Delete a key from a compacted topic* cookbook recipe, and a null-vs-empty
+  note in the consumer guide's tombstone section.
+
+## [0.19.1] — 2026-08-20
+
+### Fixed
+
+- **A compacted partition could stall `poll()` forever**, returning empty
+  `Vec`s long before the end of the log. A batch the log cleaner had emptied
+  entirely (its header retained for producer idempotence, zero records left)
+  made the budget claim return `0`, which was misread as "budget exhausted":
+  the walk broke out, discarded every later batch in the response, and never
+  advanced the position, so the next fetch re-read the same empty batch. A
+  batch drained in full had the mirror-image problem — it advanced the position
+  only to its last *surviving* record + 1, which still lay inside the batch's
+  offset span when compaction had removed its trailing records. The batch walk
+  now advances through the full offset span of any batch it skips or drains in
+  full, mirroring the Java client's `CompletedFetch.nextFetchOffset`, while a
+  batch cut short by `max_poll_records` still parks at the last delivered
+  record so its remainder is re-fetched. Every batch-level advance goes through
+  one guarded helper that refuses to move the position backwards, so a
+  misbehaving broker degrades to a visible stall rather than silent
+  re-delivery.
+
+### Changed
+
+- Dependencies refreshed in `Cargo.lock`; the ignored-advisory list in
+  `deny.toml` cleared.
+
 ## [0.19.0] — 2026-08-10
 
 A correctness release from a three-round deep audit against the reference
@@ -1066,7 +1158,10 @@ Initial development: wire protocol, producer, consumer, admin client,
 authentication (SASL PLAIN / SCRAM / OAUTHBEARER / AWS MSK IAM), TLS,
 compression codecs, schema registry integration and the metrics layer.
 
-[Unreleased]: https://github.com/hupe1980/krafka/compare/v0.18.0...HEAD
+[Unreleased]: https://github.com/hupe1980/krafka/compare/v0.20.0...HEAD
+[0.20.0]: https://github.com/hupe1980/krafka/compare/v0.19.1...v0.20.0
+[0.19.1]: https://github.com/hupe1980/krafka/compare/v0.19.0...v0.19.1
+[0.19.0]: https://github.com/hupe1980/krafka/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/hupe1980/krafka/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/hupe1980/krafka/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/hupe1980/krafka/compare/v0.15.0...v0.16.0

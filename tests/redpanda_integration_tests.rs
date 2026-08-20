@@ -219,7 +219,7 @@ async fn redpanda_produce_consume_round_trip() {
 
     // Idempotence is on by default; Redpanda supports it.
     let metadata = producer
-        .send(topic, Some(b"rp-key"), b"rp-value")
+        .send(topic, Some(b"rp-key"), Some(b"rp-value"))
         .await
         .expect("Failed to send message");
     assert!(metadata.offset >= 0);
@@ -323,7 +323,7 @@ async fn redpanda_transactions_fall_back_to_tv1() {
 
     producer.begin_transaction().expect("begin failed");
     let _metadata = producer
-        .send(topic, Some(b"txn-key"), b"txn-value")
+        .send(topic, Some(b"txn-key"), Some(b"txn-value"))
         .await
         .expect("transactional send failed");
     producer

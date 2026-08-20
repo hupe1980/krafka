@@ -279,11 +279,23 @@ pub struct RecordHeader {
 }
 
 impl RecordHeader {
-    /// Create a new record header.
+    /// Create a new record header with a present (possibly zero-length) value.
     pub fn new(key: impl Into<Bytes>, value: impl Into<Bytes>) -> Self {
         Self {
             key: key.into(),
             value: Some(value.into()),
+        }
+    }
+
+    /// Create a header whose value is **null**.
+    ///
+    /// The wire format distinguishes a null header value (a `-1` length
+    /// prefix) from a zero-length one, so this is not the same as
+    /// `RecordHeader::new(key, Bytes::new())`.
+    pub fn null(key: impl Into<Bytes>) -> Self {
+        Self {
+            key: key.into(),
+            value: None,
         }
     }
 
@@ -1289,11 +1301,15 @@ impl RecordBatchBuilder {
     }
 
     /// Add a record with headers.
+    ///
+    /// A `None` `value` is Kafka's null value (a tombstone); a `None` header
+    /// value is a null header value. Both are encoded as the `-1` length
+    /// sentinel, which the wire format distinguishes from zero-length.
     pub fn add_record_with_headers(
         mut self,
         key: Option<impl Into<Bytes>>,
         value: Option<impl Into<Bytes>>,
-        headers: Vec<(impl Into<Bytes>, impl Into<Bytes>)>,
+        headers: Vec<(impl Into<Bytes>, Option<impl Into<Bytes>>)>,
     ) -> Self {
         debug_assert!(
             self.records.len() < i32::MAX as usize,
@@ -1303,7 +1319,10 @@ impl RecordBatchBuilder {
         let mut record =
             Record::new(key.map(Into::into), value.map(Into::into)).with_offset_delta(offset_delta);
         for (k, v) in headers {
-            record.headers.push(RecordHeader::new(k, v));
+            record.headers.push(RecordHeader {
+                key: k.into(),
+                value: v.map(Into::into),
+            });
         }
         self.records.push(record);
         self

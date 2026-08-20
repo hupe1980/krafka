@@ -61,13 +61,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // All these writes are atomic - either all succeed or none
     let _ = producer
-        .send("orders", Some(b"order-123"), b"Order created")
+        .send("orders", Some(b"order-123"), Some(b"Order created"))
         .await?;
     let _ = producer
-        .send("inventory", Some(b"sku-456"), b"Stock decreased")
+        .send("inventory", Some(b"sku-456"), Some(b"Stock decreased"))
         .await?;
     let _ = producer
-        .send("notifications", Some(b"user-789"), b"Order confirmation")
+        .send(
+            "notifications",
+            Some(b"user-789"),
+            Some(b"Order confirmation"),
+        )
         .await?;
 
     // Optional: force the buffered batches onto the wire now, so a send
@@ -85,7 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     producer.begin_transaction()?;
 
     let _ = producer
-        .send("orders", Some(b"order-124"), b"Order created")
+        .send("orders", Some(b"order-124"), Some(b"Order created"))
         .await?;
 
     // Simulate a business logic failure
@@ -118,13 +122,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn process_order(producer: &TransactionalProducer) -> Result<(), Box<dyn std::error::Error>> {
     // Simulate order processing
     let _ = producer
-        .send("orders", Some(b"order-125"), b"Order processing")
+        .send("orders", Some(b"order-125"), Some(b"Order processing"))
         .await?;
     let _ = producer
-        .send("payments", Some(b"payment-125"), b"Payment initiated")
+        .send("payments", Some(b"payment-125"), Some(b"Payment initiated"))
         .await?;
     let _ = producer
-        .send("shipping", Some(b"shipment-125"), b"Shipment scheduled")
+        .send(
+            "shipping",
+            Some(b"shipment-125"),
+            Some(b"Shipment scheduled"),
+        )
         .await?;
 
     Ok(())

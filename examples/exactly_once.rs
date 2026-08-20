@@ -82,7 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // the individual send, is what determines whether this record is
             // visible to a read_committed consumer.
             let _ = producer
-                .send(OUTPUT_TOPIC, record.key.as_deref(), &transformed)
+                .send(OUTPUT_TOPIC, record.key.as_deref(), Some(&transformed))
                 .await?;
 
             // Commit the offset of the NEXT record to consume, not this one.

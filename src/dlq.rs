@@ -142,7 +142,7 @@ pub const HEADER_EXCEPTION_MESSAGE: &str = "__krafka.dlq.exception.message";
 ///         record.topic = self.topic.clone();
 ///         record.headers.push((
 ///             HEADER_EXCEPTION_MESSAGE.to_string(),
-///             bytes::Bytes::from(error),
+///             Some(bytes::Bytes::from(error)),
 ///         ));
 ///         Box::pin(async move {
 ///             // Fire-and-forget: the caller is already handling a failure,
@@ -314,11 +314,12 @@ impl DeadLetterQueue for KafkaDeadLetterQueue {
         let original_topic = std::mem::replace(&mut record.topic, self.topic.clone());
         record.headers.push((
             HEADER_ORIGINAL_TOPIC.to_string(),
-            Bytes::from(original_topic),
+            Some(Bytes::from(original_topic)),
         ));
-        record
-            .headers
-            .push((HEADER_EXCEPTION_MESSAGE.to_string(), Bytes::from(error)));
+        record.headers.push((
+            HEADER_EXCEPTION_MESSAGE.to_string(),
+            Some(Bytes::from(error)),
+        ));
         // The dead-letter topic has its own partition count, so a partition
         // index chosen for the source topic is meaningless here — and may not
         // exist. Let the partitioner place it.
@@ -359,26 +360,16 @@ impl DeadLetterQueue for KafkaDeadLetterQueue {
 /// appended *after* the original headers so existing header-based routing is
 /// not disturbed.
 ///
-/// # Null values are collapsed to empty (lossy)
+/// # Nulls are preserved
 ///
-/// The Kafka wire protocol distinguishes a **null** record value (a tombstone)
-/// and a **null** header value from a zero-length one.
-/// [`ConsumerRecord`] preserves that distinction (`value: Option<Bytes>`,
-/// headers `Vec<(Bytes, Option<Bytes>)>`), but [`ProducerRecord`] cannot
-/// express it: its `value` is `Bytes` and its header values are `Bytes`, with
-/// no null representation.
+/// A **tombstone** stays a tombstone and a null header value stays null: both
+/// [`ConsumerRecord`] and [`ProducerRecord`] model the distinction as
+/// `Option<Bytes>`. On a compacted DLQ topic that difference decides whether
+/// the key is deleted or a zero-length record is appended.
 ///
-/// This function therefore **collapses null to empty**:
-///
-/// - A tombstone (`original.value == None`) becomes a zero-length value.
-/// - A null header value becomes a zero-length header value.
-///
-/// The consequence is semantic: a tombstone routed to a **compacted** DLQ topic
-/// arrives as an ordinary zero-length record and will *not* trigger compaction
-/// deletion of its key. If your DLQ topic is compacted and tombstones matter,
-/// detect `original.value.is_none()` at the call site and handle it explicitly
-/// rather than relying on this helper. Fixing this properly requires
-/// `ProducerRecord::value` to become `Option<Bytes>`.
+/// Header **keys** are the exception: Kafka's are raw bytes and
+/// [`ProducerRecord`]'s are `String`, so a non-UTF-8 key is hex-encoded behind
+/// a `hex:` prefix.
 ///
 /// # Arguments
 ///
@@ -393,7 +384,7 @@ pub fn build_dlq_record(
     // Translate original headers: Kafka header keys are raw bytes, but
     // ProducerRecord headers use String keys. Non-UTF-8 keys are hex-encoded
     // (prefixed with "hex:") so all bytes are preserved losslessly.
-    let mut headers: Vec<(String, Bytes)> = original
+    let mut headers: Vec<(String, Option<Bytes>)> = original
         .headers
         .iter()
         .map(|(k, v)| {
@@ -412,9 +403,9 @@ pub fn build_dlq_record(
                         s
                     }
                 },
-                // Lossy: ProducerRecord header values are `Bytes`, so a null
-                // header value collapses to zero-length. See the fn docs.
-                v.clone().unwrap_or_default(),
+                // Null header values survive: both sides model the value as
+                // `Option<Bytes>`.
+                v.clone(),
             )
         })
         .collect();
@@ -422,28 +413,28 @@ pub fn build_dlq_record(
     // Append provenance headers after original headers.
     headers.push((
         HEADER_ORIGINAL_TOPIC.to_string(),
-        Bytes::from(original.topic.clone()),
+        Some(Bytes::from(original.topic.clone())),
     ));
     headers.push((
         HEADER_ORIGINAL_PARTITION.to_string(),
-        Bytes::from(original.partition.to_string()),
+        Some(Bytes::from(original.partition.to_string())),
     ));
     headers.push((
         HEADER_ORIGINAL_OFFSET.to_string(),
-        Bytes::from(original.offset.to_string()),
+        Some(Bytes::from(original.offset.to_string())),
     ));
     headers.push((
         HEADER_EXCEPTION_MESSAGE.to_string(),
-        Bytes::from(error.to_string()),
+        Some(Bytes::from(error.to_string())),
     ));
 
     ProducerRecord {
         topic: dlq_topic.to_string(),
         partition: None,
         key: original.key.clone(),
-        // Lossy: ProducerRecord::value is `Bytes`, so a tombstone (null value)
-        // collapses to zero-length. See the fn docs.
-        value: original.value.clone().unwrap_or_default(),
+        // A tombstone stays a tombstone: both sides model the value as
+        // `Option<Bytes>`. See the fn docs.
+        value: original.value.clone(),
         timestamp: None,
         headers,
         record_name: None,
@@ -461,9 +452,9 @@ mod kafka_dlq_tests {
             // A partition index chosen for the *source* topic.
             partition: Some(7),
             key: Some(Bytes::from_static(b"k")),
-            value: Bytes::from_static(b"v"),
+            value: Some(Bytes::from_static(b"v")),
             timestamp: None,
-            headers: vec![("app".to_string(), Bytes::from_static(b"x"))],
+            headers: vec![("app".to_string(), Some(Bytes::from_static(b"x")))],
             record_name: None,
         }
     }
@@ -480,11 +471,11 @@ mod kafka_dlq_tests {
         let original_topic = std::mem::replace(&mut record.topic, "orders.DLQ".to_string());
         record.headers.push((
             HEADER_ORIGINAL_TOPIC.to_string(),
-            Bytes::from(original_topic),
+            Some(Bytes::from(original_topic)),
         ));
         record.headers.push((
             HEADER_EXCEPTION_MESSAGE.to_string(),
-            Bytes::from("broker said no"),
+            Some(Bytes::from("broker said no")),
         ));
         record.partition = None;
 
@@ -500,7 +491,7 @@ mod kafka_dlq_tests {
                 .headers
                 .iter()
                 .find(|(k, _)| k == HEADER_ORIGINAL_TOPIC)
-                .map(|(_, v)| v.clone()),
+                .and_then(|(_, v)| v.clone()),
             Some(Bytes::from_static(b"orders"))
         );
         assert_eq!(
@@ -508,7 +499,7 @@ mod kafka_dlq_tests {
                 .headers
                 .iter()
                 .find(|(k, _)| k == HEADER_EXCEPTION_MESSAGE)
-                .map(|(_, v)| v.clone()),
+                .and_then(|(_, v)| v.clone()),
             Some(Bytes::from_static(b"broker said no"))
         );
     }
@@ -546,14 +537,14 @@ mod tests {
 
         assert_eq!(record.topic, "source-topic.DLQ");
         assert_eq!(record.key, Some(Bytes::from("key")));
-        assert_eq!(record.value, Bytes::from("value"));
+        assert_eq!(record.value, Some(Bytes::from("value")));
 
         let hdr = |name: &str| -> Option<Bytes> {
             record
                 .headers
                 .iter()
                 .find(|(k, _)| k == name)
-                .map(|(_, v)| v.clone())
+                .and_then(|(_, v)| v.clone())
         };
 
         assert_eq!(
@@ -582,7 +573,7 @@ mod tests {
 
         // Original header should come before provenance headers.
         assert_eq!(record.headers[0].0, "x-trace-id");
-        assert_eq!(record.headers[0].1, Bytes::from("abc123"));
+        assert_eq!(record.headers[0].1, Some(Bytes::from("abc123")));
         // DLQ provenance headers follow.
         assert!(
             record
@@ -592,28 +583,30 @@ mod tests {
         );
     }
 
+    /// A tombstone routed to the DLQ must arrive as a tombstone.
+    ///
+    /// If the null collapsed to zero-length, a compacted DLQ topic would store
+    /// an ordinary empty record instead of deleting the key.
     #[test]
-    fn test_build_dlq_record_tombstone_collapses_to_empty() {
-        // Documented lossy behaviour: ProducerRecord::value is `Bytes` and has
-        // no null representation, so a tombstone (None) becomes zero-length.
-        // A tombstone and a genuinely-empty value are indistinguishable in the
-        // resulting DLQ record.
-        let tombstone = ConsumerRecord::new("t", 0, 0, None, None);
+    fn test_build_dlq_record_preserves_tombstone() {
+        let tombstone = ConsumerRecord::new("t", 0, 0, Some(Bytes::from("k")), None);
         let from_tombstone = build_dlq_record("t.DLQ", &tombstone, &"tombstone");
-        assert_eq!(from_tombstone.value, Bytes::new());
+        assert_eq!(from_tombstone.value, None);
+        assert!(from_tombstone.is_tombstone());
 
-        let empty = ConsumerRecord::new("t", 0, 0, None, Some(Bytes::new()));
+        let empty = ConsumerRecord::new("t", 0, 0, Some(Bytes::from("k")), Some(Bytes::new()));
         let from_empty = build_dlq_record("t.DLQ", &empty, &"tombstone");
-        assert_eq!(from_empty.value, Bytes::new());
+        assert_eq!(from_empty.value, Some(Bytes::new()));
+        assert!(!from_empty.is_tombstone());
 
-        // The two are identical — this is the information loss being pinned.
-        assert_eq!(from_tombstone.value, from_empty.value);
+        // The distinction the wire format makes survives the translation.
+        assert_ne!(from_tombstone.value, from_empty.value);
     }
 
+    /// Null and zero-length header values stay distinct across the DLQ hop,
+    /// for the same reason record values do.
     #[test]
-    fn test_build_dlq_record_null_header_value_collapses_to_empty() {
-        // Same collapse applies to header values, whose ProducerRecord type is
-        // `Bytes` rather than `Option<Bytes>`.
+    fn test_build_dlq_record_preserves_null_header_value() {
         let mut original = ConsumerRecord::new("t", 0, 0, None, Some(Bytes::from("v")));
         original.headers.push((Bytes::from("null-hdr"), None));
         original
@@ -623,10 +616,9 @@ mod tests {
         let record = build_dlq_record("t.DLQ", &original, &"error");
 
         assert_eq!(record.headers[0].0, "null-hdr");
-        assert_eq!(record.headers[0].1, Bytes::new());
+        assert_eq!(record.headers[0].1, None);
         assert_eq!(record.headers[1].0, "empty-hdr");
-        assert_eq!(record.headers[1].1, Bytes::new());
-        // Null and empty are indistinguishable after translation.
-        assert_eq!(record.headers[0].1, record.headers[1].1);
+        assert_eq!(record.headers[1].1, Some(Bytes::new()));
+        assert_ne!(record.headers[0].1, record.headers[1].1);
     }
 }

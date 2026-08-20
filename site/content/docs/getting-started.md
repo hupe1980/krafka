@@ -69,7 +69,7 @@ async fn main() -> Result<()> {
 
     // Send a message
     let metadata = producer
-        .send("my-topic", Some(b"key"), b"Hello, Kafka!")
+        .send("my-topic", Some(b"key"), Some(b"Hello, Kafka!"))
         .await?;
 
     println!(

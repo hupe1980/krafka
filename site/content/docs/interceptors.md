@@ -69,7 +69,7 @@ struct TracingInterceptor;
 impl ProducerInterceptor for TracingInterceptor {
     fn on_send(&self, record: &mut ProducerRecord) -> InterceptorResult {
         let trace_id = Uuid::new_v4().to_string();
-        record.headers.push(("x-trace-id".to_string(), trace_id.into_bytes()));
+        record.headers.push(("x-trace-id".to_string(), Some(trace_id.into_bytes().into())));
         Ok(())
     }
 

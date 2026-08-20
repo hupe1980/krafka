@@ -2665,7 +2665,7 @@ mod tests {
         PendingRecord {
             record: RoutedRecord {
                 key: None,
-                value,
+                value: Some(value),
                 timestamp: None,
                 headers: Vec::new(),
             },
@@ -2850,7 +2850,11 @@ mod tests {
             record: ProducerRecord,
             error: String,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
-            let value = String::from_utf8_lossy(&record.value).into_owned();
+            let value = record
+                .value
+                .as_deref()
+                .map(|v| String::from_utf8_lossy(v).into_owned())
+                .unwrap_or_else(|| "<null>".to_string());
             Box::pin(async move {
                 self.received.lock().push((value, error));
             })
