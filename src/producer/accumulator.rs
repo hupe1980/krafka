@@ -30,7 +30,7 @@ use super::record::{
 use super::retry::{RetryContext, RetryPolicy};
 use crate::PartitionId;
 use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
-use crate::interceptor::ProducerInterceptor;
+use crate::interceptor::{ProducerInterceptor, RecordContext};
 use crate::metadata::ClusterMetadata;
 use crate::metrics::ProducerMetrics;
 use crate::protocol::{
@@ -467,10 +467,56 @@ struct AppendCommand {
     /// batch or dropped on failure.
     _buffered_record_guard: BufferedRecordGuard,
     permit_reservation: PermitReservation,
+    /// Per-record interceptor state opened by `on_send`, owed back to
+    /// `on_acknowledgement`.
+    interceptor_ctx: RecordContext,
+}
+
+/// An enqueue that was rejected, carrying back the record's interceptor
+/// context.
+///
+/// The context has to come back rather than being dropped here: `on_send`
+/// already ran, so the record owes an `on_acknowledgement` with the state that
+/// callback opened, and the accumulator handle is not the layer that knows the
+/// record's topic. The caller — `Producer::enqueue` or its transactional twin —
+/// discharges the obligation. See `SendObligation` in the producer module.
+#[derive(Debug)]
+pub(crate) struct EnqueueRejected {
+    /// Why the record could not be queued.
+    pub(crate) error: KrafkaError,
+    /// The interceptor state `on_send` opened for this record.
+    pub(crate) context: RecordContext,
+    /// The record itself, so the caller can report its headers to
+    /// `on_acknowledgement`. It is being dropped either way, so handing it back
+    /// is a move rather than a copy.
+    pub(crate) record: RoutedRecord,
+}
+
+impl EnqueueRejected {
+    /// Boxed because it is returned in an `Err`: at 200-plus bytes (error,
+    /// context and record) an unboxed variant would widen every `Result` on the
+    /// enqueue path to the size of its failure case. Rejection is the cold
+    /// path — it is already about to run an interceptor callback and format an
+    /// error — so one allocation there is the right side of the trade.
+    fn new(error: KrafkaError, context: RecordContext, record: RoutedRecord) -> Box<Self> {
+        Box::new(Self {
+            error,
+            context,
+            record,
+        })
+    }
 }
 
 /// Message sent to the accumulator background task.
 #[derive(Debug)]
+// `Append` is ~230 bytes against a handful for the control variants, and that
+// asymmetry is deliberate: it is the only variant on the per-record path, so it
+// carries the record, its guards and its interceptor context inline. Boxing it
+// to even out the enum would trade a fixed-size move for a malloc and free on
+// every single send — the opposite of the trade this path is tuned for. The
+// control variants are rare enough that the wasted slot space never
+// accumulates.
+#[allow(clippy::large_enum_variant)]
 enum AccumulatorMessage {
     /// Add a record to the accumulator.
     ///
@@ -617,8 +663,10 @@ impl RecordAccumulatorHandle {
             partition,
             operation_guard,
             send_started_at,
+            RecordContext::new(),
         )
-        .await?
+        .await
+        .map_err(|rejected| rejected.error)?
         .await
     }
 
@@ -630,6 +678,16 @@ impl RecordAccumulatorHandle {
     /// completed in a known order occupy the accumulator's channel in that
     /// order, and the run loop drains it FIFO — so produce order follows call
     /// order regardless of the order the handles are later awaited.
+    ///
+    /// `interceptor_ctx` is the record's [`RecordContext`]. On success it is
+    /// handed to the accumulator and travels to the terminal callback; on
+    /// failure it comes back inside [`EnqueueRejected`] so the caller can
+    /// discharge the `on_acknowledgement` the record still owes. Every error
+    /// path below returns it — including the two that give up on a timeout,
+    /// which is why the channel send uses `send_timeout` (it returns the
+    /// undelivered message) rather than `timeout(sender.send(..))` (which drops
+    /// it inside the cancelled future).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn enqueue_routed_with_guard(
         &self,
         topic: TopicHandle,
@@ -638,14 +696,19 @@ impl RecordAccumulatorHandle {
         partition: PartitionId,
         operation_guard: InFlightOpGuard,
         send_started_at: Instant,
-    ) -> Result<DeliveryHandle> {
+        interceptor_ctx: RecordContext,
+    ) -> std::result::Result<DeliveryHandle, Box<EnqueueRejected>> {
         let deadline = tokio::time::Instant::now() + self.max_block_ms;
 
         // Reject records that cannot physically be admitted (exceeds the
         // semaphore permit limit, max_request_size, or the configured
         // buffer_memory budget). Uses the module-level helper so all three
         // branches are unit-testable without allocating large buffers.
-        check_record_admission(record_size, self.memory_capacity, self.max_request_size)?;
+        if let Err(e) =
+            check_record_admission(record_size, self.memory_capacity, self.max_request_size)
+        {
+            return Err(EnqueueRejected::new(e, interceptor_ctx, record));
+        }
 
         // FIFO-fair reservation of `record_size` bytes from the shared pool.
         // On timeout or closed semaphore (accumulator panicked), the permit
@@ -657,11 +720,21 @@ impl RecordAccumulatorHandle {
         .await
         {
             Ok(Ok(p)) => p,
-            Ok(Err(_)) => return Err(KrafkaError::invalid_state("accumulator closed")),
+            Ok(Err(_)) => {
+                return Err(EnqueueRejected::new(
+                    KrafkaError::invalid_state("accumulator closed"),
+                    interceptor_ctx,
+                    record,
+                ));
+            }
             Err(_) => {
-                return Err(KrafkaError::timeout(
-                    "producer append: max_block exceeded while waiting for buffer \
-                     memory (ProducerConfig::max_block / AccumulatorConfig::max_block_ms)",
+                return Err(EnqueueRejected::new(
+                    KrafkaError::timeout(
+                        "producer append: max_block exceeded while waiting for buffer \
+                         memory (ProducerConfig::max_block / AccumulatorConfig::max_block_ms)",
+                    ),
+                    interceptor_ctx,
+                    record,
                 ));
             }
         };
@@ -688,29 +761,50 @@ impl RecordAccumulatorHandle {
         // `permit_reservation` drops and returns the permits to the pool
         // so another waiter can proceed. On success the accumulator now
         // owns the release obligation via the message contents.
-        match tokio::time::timeout(
-            remaining,
-            self.sender.send(AccumulatorMessage::Append(AppendCommand {
-                topic,
-                record,
-                partition,
-                record_size,
-                send_started_at,
-                response_tx,
-                operation_guard,
-                _buffered_record_guard: buffered_record_guard,
-                permit_reservation,
-            })),
-        )
-        .await
+        //
+        // `send_timeout` rather than `timeout(send(..))` because it hands the
+        // undelivered message *back*, which is the only way to recover the
+        // interceptor context out of a rejected enqueue.
+        if let Err(send_error) = self
+            .sender
+            .send_timeout(
+                AccumulatorMessage::Append(AppendCommand {
+                    topic,
+                    record,
+                    partition,
+                    record_size,
+                    send_started_at,
+                    response_tx,
+                    operation_guard,
+                    _buffered_record_guard: buffered_record_guard,
+                    permit_reservation,
+                    interceptor_ctx,
+                }),
+                remaining,
+            )
+            .await
         {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => return Err(KrafkaError::invalid_state("accumulator closed")),
-            Err(_) => {
-                return Err(KrafkaError::timeout(
-                    "producer append: max_block exceeded while sending to accumulator",
-                ));
-            }
+            let (error, message) = match send_error {
+                mpsc::error::SendTimeoutError::Closed(message) => (
+                    KrafkaError::invalid_state("accumulator closed"),
+                    Some(message),
+                ),
+                mpsc::error::SendTimeoutError::Timeout(message) => (
+                    KrafkaError::timeout(
+                        "producer append: max_block exceeded while sending to accumulator",
+                    ),
+                    Some(message),
+                ),
+            };
+            let (context, record) = match message {
+                Some(AccumulatorMessage::Append(append)) => (append.interceptor_ctx, append.record),
+                // Unreachable: the channel only ever hands back the exact
+                // message it was given. Degrading to an empty context and no
+                // headers keeps the callback firing rather than losing the
+                // acknowledgement.
+                _ => (RecordContext::new(), RoutedRecord::empty()),
+            };
+            return Err(EnqueueRejected::new(error, context, record));
         }
 
         Ok(DeliveryHandle {
@@ -891,6 +985,12 @@ impl Default for AccumulatorConfig {
 struct PendingRecord {
     record: RoutedRecord,
     response_tx: oneshot::Sender<AppendResponse>,
+    /// Per-record interceptor state opened by `on_send`.
+    ///
+    /// Rides with the record through batching, retries and batch splits — the
+    /// record's identity is this struct, so a `MESSAGE_TOO_LARGE` split that
+    /// moves it into a different batch carries its context along untouched.
+    interceptor_ctx: RecordContext,
     offset_in_batch: i64,
     /// Estimated size in bytes for memory tracking.
     estimated_size: usize,
@@ -1176,12 +1276,19 @@ impl RecordAccumulator {
                         }
                         Some(AccumulatorMessage::Shutdown { response_tx }) => {
                             debug!("Accumulator shutting down, flushing remaining batches");
+                            // Refuse anything further, then absorb what is
+                            // already queued behind this message, *then* flush.
+                            // See `absorb_queued_appends` for why the order is
+                            // load-bearing.
+                            receiver.close();
+                            self.absorb_queued_appends(&mut receiver);
                             let _ = self.flush_all().await;
                             let _ = response_tx.send(());
                             break;
                         }
                         None => {
                             debug!("Accumulator channel closed, flushing remaining batches");
+                            self.absorb_queued_appends(&mut receiver);
                             let _ = self.flush_all().await;
                             break;
                         }
@@ -1194,6 +1301,38 @@ impl RecordAccumulator {
         }
 
         debug!("Accumulator shutdown complete");
+    }
+
+    /// Move every append still sitting in the channel into a batch, so the
+    /// shutdown flush sends it.
+    ///
+    /// `close()` and the shutdown message race by design: `InFlightBarrier`
+    /// hands out a guard before `begin_close()` flips the flag, so a send that
+    /// got its guard is one `close_inner` waits for. That send still has to
+    /// serialize, route and win up to `max_block` of buffer memory before its
+    /// `Append` reaches the channel, which the shutdown message can easily
+    /// overtake — and anything landing behind it would otherwise be dropped
+    /// with the receiver, after `enqueue` had already returned `Ok`.
+    ///
+    /// The receiver is closed first, so senders that have not yet queued get a
+    /// clean `Closed` and report it through their own interceptor callback.
+    /// What is already buffered is finite (the channel is capped) and is
+    /// admitted here, then sent by the flush that follows.
+    fn absorb_queued_appends(&mut self, receiver: &mut mpsc::Receiver<AccumulatorMessage>) {
+        while let Ok(message) = receiver.try_recv() {
+            match message {
+                AccumulatorMessage::Append(append) => self.handle_append(append),
+                // A flush or a second shutdown queued behind this one: answer
+                // it rather than dropping its channel, so the caller is not
+                // left waiting on a response that can never arrive.
+                AccumulatorMessage::Flush { response_tx } => {
+                    let _ = response_tx.send(Ok(()));
+                }
+                AccumulatorMessage::Shutdown { response_tx } => {
+                    let _ = response_tx.send(());
+                }
+            }
+        }
     }
 
     /// When the loop next has something time-driven to do.
@@ -1233,6 +1372,7 @@ impl RecordAccumulator {
             operation_guard,
             _buffered_record_guard: buffered_record_guard,
             permit_reservation,
+            interceptor_ctx,
         } = append;
         let key = (topic, partition);
 
@@ -1263,6 +1403,7 @@ impl RecordAccumulator {
             accumulator_batch.pending.push(PendingRecord {
                 record,
                 response_tx,
+                interceptor_ctx,
                 offset_in_batch: offset,
                 estimated_size: record_size,
                 _buffered_record_guard: buffered_record_guard,
@@ -1321,6 +1462,7 @@ impl RecordAccumulator {
             new_batch.pending.push(PendingRecord {
                 record,
                 response_tx,
+                interceptor_ctx,
                 offset_in_batch: 0,
                 estimated_size: record_size,
                 _buffered_record_guard: buffered_record_guard,
@@ -1659,9 +1801,16 @@ impl RecordAccumulator {
 
         // Only now take a global send slot — see `spawn_batches_bounded` for
         // why the order matters. A closed semaphore means the accumulator is
-        // shutting down; drop the batch (memory permits are reclaimed by
-        // `InFlightGuard`, and callers observe a dropped response channel).
+        // shutting down, so the batch will never reach the wire. Fail it
+        // explicitly rather than dropping `pending`: that gives both the caller
+        // and the interceptor a terminal answer, and releases any per-record
+        // interceptor state.
         let Ok(_send_slot) = send_semaphore.acquire_owned().await else {
+            let error = KrafkaError::invalid_state(
+                "producer is shutting down; batch was discarded before it reached the wire",
+            );
+            metrics.record_error_for_topic(topic.as_ref());
+            Self::fail_pending(&topic, partition, pending, &error, &config).await;
             return;
         };
 
@@ -1780,15 +1929,15 @@ impl RecordAccumulator {
         config: &AccumulatorConfig,
     ) {
         let topic_owned = topic.to_string();
-        for p in pending {
-            let meta = RecordMetadata {
-                topic: topic_owned.clone(),
-                partition,
-                offset: -1,
-                timestamp: 0,
-                delivery: DeliveryConfirmation::Failed,
-            };
-            crate::interceptor::safe_on_acknowledgement(&*config.interceptor, &meta, Some(error));
+        for mut p in pending {
+            let meta = RecordMetadata::failed(topic_owned.clone(), partition);
+            crate::interceptor::safe_on_acknowledgement(
+                &*config.interceptor,
+                &meta,
+                Some(error),
+                &p.record.headers,
+                &mut p.interceptor_ctx,
+            );
 
             if let Some(dlq) = config.dead_letter_queue.as_ref() {
                 let dlq_record = ProducerRecord {
@@ -2371,7 +2520,7 @@ impl RecordAccumulator {
                     batch_bytes_total,
                 );
                 let topic_owned = topic.to_string();
-                for p in pending {
+                for mut p in pending {
                     let meta = RecordMetadata {
                         topic: topic_owned.clone(),
                         partition,
@@ -2389,7 +2538,13 @@ impl RecordAccumulator {
                             DeliveryConfirmation::Deduplicated
                         },
                     };
-                    crate::interceptor::safe_on_acknowledgement(&*config.interceptor, &meta, None);
+                    crate::interceptor::safe_on_acknowledgement(
+                        &*config.interceptor,
+                        &meta,
+                        None,
+                        &p.record.headers,
+                        &mut p.interceptor_ctx,
+                    );
                     let _ = p.response_tx.send(AppendResponse::Done(Ok(meta)));
                 }
             }
@@ -2670,6 +2825,7 @@ mod tests {
                 headers: Vec::new(),
             },
             response_tx,
+            interceptor_ctx: RecordContext::new(),
             offset_in_batch: 0,
             estimated_size,
             _buffered_record_guard: BufferedRecordGuard::new(
@@ -2710,6 +2866,97 @@ mod tests {
             partition_inflight: AHashMap::new(),
             dispatch_notify: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// An `Append` queued behind a `Shutdown` must still be admitted.
+    ///
+    /// `InFlightBarrier::start` succeeds before `begin_close` flips the flag,
+    /// so a send that got its guard is expected to complete — but it can reach
+    /// the channel *after* the shutdown message, because serialization,
+    /// partitioning and the wait for buffer memory all happen in between. That
+    /// record used to be dropped with the receiver: no acknowledgement to the
+    /// caller, and no `on_acknowledgement` for the interceptor holding its
+    /// span.
+    #[tokio::test]
+    async fn an_append_queued_behind_shutdown_is_still_admitted() {
+        let mut accumulator = test_accumulator(Duration::from_millis(50));
+        let (sender, mut receiver) = mpsc::channel::<AccumulatorMessage>(16);
+
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+        sender
+            .send(AccumulatorMessage::Shutdown {
+                response_tx: shutdown_tx,
+            })
+            .await
+            .unwrap();
+
+        let (response_tx, mut response_rx) = oneshot::channel();
+        let barrier = Arc::new(InFlightBarrier::new());
+        let metrics = Arc::new(ProducerMetrics::default());
+        sender
+            .send(AccumulatorMessage::Append(AppendCommand {
+                topic: TopicHandle::from("events"),
+                record: RoutedRecord {
+                    key: None,
+                    value: Some(bytes::Bytes::from_static(b"v")),
+                    timestamp: None,
+                    headers: Vec::new(),
+                },
+                partition: 0,
+                record_size: 1,
+                send_started_at: Instant::now(),
+                response_tx,
+                operation_guard: barrier.start("test").unwrap(),
+                _buffered_record_guard: BufferedRecordGuard::new(
+                    Arc::new(AtomicUsize::new(0)),
+                    Arc::clone(&metrics),
+                ),
+                permit_reservation: PermitReservation {
+                    bytes: 1,
+                    memory_permits: Arc::clone(&accumulator.memory_permits),
+                },
+                interceptor_ctx: RecordContext::new(),
+            }))
+            .await
+            .unwrap();
+
+        // The run loop has just taken the `Shutdown`; this is what it does next.
+        receiver.close();
+        accumulator.absorb_queued_appends(&mut receiver);
+
+        let buffered: usize = accumulator.batches.values().map(|b| b.pending.len()).sum();
+        assert_eq!(
+            buffered, 1,
+            "the append queued behind the shutdown must land in a batch, \
+             not be dropped with the receiver"
+        );
+        assert!(
+            response_rx.try_recv().is_err(),
+            "the record is queued for the shutdown flush, not answered yet"
+        );
+    }
+
+    /// A `Flush` queued behind a `Shutdown` must be answered, not dropped.
+    #[tokio::test]
+    async fn a_flush_queued_behind_shutdown_is_answered() {
+        let mut accumulator = test_accumulator(Duration::from_millis(50));
+        let (sender, mut receiver) = mpsc::channel::<AccumulatorMessage>(16);
+
+        let (flush_tx, flush_rx) = oneshot::channel();
+        sender
+            .send(AccumulatorMessage::Flush {
+                response_tx: flush_tx,
+            })
+            .await
+            .unwrap();
+
+        receiver.close();
+        accumulator.absorb_queued_appends(&mut receiver);
+
+        assert!(
+            flush_rx.await.is_ok(),
+            "a caller parked on flush() must not wait on a channel nobody will answer"
+        );
     }
 
     /// A batch holding one record, so `is_empty()` is false.

@@ -223,7 +223,11 @@ fn both_producer_builders_share_one_configuration_surface() {
     #[derive(Debug)]
     struct NoopInterceptor;
     impl krafka::interceptor::ProducerInterceptor for NoopInterceptor {
-        fn on_send(&self, _record: &mut ProducerRecord) -> krafka::interceptor::InterceptorResult {
+        fn on_send(
+            &self,
+            _record: &mut ProducerRecord,
+            _ctx: &mut krafka::interceptor::RecordContext,
+        ) -> krafka::interceptor::InterceptorResult {
             Ok(())
         }
     }

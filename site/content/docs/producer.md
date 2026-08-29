@@ -1216,12 +1216,14 @@ back through `FromStr`, so storing it needs no bespoke serialisation.
 ## Producer Interceptors
 
 Interceptors allow you to observe and modify records before they are sent, and
-observe the acknowledgement (or error) after a send completes.
-See the [Interceptors Guide](@/docs/interceptors.md) for full details.
+observe the acknowledgement (or error) after a send completes. Each record
+carries a `RecordContext` from one hook to the other, so an interceptor can hold
+a span or a timer across the send — see the
+[Interceptors Guide](@/docs/interceptors.md) for full details.
 
 ```rust
-use krafka::interceptor::{InterceptorResult, ProducerInterceptor};
-use krafka::producer::{Producer, ProducerRecord, RecordMetadata};
+use krafka::interceptor::{InterceptorResult, ProducerInterceptor, RecordContext};
+use krafka::producer::{Producer, ProducerRecord, RecordHeaders, RecordMetadata};
 use krafka::error::KrafkaError;
 use std::sync::Arc;
 
@@ -1229,13 +1231,19 @@ use std::sync::Arc;
 struct AuditInterceptor;
 
 impl ProducerInterceptor for AuditInterceptor {
-    fn on_send(&self, record: &mut ProducerRecord) -> InterceptorResult {
+    fn on_send(&self, record: &mut ProducerRecord, _ctx: &mut RecordContext) -> InterceptorResult {
         // Add a tracing header to every record
         record.headers.push(("x-trace-id".to_string(), Some(b"abc123".to_vec().into())));
         Ok(())
     }
 
-    fn on_acknowledgement(&self, metadata: &RecordMetadata, error: Option<&KrafkaError>) -> InterceptorResult {
+    fn on_acknowledgement(
+        &self,
+        metadata: &RecordMetadata,
+        error: Option<&KrafkaError>,
+        _headers: &RecordHeaders,
+        _ctx: &mut RecordContext,
+    ) -> InterceptorResult {
         if let Some(err) = error {
             eprintln!("Send failed: {}", err);
         } else {

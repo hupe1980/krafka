@@ -4095,3 +4095,487 @@ async fn a_produced_tombstone_deletes_a_key_from_a_compacted_table() {
         "the tombstone should be reported as a deletion"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Producer interceptors: per-record state, and the on_send/on_acknowledgement
+// pairing that makes it safe to hold
+// ---------------------------------------------------------------------------
+
+/// Records what an interceptor observed for every record it saw.
+///
+/// `on_send` parks a token in the record's context; `on_acknowledgement` takes
+/// it back and logs it next to the terminal metadata. A missing token means the
+/// context did not survive the trip, and a missing log entry means the record
+/// never reached the terminal callback at all — the two failure modes these
+/// tests exist to catch.
+#[derive(Debug, Default)]
+struct RecordingInterceptor {
+    sends: std::sync::atomic::AtomicUsize,
+    acks: std::sync::Mutex<Vec<AckObservation>>,
+}
+
+/// One terminal callback, as the interceptor saw it.
+#[derive(Debug)]
+struct AckObservation {
+    /// The token `on_send` stored, if it came back.
+    token: Option<String>,
+    /// Header keys visible at acknowledgement time, in order.
+    header_keys: Vec<String>,
+    partition: crate::PartitionId,
+    offset: i64,
+    delivery: crate::producer::DeliveryConfirmation,
+    failed: bool,
+}
+
+/// The value a `RecordingInterceptor` parks in each record's context.
+struct SendToken(String);
+
+impl RecordingInterceptor {
+    fn sends(&self) -> usize {
+        self.sends.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn acks(&self) -> std::sync::MutexGuard<'_, Vec<AckObservation>> {
+        self.acks.lock().unwrap()
+    }
+}
+
+impl crate::interceptor::ProducerInterceptor for RecordingInterceptor {
+    fn on_send(
+        &self,
+        record: &mut crate::producer::ProducerRecord,
+        ctx: &mut crate::interceptor::RecordContext,
+    ) -> crate::interceptor::InterceptorResult {
+        let n = self.sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        ctx.insert(SendToken(format!("{}#{n}", record.topic)));
+        Ok(())
+    }
+
+    fn on_acknowledgement(
+        &self,
+        metadata: &crate::producer::RecordMetadata,
+        error: Option<&crate::error::KrafkaError>,
+        headers: &crate::producer::RecordHeaders,
+        ctx: &mut crate::interceptor::RecordContext,
+    ) -> crate::interceptor::InterceptorResult {
+        self.acks().push(AckObservation {
+            token: ctx.take::<SendToken>().map(|t| t.0),
+            header_keys: headers.iter().map(|(k, _)| k.clone()).collect(),
+            partition: metadata.partition,
+            offset: metadata.offset,
+            delivery: metadata.delivery,
+            failed: error.is_some(),
+        });
+        Ok(())
+    }
+}
+
+async fn producer_with(
+    broker: &FakeBroker,
+    interceptor: &std::sync::Arc<RecordingInterceptor>,
+) -> Producer {
+    Producer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .add_interceptor(std::sync::Arc::clone(interceptor) as std::sync::Arc<_>)
+        .build()
+        .await
+        .expect("producer should connect")
+}
+
+/// The whole point of `RecordContext`: what `on_send` parks comes back to
+/// `on_acknowledgement`, for the right record, with real delivery metadata.
+#[tokio::test]
+async fn interceptor_state_survives_from_on_send_to_on_acknowledgement() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("events", 1);
+    let interceptor = std::sync::Arc::new(RecordingInterceptor::default());
+    let producer = producer_with(&broker, &interceptor).await;
+
+    for i in 0..3u8 {
+        let _ = producer
+            .send("events", None, Some(&[b'v', i]))
+            .await
+            .expect("send should be acknowledged");
+    }
+
+    let acks = interceptor.acks();
+    assert_eq!(acks.len(), 3, "every record must reach on_acknowledgement");
+    let tokens: Vec<_> = acks.iter().filter_map(|a| a.token.clone()).collect();
+    assert_eq!(
+        tokens,
+        vec!["events#0", "events#1", "events#2"],
+        "each record must get *its own* context back, in order"
+    );
+    for ack in acks.iter() {
+        assert!(!ack.failed, "a successful send reports no error");
+        assert_eq!(ack.delivery, crate::producer::DeliveryConfirmation::Offset);
+        assert!(ack.offset >= 0, "a successful send carries a real offset");
+    }
+}
+
+/// A record rejected by validation never reaches the accumulator. It still owes
+/// an acknowledgement, because `on_send` already ran and may already be holding
+/// a span.
+#[tokio::test]
+async fn a_record_rejected_by_validation_still_reaches_on_acknowledgement() {
+    let broker = FakeBroker::start().await.unwrap();
+    let interceptor = std::sync::Arc::new(RecordingInterceptor::default());
+    let producer = producer_with(&broker, &interceptor).await;
+
+    let mut record = crate::producer::ProducerRecord::new("events", b"v".to_vec());
+    for i in 0..(crate::protocol::MAX_RECORD_HEADERS + 1) {
+        record = record.with_header(format!("h{i}"), bytes::Bytes::from_static(b"x"));
+    }
+
+    let error = producer
+        .send_record(record)
+        .await
+        .expect_err("a record over the header limit must be rejected");
+    assert!(error.to_string().contains("headers"));
+
+    let acks = interceptor.acks();
+    assert_eq!(interceptor.sends(), 1);
+    assert_eq!(acks.len(), 1, "the rejected record still owes a callback");
+    assert_eq!(
+        acks[0].token.as_deref(),
+        Some("events#0"),
+        "the context opened in on_send must come back, not be dropped"
+    );
+    assert!(acks[0].failed);
+    assert_eq!(acks[0].partition, crate::producer::UNKNOWN_PARTITION);
+    assert_eq!(acks[0].offset, -1);
+    assert_eq!(
+        acks[0].delivery,
+        crate::producer::DeliveryConfirmation::Failed
+    );
+}
+
+/// Same guarantee one step earlier in the path: a serializer that fails runs
+/// after `on_send` and before anything else, and used to end the record's life
+/// silently.
+#[tokio::test]
+async fn a_record_rejected_by_a_serializer_still_reaches_on_acknowledgement() {
+    /// A serializer that always fails, standing in for a schema registry that
+    /// rejects a payload.
+    #[derive(Debug)]
+    struct FailingSerializer;
+
+    impl crate::serdes::Serializer for FailingSerializer {
+        fn serialize(
+            &self,
+            _payload: bytes::Bytes,
+            _topic: &str,
+            _record_name: Option<&str>,
+            _is_key: bool,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::error::Result<bytes::Bytes>> + Send + '_>,
+        > {
+            Box::pin(async {
+                Err(crate::error::KrafkaError::invalid_state(
+                    "schema registry rejected the payload",
+                ))
+            })
+        }
+    }
+
+    let broker = FakeBroker::start().await.unwrap();
+    let interceptor = std::sync::Arc::new(RecordingInterceptor::default());
+    let producer = Producer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .add_interceptor(std::sync::Arc::clone(&interceptor) as std::sync::Arc<_>)
+        .value_serializer(std::sync::Arc::new(FailingSerializer))
+        .build()
+        .await
+        .expect("producer should connect");
+
+    let _ = producer
+        .send("events", None, Some(b"v"))
+        .await
+        .expect_err("the serializer must reject the record");
+
+    let acks = interceptor.acks();
+    assert_eq!(acks.len(), 1, "the rejected record still owes a callback");
+    assert_eq!(acks[0].token.as_deref(), Some("events#0"));
+    assert!(acks[0].failed);
+    assert_eq!(acks[0].partition, crate::producer::UNKNOWN_PARTITION);
+}
+
+/// Dropping a `DeliveryHandle` discards the *caller's* view of the
+/// acknowledgement. The interceptor's view is not the caller's, so an
+/// interceptor holding a span must still be told how the record ended.
+#[tokio::test]
+async fn a_dropped_delivery_handle_does_not_suppress_on_acknowledgement() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("events", 1);
+    let interceptor = std::sync::Arc::new(RecordingInterceptor::default());
+    let producer = producer_with(&broker, &interceptor).await;
+
+    for i in 0..3u8 {
+        // Enqueued, then the handle is dropped on the spot.
+        drop(
+            producer
+                .enqueue(crate::producer::ProducerRecord::new(
+                    "events",
+                    vec![b'v', i],
+                ))
+                .await
+                .expect("enqueue should succeed"),
+        );
+    }
+    producer
+        .flush()
+        .await
+        .expect("flush should drain the buffer");
+
+    let acks = interceptor.acks();
+    assert_eq!(
+        acks.len(),
+        3,
+        "dropping the handle must not cost the interceptor its callback"
+    );
+    for ack in acks.iter() {
+        assert!(ack.token.is_some(), "the context must survive the drop");
+        assert!(!ack.failed);
+    }
+}
+
+/// The last of the pre-accumulator rejections: routing itself fails, so there
+/// is not even a partition to report.
+#[tokio::test]
+async fn a_record_for_an_unknown_topic_still_reaches_on_acknowledgement() {
+    let broker = FakeBroker::start().await.unwrap();
+    let interceptor = std::sync::Arc::new(RecordingInterceptor::default());
+    let producer = producer_with(&broker, &interceptor).await;
+
+    let error = producer
+        .send("no-such-topic", None, Some(b"v"))
+        .await
+        .expect_err("an unrouteable record must be rejected");
+    assert!(error.to_string().contains("unknown topic"));
+
+    let acks = interceptor.acks();
+    assert_eq!(acks.len(), 1, "the rejected record still owes a callback");
+    assert_eq!(acks[0].token.as_deref(), Some("no-such-topic#0"));
+    assert!(acks[0].failed);
+    assert_eq!(acks[0].partition, crate::producer::UNKNOWN_PARTITION);
+    assert_eq!(
+        acks[0].delivery,
+        crate::producer::DeliveryConfirmation::Failed
+    );
+}
+
+/// A batch rejected as too large is halved and both halves resubmitted. The
+/// records move into *different* batches partway through their lives, so this
+/// is where a context keyed to the batch rather than the record would come
+/// apart — and where a record could plausibly be acknowledged twice, or not at
+/// all.
+#[tokio::test]
+async fn a_split_batch_acknowledges_every_record_exactly_once_with_its_context() {
+    const RECORDS: usize = 4;
+
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("events", 1);
+    // Reject the first Produce as oversized; the two halves that follow are
+    // answered normally.
+    broker.on_once(ApiKey::Produce, |_| {
+        Control::Error(ErrorCode::MessageTooLarge)
+    });
+
+    let interceptor = std::sync::Arc::new(RecordingInterceptor::default());
+    let producer = Producer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        // Long enough that all four records share one batch.
+        .linger(Duration::from_millis(200))
+        .add_interceptor(std::sync::Arc::clone(&interceptor) as std::sync::Arc<_>)
+        .build()
+        .await
+        .expect("producer should connect");
+
+    for i in 0..RECORDS {
+        drop(
+            producer
+                .enqueue(
+                    crate::producer::ProducerRecord::new("events", vec![b'v', i as u8])
+                        .with_partition(0),
+                )
+                .await
+                .expect("enqueue should succeed"),
+        );
+    }
+    producer
+        .flush()
+        .await
+        .expect("flush should drain the buffer");
+
+    assert!(
+        broker.request_count(ApiKey::Produce) >= 3,
+        "expected the rejected batch plus two halves, saw {}",
+        broker.request_count(ApiKey::Produce)
+    );
+
+    let acks = interceptor.acks();
+    assert_eq!(
+        acks.len(),
+        RECORDS,
+        "exactly one acknowledgement per record — no losses, no duplicates"
+    );
+    let mut tokens: Vec<_> = acks.iter().filter_map(|a| a.token.clone()).collect();
+    tokens.sort();
+    assert_eq!(
+        tokens,
+        vec!["events#0", "events#1", "events#2", "events#3"],
+        "every record must carry its own context across the split"
+    );
+    for ack in acks.iter() {
+        assert!(!ack.failed, "both halves should have been accepted");
+    }
+}
+
+/// The transactional producer has its own send path, its own failure modes and
+/// its own copy of the obligation wiring. It must honour the same contract.
+#[tokio::test]
+async fn the_transactional_send_path_pairs_on_send_with_on_acknowledgement() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("orders", 1);
+
+    let interceptor = std::sync::Arc::new(RecordingInterceptor::default());
+    let producer = crate::producer::TransactionalProducer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .transactional_id("txn-interceptor")
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .add_interceptor(std::sync::Arc::clone(&interceptor) as std::sync::Arc<_>)
+        .build()
+        .await
+        .expect("transactional producer should connect");
+
+    producer.init_transactions().await.expect("init");
+    producer.begin_transaction().expect("begin");
+    let _ = producer
+        .send("orders", None, Some(b"committed"))
+        .await
+        .expect("send");
+
+    // Rejected before the accumulator, inside an open transaction: the record
+    // still owes an acknowledgement.
+    let _ = producer
+        .send("no-such-topic", None, Some(b"unrouteable"))
+        .await
+        .expect_err("an unrouteable record must be rejected");
+
+    producer.commit_transaction().await.expect("commit");
+    producer.close().await;
+
+    let acks = interceptor.acks();
+    assert_eq!(acks.len(), 2, "both records owe an acknowledgement");
+
+    let committed = acks
+        .iter()
+        .find(|a| a.token.as_deref() == Some("orders#0"))
+        .expect("the committed record must report with its own context");
+    assert!(!committed.failed);
+    assert_eq!(
+        committed.delivery,
+        crate::producer::DeliveryConfirmation::Offset
+    );
+
+    let rejected = acks
+        .iter()
+        .find(|a| a.token.as_deref() == Some("no-such-topic#1"))
+        .expect("the rejected record must report with its own context");
+    assert!(rejected.failed);
+    assert_eq!(rejected.partition, crate::producer::UNKNOWN_PARTITION);
+    assert_eq!(
+        rejected.delivery,
+        crate::producer::DeliveryConfirmation::Failed
+    );
+}
+
+/// `on_acknowledgement` reports the record's **final** header set — including
+/// headers written by interceptors *after* this one in the chain, which
+/// `on_send` cannot show it because it runs first.
+///
+/// This is the one thing a `RecordContext` genuinely cannot provide, and it is
+/// what the Java client's KIP-512 exists for.
+#[tokio::test]
+async fn on_acknowledgement_sees_headers_written_later_in_the_chain() {
+    /// Runs after the recorder and adds a header the recorder never saw.
+    #[derive(Debug)]
+    struct LateHeaderInterceptor;
+
+    impl crate::interceptor::ProducerInterceptor for LateHeaderInterceptor {
+        fn on_send(
+            &self,
+            record: &mut crate::producer::ProducerRecord,
+            _ctx: &mut crate::interceptor::RecordContext,
+        ) -> crate::interceptor::InterceptorResult {
+            record.headers.push((
+                "added-last".to_string(),
+                Some(bytes::Bytes::from_static(b"1")),
+            ));
+            Ok(())
+        }
+    }
+
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("events", 1);
+    let interceptor = std::sync::Arc::new(RecordingInterceptor::default());
+    let producer = Producer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .add_interceptor(std::sync::Arc::clone(&interceptor) as std::sync::Arc<_>)
+        .add_interceptor(std::sync::Arc::new(LateHeaderInterceptor))
+        .build()
+        .await
+        .expect("producer should connect");
+
+    let _ = producer
+        .send_record(
+            crate::producer::ProducerRecord::new("events", b"v".to_vec())
+                .with_header("added-first", bytes::Bytes::from_static(b"0")),
+        )
+        .await
+        .expect("send should be acknowledged");
+
+    let acks = interceptor.acks();
+    assert_eq!(acks.len(), 1);
+    assert_eq!(
+        acks[0].header_keys,
+        vec!["added-first".to_string(), "added-last".to_string()],
+        "the acknowledgement must carry the final header set, not the one this \
+         interceptor saw in on_send"
+    );
+}
+
+/// A record rejected before the accumulator reports the headers it had reached
+/// by then, rather than an empty set.
+#[tokio::test]
+async fn a_rejected_record_still_reports_its_headers() {
+    let broker = FakeBroker::start().await.unwrap();
+    let interceptor = std::sync::Arc::new(RecordingInterceptor::default());
+    let producer = producer_with(&broker, &interceptor).await;
+
+    let _ = producer
+        .send_record(
+            crate::producer::ProducerRecord::new("no-such-topic", b"v".to_vec())
+                .with_header("trace-id", bytes::Bytes::from_static(b"abc")),
+        )
+        .await
+        .expect_err("an unrouteable record must be rejected");
+
+    let acks = interceptor.acks();
+    assert_eq!(acks.len(), 1);
+    assert_eq!(
+        acks[0].header_keys,
+        vec!["trace-id".to_string()],
+        "a pre-accumulator rejection must still report the record's headers"
+    );
+    assert!(acks[0].failed);
+}

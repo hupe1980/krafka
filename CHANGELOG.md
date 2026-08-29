@@ -15,6 +15,87 @@ not a complete record.
 
 Nothing yet.
 
+## [0.21.0] — 2026-08-29
+
+An interceptor could rewrite a record in `on_send` and observe its
+acknowledgement later, but had no way to connect the two. `RecordMetadata`
+carries no key and no identifier, and the partition is not chosen until after
+`on_send` returns — so there was not even a value an interceptor could have used
+as a key into a side table of its own. Retaining a tracing span, timing true
+end-to-end delivery, or attaching correlation state was impossible to write as a
+reusable interceptor.
+
+This release adds a library-owned per-record context, and closes the gaps that
+made holding state across the two callbacks unsafe.
+
+### Breaking
+
+- **`ProducerInterceptor::on_send` and `on_acknowledgement` take a
+  `&mut RecordContext`.** The context is created before `on_send`, travels with
+  the record through the accumulator, batching, retries and batch splits, and is
+  handed back to the terminal callback.
+- **`on_acknowledgement` also takes `&RecordHeaders`** — the record's final,
+  read-only header set, mirroring the Java client's KIP-512 (Kafka 4.1).
+
+  Interceptors that need neither add `_headers: &RecordHeaders` and
+  `_ctx: &mut RecordContext` to the signatures and change nothing else.
+  `ConsumerInterceptor` is unchanged.
+- **Terminal failure metadata reports `timestamp: -1`** (the new
+  `producer::NO_TIMESTAMP`) rather than `0`, matching the Java client's
+  `RecordBatch.NO_TIMESTAMP`.
+
+### Added
+
+- **`krafka::interceptor::RecordContext`** — per-record state carried from
+  `on_send` to `on_acknowledgement`. `insert` / `get` / `get_mut` / `take` /
+  `contains`, keyed by type.
+
+  Values are keyed by `(interceptor, type)`, not by type alone: two interceptors
+  in one chain that both store a `Span` each get their own, and neither can
+  read, overwrite or `take` the other's — including when a neighbour panics
+  mid-`on_send`. A context nothing writes to allocates nothing; the first
+  `insert` allocates once, and one allocation serves the whole chain.
+- **`krafka::producer::RecordHeaders`** — the header slice handed to
+  `on_acknowledgement`. `Vec<(String, Option<Bytes>)>` derefs to it, so
+  `&record.headers` already is one.
+
+  This is the one thing a context cannot provide: an interceptor cannot see
+  headers written by interceptors *after* it in the chain, or by a serializer,
+  because `on_send` runs first.
+- **`krafka::producer::UNKNOWN_PARTITION`** (`-1`) — the partition reported for
+  a record that failed before it was routed. Mirrors the Java client's
+  `RecordMetadata.UNKNOWN_PARTITION`.
+- **`krafka::producer::NO_TIMESTAMP`** (`-1`) — the timestamp reported when the
+  broker never assigned one.
+
+### Fixed
+
+- **`on_send` and `on_acknowledgement` are now paired.** `on_send` runs at the
+  top of the send path, before serialization, validation, partitioning and the
+  wait for buffer memory — and each of those could reject the record and return
+  early with **no terminal callback at all**. An interceptor that opened a span
+  in `on_send` never got to close it, and a count of acknowledgements silently
+  disagreed with a count of sends.
+
+  Every one of those paths now reports the failure, with
+  `DeliveryConfirmation::Failed`, offset `-1` and `UNKNOWN_PARTITION`, on the
+  transactional send path too. The obligation is a value the send path has to
+  spend rather than a convention to remember, so a future early return cannot
+  quietly reintroduce the gap. Java closes the same hole with
+  `ProducerInterceptors.onSendError`.
+- **A batch discarded during producer shutdown reports its records as failed.**
+  When the send semaphore closed, `send_extracted_batch` dropped the batch — the
+  caller saw a dropped response channel and the interceptor saw nothing.
+- **A record that races `close()` into the accumulator's queue is no longer
+  dropped.** `InFlightBarrier::start` hands out a guard before `begin_close`
+  flips the flag, so such a send is one `close_inner` waits for — but it still
+  has to serialize, route and win buffer memory before its append reaches the
+  channel, which the shutdown message can overtake. Anything queued behind the
+  shutdown was discarded with the receiver, after `enqueue` had already returned
+  `Ok`. The accumulator now closes the channel and absorbs what is queued before
+  it flushes, so those records are sent; a `flush()` queued behind the shutdown
+  is answered rather than left hanging.
+
 ## [0.20.0] — 2026-08-20
 
 krafka could read a Kafka tombstone but not write one. `ProducerRecord::value`
@@ -1158,7 +1239,8 @@ Initial development: wire protocol, producer, consumer, admin client,
 authentication (SASL PLAIN / SCRAM / OAUTHBEARER / AWS MSK IAM), TLS,
 compression codecs, schema registry integration and the metrics layer.
 
-[Unreleased]: https://github.com/hupe1980/krafka/compare/v0.20.0...HEAD
+[Unreleased]: https://github.com/hupe1980/krafka/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/hupe1980/krafka/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/hupe1980/krafka/compare/v0.19.1...v0.20.0
 [0.19.1]: https://github.com/hupe1980/krafka/compare/v0.19.0...v0.19.1
 [0.19.0]: https://github.com/hupe1980/krafka/compare/v0.18.0...v0.19.0
