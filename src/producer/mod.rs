@@ -29,7 +29,10 @@ pub use partitioner::{
     DefaultPartitioner, HashPartitioner, Partitioner, RoundRobinPartitioner, StickyPartitioner,
     UniformStickyPartitioner, murmur2,
 };
-pub use record::{DeliveryConfirmation, ProducerRecord, RecordMetadata};
+pub use record::{
+    DeliveryConfirmation, NO_TIMESTAMP, ProducerRecord, RecordHeaders, RecordMetadata,
+    UNKNOWN_PARTITION,
+};
 pub use retry::{RetryContext, RetryPolicy};
 pub use transaction::{
     PreparedTxnState, TopicPartitionOffset, TransactionOutcome, TransactionState,
@@ -111,6 +114,95 @@ pub(crate) async fn apply_serializers(
         );
     }
     Ok(())
+}
+
+/// The `on_acknowledgement` a record owes once `on_send` has observed it.
+///
+/// `on_send` runs at the very top of the send path, before serialization,
+/// validation, partitioning and the wait for buffer memory — every one of which
+/// can reject the record and return early. Without this guard each of those
+/// early returns is a record whose terminal callback never fires, which with
+/// [`RecordContext`](crate::interceptor::RecordContext) in the picture leaks
+/// whatever the interceptor parked there.
+///
+/// The guard makes the obligation a value that has to be spent: discharged by
+/// [`fail`](Self::fail), which fires the terminal callback with the error, or
+/// by [`take_context`](Self::take_context), which hands the context to the
+/// accumulator so the callback fires there. Dropping it undischarged is a bug
+/// in this crate, and `Drop` says so.
+struct SendObligation<'a> {
+    interceptor: &'a dyn crate::interceptor::ProducerInterceptor,
+    /// `None` once discharged.
+    context: Option<crate::interceptor::RecordContext>,
+}
+
+impl<'a> SendObligation<'a> {
+    /// Open the obligation and run `on_send`.
+    ///
+    /// The context is created here rather than at the first `insert`, so from
+    /// this point on every failure path has one to hand back. An untouched
+    /// context allocates nothing.
+    fn on_send(
+        interceptor: &'a dyn crate::interceptor::ProducerInterceptor,
+        record: &mut ProducerRecord,
+    ) -> Self {
+        let mut context = crate::interceptor::RecordContext::new();
+        crate::interceptor::safe_on_send(interceptor, record, &mut context);
+        Self {
+            interceptor,
+            context: Some(context),
+        }
+    }
+
+    /// Discharge by reporting a terminal failure, returning `error` so call
+    /// sites read `return Err(obligation.fail(..))`.
+    ///
+    /// Pass [`UNKNOWN_PARTITION`] when the record failed before it was routed.
+    /// `headers` are the record's as of the failure — however far the chain and
+    /// the serializers got before it was rejected.
+    fn fail(
+        &mut self,
+        topic: &str,
+        partition: PartitionId,
+        headers: &RecordHeaders,
+        error: KrafkaError,
+    ) -> KrafkaError {
+        if let Some(mut context) = self.context.take() {
+            let metadata = RecordMetadata::failed(topic.to_owned(), partition);
+            crate::interceptor::safe_on_acknowledgement(
+                self.interceptor,
+                &metadata,
+                Some(&error),
+                headers,
+                &mut context,
+            );
+        }
+        error
+    }
+
+    /// Discharge by handing the context to the accumulator, which owes the
+    /// terminal callback from here on.
+    fn take_context(&mut self) -> crate::interceptor::RecordContext {
+        self.context.take().unwrap_or_default()
+    }
+}
+
+impl Drop for SendObligation<'_> {
+    fn drop(&mut self) {
+        if self.context.is_some() && !std::thread::panicking() {
+            // A send path grew an early return that forgot to report. Loud in
+            // this crate's own tests, logged in production — never a panic in a
+            // user's process.
+            debug_assert!(
+                false,
+                "krafka bug: a record ran on_send but no on_acknowledgement was reported",
+            );
+            tracing::error!(
+                "krafka bug: a record ran on_send but no on_acknowledgement was reported; \
+                 per-record interceptor state was dropped",
+            );
+        }
+    }
 }
 
 /// A Kafka producer.
@@ -865,23 +957,32 @@ impl Producer {
         let send_started_at = Instant::now();
         let operation_guard = self.in_flight_barrier.start("producer")?;
 
-        // Invoke interceptor before send
+        // Invoke interceptor before send.
+        //
+        // Everything from here to the handoff is inside the obligation: each
+        // early return goes through `obligation.fail(..)`, so a record that
+        // `on_send` observed always reaches `on_acknowledgement`.
         let mut record = record;
-        crate::interceptor::safe_on_send(&*self.interceptor, &mut record);
+        let mut obligation = SendObligation::on_send(&*self.interceptor, &mut record);
 
         // Transparently apply producer-level schema encoders if configured.
         // Runs after the interceptor (which may set topic/key/value) but before
         // validation, so oversized encoded payloads are still caught.
-        apply_serializers(
+        if let Err(e) = apply_serializers(
             &mut record,
             self.key_serializer.as_deref(),
             self.value_serializer.as_deref(),
         )
-        .await?;
+        .await
+        {
+            return Err(obligation.fail(&record.topic, UNKNOWN_PARTITION, &record.headers, e));
+        }
 
         // Validate record fields against Kafka protocol wire-format limits.
         // Runs after the interceptor since interceptors can mutate the record.
-        record.validate()?;
+        if let Err(e) = record.validate() {
+            return Err(obligation.fail(&record.topic, UNKNOWN_PARTITION, &record.headers, e));
+        }
 
         let record_size = record.estimated_size();
         let routed = record.into_routed_parts();
@@ -891,26 +992,50 @@ impl Producer {
         // Determine partition
         let partition = match routed.partition {
             Some(p) => p,
-            None => {
-                let partition_count = self
-                    .metadata
-                    .partition_count(topic.as_ref())
-                    .ok_or_else(|| KrafkaError::invalid_state(format!("unknown topic: {topic}")))?;
-                self.partitioner
-                    .partition(topic.as_ref(), record.key_bytes(), partition_count)
-            }
+            None => match self.metadata.partition_count(topic.as_ref()) {
+                Some(partition_count) => {
+                    self.partitioner
+                        .partition(topic.as_ref(), record.key_bytes(), partition_count)
+                }
+                None => {
+                    let error = KrafkaError::invalid_state(format!("unknown topic: {topic}"));
+                    return Err(obligation.fail(
+                        topic.as_ref(),
+                        UNKNOWN_PARTITION,
+                        &record.headers,
+                        error,
+                    ));
+                }
+            },
         };
 
-        self.accumulator
+        match self
+            .accumulator
             .enqueue_routed_with_guard(
-                topic,
+                topic.clone(),
                 record,
                 record_size,
                 partition,
                 operation_guard,
                 send_started_at,
+                obligation.take_context(),
             )
             .await
+        {
+            Ok(handle) => Ok(handle),
+            // The accumulator hands the context back rather than dropping it,
+            // so the obligation is re-opened here and discharged as a failure
+            // with the partition the record had already been routed to.
+            Err(rejected) => {
+                obligation.context = Some(rejected.context);
+                Err(obligation.fail(
+                    topic.as_ref(),
+                    partition,
+                    &rejected.record.headers,
+                    rejected.error,
+                ))
+            }
+        }
     }
 
     /// Flush all pending records.
@@ -2086,7 +2211,11 @@ mod tests {
         #[derive(Debug)]
         struct TestInterceptor;
         impl ProducerInterceptor for TestInterceptor {
-            fn on_send(&self, _record: &mut ProducerRecord) -> InterceptorResult {
+            fn on_send(
+                &self,
+                _record: &mut ProducerRecord,
+                _ctx: &mut crate::interceptor::RecordContext,
+            ) -> InterceptorResult {
                 Ok(())
             }
         }

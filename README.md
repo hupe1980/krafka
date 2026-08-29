@@ -53,7 +53,7 @@ simply correct. Different partitions still proceed concurrently.
 | **Consistency** | Every client shares one configuration surface and one operational surface (`close`, `rebootstrap`, `update_seed_brokers`, `refresh_tls`, `metrics`) — asserted at compile time, builders included. One builder per client, with `build_config()` to validate without a broker and `build()` to validate and connect, both through the same validator. The transactional producer mirrors the plain one setter for setter, minus the two settings transactions fix (`acks`, `idempotent`) |
 | **Tuning** | Per-codec compression levels (Gzip 0–9, Zstd through 22) validated against the selected codec at build time, so a level set on a codec that has none is rejected rather than ignored — on the plain and the transactional producer alike |
 | **Transport** | One `TransportConfig` on every builder — pass the same instance to every client that shares a network path: TCP keepalive, response ceiling, in-flight cap, idle eviction, file-descriptor cap · KIP-227 incremental fetch sessions · SOCKS5 |
-| **Observability** | Lock-free counters, gauges and latency histograms with bounded per-topic cardinality · Prometheus export · producer interceptors and dead-letter queues on **both** producers, over the single send path · OAUTHBEARER token-fetch counters and expiry gauge · OpenTelemetry semantic conventions |
+| **Observability** | Lock-free counters, gauges and latency histograms with bounded per-topic cardinality · Prometheus export · producer interceptors and dead-letter queues on **both** producers, over the single send path, with a per-record `RecordContext` carrying a span or timer from `on_send` to a terminal callback that fires for **every** record `on_send` saw · OAUTHBEARER token-fetch counters and expiry gauge · OpenTelemetry semantic conventions |
 | **Hardening** | Secret zeroization · constant-time comparison (`subtle`) · decompression-bomb limits · decode-loop bounds · RFC 3986 path encoding on every outbound HTTP target · CI forbids any credential-bearing type from deriving `Debug` |
 | **Testing** | 2 350+ tests · 6 cargo-fuzz targets · proptest round-trips across the protocol layer · an in-process fake broker with fault injection that serves the **full transaction protocol** — KIP-360 fencing, commit/abort markers, `read_committed` isolation, TV1 and KIP-890 TV2 — so even exactly-once tests need no Docker |
 
@@ -662,6 +662,45 @@ what it does and, just as importantly, what it deliberately does not model.
 ## ⬆️ Upgrading
 
 Release-by-release detail lives in **[CHANGELOG.md](CHANGELOG.md)**.
+
+### Upgrading to 0.21
+
+`ProducerInterceptor` gained a per-record `RecordContext`, so an interceptor can
+open a span or timer in `on_send` and finish it in `on_acknowledgement`, which
+also now receives the record's final read-only headers (the Java client's
+KIP-512). `ConsumerInterceptor` is unchanged.
+
+```rust
+impl ProducerInterceptor for LatencyInterceptor {
+    fn on_send(&self, _record: &mut ProducerRecord, ctx: &mut RecordContext) -> InterceptorResult {
+        ctx.insert(SendStart(Instant::now()));
+        Ok(())
+    }
+
+    fn on_acknowledgement(
+        &self,
+        _metadata: &RecordMetadata,
+        _error: Option<&KrafkaError>,
+        _headers: &RecordHeaders,
+        ctx: &mut RecordContext,
+    ) -> InterceptorResult {
+        if let Some(SendStart(t)) = ctx.take::<SendStart>() {
+            record_latency(t.elapsed());
+        }
+        Ok(())
+    }
+}
+```
+
+If you need neither, add `_headers: &RecordHeaders` and
+`_ctx: &mut RecordContext` to the signatures and change nothing else.
+
+`on_acknowledgement` now fires for **every** record `on_send` saw, including
+those rejected before the accumulator — a failed serializer, failed validation,
+an unrouteable topic, `max.block.ms` exhausted. Those report
+`UNKNOWN_PARTITION`, offset `-1` and `DeliveryConfirmation::Failed`, where
+before they produced no callback at all. See the
+[Interceptors Guide](https://hupe1980.github.io/krafka/docs/interceptors/).
 
 ### Upgrading to 0.20
 

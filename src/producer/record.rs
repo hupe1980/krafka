@@ -395,6 +395,20 @@ impl ProducerRecord {
     }
 }
 
+/// The record headers handed to
+/// [`ProducerInterceptor::on_acknowledgement`](crate::interceptor::ProducerInterceptor::on_acknowledgement).
+///
+/// Named rather than spelled out for the same reason as
+/// [`CommitOffsets`](crate::interceptor::CommitOffsets): a trait signature that
+/// wrote `&[(String, Option<Bytes>)]` inline would make every implementor
+/// repeat it, and would pin the representation in place the first time someone
+/// did.
+///
+/// `Vec<(String, Option<Bytes>)>` — the type of
+/// [`ProducerRecord::headers`] — derefs to this, so `&record.headers` is
+/// already a `&RecordHeaders`.
+pub type RecordHeaders = [(String, Option<Bytes>)];
+
 /// Interned topic handle reused across the producer routing path.
 pub(crate) type TopicHandle = Arc<str>;
 
@@ -409,6 +423,20 @@ pub(crate) struct RoutedRecord {
 }
 
 impl RoutedRecord {
+    /// A record with no fields set.
+    ///
+    /// Only for the unreachable arm where a channel hands back something other
+    /// than the message it was given: the terminal callback still has to fire,
+    /// and it needs *some* header slice to report.
+    pub(crate) fn empty() -> Self {
+        Self {
+            key: None,
+            value: None,
+            timestamp: None,
+            headers: Vec::new(),
+        }
+    }
+
     #[inline]
     pub(crate) fn key_bytes(&self) -> Option<&[u8]> {
         self.key.as_deref()
@@ -467,6 +495,23 @@ pub enum DeliveryConfirmation {
     Failed,
 }
 
+/// Partition value reported when a record failed before it was routed.
+///
+/// A record rejected by serialization, validation or topic lookup never
+/// reaches the partitioner, so the
+/// [`RecordMetadata`] handed to
+/// [`ProducerInterceptor::on_acknowledgement`](crate::interceptor::ProducerInterceptor::on_acknowledgement)
+/// carries this instead of a real partition. Mirrors the Java client's
+/// `RecordMetadata.UNKNOWN_PARTITION`.
+pub const UNKNOWN_PARTITION: PartitionId = -1;
+
+/// Timestamp reported when the broker never assigned one.
+///
+/// Mirrors the Java client's `RecordBatch.NO_TIMESTAMP`. Only meaningful
+/// alongside [`DeliveryConfirmation::Failed`] or an `acks = 0` send — a
+/// successful append always carries a real timestamp.
+pub const NO_TIMESTAMP: Timestamp = -1;
+
 /// Metadata returned after successfully sending a record.
 ///
 /// Always check [`delivery`](Self::delivery) (or the
@@ -494,6 +539,24 @@ pub struct RecordMetadata {
 }
 
 impl RecordMetadata {
+    /// Terminal metadata for a record that failed and therefore has no offset.
+    ///
+    /// The single constructor for the failure case, so every path that reports
+    /// a terminal failure to
+    /// [`ProducerInterceptor::on_acknowledgement`](crate::interceptor::ProducerInterceptor::on_acknowledgement)
+    /// — pre-enqueue rejection, batch failure, dead-letter hand-off — describes
+    /// it identically. Pass [`UNKNOWN_PARTITION`] when the record failed before
+    /// it was routed.
+    pub(crate) fn failed(topic: String, partition: PartitionId) -> Self {
+        Self {
+            topic,
+            partition,
+            offset: -1,
+            timestamp: NO_TIMESTAMP,
+            delivery: DeliveryConfirmation::Failed,
+        }
+    }
+
     /// Returns `true` if the record was committed with a known log offset.
     ///
     /// Deduplicated records return `false` even though their data *is* in

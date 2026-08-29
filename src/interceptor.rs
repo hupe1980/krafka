@@ -34,19 +34,24 @@
 //! and observe the acknowledgement (or error) after a send completes.
 //!
 //! ```rust,ignore
-//! use krafka::interceptor::{ProducerInterceptor, InterceptorResult};
+//! use krafka::interceptor::{ProducerInterceptor, InterceptorResult, RecordContext};
 //! use krafka::producer::{ProducerRecord, RecordMetadata};
 //! use krafka::error::KrafkaError;
 //!
 //! struct LoggingInterceptor;
 //!
 //! impl ProducerInterceptor for LoggingInterceptor {
-//!     fn on_send(&self, record: &mut ProducerRecord) -> InterceptorResult {
+//!     fn on_send(&self, record: &mut ProducerRecord, ctx: &mut RecordContext) -> InterceptorResult {
 //!         println!("Sending to topic: {}", record.topic);
 //!         Ok(())
 //!     }
 //!
-//!     fn on_acknowledgement(&self, metadata: &RecordMetadata, error: Option<&KrafkaError>) -> InterceptorResult {
+//!     fn on_acknowledgement(
+//!         &self,
+//!         metadata: &RecordMetadata,
+//!         error: Option<&KrafkaError>,
+//!         ctx: &mut RecordContext,
+//!     ) -> InterceptorResult {
 //!         if let Some(err) = error {
 //!             eprintln!("Send failed: {}", err);
 //!         } else {
@@ -62,6 +67,24 @@
 //!     .build()
 //!     .await?;
 //! ```
+//!
+//! # Per-record State
+//!
+//! `on_send` mutates the record; `on_acknowledgement` sees [`RecordMetadata`]
+//! and the final headers, but nothing identifying *which* record this was to
+//! the interceptor that sent it. [`RecordContext`] closes that gap: the library
+//! creates one per record before `on_send`, carries it through the accumulator,
+//! batching, retries and batch splits, and hands the same context back to
+//! `on_acknowledgement` — so a tracing interceptor can open a span in one
+//! callback and close it in the other.
+//!
+//! Values are keyed by `(interceptor, type)`, so chained interceptors cannot
+//! see or clobber each other's state. `on_acknowledgement` fires **exactly
+//! once** for every record `on_send` observed, including records rejected
+//! before they reach the accumulator and records whose
+//! [`DeliveryHandle`](crate::producer::DeliveryHandle) the caller dropped, so
+//! an interceptor never leaks a span. See [`RecordContext`] for the full
+//! contract, its cost, and an example.
 //!
 //! # Consumer Interceptors
 //!
@@ -91,13 +114,14 @@
 
 use ahash::AHashMap as HashMap;
 use bytes::Bytes;
+use std::any::{Any, TypeId};
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 use crate::consumer::ConsumerRecord;
 use crate::error::KrafkaError;
-use crate::producer::{ProducerRecord, RecordMetadata};
+use crate::producer::{ProducerRecord, RecordHeaders, RecordMetadata};
 use crate::{Offset, PartitionId, Timestamp};
 
 /// The offset map handed to [`ConsumerInterceptor::on_commit`].
@@ -120,6 +144,225 @@ pub type CommitOffsets = HashMap<(String, PartitionId), Offset>;
 /// don't need to downcast. Use the `Display` impl to provide diagnostic context.
 pub type InterceptorResult = std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
+/// One value parked in a [`RecordContext`], tagged with the interceptor that
+/// owns it.
+///
+/// `owner` is the interceptor's index in the chain. Tagging every value —
+/// rather than giving each interceptor its own map — is what keeps the whole
+/// context to a *single* lazily-allocated `Vec` per record instead of one
+/// allocation per interceptor per record.
+struct ContextEntry {
+    owner: u16,
+    type_id: TypeId,
+    value: Box<dyn Any + Send + Sync>,
+}
+
+/// Per-record state that travels from [`ProducerInterceptor::on_send`] to
+/// [`ProducerInterceptor::on_acknowledgement`].
+///
+/// A context is created by the library *before* `on_send` and carried with the
+/// record through the accumulator, batching, retries and batch splits, until
+/// the record reaches its terminal outcome. Whatever an interceptor parks in it
+/// during `on_send` is handed back — same record, same context — in
+/// `on_acknowledgement`.
+///
+/// This is what makes stateful interceptors possible. [`RecordMetadata`]
+/// carries no key and no identifier, and the partition is not chosen until
+/// after `on_send` returns; the headers can serve as a key into a side table
+/// you maintain yourself, but only for state that survives being reduced to
+/// bytes. A context hands back the value itself — a live span, a timer, a
+/// permit.
+///
+/// # Isolation
+///
+/// Values are keyed by `(interceptor, type)`, not by type alone. Two
+/// interceptors in the same chain that both store a `SpanGuard` each see their
+/// own, and neither can read, overwrite or [`take`](Self::take) the other's.
+/// This preserves the chain's isolation guarantee: an interceptor's behaviour
+/// cannot be changed by what its neighbours do.
+///
+/// A single interceptor may store any number of *distinct* types; storing the
+/// same type twice replaces the previous value (and returns it).
+///
+/// # Cost
+///
+/// An unused context allocates nothing — it is an empty `Vec` — so records
+/// flowing through a producer with no interceptor, or past an interceptor that
+/// stores nothing, pay no heap traffic at all. The first
+/// [`insert`](Self::insert) allocates once, and that one allocation serves
+/// every interceptor and every type in the chain.
+///
+/// Inline it is 32 bytes on 64-bit targets, carried on each buffered record and
+/// pinned by `a_context_stays_within_its_per_record_size_budget`.
+///
+/// Whatever you store is held for the record's entire buffered lifetime, up to
+/// `delivery.timeout.ms`, and is **not** counted against `buffer_memory`.
+/// Store handles (a span, an `Instant`, an ID), not payloads.
+///
+/// # Delivery guarantee
+///
+/// Every record that `on_send` observes reaches `on_acknowledgement` exactly
+/// once, with its context — including records rejected before they ever reach
+/// the accumulator (serialization failure, validation failure, unknown topic,
+/// `max.block.ms` exhaustion). Those arrive with
+/// [`DeliveryConfirmation::Failed`](crate::producer::DeliveryConfirmation::Failed),
+/// offset `-1` and, when routing never happened,
+/// [`UNKNOWN_PARTITION`](crate::producer::UNKNOWN_PARTITION) — the same values
+/// the Java client synthesizes in `ProducerInterceptors.onSendError`. The one
+/// exception is a panic inside krafka's own batch-send task, which abandons the
+/// batch it was sending and costs the caller its acknowledgement too.
+///
+/// A value you leave in the context is dropped on the producer's send task,
+/// immediately after the terminal callback returns. Keep its `Drop` cheap and
+/// non-blocking, for the same reason the callbacks themselves must be.
+///
+/// # Example
+///
+/// ```rust
+/// use krafka::interceptor::{InterceptorResult, ProducerInterceptor, RecordContext};
+/// use krafka::producer::{ProducerRecord, RecordHeaders, RecordMetadata};
+/// use krafka::error::KrafkaError;
+/// use std::time::Instant;
+///
+/// #[derive(Debug)]
+/// struct LatencyInterceptor;
+///
+/// struct SendStart(Instant);
+///
+/// impl ProducerInterceptor for LatencyInterceptor {
+///     fn on_send(&self, _record: &mut ProducerRecord, ctx: &mut RecordContext) -> InterceptorResult {
+///         ctx.insert(SendStart(Instant::now()));
+///         Ok(())
+///     }
+///
+///     fn on_acknowledgement(
+///         &self,
+///         _metadata: &RecordMetadata,
+///         _error: Option<&KrafkaError>,
+///         _headers: &RecordHeaders,
+///         ctx: &mut RecordContext,
+///     ) -> InterceptorResult {
+///         if let Some(SendStart(started)) = ctx.take::<SendStart>() {
+///             let _e2e = started.elapsed();
+///         }
+///         Ok(())
+///     }
+/// }
+/// ```
+#[derive(Default)]
+pub struct RecordContext {
+    /// Lazily allocated: an untouched context never reaches the heap.
+    entries: Vec<ContextEntry>,
+    /// Index of the interceptor currently executing. Set by
+    /// [`ProducerInterceptorChain`] around each call; `0` for a producer
+    /// configured with a single interceptor.
+    owner: u16,
+}
+
+impl fmt::Debug for RecordContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The values are `dyn Any` and cannot be formatted; showing how many
+        // are parked (and for whom) is the useful part and leaks no payload.
+        f.debug_struct("RecordContext")
+            .field("entries", &self.entries.len())
+            .field("owner", &self.owner)
+            .finish()
+    }
+}
+
+impl RecordContext {
+    /// Create an empty context.
+    ///
+    /// The producer creates one per record; you only need this to unit-test an
+    /// interceptor without a live producer.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            owner: 0,
+        }
+    }
+
+    /// Point the accessors at interceptor `owner`, returning the previous one.
+    ///
+    /// Called by the chain around each interceptor invocation. Keeping this
+    /// crate-private is what makes the isolation guarantee enforceable: an
+    /// interceptor cannot address another's slot because it cannot name it.
+    pub(crate) fn set_owner(&mut self, owner: u16) -> u16 {
+        std::mem::replace(&mut self.owner, owner)
+    }
+
+    /// Index of the calling interceptor's `T`, if present.
+    fn position<T: 'static>(&self) -> Option<usize> {
+        let type_id = TypeId::of::<T>();
+        self.entries
+            .iter()
+            .position(|entry| entry.owner == self.owner && entry.type_id == type_id)
+    }
+
+    /// Store `value`, returning the previous value of the same type if the
+    /// calling interceptor had already stored one.
+    ///
+    /// `T: Send + Sync` because the context travels with the record into the
+    /// accumulator's send tasks, and the batch it lands in is borrowed across
+    /// `await` points there — a shared borrow of a non-`Sync` value is not
+    /// `Send`, so the whole batch future would stop being spawnable. In
+    /// practice this costs nothing: spans, `Instant`s, IDs and OpenTelemetry
+    /// contexts are all `Sync`. Wrap genuinely non-`Sync` state in a `Mutex`.
+    pub fn insert<T: Send + Sync + 'static>(&mut self, value: T) -> Option<T> {
+        match self.position::<T>() {
+            Some(index) => {
+                let previous = self
+                    .entries
+                    .get_mut(index)
+                    .map(|entry| std::mem::replace(&mut entry.value, Box::new(value)))?;
+                previous.downcast::<T>().ok().map(|boxed| *boxed)
+            }
+            None => {
+                self.entries.push(ContextEntry {
+                    owner: self.owner,
+                    type_id: TypeId::of::<T>(),
+                    value: Box::new(value),
+                });
+                None
+            }
+        }
+    }
+
+    /// Borrow the value of type `T` stored by the calling interceptor.
+    #[must_use]
+    pub fn get<T: Send + Sync + 'static>(&self) -> Option<&T> {
+        let index = self.position::<T>()?;
+        self.entries.get(index)?.value.downcast_ref::<T>()
+    }
+
+    /// Mutably borrow the value of type `T` stored by the calling interceptor.
+    #[must_use]
+    pub fn get_mut<T: Send + Sync + 'static>(&mut self) -> Option<&mut T> {
+        let index = self.position::<T>()?;
+        self.entries.get_mut(index)?.value.downcast_mut::<T>()
+    }
+
+    /// Remove and return the value of type `T` stored by the calling
+    /// interceptor.
+    ///
+    /// This is the natural end of a span or timer in `on_acknowledgement`:
+    /// taking ownership means the value is dropped when you are done with it,
+    /// rather than living until the record's context is dropped.
+    #[must_use]
+    pub fn take<T: Send + Sync + 'static>(&mut self) -> Option<T> {
+        let index = self.position::<T>()?;
+        let entry = self.entries.remove(index);
+        entry.value.downcast::<T>().ok().map(|boxed| *boxed)
+    }
+
+    /// Whether the calling interceptor has stored a value of type `T`.
+    #[must_use]
+    pub fn contains<T: Send + Sync + 'static>(&self) -> bool {
+        self.position::<T>().is_some()
+    }
+}
+
 /// Interceptor for the Kafka producer pipeline.
 ///
 /// Implement this trait to hook into the producer's send and acknowledgement
@@ -141,18 +384,48 @@ pub trait ProducerInterceptor: Send + Sync + fmt::Debug {
     /// the record's key; `Some(Bytes::new())` looks similar and does the
     /// opposite. An interceptor that rewrites values should leave `None` alone
     /// unless it means to cancel the deletion. Header values likewise.
-    fn on_send(&self, _record: &mut ProducerRecord) -> InterceptorResult {
+    ///
+    /// `ctx` is this record's [`RecordContext`]. Anything stored in it here is
+    /// handed back to [`on_acknowledgement`](Self::on_acknowledgement) for the
+    /// same record — that is how a span, a timer or a correlation ID survives
+    /// the trip through the accumulator.
+    fn on_send(&self, _record: &mut ProducerRecord, _ctx: &mut RecordContext) -> InterceptorResult {
         Ok(())
     }
 
-    /// Called after a record has been acknowledged (or failed).
+    /// Called after a record has reached its terminal outcome.
     ///
     /// `error` is `None` on success. This is invoked asynchronously and
     /// should not block.
+    ///
+    /// Fires exactly once for every record [`on_send`](Self::on_send)
+    /// observed — see [`RecordContext`] for the precise guarantee and its one
+    /// exception. Records rejected before reaching the accumulator arrive with
+    /// [`DeliveryConfirmation::Failed`](crate::producer::DeliveryConfirmation::Failed),
+    /// offset `-1`, and
+    /// [`UNKNOWN_PARTITION`](crate::producer::UNKNOWN_PARTITION) when the
+    /// record never got as far as being routed. Dropping the
+    /// [`DeliveryHandle`](crate::producer::DeliveryHandle) does not suppress
+    /// it: the handle discards the *caller's* view of the acknowledgement, not
+    /// the interceptor's.
+    ///
+    /// `headers` is the record's **final** header set, read-only: everything
+    /// this interceptor, the ones after it in the chain, and the configured
+    /// serializers wrote. `on_send` cannot show you that — it runs before the
+    /// rest of the chain — so this is the only place the complete set is
+    /// visible. Mirrors the Java client's
+    /// `onAcknowledgement(RecordMetadata, Exception, Headers)` (KIP-512).
+    ///
+    /// For correlating with `on_send`, reach for `ctx` rather than a header:
+    /// see [`RecordContext`] for why.
+    ///
+    /// `ctx` is the same [`RecordContext`] `on_send` saw for this record.
     fn on_acknowledgement(
         &self,
         _metadata: &RecordMetadata,
         _error: Option<&KrafkaError>,
+        _headers: &RecordHeaders,
+        _ctx: &mut RecordContext,
     ) -> InterceptorResult {
         Ok(())
     }
@@ -302,6 +575,17 @@ pub(crate) struct ProducerInterceptorChain {
     interceptors: Vec<Arc<dyn ProducerInterceptor>>,
 }
 
+/// [`RecordContext`] owner tag for chain position `index`.
+///
+/// Saturates rather than wrapping: a chain long enough to overflow `u16` would
+/// otherwise alias interceptor 65 536 onto interceptor 0 and silently break
+/// isolation between them. Saturating collapses only the tail of an absurd
+/// chain, and does so deterministically.
+#[inline]
+fn chain_owner(index: usize) -> u16 {
+    u16::try_from(index).unwrap_or(u16::MAX)
+}
+
 impl fmt::Debug for ProducerInterceptorChain {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ProducerInterceptorChain")
@@ -318,14 +602,17 @@ impl ProducerInterceptorChain {
 }
 
 impl ProducerInterceptor for ProducerInterceptorChain {
-    fn on_send(&self, record: &mut ProducerRecord) -> InterceptorResult {
+    fn on_send(&self, record: &mut ProducerRecord, ctx: &mut RecordContext) -> InterceptorResult {
         for (i, interceptor) in self.interceptors.iter().enumerate() {
+            // Scope the shared context to this interceptor's slot, so what it
+            // stores is invisible — and untakeable — to the rest of the chain.
+            let previous_owner = ctx.set_owner(chain_owner(i));
             // O(1) snapshot of the cheaply-restorable fields. Deliberately not
             // a full `record.clone()`: that deep-copies `topic` and every
             // header key on the producer's per-record hot path. See the type
             // docs for exactly what a panic does and does not roll back.
             let snapshot = CheapRecordSnapshot::capture(record);
-            match catch_unwind(AssertUnwindSafe(|| interceptor.on_send(record))) {
+            match catch_unwind(AssertUnwindSafe(|| interceptor.on_send(record, ctx))) {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     tracing::warn!(
@@ -348,6 +635,7 @@ impl ProducerInterceptor for ProducerInterceptorChain {
                     );
                 }
             }
+            ctx.set_owner(previous_owner);
         }
         Ok(())
     }
@@ -356,11 +644,18 @@ impl ProducerInterceptor for ProducerInterceptorChain {
         &self,
         metadata: &RecordMetadata,
         error: Option<&KrafkaError>,
+        headers: &RecordHeaders,
+        ctx: &mut RecordContext,
     ) -> InterceptorResult {
         for (i, interceptor) in self.interceptors.iter().enumerate() {
-            match catch_unwind(AssertUnwindSafe(|| {
-                interceptor.on_acknowledgement(metadata, error)
-            })) {
+            // Same slot this interceptor wrote to in `on_send` — see
+            // `chain_owner`.
+            let previous_owner = ctx.set_owner(chain_owner(i));
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                interceptor.on_acknowledgement(metadata, error, headers, ctx)
+            }));
+            ctx.set_owner(previous_owner);
+            match outcome {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     tracing::warn!(
@@ -522,8 +817,12 @@ impl ConsumerInterceptor for ConsumerInterceptorChain {
 ///
 /// Catches errors and panics from user-provided interceptor code so that a
 /// misbehaving interceptor cannot crash the producer.
-pub(crate) fn safe_on_send(interceptor: &dyn ProducerInterceptor, record: &mut ProducerRecord) {
-    match catch_unwind(AssertUnwindSafe(|| interceptor.on_send(record))) {
+pub(crate) fn safe_on_send(
+    interceptor: &dyn ProducerInterceptor,
+    record: &mut ProducerRecord,
+    ctx: &mut RecordContext,
+) {
+    match catch_unwind(AssertUnwindSafe(|| interceptor.on_send(record, ctx))) {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
             tracing::warn!(
@@ -546,9 +845,11 @@ pub(crate) fn safe_on_acknowledgement(
     interceptor: &dyn ProducerInterceptor,
     metadata: &RecordMetadata,
     error: Option<&KrafkaError>,
+    headers: &RecordHeaders,
+    ctx: &mut RecordContext,
 ) {
     match catch_unwind(AssertUnwindSafe(|| {
-        interceptor.on_acknowledgement(metadata, error)
+        interceptor.on_acknowledgement(metadata, error, headers, ctx)
     })) {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
@@ -674,7 +975,11 @@ mod tests {
     }
 
     impl ProducerInterceptor for TestProducerInterceptor {
-        fn on_send(&self, record: &mut ProducerRecord) -> InterceptorResult {
+        fn on_send(
+            &self,
+            record: &mut ProducerRecord,
+            _ctx: &mut RecordContext,
+        ) -> InterceptorResult {
             self.send_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // Add a tracing header
@@ -689,6 +994,8 @@ mod tests {
             &self,
             _metadata: &RecordMetadata,
             _error: Option<&KrafkaError>,
+            _headers: &RecordHeaders,
+            _ctx: &mut RecordContext,
         ) -> InterceptorResult {
             self.ack_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -745,7 +1052,9 @@ mod tests {
         assert_eq!(interceptor.send_count(), 0);
         assert!(record.headers.is_empty());
 
-        interceptor.on_send(&mut record).unwrap();
+        interceptor
+            .on_send(&mut record, &mut RecordContext::new())
+            .unwrap();
 
         assert_eq!(interceptor.send_count(), 1);
         assert_eq!(record.headers.len(), 1);
@@ -767,12 +1076,14 @@ mod tests {
             delivery: crate::producer::DeliveryConfirmation::Offset,
         };
 
-        interceptor.on_acknowledgement(&metadata, None).unwrap();
+        interceptor
+            .on_acknowledgement(&metadata, None, &[], &mut RecordContext::new())
+            .unwrap();
         assert_eq!(interceptor.ack_count(), 1);
 
         let err = KrafkaError::config("test error");
         interceptor
-            .on_acknowledgement(&metadata, Some(&err))
+            .on_acknowledgement(&metadata, Some(&err), &[], &mut RecordContext::new())
             .unwrap();
         assert_eq!(interceptor.ack_count(), 2);
     }
@@ -803,7 +1114,9 @@ mod tests {
     fn test_noop_interceptors() {
         let producer_interceptor = NoOpProducerInterceptor;
         let mut record = ProducerRecord::new("test", b"value".to_vec());
-        producer_interceptor.on_send(&mut record).unwrap();
+        producer_interceptor
+            .on_send(&mut record, &mut RecordContext::new())
+            .unwrap();
         assert!(record.headers.is_empty());
 
         let consumer_interceptor = NoOpConsumerInterceptor;
@@ -819,13 +1132,19 @@ mod tests {
     struct PanickingProducerInterceptor;
 
     impl ProducerInterceptor for PanickingProducerInterceptor {
-        fn on_send(&self, _record: &mut ProducerRecord) -> InterceptorResult {
+        fn on_send(
+            &self,
+            _record: &mut ProducerRecord,
+            _ctx: &mut RecordContext,
+        ) -> InterceptorResult {
             panic!("on_send panic");
         }
         fn on_acknowledgement(
             &self,
             _metadata: &RecordMetadata,
             _error: Option<&KrafkaError>,
+            _headers: &RecordHeaders,
+            _ctx: &mut RecordContext,
         ) -> InterceptorResult {
             panic!("on_acknowledgement panic");
         }
@@ -858,7 +1177,7 @@ mod tests {
         let interceptor = PanickingProducerInterceptor;
         let mut record = ProducerRecord::new("test", b"value".to_vec());
         // Should not propagate the panic
-        safe_on_send(&interceptor, &mut record);
+        safe_on_send(&interceptor, &mut record, &mut RecordContext::new());
     }
 
     #[test]
@@ -871,7 +1190,13 @@ mod tests {
             timestamp: 0,
             delivery: crate::producer::DeliveryConfirmation::Offset,
         };
-        safe_on_acknowledgement(&interceptor, &metadata, None);
+        safe_on_acknowledgement(
+            &interceptor,
+            &metadata,
+            None,
+            &[],
+            &mut RecordContext::new(),
+        );
     }
 
     #[test]
@@ -918,7 +1243,11 @@ mod tests {
     }
 
     impl ProducerInterceptor for OrderedProducerInterceptor {
-        fn on_send(&self, _record: &mut ProducerRecord) -> InterceptorResult {
+        fn on_send(
+            &self,
+            _record: &mut ProducerRecord,
+            _ctx: &mut RecordContext,
+        ) -> InterceptorResult {
             self.log
                 .lock()
                 .unwrap()
@@ -930,6 +1259,8 @@ mod tests {
             &self,
             _metadata: &RecordMetadata,
             _error: Option<&KrafkaError>,
+            _headers: &RecordHeaders,
+            _ctx: &mut RecordContext,
         ) -> InterceptorResult {
             self.log
                 .lock()
@@ -967,7 +1298,9 @@ mod tests {
         ]);
 
         let mut record = ProducerRecord::new("test", b"value".to_vec());
-        chain.on_send(&mut record).unwrap();
+        chain
+            .on_send(&mut record, &mut RecordContext::new())
+            .unwrap();
 
         let metadata = RecordMetadata {
             topic: "test".to_string(),
@@ -976,7 +1309,9 @@ mod tests {
             timestamp: 0,
             delivery: crate::producer::DeliveryConfirmation::Offset,
         };
-        chain.on_acknowledgement(&metadata, None).unwrap();
+        chain
+            .on_acknowledgement(&metadata, None, &[], &mut RecordContext::new())
+            .unwrap();
         chain.close().unwrap();
 
         let log = log.lock().unwrap();
@@ -1003,7 +1338,11 @@ mod tests {
         struct HeaderAdder(&'static str);
 
         impl ProducerInterceptor for HeaderAdder {
-            fn on_send(&self, record: &mut ProducerRecord) -> InterceptorResult {
+            fn on_send(
+                &self,
+                record: &mut ProducerRecord,
+                _ctx: &mut RecordContext,
+            ) -> InterceptorResult {
                 record.headers.push((
                     self.0.to_string(),
                     Some(bytes::Bytes::copy_from_slice(self.0.as_bytes())),
@@ -1018,7 +1357,9 @@ mod tests {
         ]);
 
         let mut record = ProducerRecord::new("test", b"value".to_vec());
-        chain.on_send(&mut record).unwrap();
+        chain
+            .on_send(&mut record, &mut RecordContext::new())
+            .unwrap();
 
         assert_eq!(record.headers.len(), 2);
         assert_eq!(record.headers[0].0, "first");
@@ -1042,7 +1383,9 @@ mod tests {
         ]);
 
         let mut record = ProducerRecord::new("test", b"value".to_vec());
-        chain.on_send(&mut record).unwrap();
+        chain
+            .on_send(&mut record, &mut RecordContext::new())
+            .unwrap();
 
         let metadata = RecordMetadata {
             topic: "test".to_string(),
@@ -1051,7 +1394,9 @@ mod tests {
             timestamp: 0,
             delivery: crate::producer::DeliveryConfirmation::Offset,
         };
-        chain.on_acknowledgement(&metadata, None).unwrap();
+        chain
+            .on_acknowledgement(&metadata, None, &[], &mut RecordContext::new())
+            .unwrap();
         chain.close().unwrap();
 
         let log = log.lock().unwrap();
@@ -1076,7 +1421,11 @@ mod tests {
     struct MutateThenPanicInterceptor;
 
     impl ProducerInterceptor for MutateThenPanicInterceptor {
-        fn on_send(&self, record: &mut ProducerRecord) -> InterceptorResult {
+        fn on_send(
+            &self,
+            record: &mut ProducerRecord,
+            _ctx: &mut RecordContext,
+        ) -> InterceptorResult {
             record.partition = Some(99);
             record.timestamp = Some(1234);
             record.key = Some(bytes::Bytes::from_static(b"clobbered-key"));
@@ -1102,7 +1451,9 @@ mod tests {
             Some(bytes::Bytes::from_static(b"h")),
         ));
 
-        chain.on_send(&mut record).unwrap();
+        chain
+            .on_send(&mut record, &mut RecordContext::new())
+            .unwrap();
 
         // Cheaply-restorable fields are rolled back exactly.
         assert_eq!(record.partition, Some(1));
@@ -1123,7 +1474,9 @@ mod tests {
         let chain = ProducerInterceptorChain::new(vec![Arc::new(MutateThenPanicInterceptor)]);
 
         let mut record = ProducerRecord::new("original-topic", b"v".to_vec());
-        chain.on_send(&mut record).unwrap();
+        chain
+            .on_send(&mut record, &mut RecordContext::new())
+            .unwrap();
 
         assert_eq!(record.topic, "clobbered-topic");
     }
@@ -1139,7 +1492,11 @@ mod tests {
         struct Observer(Arc<std::sync::Mutex<Vec<String>>>);
 
         impl ProducerInterceptor for Observer {
-            fn on_send(&self, record: &mut ProducerRecord) -> InterceptorResult {
+            fn on_send(
+                &self,
+                record: &mut ProducerRecord,
+                _ctx: &mut RecordContext,
+            ) -> InterceptorResult {
                 self.0.lock().unwrap().push(format!(
                     "value={} headers={}",
                     record.value_str().unwrap_or("<null>"),
@@ -1156,7 +1513,9 @@ mod tests {
 
         let mut record = ProducerRecord::new("t", b"v".to_vec());
         // Returns Ok — the panic is caught and logged, exactly as before.
-        chain.on_send(&mut record).unwrap();
+        chain
+            .on_send(&mut record, &mut RecordContext::new())
+            .unwrap();
 
         let log = log.lock().unwrap();
         assert_eq!(*log, vec!["value=v headers=0"]);
@@ -1169,7 +1528,11 @@ mod tests {
         struct Mutator;
 
         impl ProducerInterceptor for Mutator {
-            fn on_send(&self, record: &mut ProducerRecord) -> InterceptorResult {
+            fn on_send(
+                &self,
+                record: &mut ProducerRecord,
+                _ctx: &mut RecordContext,
+            ) -> InterceptorResult {
                 record.partition = Some(5);
                 record.value = Some(bytes::Bytes::from_static(b"new"));
                 record
@@ -1181,7 +1544,9 @@ mod tests {
 
         let chain = ProducerInterceptorChain::new(vec![Arc::new(Mutator)]);
         let mut record = ProducerRecord::new("t", b"old".to_vec());
-        chain.on_send(&mut record).unwrap();
+        chain
+            .on_send(&mut record, &mut RecordContext::new())
+            .unwrap();
 
         assert_eq!(record.partition, Some(5));
         assert_eq!(record.value, Some(bytes::Bytes::from_static(b"new")));
@@ -1196,7 +1561,11 @@ mod tests {
         struct MutateThenErr;
 
         impl ProducerInterceptor for MutateThenErr {
-            fn on_send(&self, record: &mut ProducerRecord) -> InterceptorResult {
+            fn on_send(
+                &self,
+                record: &mut ProducerRecord,
+                _ctx: &mut RecordContext,
+            ) -> InterceptorResult {
                 record.partition = Some(3);
                 Err("boom".into())
             }
@@ -1204,7 +1573,9 @@ mod tests {
 
         let chain = ProducerInterceptorChain::new(vec![Arc::new(MutateThenErr)]);
         let mut record = ProducerRecord::new("t", b"v".to_vec());
-        chain.on_send(&mut record).unwrap();
+        chain
+            .on_send(&mut record, &mut RecordContext::new())
+            .unwrap();
 
         assert_eq!(record.partition, Some(3));
     }
@@ -1214,7 +1585,9 @@ mod tests {
         let chain = ProducerInterceptorChain::new(vec![]);
         let mut record = ProducerRecord::new("test", b"value".to_vec());
         // Empty chain is a no-op — should not panic
-        chain.on_send(&mut record).unwrap();
+        chain
+            .on_send(&mut record, &mut RecordContext::new())
+            .unwrap();
         chain.close().unwrap();
     }
 
@@ -1346,7 +1719,7 @@ mod tests {
         ]);
 
         let mut record = ProducerRecord::new("test", b"v".to_vec());
-        safe_on_send(&chain, &mut record);
+        safe_on_send(&chain, &mut record, &mut RecordContext::new());
 
         let log = log.lock().unwrap();
         assert_eq!(*log, vec!["a.on_send", "b.on_send"]);
@@ -1359,13 +1732,19 @@ mod tests {
     struct FailingProducerInterceptor;
 
     impl ProducerInterceptor for FailingProducerInterceptor {
-        fn on_send(&self, _record: &mut ProducerRecord) -> InterceptorResult {
+        fn on_send(
+            &self,
+            _record: &mut ProducerRecord,
+            _ctx: &mut RecordContext,
+        ) -> InterceptorResult {
             Err("metrics backend unavailable".into())
         }
         fn on_acknowledgement(
             &self,
             _metadata: &RecordMetadata,
             _error: Option<&KrafkaError>,
+            _headers: &RecordHeaders,
+            _ctx: &mut RecordContext,
         ) -> InterceptorResult {
             Err("ack handler failed".into())
         }
@@ -1411,7 +1790,9 @@ mod tests {
 
         let mut record = ProducerRecord::new("test", b"value".to_vec());
         // Chain returns Ok — individual errors are logged, not propagated.
-        chain.on_send(&mut record).unwrap();
+        chain
+            .on_send(&mut record, &mut RecordContext::new())
+            .unwrap();
         chain.close().unwrap();
 
         let log = log.lock().unwrap();
@@ -1462,7 +1843,7 @@ mod tests {
         let interceptor = FailingProducerInterceptor;
         let mut record = ProducerRecord::new("test", b"v".to_vec());
         // Should not panic — error is caught and logged
-        safe_on_send(&interceptor, &mut record);
+        safe_on_send(&interceptor, &mut record, &mut RecordContext::new());
         safe_producer_close(&interceptor);
 
         let interceptor = FailingConsumerInterceptor;
@@ -1483,7 +1864,9 @@ mod tests {
         ]);
 
         let mut record = ProducerRecord::new("test", b"value".to_vec());
-        chain.on_send(&mut record).unwrap();
+        chain
+            .on_send(&mut record, &mut RecordContext::new())
+            .unwrap();
 
         let log = log.lock().unwrap();
         assert_eq!(*log, vec!["second.on_send"]);
@@ -1502,7 +1885,9 @@ mod tests {
         ]);
 
         let mut record = ProducerRecord::new("test", b"value".to_vec());
-        chain.on_send(&mut record).unwrap();
+        chain
+            .on_send(&mut record, &mut RecordContext::new())
+            .unwrap();
 
         let log = log.lock().unwrap();
         assert_eq!(*log, vec!["first.on_send"]);
@@ -1527,7 +1912,9 @@ mod tests {
 
         let mut record = ProducerRecord::new("test", b"value".to_vec());
         // Chain survives both an error and a panic — all healthy interceptors run
-        chain.on_send(&mut record).unwrap();
+        chain
+            .on_send(&mut record, &mut RecordContext::new())
+            .unwrap();
 
         let log = log.lock().unwrap();
         assert_eq!(*log, vec!["first.on_send", "last.on_send"]);
@@ -1554,5 +1941,226 @@ mod tests {
 
         let log = log.lock().unwrap();
         assert_eq!(*log, vec!["first.on_consume", "last.on_consume"]);
+    }
+
+    // -----------------------------------------------------------------
+    // RecordContext
+    // -----------------------------------------------------------------
+
+    #[derive(Debug, PartialEq)]
+    struct Span(&'static str);
+
+    #[derive(Debug, PartialEq)]
+    struct Started(u64);
+
+    #[test]
+    fn record_context_round_trips_distinct_types() {
+        let mut ctx = RecordContext::new();
+
+        assert!(ctx.insert(Span("send")).is_none());
+        assert!(ctx.insert(Started(7)).is_none());
+
+        assert_eq!(ctx.get::<Span>(), Some(&Span("send")));
+        assert_eq!(ctx.get::<Started>(), Some(&Started(7)));
+        assert!(ctx.contains::<Span>());
+
+        if let Some(started) = ctx.get_mut::<Started>() {
+            started.0 = 9;
+        }
+        assert_eq!(ctx.take::<Started>(), Some(Started(9)));
+        assert!(
+            !ctx.contains::<Started>(),
+            "take removes the value, so a second take sees nothing"
+        );
+        assert_eq!(ctx.take::<Started>(), None);
+        // Unrelated types are untouched by a take.
+        assert_eq!(ctx.get::<Span>(), Some(&Span("send")));
+    }
+
+    #[test]
+    fn record_context_insert_of_the_same_type_returns_the_previous_value() {
+        let mut ctx = RecordContext::new();
+        assert!(ctx.insert(Span("first")).is_none());
+        assert_eq!(ctx.insert(Span("second")), Some(Span("first")));
+        assert_eq!(ctx.get::<Span>(), Some(&Span("second")));
+    }
+
+    #[test]
+    fn record_context_of_a_type_never_stored_is_empty() {
+        let ctx = RecordContext::new();
+        assert_eq!(ctx.get::<Span>(), None);
+        assert!(!ctx.contains::<Span>());
+    }
+
+    /// Stores `Span(name)` in `on_send` and records what it reads back in
+    /// `on_acknowledgement`, so a test can assert on cross-interceptor
+    /// visibility rather than on internal state.
+    #[derive(Debug)]
+    struct ContextInterceptor {
+        name: &'static str,
+        /// What this interceptor saw in its own slot at acknowledgement time.
+        seen: Arc<std::sync::Mutex<Option<Span>>>,
+        /// Panic at the end of `on_send`, after storing.
+        panic_after_store: bool,
+    }
+
+    impl ContextInterceptor {
+        fn new(name: &'static str) -> (Arc<Self>, Arc<std::sync::Mutex<Option<Span>>>) {
+            let seen = Arc::new(std::sync::Mutex::new(None));
+            (
+                Arc::new(Self {
+                    name,
+                    seen: Arc::clone(&seen),
+                    panic_after_store: false,
+                }),
+                seen,
+            )
+        }
+    }
+
+    impl ProducerInterceptor for ContextInterceptor {
+        fn on_send(
+            &self,
+            _record: &mut ProducerRecord,
+            ctx: &mut RecordContext,
+        ) -> InterceptorResult {
+            ctx.insert(Span(self.name));
+            if self.panic_after_store {
+                panic!("interceptor blew up after storing its state");
+            }
+            Ok(())
+        }
+
+        fn on_acknowledgement(
+            &self,
+            _metadata: &RecordMetadata,
+            _error: Option<&KrafkaError>,
+            _headers: &RecordHeaders,
+            ctx: &mut RecordContext,
+        ) -> InterceptorResult {
+            *self.seen.lock().unwrap() = ctx.take::<Span>();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn chained_interceptors_cannot_see_each_others_context() {
+        let (first, first_seen) = ContextInterceptor::new("first");
+        let (second, second_seen) = ContextInterceptor::new("second");
+        let chain = ProducerInterceptorChain::new(vec![first, second]);
+
+        let mut ctx = RecordContext::new();
+        let mut record = ProducerRecord::new("test", b"v".to_vec());
+        chain.on_send(&mut record, &mut ctx).unwrap();
+
+        // Both stored a `Span`; keyed by type alone the second would have
+        // clobbered the first.
+        let metadata = RecordMetadata::failed("test".to_string(), 0);
+        chain
+            .on_acknowledgement(&metadata, None, &[], &mut ctx)
+            .unwrap();
+
+        assert_eq!(*first_seen.lock().unwrap(), Some(Span("first")));
+        assert_eq!(*second_seen.lock().unwrap(), Some(Span("second")));
+    }
+
+    #[test]
+    fn a_chained_interceptor_cannot_take_a_neighbours_state() {
+        /// Tries to steal whatever `Span` is in the context.
+        #[derive(Debug)]
+        struct Thief {
+            stole: Arc<std::sync::Mutex<bool>>,
+        }
+
+        impl ProducerInterceptor for Thief {
+            fn on_send(
+                &self,
+                _record: &mut ProducerRecord,
+                ctx: &mut RecordContext,
+            ) -> InterceptorResult {
+                *self.stole.lock().unwrap() = ctx.take::<Span>().is_some();
+                Ok(())
+            }
+        }
+
+        let (victim, victim_seen) = ContextInterceptor::new("victim");
+        let stole = Arc::new(std::sync::Mutex::new(false));
+        let thief = Arc::new(Thief {
+            stole: Arc::clone(&stole),
+        });
+        let chain = ProducerInterceptorChain::new(vec![victim, thief]);
+
+        let mut ctx = RecordContext::new();
+        let mut record = ProducerRecord::new("test", b"v".to_vec());
+        chain.on_send(&mut record, &mut ctx).unwrap();
+        let metadata = RecordMetadata::failed("test".to_string(), 0);
+        chain
+            .on_acknowledgement(&metadata, None, &[], &mut ctx)
+            .unwrap();
+
+        assert!(!*stole.lock().unwrap(), "the thief must see an empty slot");
+        assert_eq!(
+            *victim_seen.lock().unwrap(),
+            Some(Span("victim")),
+            "the victim's state must survive the attempt"
+        );
+    }
+
+    #[test]
+    fn a_panicking_interceptor_does_not_disturb_its_neighbours_context() {
+        let (healthy, healthy_seen) = ContextInterceptor::new("healthy");
+        let exploder = Arc::new(ContextInterceptor {
+            name: "exploder",
+            seen: Arc::new(std::sync::Mutex::new(None)),
+            panic_after_store: true,
+        });
+        let chain = ProducerInterceptorChain::new(vec![exploder, healthy]);
+
+        let mut ctx = RecordContext::new();
+        let mut record = ProducerRecord::new("test", b"v".to_vec());
+        chain.on_send(&mut record, &mut ctx).unwrap();
+
+        let metadata = RecordMetadata::failed("test".to_string(), 0);
+        chain
+            .on_acknowledgement(&metadata, None, &[], &mut ctx)
+            .unwrap();
+
+        assert_eq!(
+            *healthy_seen.lock().unwrap(),
+            Some(Span("healthy")),
+            "a panic in interceptor 0 must not cost interceptor 1 its state"
+        );
+    }
+
+    /// The context rides on every buffered record, so its inline size is a
+    /// budget, not an accident.
+    ///
+    /// 32 bytes = a `Vec` (24) plus the owner tag, padded. If a field is added
+    /// here, weigh it against `PendingRecord`, which is 184 bytes — the context
+    /// is already about a sixth of it, and a producer under backpressure holds
+    /// one per buffered record for up to `delivery.timeout.ms`.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn a_context_stays_within_its_per_record_size_budget() {
+        assert_eq!(std::mem::size_of::<RecordContext>(), 32);
+    }
+
+    /// The empty case is the common case — a producer with no interceptor, or
+    /// an interceptor that stores nothing, must not touch the heap.
+    #[test]
+    fn an_untouched_context_never_allocates() {
+        let ctx = RecordContext::new();
+        assert_eq!(ctx.entries.capacity(), 0, "an empty Vec owns no allocation");
+    }
+
+    #[test]
+    fn chain_owner_saturates_rather_than_wrapping() {
+        assert_eq!(chain_owner(0), 0);
+        assert_eq!(chain_owner(usize::from(u16::MAX)), u16::MAX);
+        assert_eq!(
+            chain_owner(usize::from(u16::MAX) + 1),
+            u16::MAX,
+            "an absurd chain collapses its tail rather than aliasing onto index 0"
+        );
     }
 }

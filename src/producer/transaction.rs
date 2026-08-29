@@ -75,7 +75,7 @@ use super::accumulator::{AccumulatorConfig, RecordAccumulator, RecordAccumulator
 use super::config::Acks;
 use super::idempotent::ProducerIdentity;
 use super::partitioner::{Partitioner, UniformStickyPartitioner};
-use super::record::{ProducerRecord, RecordMetadata, TopicHandle};
+use super::record::{ProducerRecord, RecordMetadata, TopicHandle, UNKNOWN_PARTITION};
 use super::retry::RetryPolicy;
 use crate::barrier::InFlightBarrier;
 use crate::consumer::ConsumerGroupMetadata;
@@ -1971,23 +1971,36 @@ impl TransactionalProducer {
         // the plain producer: an interceptor that rewrites the topic must do so
         // before the partition is chosen and before the partition is registered
         // with the transaction coordinator.
+        //
+        // The obligation carries the record's interceptor context from here to
+        // whichever end it reaches, so the transactional path pairs `on_send`
+        // with `on_acknowledgement` on exactly the same terms as the plain one
+        // — including the failures unique to it, such as a lost transactional
+        // identity or a coordinator that refuses to add the partition.
         let mut record = record;
-        crate::interceptor::safe_on_send(&*self.interceptor, &mut record);
+        let mut obligation = super::SendObligation::on_send(&*self.interceptor, &mut record);
 
         // Transparently apply producer-level schema encoders if configured.
         // Shared with the plain producer so the two paths cannot drift; null
         // keys and tombstone values are passed through unserialized.
-        super::apply_serializers(
+        if let Err(e) = super::apply_serializers(
             &mut record,
             self.key_serializer.as_deref(),
             self.value_serializer.as_deref(),
         )
-        .await?;
+        .await
+        {
+            return Err(obligation.fail(&record.topic, UNKNOWN_PARTITION, &record.headers, e));
+        }
 
         // Validate record fields against Kafka protocol wire-format limits.
-        record.validate()?;
+        if let Err(e) = record.validate() {
+            return Err(obligation.fail(&record.topic, UNKNOWN_PARTITION, &record.headers, e));
+        }
 
-        let _identity = self.checked_transactional_identity()?;
+        if let Err(e) = self.checked_transactional_identity() {
+            return Err(obligation.fail(&record.topic, UNKNOWN_PARTITION, &record.headers, e));
+        }
 
         let record_size = record.estimated_size();
         let routed = record.into_routed_parts();
@@ -1997,14 +2010,21 @@ impl TransactionalProducer {
         // Determine partition
         let partition = match routed.partition {
             Some(p) => p,
-            None => {
-                let partition_count = self
-                    .metadata
-                    .partition_count(topic.as_ref())
-                    .ok_or_else(|| KrafkaError::invalid_state(format!("unknown topic: {topic}")))?;
-                self.partitioner
-                    .partition(topic.as_ref(), record.key_bytes(), partition_count)
-            }
+            None => match self.metadata.partition_count(topic.as_ref()) {
+                Some(partition_count) => {
+                    self.partitioner
+                        .partition(topic.as_ref(), record.key_bytes(), partition_count)
+                }
+                None => {
+                    let error = KrafkaError::invalid_state(format!("unknown topic: {topic}"));
+                    return Err(obligation.fail(
+                        topic.as_ref(),
+                        UNKNOWN_PARTITION,
+                        &record.headers,
+                        error,
+                    ));
+                }
+            },
         };
 
         // Register the partition with the transaction coordinator.
@@ -2021,9 +2041,10 @@ impl TransactionalProducer {
         // partition is not covered by the commit marker, so the RPC must
         // precede the first record. The Pending/Added states stop concurrent
         // callers from skipping the RPC while an in-flight add is outstanding.
-        if self.requires_explicit_partition_registration() {
-            self.add_partition_to_txn_if_needed(&topic, partition)
-                .await?;
+        if self.requires_explicit_partition_registration()
+            && let Err(e) = self.add_partition_to_txn_if_needed(&topic, partition).await
+        {
+            return Err(obligation.fail(topic.as_ref(), partition, &record.headers, e));
         }
 
         // Hand off to the accumulator, which batches, stamps PID/epoch/sequence
@@ -2033,14 +2054,27 @@ impl TransactionalProducer {
         let enqueued = self
             .accumulator
             .enqueue_routed_with_guard(
-                topic,
+                topic.clone(),
                 record,
                 record_size,
                 partition,
                 operation_guard,
                 send_started_at,
+                obligation.take_context(),
             )
-            .await;
+            .await
+            .map_err(|rejected| {
+                // The context and the record come back rather than being
+                // dropped, so the obligation re-opens and is discharged as a
+                // failure that can still report the record's headers.
+                obligation.context = Some(rejected.context);
+                obligation.fail(
+                    topic.as_ref(),
+                    partition,
+                    &rejected.record.headers,
+                    rejected.error,
+                )
+            });
 
         // An enqueue failure is classified immediately; a delivery failure is
         // classified by the handle, which is the same code either way.
@@ -5750,6 +5784,7 @@ mod tests {
             fn on_send(
                 &self,
                 record: &mut ProducerRecord,
+                _ctx: &mut crate::interceptor::RecordContext,
             ) -> crate::interceptor::InterceptorResult {
                 self.sends.fetch_add(1, Ordering::SeqCst);
                 record.headers.push((
