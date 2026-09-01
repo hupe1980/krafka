@@ -722,6 +722,221 @@ async fn test_producer_continues_after_metadata_refresh() {
 
 #[tokio::test]
 #[ignore = "requires Docker"]
+async fn test_topic_survives_a_partial_metadata_refresh_for_another_topic() {
+    use krafka::producer::Producer;
+
+    let (_container, bootstrap_servers) = kafka_container().await;
+
+    let topic_a = "partial-refresh-a";
+    let topic_b = "partial-refresh-b";
+    create_topic(&bootstrap_servers, topic_a, 1).await;
+    create_topic(&bootstrap_servers, topic_b, 1).await;
+
+    // Short ages reproduce the five-minute defaults without a five-minute test:
+    // both topics go stale, and routing a record to topic A then triggers a
+    // metadata refresh that names topic A alone.
+    let producer = Producer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .client_id("partial-refresh-test")
+        .metadata_max_age(Duration::from_millis(200))
+        .metadata_topic_cache_ttl(Duration::from_millis(200))
+        .build()
+        .await
+        .expect("Failed to create producer");
+
+    let _ = producer
+        .send(topic_a, None, Some(b"warm-a"))
+        .await
+        .expect("warming topic A should succeed");
+    let _ = producer
+        .send(topic_b, None, Some(b"warm-b"))
+        .await
+        .expect("warming topic B should succeed");
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let _ = producer
+        .send(topic_a, None, Some(b"refresh-a"))
+        .await
+        .expect("a stale topic refreshes itself");
+
+    // Topic B still exists in the cluster. It used to be evicted by the
+    // refresh above and then reported as `unknown topic` for the rest of the
+    // producer's life, because nothing on the send path re-fetched it.
+    let _ = producer
+        .send(topic_b, None, Some(b"after-refresh"))
+        .await
+        .expect("topic B must stay usable after a partial refresh for topic A");
+
+    producer.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_send_to_a_nonexistent_topic_reports_the_broker_error() {
+    use krafka::error::{ErrorCode, KrafkaError};
+    use krafka::producer::Producer;
+
+    let (_container, bootstrap_servers) = kafka_container().await;
+
+    let producer = Producer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .client_id("unknown-topic-test")
+        // Bound the metadata wait so the test does not sit out the 60 s default.
+        .max_block(Duration::from_secs(5))
+        .build()
+        .await
+        .expect("Failed to create producer");
+
+    let error = producer
+        .send("no-such-topic-anywhere", None, Some(b"v"))
+        .await
+        .expect_err("a topic the cluster does not have cannot be produced to");
+
+    assert!(
+        matches!(
+            error,
+            KrafkaError::Broker {
+                code: ErrorCode::UnknownTopicOrPartition,
+                ..
+            }
+        ),
+        "expected the broker's own topic error, got: {error}"
+    );
+
+    producer.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_auto_create_topics_materialises_the_topic() {
+    use krafka::producer::Producer;
+
+    let (_container, bootstrap_servers) = kafka_container().await;
+
+    // The broker runs with `auto.create.topics.enable=true` (Kafka's default),
+    // so the only thing standing between this send and a created topic is
+    // whether the client says it is willing.
+    let producer = Producer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .client_id("auto-create-test")
+        .allow_auto_create_topics(true)
+        .max_block(Duration::from_secs(20))
+        .build()
+        .await
+        .expect("Failed to create producer");
+
+    let metadata = producer
+        .send("created-by-the-producer", None, Some(b"v"))
+        .await
+        .expect("the broker creates the topic because the client asked it to");
+    assert_eq!(metadata.topic, "created-by-the-producer");
+
+    producer.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_standalone_subscription_picks_up_a_topic_created_later() {
+    use krafka::consumer::{AutoOffsetReset, Consumer};
+    use krafka::producer::Producer;
+
+    let (_container, bootstrap_servers) = kafka_container().await;
+
+    let topic = "appears-after-subscribe";
+
+    let consumer = Consumer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .client_id("late-topic-consumer")
+        .auto_offset_reset(AutoOffsetReset::Earliest)
+        .build()
+        .await
+        .expect("Failed to create consumer");
+
+    // Subscribing to a topic that does not exist yet is not an error, and used
+    // to be a permanent silence: the partition list was resolved once, found
+    // nothing, and was never revisited.
+    consumer
+        .subscribe(&[topic])
+        .await
+        .expect("subscribe should not fail on an absent topic");
+    assert!(consumer.assignment().await.is_empty());
+
+    create_topic(&bootstrap_servers, topic, 1).await;
+
+    let producer = Producer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .build()
+        .await
+        .expect("Failed to create producer");
+    let _ = producer
+        .send(topic, None, Some(b"after-creation"))
+        .await
+        .expect("produce to the new topic");
+    producer.close().await;
+
+    let records = poll_for_records(&consumer, 1, Duration::from_millis(500), 30).await;
+    assert_eq!(
+        records.len(),
+        1,
+        "the consumer must pick up a topic created after it subscribed"
+    );
+    assert_eq!(records[0].value.as_deref(), Some(&b"after-creation"[..]));
+
+    consumer.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_standalone_subscription_picks_up_added_partitions() {
+    use krafka::admin::AdminClient;
+    use krafka::consumer::{AutoOffsetReset, Consumer};
+
+    let (_container, bootstrap_servers) = kafka_container().await;
+
+    let topic = "scaled-up-under-a-consumer";
+    create_topic(&bootstrap_servers, topic, 1).await;
+
+    let consumer = Consumer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .client_id("grow-partitions-consumer")
+        .auto_offset_reset(AutoOffsetReset::Earliest)
+        .metadata_max_age(Duration::from_millis(500))
+        .build()
+        .await
+        .expect("Failed to create consumer");
+
+    consumer.subscribe(&[topic]).await.expect("subscribe");
+    assert_eq!(consumer.assignment().await[topic].len(), 1);
+
+    let admin = AdminClient::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .build()
+        .await
+        .expect("Failed to create admin client");
+    admin
+        .create_partitions(topic, 3, Duration::from_secs(10), false)
+        .await
+        .expect("Failed to add partitions");
+
+    let mut assigned = 1;
+    for _ in 0..30 {
+        let _ = consumer.poll(Duration::from_millis(300)).await;
+        assigned = consumer.assignment().await.get(topic).map_or(0, Vec::len);
+        if assigned == 3 {
+            break;
+        }
+    }
+    assert_eq!(
+        assigned, 3,
+        "partitions added to a subscribed topic must be assigned"
+    );
+
+    consumer.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "requires Docker"]
 async fn test_consumer_handles_no_messages_gracefully() {
     use krafka::consumer::{AutoOffsetReset, Consumer};
     use krafka::producer::Producer;

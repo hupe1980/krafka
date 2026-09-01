@@ -102,7 +102,9 @@ use tracing::{debug, error, info, trace, warn};
 use lock_order::LeveledRwLock;
 
 use crate::error::{KrafkaError, ProtocolErrorKind, RecvError, Result};
-use crate::metadata::{BrokerInfo, ClusterMetadata, TopicInfo, broker_info_for_node};
+use crate::metadata::{
+    BrokerInfo, ClusterMetadata, RefreshOutcome, TopicInfo, broker_info_for_node,
+};
 use crate::metrics::{ConnectionMetrics, ConsumerMetrics};
 use crate::network::{ConnectionConfig, ConnectionPool};
 use crate::protocol::{
@@ -138,6 +140,7 @@ use fetch_session::FetchSessionCache;
 //   7. `fetch_sessions`        (sync — `parking_lot::Mutex`, pure mutation;
 //                               ALWAYS release before fetch RPC send/recv)
 //   8. `last_auto_commit`      (sync — `parking_lot::Mutex<Instant>`)
+//   9. `standalone`            (sync — `parking_lot::Mutex`, snapshot only)
 //
 // ── ASYNC / SYNC BOUNDARY ────────────────────────────────────────────────────
 //
@@ -398,6 +401,26 @@ impl Future for OffsetCommitHandle {
     }
 }
 
+/// A group-less `subscribe()`'s topic set and the clock that governs how often
+/// its partition list is re-derived from cluster metadata.
+#[derive(Debug)]
+struct StandaloneSubscription {
+    /// Subscribed topic names.
+    topics: HashSet<String>,
+    /// When the partition list was last successfully re-derived. `None` until
+    /// the first resolution, which `subscribe()` performs eagerly.
+    last_resolved: Option<Instant>,
+}
+
+impl StandaloneSubscription {
+    fn new() -> Self {
+        Self {
+            topics: HashSet::new(),
+            last_resolved: None,
+        }
+    }
+}
+
 /// A Kafka consumer.
 pub struct Consumer {
     /// Consumer configuration.
@@ -419,6 +442,18 @@ pub struct Consumer {
     subscriptions: LeveledRwLock<1, HashSet<String>>,
     /// Assigned partitions. Lock level 2 — acquire after `subscriptions`.
     assignments: LeveledRwLock<2, HashMap<String, Vec<PartitionId>>>,
+    /// Topics whose partitions this consumer resolves from cluster metadata
+    /// itself, because it has no group coordinator to do it.
+    ///
+    /// Only `subscribe()` on a group-less consumer populates this.
+    /// `assign()` deliberately removes the topic it names: the caller has
+    /// taken the partition list over, and re-deriving it from metadata would
+    /// silently widen a narrow manual assignment back to every partition.
+    ///
+    /// Held only long enough to clone the set or stamp the timer — never
+    /// across an `.await` — so a sync `parking_lot::Mutex` is the right
+    /// primitive.
+    standalone: SyncMutex<StandaloneSubscription>,
     /// Current offsets. Lock level 3 — acquire after `assignments`.
     offsets: LeveledRwLock<3, HashMap<(String, PartitionId), Offset>>,
     /// Paused partitions. Lock level 4 — acquire after `offsets`.
@@ -1679,6 +1714,7 @@ impl Consumer {
                 } else {
                     meta = meta.with_topic_cache_ttl_disabled();
                 }
+                meta = meta.with_auto_create_topics(config.allow_auto_create_topics);
                 meta
             });
 
@@ -1727,6 +1763,7 @@ impl Consumer {
             pool,
             pool_owned,
             subscriptions: LeveledRwLock::new(HashSet::new()),
+            standalone: SyncMutex::new(StandaloneSubscription::new()),
             assignments: LeveledRwLock::new(HashMap::new()),
             offsets: LeveledRwLock::new(HashMap::new()),
             paused: LeveledRwLock::new(HashSet::new()),
@@ -1908,33 +1945,185 @@ impl Consumer {
 
             debug!("Subscribed to topics via group coordinator: {:?}", topics);
         } else {
-            // Assign all partitions (simple assignment without group coordination)
-            let mut assignments = self.assignments.write().await;
-            for topic in topics {
-                if let Some(topic_info) = self.metadata.topic(topic) {
-                    let partitions: Vec<_> = topic_info
-                        .partitions
-                        .values()
-                        .map(|p| p.partition)
-                        .collect();
-                    assignments.insert((*topic).to_string(), partitions);
-                }
+            // No coordinator, so this consumer derives its own assignment from
+            // cluster metadata — and keeps deriving it. Recording the topic set
+            // is what makes that ongoing: `poll()` re-resolves it, so a topic
+            // created after `subscribe()`, or partitions added to one with
+            // CreatePartitions, are picked up instead of being invisible for
+            // the life of the consumer.
+            {
+                let mut standalone = self.standalone.lock();
+                standalone.topics = topics.iter().map(|t| (*t).to_string()).collect();
+                standalone.last_resolved = None;
             }
-            let assigned_snapshot = assignments.clone();
-            drop(assignments);
-
-            // Update metric for standalone partition count
-            let count: usize = assigned_snapshot.values().map(|p| p.len()).sum();
-            self.metrics.assigned_partitions.set(count as u64);
-
-            // Apply auto_offset_reset for non-group consumers.
-            // Without this, all partitions default to offset 0 regardless of
-            // the configured auto_offset_reset policy.
-            self.apply_auto_offset_reset(&assigned_snapshot).await?;
+            self.resolve_standalone_subscription(true).await?;
 
             debug!("Subscribed to topics: {:?}", topics);
         }
 
+        Ok(())
+    }
+
+    /// Re-derive the partition assignment of a group-less `subscribe()` from
+    /// cluster metadata.
+    ///
+    /// A consumer with no coordinator has to be its own assignor. Doing that
+    /// once at `subscribe()` time made the assignment a snapshot: a topic that
+    /// did not exist yet was silently never consumed, and partitions added
+    /// later by `CreatePartitions` never appeared — in both cases with no
+    /// error, for the life of the consumer. This runs it as a loop instead,
+    /// from `poll()`.
+    ///
+    /// Cadence: once per `metadata_max_age` while every subscribed topic
+    /// resolves, and on every poll while one does not — a topic waiting to be
+    /// created should not have to wait out a five-minute timer. The
+    /// no-progress case costs nothing: it goes through
+    /// [`refresh_for_topics_outcome`](ClusterMetadata::refresh_for_topics_outcome),
+    /// which reports `RateLimited` and returns rather than sleeping, so the
+    /// metadata layer's own backoff governs the request rate and `poll()` is
+    /// never blocked behind it.
+    ///
+    /// A failed refresh leaves the current assignment alone. Reacting to "the
+    /// broker did not answer" by revoking partitions would turn a blip into a
+    /// consumption gap.
+    ///
+    /// # Errors
+    ///
+    /// Only from applying `auto_offset_reset` to newly appearing partitions.
+    /// Metadata failures are logged and skipped.
+    async fn resolve_standalone_subscription(&self, force: bool) -> Result<()> {
+        if self.group_coordinator.is_some() {
+            return Ok(());
+        }
+
+        let (topics, last_resolved) = {
+            let standalone = self.standalone.lock();
+            if standalone.topics.is_empty() {
+                return Ok(());
+            }
+            (
+                standalone.topics.iter().cloned().collect::<Vec<String>>(),
+                standalone.last_resolved,
+            )
+        };
+
+        let due = force
+            || match last_resolved {
+                None => true,
+                Some(at) => {
+                    at.elapsed() >= self.config.metadata_max_age || {
+                        // A subscribed topic with no partitions assigned has not
+                        // resolved yet — it does not exist, or did not when we
+                        // last looked. Making it wait out `metadata_max_age`
+                        // would mean five minutes of silence after the topic is
+                        // finally created, so retry it every poll instead. The
+                        // metadata layer's rate limiter is what keeps that from
+                        // becoming a request storm.
+                        let assignments = self.assignments.read().await;
+                        topics.iter().any(|topic| !assignments.contains_key(topic))
+                    }
+                }
+            };
+        if !due {
+            return Ok(());
+        }
+
+        let names: Vec<&str> = topics.iter().map(String::as_str).collect();
+        match self.metadata.refresh_for_topics_outcome(Some(&names)).await {
+            Ok(RefreshOutcome::RateLimited(_)) => return Ok(()),
+            Ok(_) => {}
+            Err(e) => {
+                debug!(
+                    error = %e,
+                    "metadata refresh for a standalone subscription failed; keeping the current assignment"
+                );
+                return Ok(());
+            }
+        }
+
+        // What the cluster says the subscription covers right now. A topic
+        // absent from metadata contributes nothing, which is how a deleted
+        // topic's partitions get revoked below.
+        let mut desired: HashMap<String, Vec<PartitionId>> = HashMap::new();
+        for topic in &topics {
+            if let Some(info) = self.metadata.topic_arc(topic) {
+                let mut partitions: Vec<PartitionId> =
+                    info.partitions_iter().map(|p| p.partition).collect();
+                partitions.sort_unstable();
+                if !partitions.is_empty() {
+                    desired.insert(topic.clone(), partitions);
+                }
+            }
+        }
+
+        let (added, revoked) = {
+            let assignments = self.assignments.read().await;
+            let mut added: HashMap<String, Vec<PartitionId>> = HashMap::new();
+            let mut revoked: Vec<(String, PartitionId)> = Vec::new();
+            for topic in &topics {
+                let current: HashSet<PartitionId> = assignments
+                    .get(topic)
+                    .map(|ps| ps.iter().copied().collect())
+                    .unwrap_or_default();
+                let wanted: HashSet<PartitionId> = desired
+                    .get(topic)
+                    .map(|ps| ps.iter().copied().collect())
+                    .unwrap_or_default();
+
+                let mut new_for_topic: Vec<PartitionId> =
+                    wanted.difference(&current).copied().collect();
+                if !new_for_topic.is_empty() {
+                    new_for_topic.sort_unstable();
+                    added.insert(topic.clone(), new_for_topic);
+                }
+                revoked.extend(
+                    current
+                        .difference(&wanted)
+                        .map(|partition| (topic.clone(), *partition)),
+                );
+            }
+            (added, revoked)
+        };
+
+        // Revoke first: `apply_partition_revocations` also drops the buffered
+        // records, offsets and paused flags belonging to partitions that are
+        // gone, which must not survive into the new assignment.
+        if !revoked.is_empty() {
+            debug!(
+                partitions = revoked.len(),
+                "standalone subscription lost partitions; dropping their state"
+            );
+            self.apply_partition_revocations(&revoked).await;
+        }
+
+        if !added.is_empty() {
+            {
+                let mut assignments = self.assignments.write().await;
+                for (topic, partitions) in &desired {
+                    assignments.insert(topic.clone(), partitions.clone());
+                }
+            }
+            debug!(
+                topics = added.len(),
+                "standalone subscription gained partitions"
+            );
+            // Only the new partitions need a starting position; the helper
+            // skips any that already have one, so this is a no-op for the rest.
+            self.apply_auto_offset_reset(&added).await?;
+        }
+
+        if !added.is_empty() || !revoked.is_empty() {
+            let count: usize = self
+                .assignments
+                .read()
+                .await
+                .values()
+                .map(|ps| ps.len())
+                .sum();
+            self.metrics.assigned_partitions.set(count as u64);
+        }
+
+        self.standalone.lock().last_resolved = Some(Instant::now());
         Ok(())
     }
 
@@ -2935,6 +3124,12 @@ impl Consumer {
             self.apply_partition_revocations(&dropped).await;
         }
 
+        // The caller owns this topic's partition list from here on. Leaving it
+        // in the standalone set would let the metadata-driven resolver widen a
+        // deliberately narrow `assign()` back to every partition on its next
+        // pass.
+        self.standalone.lock().topics.remove(&topic_owned);
+
         let mut assignments = self.assignments.write().await;
         assignments.insert(topic_owned.clone(), partitions.clone());
 
@@ -3735,6 +3930,10 @@ impl Consumer {
         if self.handle_group_rebalance(timeout).await? {
             return Ok(vec![]);
         }
+
+        // A group-less subscription has no coordinator to notice that a topic
+        // appeared, was deleted, or grew partitions. This is its rebalance.
+        self.resolve_standalone_subscription(false).await?;
 
         let assignments = self.assignments.read().await;
         if assignments.is_empty() {
@@ -6380,6 +6579,7 @@ impl Consumer {
             Ok(())
         };
 
+        self.standalone.lock().topics.clear();
         self.subscriptions.write().await.clear();
         self.assignments.write().await.clear();
         self.clear_partition_state().await;
@@ -6536,6 +6736,7 @@ impl Consumer {
 
         // Clear per-partition state so post-close recv() cannot return records
         // from partitions already signaled as lost via on_partitions_lost above.
+        self.standalone.lock().topics.clear();
         self.subscriptions.write().await.clear();
         self.assignments.write().await.clear();
         self.clear_partition_state().await;
@@ -9029,6 +9230,7 @@ mod tests {
             pool,
             pool_owned: true,
             subscriptions: LeveledRwLock::new(HashSet::new()),
+            standalone: SyncMutex::new(StandaloneSubscription::new()),
             assignments: LeveledRwLock::new(HashMap::new()),
             offsets: LeveledRwLock::new(HashMap::new()),
             paused: LeveledRwLock::new(HashSet::new()),

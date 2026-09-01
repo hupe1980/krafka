@@ -94,6 +94,10 @@ broker.set_controller(-1);
 
 // A broker is up but out of the cluster's view.
 broker.set_broker_online(1, false);
+
+// The topic is scaled up, as a `CreatePartitions` admin call would.
+// Returns how many partitions were added; Kafka never removes them.
+broker.add_partitions("orders", 4);
 ```
 
 `set_txn_coordinator` does the same for a transactional ID, and `with_state`
@@ -213,9 +217,10 @@ than no test because it trains people to re-run.
 
 ## What the broker implements
 
-The produce and fetch path, `ListOffsets`, `Metadata` v12 (topic UUIDs),
-`FindCoordinator`, `CreateTopics`/`DeleteTopics`, `UpdateFeatures` with
-controller routing, the full transaction protocol, and **both** group
+The produce and fetch path, `ListOffsets`, `Metadata` v12 (topic UUIDs, and
+`allow.auto.create.topics` — a request naming a topic the cluster does not have
+creates it), `FindCoordinator`, `CreateTopics`/`DeleteTopics`, `UpdateFeatures`
+with controller routing, the full transaction protocol, and **both** group
 protocols:
 
 - **Transactions** — `InitProducerId` with KIP-360 fencing (a stable producer

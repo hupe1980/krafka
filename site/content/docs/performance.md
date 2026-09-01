@@ -297,7 +297,7 @@ Fetch sessions are enabled automatically — no configuration needed. Error reco
 
 ## Memory Backpressure
 
-Configure memory limits to prevent OOM during high throughput. When the buffer is full, `send()` blocks the caller for up to `max_block` waiting for in-flight batches to drain, matching the Kafka Java client's `max.block.ms` semantics. That wait counts against `delivery_timeout`, which is charged from the moment you call `send()`:
+Configure memory limits to prevent OOM during high throughput. When the buffer is full, `send()` blocks the caller waiting for in-flight batches to drain, matching the Kafka Java client's `max.block.ms` semantics. `max_block` is one budget for the whole call — resolving the topic, then waiting for memory — and that wait counts against `delivery_timeout`, which is charged from the moment you call `send()`:
 
 ```rust
 use krafka::producer::AccumulatorConfig;

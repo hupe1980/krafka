@@ -366,7 +366,9 @@ let consumer = Consumer::builder()
 
 ### Metadata Topic Cache TTL
 
-During a partial metadata refresh (where only the subscribed topics are re-fetched rather than the entire cluster), krafka caches each topic's metadata between refreshes. By default, a topic entry is evicted from this cache after **5 minutes** of not being successfully refreshed — matching Java's `metadata.max.idle.ms` — to prevent unbounded growth when topics are deleted or subscriptions change.
+During a partial metadata refresh (where only the subscribed topics are re-fetched rather than the entire cluster), krafka caches each topic's metadata between refreshes. By default, a topic entry is evicted from this cache after **5 minutes** of being **idle** — matching Java's `metadata.max.idle.ms` — to prevent unbounded growth when topics are deleted or subscriptions change.
+
+Idle means nothing has addressed the topic: fetching from it, resolving a leader for it, or naming it in a metadata refresh all reset the timer. A topic whose metadata is still current survives regardless.
 
 ```rust,compile
 use krafka::consumer::Consumer;
@@ -390,6 +392,35 @@ let consumer = Consumer::builder()
 ```
 
 > **Note:** TTL eviction only affects the partial-refresh cache. A full metadata refresh (triggered by `metadata_max_age` expiry or an explicit refresh) always replaces the cache unconditionally.
+
+### Automatic Topic Creation
+
+`allow_auto_create_topics` puts `allow.auto.create.topics` on the metadata
+requests this consumer issues, so subscribing to a topic the cluster does not
+have creates it:
+
+```rust,compile
+use krafka::consumer::Consumer;
+
+let consumer = Consumer::builder()
+    .bootstrap_servers("localhost:9092")
+    .group_id("my-group")
+    .allow_auto_create_topics(true)
+    .build()
+    .await?;
+```
+
+The broker must also run with `auto.create.topics.enable=true`; the client flag
+only says it is willing.
+
+**Defaults to `false`**, where the Java client defaults to `true`. A consumer
+bringing a topic into existence — with the broker's default partition count and
+replication factor — is almost always a typo. Turn it on for development and
+test clusters.
+
+The flag lives on the metadata cache, so a consumer sharing a
+[`KrafkaClient`](@/docs/getting-started.md)'s metadata inherits that client's
+setting instead.
 
 ## Consumer Groups
 
@@ -831,6 +862,11 @@ For direct partition control (without consumer groups):
 
 > **Standalone Recovery:** Standalone consumers have the same `OffsetOutOfRange` recovery as group consumers — the configured `auto_offset_reset` policy is applied automatically to recover stalled partitions.
 
+> **`assign()` wins over `subscribe()` for the topic it names.** On a group-less
+> consumer, `subscribe()` keeps re-deriving the partition list from metadata
+> (see [Subscribing without a group](#subscribing-without-a-group)); `assign()`
+> takes that topic out of the loop.
+
 ```rust,compile
 use krafka::consumer::Consumer;
 
@@ -846,6 +882,31 @@ consumer.assign("topic", vec![0, 1, 2]).await?;
 ```
 
 ## Subscription Management
+
+### Subscribing without a group
+
+A consumer with no `group_id` may still `subscribe()`. With no coordinator to
+assign partitions, the consumer is its own assignor and takes every partition of
+every subscribed topic.
+
+That assignment is live, not a snapshot: `poll()` re-derives it from cluster
+metadata, so a topic created after `subscribe()` is picked up, partitions added
+to a subscribed topic are assigned, and a deleted topic's partitions are revoked
+along with their buffered records, positions and paused flags. Subscribing to a
+topic that does not exist yet is not an error.
+
+The re-derivation runs once per `metadata_max_age` while every subscribed topic
+resolves, and on every `poll()` while one does not. The metadata layer's rate
+limiter governs the request rate, so the unresolved case costs no extra round
+trips and never blocks the poll. A failed refresh leaves the current assignment
+alone.
+
+`assign()` takes a topic over from this loop: after
+`consumer.assign("orders", vec![0])` the caller owns that topic's partition
+list, even if `subscribe()` named it earlier.
+
+Consumers with a `group_id` are unaffected — the coordinator owns assignment
+there.
 
 ### Subscribe to Multiple Topics
 

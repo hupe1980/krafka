@@ -271,7 +271,7 @@ use std::time::Duration;
 let producer = Producer::builder()
     .bootstrap_servers("localhost:9092")
     .buffer_memory(64 * 1024 * 1024)        // 64MB buffer limit
-    .max_block(Duration::from_secs(30))     // Wait up to 30s when buffer full
+    .max_block(Duration::from_secs(30))     // Total time send() may block
     .build()
     .await?;
 ```
@@ -279,13 +279,14 @@ let producer = Producer::builder()
 | Option | Default | Description |
 |--------|---------|-------------|
 | `buffer_memory` | 32 MB | Maximum total memory for buffering records |
-| `max_block` | 60s | Maximum time to block when buffer is full |
+| `max_block` | 60s | Total time `send()` may block: resolving the topic, then waiting for buffer memory |
 
 Once a record is admitted it holds a share of the producer memory budget until
 it is acknowledged or fails. If memory is unavailable, `send()` blocks the
-caller for up to `max_block` before returning an error — the Kafka Java
-client's `max.block.ms` behaviour, which prevents both OOM conditions and
-unnecessary record loss under bursty load.
+caller before returning an error — the Kafka Java client's `max.block.ms`
+behaviour, which prevents both OOM conditions and unnecessary record loss under
+bursty load. `max_block` is one budget for the whole call, so time already spent
+resolving the topic is deducted from this wait.
 
 That wait is charged against `delivery_timeout`: the clock starts when you call
 `send()`, not when the record reaches a batch, so a record that spent 30 s
@@ -432,7 +433,9 @@ impl Partitioner for RegionPartitioner {
 
 ## Metadata Topic Cache TTL
 
-During a partial metadata refresh for produced topics, krafka caches topic metadata between refreshes. By default, a topic entry is evicted after **5 minutes** without a successful refresh, matching Java's `metadata.max.idle.ms`, so topic churn does not grow the cache indefinitely.
+krafka caches topic metadata between refreshes. During a *partial* refresh — one that names specific topics — entries that have been **idle** for longer than the TTL are evicted, so topic churn does not grow the cache indefinitely. The default is **5 minutes**, matching Java's `metadata.max.idle.ms`.
+
+Idle means nothing has addressed the topic: producing to it, resolving a leader for it, asking for its partition count, or naming it in a metadata refresh all reset the timer. A topic whose metadata is still current survives regardless.
 
 ```rust,compile
 use krafka::producer::Producer;
@@ -452,6 +455,72 @@ let producer = Producer::builder()
 ```
 
 A full metadata refresh still replaces the cache unconditionally.
+
+## Topic Resolution
+
+`send()` to a topic the cache does not hold fetches metadata for it and retries until it resolves or the [`max_block`](#configuration) budget expires — the equivalent of `KafkaProducer.waitOnMetadata`. A topic that was never fetched, one evicted as idle, and one still being created all resolve this way.
+
+A topic the cluster will not resolve within `max_block` fails with the broker's own reason:
+
+```rust,compile
+use krafka::error::{ErrorCode, KrafkaError};
+use krafka::producer::Producer;
+
+let producer = Producer::builder()
+    .bootstrap_servers("localhost:9092")
+    .build()
+    .await?;
+
+match producer.send("maybe-missing", None, Some(b"v")).await {
+    Ok(metadata) => println!("wrote to partition {}", metadata.partition),
+    Err(KrafkaError::Broker { code: ErrorCode::TopicAuthorizationFailed, .. }) => {
+        // The topic exists; this principal may not write to it.
+    }
+    Err(KrafkaError::Broker { code: ErrorCode::UnknownTopicOrPartition, .. }) => {
+        // The cluster does not have this topic.
+    }
+    Err(e) => eprintln!("send failed: {e}"),
+}
+```
+
+`max_block` is one budget for the whole call: time spent resolving the topic is deducted from the wait for buffer memory, so `send()` never blocks longer than `max_block` in total.
+
+[`partitions_for`](https://docs.rs/krafka/latest/krafka/producer/struct.Producer.html#method.partitions_for) — the equivalent of `KafkaProducer.partitionsFor` — inspects a topic directly, fetching on a cache miss under the same budget:
+
+```rust,compile
+use krafka::producer::Producer;
+
+let producer = Producer::builder()
+    .bootstrap_servers("localhost:9092")
+    .build()
+    .await?;
+
+for partition in producer.partitions_for("events").await? {
+    println!("partition {} led by {}", partition.partition, partition.leader);
+}
+```
+
+An explicit partition is range-checked too: partition 7 of a 2-partition topic is rejected by `send()`.
+
+### Letting the broker create the topic
+
+`allow_auto_create_topics` sets `allow.auto.create.topics` on the metadata requests the send path issues, so the broker creates a missing topic on demand:
+
+```rust,compile
+use krafka::producer::Producer;
+
+let producer = Producer::builder()
+    .bootstrap_servers("localhost:9092")
+    .allow_auto_create_topics(true)
+    .build()
+    .await?;
+```
+
+The broker must also run with `auto.create.topics.enable=true`; the client flag only says it is willing.
+
+**Off by default**, unlike the Java producer, which always asks for auto-creation. A typo'd topic name that silently materialises a real topic reports nothing until the traffic is found missing from the topic it was meant for. Turn it on for development and test clusters.
+
+The flag lives on the metadata cache, so a client sharing a [`KrafkaClient`](@/docs/getting-started.md)'s metadata inherits that client's setting instead.
 
 ## Error Handling
 

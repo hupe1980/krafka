@@ -116,6 +116,53 @@ pub(crate) async fn apply_serializers(
     Ok(())
 }
 
+/// Resolve the partition a record is routed to, fetching topic metadata when
+/// the cache does not have it.
+///
+/// Shared by [`Producer::enqueue`] and
+/// [`TransactionalProducer::enqueue`](transaction::TransactionalProducer::enqueue)
+/// so the two send paths cannot drift apart.
+///
+/// Two things happen here that a plain cache lookup did not do, both mirroring
+/// `KafkaProducer.waitOnMetadata`:
+///
+/// 1. **A cache miss fetches.** A topic can be absent because it was never
+///    fetched, because it was evicted as idle, or because it is still being
+///    created — none of which mean it does not exist. Failing the send on a
+///    miss left a long-lived producer unable to reach a topic it had been
+///    writing to seconds earlier, with no path back short of rebuilding the
+///    producer.
+/// 2. **An explicitly requested partition is range-checked.** Routing a record
+///    to a partition the topic does not have used to fail much later, as a
+///    leader lookup for a partition that cannot exist, after the record had
+///    already been accepted and batched.
+///
+/// The fetch is bounded by `max_wait`, which the callers set to what remains of
+/// `max.block.ms`.
+pub(crate) async fn resolve_partition(
+    metadata: &ClusterMetadata,
+    partitioner: &dyn Partitioner,
+    topic: &str,
+    key: Option<&[u8]>,
+    requested: Option<PartitionId>,
+    max_wait: Duration,
+) -> Result<PartitionId> {
+    let partition_count = metadata.ensure_partition_count(topic, max_wait).await?;
+
+    match requested {
+        Some(partition) => {
+            if partition < 0 || partition as usize >= partition_count {
+                return Err(KrafkaError::config(format!(
+                    "invalid partition given with record: {partition} is not in the range \
+                     [0, {partition_count}) for topic {topic}"
+                )));
+            }
+            Ok(partition)
+        }
+        None => Ok(partitioner.partition(topic, key, partition_count)),
+    }
+}
+
 /// The `on_acknowledgement` a record owes once `on_send` has observed it.
 ///
 /// `on_send` runs at the very top of the send path, before serialization,
@@ -693,6 +740,7 @@ impl Producer {
                 } else {
                     meta = meta.with_topic_cache_ttl_disabled();
                 }
+                meta = meta.with_auto_create_topics(config.allow_auto_create_topics);
                 meta
             });
 
@@ -946,8 +994,16 @@ impl Producer {
     /// # Errors
     ///
     /// The outer `Result` covers everything up to and including the enqueue:
-    /// interceptors, serializers, record validation, unknown topics, and the
-    /// up-to-`max_block` wait for buffer memory. The handle covers delivery.
+    /// interceptors, serializers, record validation, topic resolution, and the
+    /// wait for buffer memory. The handle covers delivery.
+    ///
+    /// A topic the metadata cache does not have is fetched rather than
+    /// rejected; only a topic the cluster will not resolve within `max_block`
+    /// fails here, and it fails with the broker's own reason
+    /// (`UNKNOWN_TOPIC_OR_PARTITION`, `TOPIC_AUTHORIZATION_FAILED`) when the
+    /// broker gave one. A record addressed to a partition the topic does not
+    /// have is rejected here too, rather than being accepted and failing later
+    /// as an unroutable batch.
     pub async fn enqueue(&self, record: ProducerRecord) -> Result<DeliveryHandle> {
         // `delivery.timeout.ms` covers everything from `send()` entry, so
         // the clock starts here — before schema encoding, partition lookup and,
@@ -989,24 +1045,31 @@ impl Producer {
         let topic = routed.topic;
         let record = routed.record;
 
-        // Determine partition
-        let partition = match routed.partition {
-            Some(p) => p,
-            None => match self.metadata.partition_count(topic.as_ref()) {
-                Some(partition_count) => {
-                    self.partitioner
-                        .partition(topic.as_ref(), record.key_bytes(), partition_count)
-                }
-                None => {
-                    let error = KrafkaError::invalid_state(format!("unknown topic: {topic}"));
-                    return Err(obligation.fail(
-                        topic.as_ref(),
-                        UNKNOWN_PARTITION,
-                        &record.headers,
-                        error,
-                    ));
-                }
-            },
+        // Determine the partition, fetching metadata for the topic if the
+        // cache does not have it. The wait is charged against what is left of
+        // `max_block`, so a topic that never resolves cannot block a send past
+        // the budget the caller configured.
+        let partition = match resolve_partition(
+            &self.metadata,
+            &*self.partitioner,
+            topic.as_ref(),
+            record.key_bytes(),
+            routed.partition,
+            self.config
+                .max_block
+                .saturating_sub(send_started_at.elapsed()),
+        )
+        .await
+        {
+            Ok(partition) => partition,
+            Err(error) => {
+                return Err(obligation.fail(
+                    topic.as_ref(),
+                    UNKNOWN_PARTITION,
+                    &record.headers,
+                    error,
+                ));
+            }
         };
 
         match self
@@ -1036,6 +1099,41 @@ impl Producer {
                 ))
             }
         }
+    }
+
+    /// The shared cluster-metadata view this producer routes with.
+    ///
+    /// Exposed for inspection and for keeping a topic warm across a quiet
+    /// period via [`ClusterMetadata::touch_topic`]. Mirrors
+    /// [`KrafkaClient::metadata`](crate::client::KrafkaClient::metadata).
+    pub fn metadata(&self) -> &Arc<ClusterMetadata> {
+        &self.metadata
+    }
+
+    /// Partition metadata for `topic`, fetching it if the cache does not have
+    /// it.
+    ///
+    /// The equivalent of `KafkaProducer.partitionsFor`. The fetch is bounded by
+    /// [`max_block`](ProducerBuilder::max_block) and reports the broker's own
+    /// reason — `UNKNOWN_TOPIC_OR_PARTITION`, `TOPIC_AUTHORIZATION_FAILED` —
+    /// when the topic cannot be resolved.
+    ///
+    /// Partitions are returned in ascending partition order.
+    ///
+    /// # Errors
+    ///
+    /// See [`ClusterMetadata::ensure_partition_count`].
+    pub async fn partitions_for(&self, topic: &str) -> Result<Vec<crate::metadata::PartitionInfo>> {
+        self.metadata
+            .ensure_partition_count(topic, self.config.max_block)
+            .await?;
+        let mut partitions: Vec<_> = self
+            .metadata
+            .topic_arc(topic)
+            .map(|info| info.partitions_iter().cloned().collect())
+            .unwrap_or_default();
+        partitions.sort_by_key(|p| p.partition);
+        Ok(partitions)
     }
 
     /// Flush all pending records.
@@ -1319,7 +1417,15 @@ impl ProducerBuilder {
         self
     }
 
-    /// How long `send()` may block when the buffer is full before failing.
+    /// How long `send()` may block before failing, i.e. `max.block.ms`.
+    ///
+    /// This is one budget for the whole call, spent on whichever of the two
+    /// blocking stages needs it: fetching metadata for a topic the cache does
+    /// not have, and waiting for [`buffer_memory`](Self::buffer_memory) when
+    /// the accumulator is full. Time spent on the first is deducted from what
+    /// the second may take, matching `max.block.ms` in the Java client.
+    ///
+    /// Default: 60 s.
     pub fn max_block(mut self, duration: Duration) -> Self {
         self.config.max_block = duration;
         self
@@ -1507,6 +1613,26 @@ impl ProducerBuilder {
     /// Default: 5 minutes (matching Java's `metadata.max.idle.ms`).
     pub fn metadata_topic_cache_ttl(mut self, ttl: Duration) -> Self {
         self.config.metadata_topic_cache_ttl = Some(ttl);
+        self
+    }
+
+    /// Let the broker create a topic this client asks about but the cluster
+    /// does not have, i.e. `allow.auto.create.topics`.
+    ///
+    /// The broker must additionally be configured with
+    /// `auto.create.topics.enable=true`; this flag only says the client is
+    /// willing.
+    ///
+    /// Default: `false`, unlike the Java producer, which always asks for
+    /// auto-creation. A typo'd topic name that silently materialises a real
+    /// topic reports nothing until the traffic is found missing from the topic
+    /// it was meant for. Turn it on for development and test clusters.
+    ///
+    /// Ignored when the client shares a
+    /// [`KrafkaClient`](crate::client::KrafkaClient)'s metadata: that client's
+    /// own setting governs.
+    pub fn allow_auto_create_topics(mut self, allow: bool) -> Self {
+        self.config.allow_auto_create_topics = allow;
         self
     }
 

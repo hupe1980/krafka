@@ -22,7 +22,10 @@ slug_id = "configuration"
 | `retries` | u32 | `u32::MAX` | Number of retries on failure; bounded by `delivery_timeout` |
 | `retry_backoff` | Duration | `100ms` | Wait between retries |
 | `metadata_max_age` | Duration | `5m` | Max age before metadata refresh |
-| `metadata_topic_cache_ttl` | `Option<Duration>` | `Some(5m)` | TTL for topic entries in the partial-refresh cache. `None` disables eviction. |
+| `metadata_topic_cache_ttl` | `Option<Duration>` | `Some(5m)` | How long a topic entry may sit **idle** before a partial refresh evicts it (`metadata.max.idle.ms`). Any use — producing, resolving a leader, a partition-count lookup, naming it in a refresh — resets the timer. `None` disables eviction. |
+| `buffer_memory` | usize | `32MiB` | Total bytes the producer may buffer for unsent records |
+| `allow_auto_create_topics` | bool | `false` | Let the broker create a topic this producer sends to but the cluster does not have (`allow.auto.create.topics`). The broker must also have `auto.create.topics.enable=true` |
+| `max_block` | Duration | `60s` | One budget for everything `send()` blocks on: fetching metadata for an unresolved topic, then waiting for `buffer_memory` (`max.block.ms`) |
 | `idempotent` | bool | `true` | Enable idempotent production (KIP-679, requires acks=All) |
 | `metadata_recovery_strategy` | MetadataRecoveryStrategy | `Rebootstrap` | Recovery strategy when metadata refresh fails (KIP-899, extended by KIP-1102) |
 | `metadata_recovery_rebootstrap_trigger` | Duration | `5m` | Duration after which failing refreshes trigger a rebootstrap |
@@ -102,7 +105,8 @@ let producer = Producer::builder()
 | `idle_poll_backoff` | Duration | `10ms` | Backoff between polls when no partition assignment is active. Set to `Duration::ZERO` for minimum latency. |
 | `request_timeout` | Duration | `30s` | Timeout for broker requests |
 | `metadata_max_age` | Duration | `5m` | Max age before metadata refresh |
-| `metadata_topic_cache_ttl` | `Option<Duration>` | `Some(5m)` | TTL for topic entries in the partial-refresh cache. `None` disables eviction. |
+| `metadata_topic_cache_ttl` | `Option<Duration>` | `Some(5m)` | How long a topic entry may sit **idle** before a partial refresh evicts it (`metadata.max.idle.ms`). Any use — producing, resolving a leader, a partition-count lookup, naming it in a refresh — resets the timer. `None` disables eviction. |
+| `allow_auto_create_topics` | bool | `false` | Let the broker create a subscribed or assigned topic the cluster does not have (`allow.auto.create.topics`). Java defaults this to `true`; krafka does not — see [Consumer](@/docs/consumer.md) |
 | `metadata_recovery_strategy` | MetadataRecoveryStrategy | `Rebootstrap` | Recovery strategy when metadata refresh fails (KIP-899, extended by KIP-1102) |
 | `metadata_recovery_rebootstrap_trigger` | Duration | `5m` | Duration after which failing refreshes trigger a rebootstrap |
 

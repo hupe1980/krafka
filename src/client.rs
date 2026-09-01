@@ -104,6 +104,7 @@ impl KrafkaClient {
             metadata_recovery_strategy: MetadataRecoveryStrategy::Rebootstrap,
             metadata_recovery_rebootstrap_trigger: Duration::from_secs(300),
             metadata_topic_cache_ttl: Some(Duration::from_secs(300)),
+            allow_auto_create_topics: false,
             transport: crate::network::TransportConfig::default(),
             #[cfg(feature = "socks5")]
             proxy: None,
@@ -159,6 +160,7 @@ pub struct KrafkaClientBuilder {
     metadata_recovery_strategy: MetadataRecoveryStrategy,
     metadata_recovery_rebootstrap_trigger: Duration,
     metadata_topic_cache_ttl: Option<Duration>,
+    allow_auto_create_topics: bool,
     transport: crate::network::TransportConfig,
     #[cfg(feature = "socks5")]
     proxy: Option<crate::network::ProxyConfig>,
@@ -255,6 +257,21 @@ impl KrafkaClientBuilder {
     /// Entries will then persist across partial refreshes indefinitely.
     pub fn disable_metadata_topic_cache_ttl(mut self) -> Self {
         self.metadata_topic_cache_ttl = None;
+        self
+    }
+
+    /// Let the broker create a topic this client asks about but the cluster
+    /// does not have, i.e. `allow.auto.create.topics`.
+    ///
+    /// **This setting is shared.** Every producer and consumer built with
+    /// [`ProducerBuilder::with_client`](crate::producer::ProducerBuilder::with_client)
+    /// and its siblings routes through this client's metadata, so it governs
+    /// them too and their own `allow_auto_create_topics` is not consulted.
+    ///
+    /// Default: `false` — see
+    /// [`ClusterMetadata::with_auto_create_topics`] for why.
+    pub fn allow_auto_create_topics(mut self, allow: bool) -> Self {
+        self.allow_auto_create_topics = allow;
         self
     }
 
@@ -376,6 +393,7 @@ impl KrafkaClientBuilder {
             Some(ttl) => meta.with_topic_cache_ttl(ttl),
             None => meta.with_topic_cache_ttl_disabled(),
         };
+        meta = meta.with_auto_create_topics(self.allow_auto_create_topics);
         let metadata = Arc::new(meta);
 
         metadata.refresh().await?;

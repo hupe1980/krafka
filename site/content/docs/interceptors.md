@@ -63,8 +63,8 @@ All methods have default no-op implementations, so you only need to override the
 
 `on_acknowledgement` fires **exactly once for every record `on_send` observed** —
 on success, on permanent failure, and for records rejected before they ever
-reach the accumulator (a failing serializer, failed validation, an unrouteable
-topic, `max.block.ms` exhausted). It holds at every `linger` setting and on the
+reach the accumulator (a failing serializer, failed validation, a topic that
+does not resolve, `max.block.ms` exhausted). It holds at every `linger` setting and on the
 `TransactionalProducer`, and dropping the `DeliveryHandle` does not suppress it:
 the handle discards the *caller's* view of the acknowledgement, not the
 interceptor's. The one exception is a panic inside krafka's own send task.
@@ -529,7 +529,7 @@ the per-record `RecordContext` nobody writes to never allocates.
        ▼
   on_send(&mut record, &mut ctx)        ← modify record, park per-record state
        │
-       ├─ rejected here (serializer, validation, unknown topic, max.block)
+       ├─ rejected here (serializer, validation, topic resolution, max.block)
        │      └─► on_acknowledgement(Failed / UNKNOWN_PARTITION, err, headers, ctx)
        ▼
   partitioner.partition()

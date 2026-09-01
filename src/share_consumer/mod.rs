@@ -693,6 +693,7 @@ impl ShareConsumer {
                 } else {
                     meta = meta.with_topic_cache_ttl_disabled();
                 }
+                meta = meta.with_auto_create_topics(config.allow_auto_create_topics);
                 meta
             });
 
@@ -3490,6 +3491,26 @@ impl ShareConsumerBuilder {
     /// Default: 5 minutes (matching Java's `metadata.max.idle.ms`).
     pub fn metadata_topic_cache_ttl(mut self, ttl: Duration) -> Self {
         self.config.metadata_topic_cache_ttl = Some(ttl);
+        self
+    }
+
+    /// Let the broker create a topic this client asks about but the cluster
+    /// does not have, i.e. `allow.auto.create.topics`.
+    ///
+    /// The broker must additionally be configured with
+    /// `auto.create.topics.enable=true`; this flag only says the client is
+    /// willing.
+    ///
+    /// Default: `false`, unlike the Java producer, which always asks for
+    /// auto-creation. A typo'd topic name that silently materialises a real
+    /// topic reports nothing until the traffic is found missing from the topic
+    /// it was meant for. Turn it on for development and test clusters.
+    ///
+    /// Ignored when the client shares a
+    /// [`KrafkaClient`](crate::client::KrafkaClient)'s metadata: that client's
+    /// own setting governs.
+    pub fn allow_auto_create_topics(mut self, allow: bool) -> Self {
+        self.config.allow_auto_create_topics = allow;
         self
     }
 

@@ -113,7 +113,9 @@ pub struct ProducerConfig {
     /// partition on the wire — so there is no in-flight-request limit to
     /// configure for it, unlike the Java client's `max.in.flight ≤ 5` rule.
     pub(crate) idempotent: bool,
-    /// Max block time when buffer is full.
+    /// One budget for everything `send()` may block on: fetching metadata for
+    /// an unresolved topic, and waiting for buffer memory when the accumulator
+    /// is full. Mirrors `max.block.ms`.
     pub(crate) max_block: Duration,
     /// Buffer memory size.
     pub(crate) buffer_memory: usize,
@@ -121,6 +123,12 @@ pub struct ProducerConfig {
     pub(crate) metadata_max_age: Duration,
     /// Topic cache TTL for partial metadata refreshes.
     pub(crate) metadata_topic_cache_ttl: Option<Duration>,
+    /// Whether a metadata request for a topic the cluster does not have may
+    /// ask the broker to create it, i.e. `allow.auto.create.topics`.
+    ///
+    /// Defaults to `false`. The broker must have
+    /// `auto.create.topics.enable=true` for this flag to do anything.
+    pub(crate) allow_auto_create_topics: bool,
     /// Metadata recovery strategy (KIP-899).
     ///
     /// When set to [`MetadataRecoveryStrategy::Rebootstrap`], the producer
@@ -168,6 +176,7 @@ impl Default for ProducerConfig {
             buffer_memory: 32 * 1024 * 1024, // 32 MB
             metadata_max_age: Duration::from_secs(300),
             metadata_topic_cache_ttl: Some(Duration::from_secs(300)),
+            allow_auto_create_topics: false,
             metadata_recovery_strategy: MetadataRecoveryStrategy::Rebootstrap,
             metadata_recovery_rebootstrap_trigger: Duration::from_secs(300),
             auth: None,
@@ -276,7 +285,8 @@ impl ProducerConfig {
         self.idempotent
     }
 
-    /// Returns the max block time when buffer is full.
+    /// Returns the total time `send()` may block on metadata and buffer
+    /// memory combined (`max.block.ms`).
     #[inline]
     pub fn max_block(&self) -> Duration {
         self.max_block
@@ -298,6 +308,13 @@ impl ProducerConfig {
     #[inline]
     pub fn metadata_topic_cache_ttl(&self) -> Option<Duration> {
         self.metadata_topic_cache_ttl
+    }
+
+    /// Returns whether the client may ask the broker to auto-create topics
+    /// (`allow.auto.create.topics`).
+    #[inline]
+    pub fn allow_auto_create_topics(&self) -> bool {
+        self.allow_auto_create_topics
     }
 
     /// Returns the metadata recovery strategy (KIP-899).

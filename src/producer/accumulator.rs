@@ -698,7 +698,14 @@ impl RecordAccumulatorHandle {
         send_started_at: Instant,
         interceptor_ctx: RecordContext,
     ) -> std::result::Result<DeliveryHandle, Box<EnqueueRejected>> {
-        let deadline = tokio::time::Instant::now() + self.max_block_ms;
+        // `max_block` is a budget for the whole of `send()`, not for this
+        // stage alone: the interceptor, serializers and the metadata fetch for
+        // an unknown topic have already spent part of it. Restarting the clock
+        // here let a send block for `max_block` *on top of* everything that
+        // came before it. Java charges the same `remainingWaitMs` across both
+        // halves, and so does this.
+        let deadline = tokio::time::Instant::now()
+            + self.max_block_ms.saturating_sub(send_started_at.elapsed());
 
         // Reject records that cannot physically be admitted (exceeds the
         // semaphore permit limit, max_request_size, or the configured

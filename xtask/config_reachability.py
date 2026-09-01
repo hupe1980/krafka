@@ -101,8 +101,7 @@ EXEMPT = {
     ("TransactionalProducerConfig", "topic_compression", "accessor"): "populated one topic at a time by topic_compression()",
     # Bulk seeds, meaningful only at build time.
     ("ConsumerConfig", "initial_offsets", "accessor"): "seed map consumed during assignment; position() is the read side",
-    # Nullable knobs whose setter pair is (set, disable) rather than one method.
-    ("ConsumerConfig", "metadata_topic_cache_ttl", "accessor"): "read via metadata_topic_cache_ttl_or_none()",
+    # Set through a differently named accessor.
     ("AdminConfig", "metadata_max_age", "accessor"): "AdminClient exposes it through metadata_max_age_duration()",
     # `ConnectionConfig`'s field names predate `TransportConfig`, which is the
     # façade every client builder actually takes. The setters carry the public

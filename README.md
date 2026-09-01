@@ -663,6 +663,42 @@ what it does and, just as importantly, what it deliberately does not model.
 
 Release-by-release detail lives in **[CHANGELOG.md](CHANGELOG.md)**.
 
+### Upgrading to 0.22
+
+**Producer topic resolution.** A `send()` to a topic the metadata cache does not
+hold now fetches metadata for it and retries until it resolves or `max_block`
+expires, instead of failing outright — the equivalent of
+`KafkaProducer.waitOnMetadata`. A topic that cannot be resolved fails with the
+broker's own error code, so match on that rather than on
+`KrafkaError::InvalidState { message: "unknown topic: …" }`:
+
+```rust
+match producer.send("maybe-missing", None, Some(b"v")).await {
+    Err(KrafkaError::Broker { code: ErrorCode::TopicAuthorizationFailed, .. }) => { /* ACLs */ }
+    Err(KrafkaError::Broker { code: ErrorCode::UnknownTopicOrPartition, .. }) => { /* absent */ }
+    _ => {}
+}
+```
+
+Alongside it: `max_block` is one budget for the whole `send()` call — metadata
+resolution *and* the wait for buffer memory — rather than restarting at the
+second; and a record addressed to a partition the topic does not have is
+rejected by `send()` with `KrafkaError::Config` naming the valid range.
+
+**`metadata_topic_cache_ttl` is an idle timeout.** Same name, default and
+opt-out; an entry is now evicted only after nothing has addressed the topic for
+the whole TTL, matching Java's `metadata.max.idle.ms`.
+
+**Group-less `subscribe()` keeps its assignment current.** `poll()` re-derives
+the partition list from metadata, so topics created after subscribing and
+partitions added later are picked up. `assign()` takes the topic it names out of
+that loop, which is what keeps a narrow manual assignment narrow. Consumers with
+a `group_id` are unaffected.
+
+**`allow_auto_create_topics`** is new on every builder
+(`allow.auto.create.topics`), defaulting to `false`. Enable it where you want
+the broker to materialise missing topics.
+
 ### Upgrading to 0.21
 
 `ProducerInterceptor` gained a per-record `RecordContext`, so an interceptor can

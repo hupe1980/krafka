@@ -622,6 +622,37 @@ impl ClusterState {
         true
     }
 
+    /// Grow `name` to `partitions` partitions, mirroring a `CreatePartitions`
+    /// admin call.
+    ///
+    /// Kafka can only ever add partitions to a topic, never remove them, so a
+    /// request for fewer than the topic already has is a no-op. New partitions
+    /// start empty, with leadership spread round-robin over the online brokers
+    /// exactly as [`create_topic`](Self::create_topic) assigns it.
+    ///
+    /// Returns the number of partitions added.
+    pub fn add_partitions(&mut self, name: &str, partitions: i32) -> usize {
+        let online: Vec<i32> = self
+            .brokers
+            .iter()
+            .filter(|b| b.online)
+            .map(|b| b.node_id)
+            .collect();
+        let Some(topic) = self.topics.get_mut(name) else {
+            return 0;
+        };
+        let existing = topic.partitions.len();
+        let target = partitions.max(0) as usize;
+        if target <= existing {
+            return 0;
+        }
+        for i in existing..target {
+            let leader = online.get(i % online.len().max(1)).copied().unwrap_or(0);
+            topic.partitions.push(PartitionState::new(leader));
+        }
+        target - existing
+    }
+
     /// Mutable access to one partition.
     pub fn partition_mut(&mut self, topic: &str, partition: i32) -> Option<&mut PartitionState> {
         self.topics

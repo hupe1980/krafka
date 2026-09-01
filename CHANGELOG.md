@@ -11,9 +11,101 @@ Entries before 0.17.0 were reconstructed from the release history and the
 `Upgrading` sections that previously lived in `README.md`. They are summaries,
 not a complete record.
 
-## [Unreleased]
+## [0.22.0] — 2026-09-01
 
-Nothing yet.
+A long-lived producer could permanently lose a topic it was actively writing
+to. The metadata cache expired entries on *refresh recency*, and a partial
+refresh names one topic — so a refresh for topic A stamped only topic A and let
+topic B age out, even though topic B was being produced to every second. The
+next send to topic B then failed with `unknown state: unknown topic: topic-b`,
+and stayed broken for the life of the producer, because nothing on the send
+path ever asked the broker again.
+
+Both halves of that are fixed: eviction is now an idleness rule, and a cache
+miss fetches instead of failing.
+
+### Breaking
+
+- **A `send()` to a topic the cache does not hold now fetches metadata for it**
+  rather than failing immediately with `unknown topic`. The fetch is bounded by
+  `max_block` and retries while the answer is retriable, so a topic that is
+  still being created resolves as soon as the cluster settles. A topic that
+  genuinely cannot be resolved now fails with the broker's own error code —
+  `UNKNOWN_TOPIC_OR_PARTITION`, `TOPIC_AUTHORIZATION_FAILED`,
+  `INVALID_TOPIC_EXCEPTION` — instead of `KrafkaError::InvalidState`. Code
+  matching on the old message or variant must be updated.
+- **`max_block` is one budget for the whole `send()` call.** It previously
+  started afresh at the wait for buffer memory, so a send could block for
+  `max_block` on top of everything before it. Time spent resolving the topic is
+  now deducted from the buffer-memory wait, matching `max.block.ms` in Java.
+- **A record addressed to a partition the topic does not have is rejected by
+  `send()`** with `KrafkaError::Config`, naming the valid range. It used to be
+  accepted and fail later as a batch with no reachable leader.
+- **A group-less `subscribe()` keeps its assignment up to date** (see *Fixed*).
+  Code that narrowed a subscription afterwards with `assign()` still works:
+  `assign()` takes the topic it names out of the subscription loop.
+- **`metadata_topic_cache_ttl` is an idle timeout, not a refresh timeout.** An
+  entry is evicted only after nothing has addressed the topic for the whole
+  TTL. The setting keeps its name, its default (5 minutes) and its opt-out; what
+  changed is which clock it reads.
+
+### Fixed
+
+- **A group-less `subscribe()` resolved its partitions exactly once.** A topic
+  that did not exist yet was silently never consumed, and partitions added later
+  by `CreatePartitions` never appeared — both with no error, for the life of the
+  consumer. `poll()` now re-derives the assignment from metadata: once per
+  `metadata_max_age` while every subscribed topic resolves, and on every poll
+  while one does not. A failed refresh leaves the current assignment alone.
+  Consumers with a `group_id` are unaffected.
+- **A topic in active use could be evicted from the metadata cache and never
+  come back.** Eviction keyed off `topic_last_refreshed`, which a partial
+  refresh advances only for the topics it names. A producer alternating between
+  two topics evicted whichever one it did not happen to be refreshing, and every
+  subsequent send to it failed as an unknown topic until the producer was
+  rebuilt. Eviction now follows Java's `metadata.max.idle.ms`: a topic survives
+  while anything addresses it — producing to it, resolving its leader, asking
+  for its partition count, or naming it in a refresh — and, as a second line of
+  defence, while its metadata is still current.
+- **A topic with zero partitions is no longer treated as resolved.** That is
+  what a topic mid-creation looks like; routing against it produced a
+  partitioner call with a modulus of zero.
+- **The topic-UUID map could outlive the topic map it indexes.** It was filtered
+  against surviving topics only when a TTL was configured.
+
+### Added
+
+- **`allow.auto.create.topics`** on every client
+  (`ProducerBuilder`, `TransactionalProducerBuilder`, `ConsumerBuilder`,
+  `ShareConsumerBuilder`, `KrafkaClientBuilder`, and
+  `ClusterMetadata::with_auto_create_topics`). krafka never set the flag at
+  all, so a broker with `auto.create.topics.enable=true` would not create a
+  topic the client asked for.
+
+  Defaults to `false` — the Java client asks for auto-creation on the producer
+  and defaults the consumer to `true`, but a typo'd topic name that silently
+  materialises a real topic reports nothing until the traffic is found missing
+  from the topic it was meant for. The flag lives on the metadata cache, so a
+  client sharing a `KrafkaClient`'s metadata inherits that client's setting.
+- **`FakeBroker::add_partitions`** — grow a topic mid-test, as a
+  `CreatePartitions` admin call would. Its `Metadata` handler also honours
+  `allow.auto.create.topics`, so both sides of that setting are testable
+  without a container.
+- **`ClusterMetadata::ensure_partition_count`** — resolve a topic's partition
+  count, fetching metadata on a miss and retrying within a caller-supplied
+  budget. The client's equivalent of `KafkaProducer.waitOnMetadata`.
+- **`ClusterMetadata::topic_error`** — the topic-level error code the broker
+  last reported for a topic, mirroring `Metadata.getError(topic)` in the Java
+  client. Cleared as soon as the topic comes back healthy.
+- **`ClusterMetadata::touch_topic` / `touch_topics`** — mark a topic as in use,
+  for a client that keeps a topic warm through some route the metadata
+  accessors do not see.
+- **`Producer::partitions_for` and `TransactionalProducer::partitions_for`** —
+  partition metadata for a topic, fetched on a cache miss under the `max_block`
+  budget. The equivalent of `KafkaProducer.partitionsFor`.
+- **`Producer::metadata` and `TransactionalProducer::metadata`** — the shared
+  cluster-metadata view the producer routes with, matching
+  `KrafkaClient::metadata`.
 
 ## [0.21.0] — 2026-08-29
 
@@ -1239,7 +1331,8 @@ Initial development: wire protocol, producer, consumer, admin client,
 authentication (SASL PLAIN / SCRAM / OAUTHBEARER / AWS MSK IAM), TLS,
 compression codecs, schema registry integration and the metrics layer.
 
-[Unreleased]: https://github.com/hupe1980/krafka/compare/v0.21.0...HEAD
+[Unreleased]: https://github.com/hupe1980/krafka/compare/v0.22.0...HEAD
+[0.22.0]: https://github.com/hupe1980/krafka/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/hupe1980/krafka/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/hupe1980/krafka/compare/v0.19.1...v0.20.0
 [0.19.1]: https://github.com/hupe1980/krafka/compare/v0.19.0...v0.19.1

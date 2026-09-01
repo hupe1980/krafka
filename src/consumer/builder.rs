@@ -492,6 +492,26 @@ impl ConsumerBuilder {
         self
     }
 
+    /// Let the broker create a topic this consumer subscribes to or assigns
+    /// but the cluster does not have, i.e. `allow.auto.create.topics`.
+    ///
+    /// The broker must additionally be configured with
+    /// `auto.create.topics.enable=true`; this flag only says the client is
+    /// willing.
+    ///
+    /// Default: `false`, where the Java client defaults to `true`. A consumer
+    /// bringing a topic into existence — with the broker's default partition
+    /// count and replication factor — is almost always a typo. Turn it on for
+    /// development and test clusters.
+    ///
+    /// Ignored when the consumer shares a
+    /// [`KrafkaClient`](crate::client::KrafkaClient)'s metadata: that client's
+    /// own setting governs.
+    pub fn allow_auto_create_topics(mut self, allow: bool) -> Self {
+        self.config.allow_auto_create_topics = allow;
+        self
+    }
+
     /// Set per-partition initial offsets applied before auto-offset-reset.
     ///
     /// When a partition is first assigned and has no committed group offset,
