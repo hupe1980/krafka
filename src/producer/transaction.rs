@@ -578,12 +578,19 @@ pub struct TransactionalProducerConfig {
     linger: Duration,
     /// Total accumulator buffer memory in bytes.
     buffer_memory: usize,
-    /// Maximum time `send` blocks waiting for accumulator buffer memory.
+    /// One budget for everything `send()` may block on: fetching metadata for
+    /// an unresolved topic, and waiting for accumulator buffer memory.
     max_block: Duration,
     /// Metadata max age.
     metadata_max_age: Duration,
     /// Topic cache TTL for partial metadata refreshes, or `None` to disable it.
     metadata_topic_cache_ttl: Option<Duration>,
+    /// Whether a metadata request for a topic the cluster does not have may
+    /// ask the broker to create it, i.e. `allow.auto.create.topics`.
+    ///
+    /// Defaults to `false`. The broker must have
+    /// `auto.create.topics.enable=true` for this flag to do anything.
+    allow_auto_create_topics: bool,
     /// What to do when every known broker becomes unreachable (KIP-899).
     metadata_recovery_strategy: crate::metadata::MetadataRecoveryStrategy,
     /// How long metadata refreshes may keep failing before a rebootstrap is
@@ -642,6 +649,7 @@ impl Default for TransactionalProducerConfig {
             max_block: Duration::from_secs(60),
             metadata_max_age: Duration::from_secs(300),
             metadata_topic_cache_ttl: Some(Duration::from_secs(300)),
+            allow_auto_create_topics: false,
             metadata_recovery_strategy: crate::metadata::MetadataRecoveryStrategy::Rebootstrap,
             metadata_recovery_rebootstrap_trigger: Duration::from_secs(300),
             auth: None,
@@ -747,7 +755,8 @@ impl TransactionalProducerConfig {
         self.buffer_memory
     }
 
-    /// Returns the maximum time `send` blocks waiting for buffer memory.
+    /// Returns the total time `send()` may block on metadata and buffer
+    /// memory combined (`max.block.ms`).
     #[inline]
     pub fn max_block(&self) -> Duration {
         self.max_block
@@ -763,6 +772,13 @@ impl TransactionalProducerConfig {
     #[inline]
     pub fn metadata_topic_cache_ttl(&self) -> Option<Duration> {
         self.metadata_topic_cache_ttl
+    }
+
+    /// Returns whether the client may ask the broker to auto-create topics
+    /// (`allow.auto.create.topics`).
+    #[inline]
+    pub fn allow_auto_create_topics(&self) -> bool {
+        self.allow_auto_create_topics
     }
 
     /// Returns the metadata recovery strategy (KIP-899).
@@ -1983,48 +1999,54 @@ impl TransactionalProducer {
         // Transparently apply producer-level schema encoders if configured.
         // Shared with the plain producer so the two paths cannot drift; null
         // keys and tombstone values are passed through unserialized.
-        if let Err(e) = super::apply_serializers(
-            &mut record,
-            self.key_serializer.as_deref(),
-            self.value_serializer.as_deref(),
-        )
-        .await
+        if let Err(e) = obligation
+            .suspend(super::apply_serializers(
+                &mut record,
+                self.key_serializer.as_deref(),
+                self.value_serializer.as_deref(),
+            ))
+            .await
         {
-            return Err(obligation.fail(&record.topic, UNKNOWN_PARTITION, &record.headers, e));
+            return Err(obligation.fail(UNKNOWN_PARTITION, &record.headers, e));
         }
 
         // Validate record fields against Kafka protocol wire-format limits.
         if let Err(e) = record.validate() {
-            return Err(obligation.fail(&record.topic, UNKNOWN_PARTITION, &record.headers, e));
+            return Err(obligation.fail(UNKNOWN_PARTITION, &record.headers, e));
         }
 
         if let Err(e) = self.checked_transactional_identity() {
-            return Err(obligation.fail(&record.topic, UNKNOWN_PARTITION, &record.headers, e));
+            return Err(obligation.fail(UNKNOWN_PARTITION, &record.headers, e));
         }
 
         let record_size = record.estimated_size();
-        let routed = record.into_routed_parts();
+        // The obligation already interned the topic; routing shares that handle
+        // rather than allocating a second one.
+        let routed = record.into_routed_parts_with_topic(obligation.topic());
         let topic = routed.topic;
         let record = routed.record;
 
-        // Determine partition
-        let partition = match routed.partition {
-            Some(p) => p,
-            None => match self.metadata.partition_count(topic.as_ref()) {
-                Some(partition_count) => {
-                    self.partitioner
-                        .partition(topic.as_ref(), record.key_bytes(), partition_count)
-                }
-                None => {
-                    let error = KrafkaError::invalid_state(format!("unknown topic: {topic}"));
-                    return Err(obligation.fail(
-                        topic.as_ref(),
-                        UNKNOWN_PARTITION,
-                        &record.headers,
-                        error,
-                    ));
-                }
-            },
+        // Determine the partition, fetching metadata for the topic if the cache
+        // does not have it. Shared with the plain producer, so an evicted or
+        // not-yet-fetched topic recovers identically on both paths, and the
+        // wait is charged against what is left of `max_block`.
+        let partition = match obligation
+            .suspend(super::resolve_partition(
+                &self.metadata,
+                &*self.partitioner,
+                topic.as_ref(),
+                record.key_bytes(),
+                routed.partition,
+                self.config
+                    .max_block
+                    .saturating_sub(send_started_at.elapsed()),
+            ))
+            .await
+        {
+            Ok(partition) => partition,
+            Err(error) => {
+                return Err(obligation.fail(UNKNOWN_PARTITION, &record.headers, error));
+            }
         };
 
         // Register the partition with the transaction coordinator.
@@ -2042,9 +2064,11 @@ impl TransactionalProducer {
         // precede the first record. The Pending/Added states stop concurrent
         // callers from skipping the RPC while an in-flight add is outstanding.
         if self.requires_explicit_partition_registration()
-            && let Err(e) = self.add_partition_to_txn_if_needed(&topic, partition).await
+            && let Err(e) = obligation
+                .suspend(self.add_partition_to_txn_if_needed(&topic, partition))
+                .await
         {
-            return Err(obligation.fail(topic.as_ref(), partition, &record.headers, e));
+            return Err(obligation.fail(partition, &record.headers, e));
         }
 
         // Hand off to the accumulator, which batches, stamps PID/epoch/sequence
@@ -2060,7 +2084,7 @@ impl TransactionalProducer {
                 partition,
                 operation_guard,
                 send_started_at,
-                obligation.take_context(),
+                &mut obligation,
             )
             .await
             .map_err(|rejected| {
@@ -2068,12 +2092,7 @@ impl TransactionalProducer {
                 // dropped, so the obligation re-opens and is discharged as a
                 // failure that can still report the record's headers.
                 obligation.context = Some(rejected.context);
-                obligation.fail(
-                    topic.as_ref(),
-                    partition,
-                    &rejected.record.headers,
-                    rejected.error,
-                )
+                obligation.fail(partition, &rejected.record.headers, rejected.error)
             });
 
         // An enqueue failure is classified immediately; a delivery failure is
@@ -3222,6 +3241,34 @@ impl TransactionalProducer {
         self.classify_transaction_result(result)
     }
 
+    /// The shared cluster-metadata view this producer routes with.
+    ///
+    /// See [`Producer::metadata`](super::Producer::metadata).
+    pub fn metadata(&self) -> &Arc<ClusterMetadata> {
+        &self.metadata
+    }
+
+    /// Partition metadata for `topic`, fetching it if the cache does not have
+    /// it.
+    ///
+    /// See [`Producer::partitions_for`](super::Producer::partitions_for).
+    ///
+    /// # Errors
+    ///
+    /// See [`ClusterMetadata::ensure_partition_count`].
+    pub async fn partitions_for(&self, topic: &str) -> Result<Vec<crate::metadata::PartitionInfo>> {
+        self.metadata
+            .ensure_partition_count(topic, self.config.max_block)
+            .await?;
+        let mut partitions: Vec<_> = self
+            .metadata
+            .topic_arc(topic)
+            .map(|info| info.partitions_iter().cloned().collect())
+            .unwrap_or_default();
+        partitions.sort_by_key(|p| p.partition);
+        Ok(partitions)
+    }
+
     /// Dispatch every buffered record and wait for all in-flight sends to
     /// complete.
     ///
@@ -3725,7 +3772,11 @@ impl TransactionalProducerBuilder {
         self
     }
 
-    /// Set the maximum time `send` blocks waiting for buffer memory.
+    /// How long `send()` may block before failing, i.e. `max.block.ms`.
+    ///
+    /// One budget for the whole call, spent on whichever of the two blocking
+    /// stages needs it: fetching metadata for a topic the cache does not have,
+    /// and waiting for buffer memory when the accumulator is full.
     pub fn max_block(mut self, max_block: Duration) -> Self {
         self.config.max_block = max_block;
         self
@@ -3849,6 +3900,26 @@ impl TransactionalProducerBuilder {
     /// Set the topic cache TTL for partial metadata refreshes.
     pub fn metadata_topic_cache_ttl(mut self, ttl: Duration) -> Self {
         self.config.metadata_topic_cache_ttl = Some(ttl);
+        self
+    }
+
+    /// Let the broker create a topic this client asks about but the cluster
+    /// does not have, i.e. `allow.auto.create.topics`.
+    ///
+    /// The broker must additionally be configured with
+    /// `auto.create.topics.enable=true`; this flag only says the client is
+    /// willing.
+    ///
+    /// Default: `false`, unlike the Java producer, which always asks for
+    /// auto-creation. A typo'd topic name that silently materialises a real
+    /// topic reports nothing until the traffic is found missing from the topic
+    /// it was meant for. Turn it on for development and test clusters.
+    ///
+    /// Ignored when the client shares a
+    /// [`KrafkaClient`](crate::client::KrafkaClient)'s metadata: that client's
+    /// own setting governs.
+    pub fn allow_auto_create_topics(mut self, allow: bool) -> Self {
+        self.config.allow_auto_create_topics = allow;
         self
     }
 
@@ -4116,6 +4187,7 @@ impl TransactionalProducerBuilder {
                 } else {
                     meta = meta.with_topic_cache_ttl_disabled();
                 }
+                meta = meta.with_auto_create_topics(self.config.allow_auto_create_topics);
                 meta
             });
 
@@ -5355,6 +5427,11 @@ mod tests {
             config: TransactionalProducerConfig {
                 bootstrap_servers: address.to_string(),
                 transactional_id: "txn-test".to_string(),
+                // These tests have no broker, so every send has to resolve its
+                // topic from an unreachable cluster. The production default
+                // (60 s) would make each one sit out its caller's timeout, at
+                // whatever speed the platform refuses a connection.
+                max_block: Duration::from_millis(200),
                 ..TransactionalProducerConfig::default()
             },
             metadata,

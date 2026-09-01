@@ -14,12 +14,13 @@
 // metadata, at which point hash-flooding is the least of the client's problems.
 // Key lengths are also bounded by Kafka's own validation (topic names ≤ 249
 // characters, broker IDs are i32).
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use parking_lot::Mutex as SyncMutex;
+use parking_lot::{Mutex as SyncMutex, RwLock as SyncRwLock};
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
@@ -464,6 +465,136 @@ impl RefreshBackoffState {
     }
 }
 
+/// Upper bound on the number of topics whose usage is tracked.
+///
+/// The map is pruned on every metadata refresh, so it is normally bounded by
+/// "topics touched within the TTL". The cap only matters for a client that
+/// addresses a very large number of distinct topics between two refreshes; it
+/// keeps a pathological workload from turning the tracker itself into the leak
+/// the TTL exists to prevent.
+const MAX_TRACKED_TOPIC_USAGE: usize = 10_000;
+
+/// Records when each topic was last *used* by this client.
+///
+/// TTL eviction is an idleness rule, mirroring `metadata.max.idle.ms`: every
+/// `send()` resets the timer, as `ProducerMetadata.add` does in Java. Keying it
+/// off the last *refresh* instead would evict a topic being written to every
+/// second, because a partial refresh stamps only the topic it names — leaving
+/// every other topic in active use to age out.
+///
+/// Timestamps are milliseconds since a fixed epoch so that a touch on the send
+/// path is a shared-lock lookup plus one relaxed atomic store: no allocation,
+/// and no writer contention between topics once an entry exists.
+#[derive(Debug)]
+struct TopicUsageTracker {
+    /// Reference point for the stored millisecond timestamps.
+    epoch: Instant,
+    /// Topic name → milliseconds since `epoch` at which it was last used.
+    entries: SyncRwLock<AHashMap<String, AtomicU64>>,
+}
+
+impl TopicUsageTracker {
+    fn new() -> Self {
+        Self {
+            epoch: Instant::now(),
+            entries: SyncRwLock::new(AHashMap::new()),
+        }
+    }
+
+    /// Milliseconds since `epoch`. Saturates rather than wrapping; a client
+    /// would have to run for ~584 million years to reach the ceiling.
+    fn now_millis(&self) -> u64 {
+        u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn millis(duration: Duration) -> u64 {
+        u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Mark `topic` as used now.
+    fn touch(&self, topic: &str, ttl: Duration) {
+        let now = self.now_millis();
+
+        // Fast path: the entry exists, so a shared lock and a relaxed store are
+        // enough. Concurrent touches of different topics never serialise.
+        if let Some(slot) = self.entries.read().get(topic) {
+            slot.store(now, Ordering::Relaxed);
+            return;
+        }
+
+        let mut entries = self.entries.write();
+        // Re-check: another task may have inserted between the two locks.
+        if let Some(slot) = entries.get(topic) {
+            slot.store(now, Ordering::Relaxed);
+            return;
+        }
+        if entries.len() >= MAX_TRACKED_TOPIC_USAGE {
+            // Drop everything already past the TTL first: one O(n) pass
+            // reclaims many slots, so the scan amortises to nothing across the
+            // inserts that follow. Evicting one entry per insert instead would
+            // make every new topic pay a full scan once the cap is reached.
+            let ttl_ms = Self::millis(ttl);
+            entries.retain(|_, ts| now.saturating_sub(ts.load(Ordering::Relaxed)) <= ttl_ms);
+
+            // Everything is still live: give up the least recently used one.
+            // At worst that makes a nearly-idle topic evictable slightly early,
+            // and it is refetched on its next use.
+            if entries.len() >= MAX_TRACKED_TOPIC_USAGE
+                && let Some(oldest) = entries
+                    .iter()
+                    .min_by_key(|(_, ts)| ts.load(Ordering::Relaxed))
+                    .map(|(name, _)| name.clone())
+            {
+                entries.remove(&oldest);
+            }
+        }
+        entries.insert(topic.to_owned(), AtomicU64::new(now));
+    }
+
+    /// Of `names`, those used within `ttl`.
+    ///
+    /// Borrows the names from the caller's map so the filter costs one shared
+    /// lock and no per-topic allocation.
+    fn active_among<'a, I>(&self, ttl: Duration, names: I) -> AHashSet<&'a str>
+    where
+        I: Iterator<Item = &'a str>,
+    {
+        let now = self.now_millis();
+        let ttl_ms = Self::millis(ttl);
+        let entries = self.entries.read();
+        names
+            .filter(|name| {
+                entries
+                    .get(*name)
+                    .is_some_and(|ts| now.saturating_sub(ts.load(Ordering::Relaxed)) <= ttl_ms)
+            })
+            .collect()
+    }
+
+    /// Drop entries idle for longer than `ttl`, bounding the map.
+    fn prune(&self, ttl: Duration) {
+        let now = self.now_millis();
+        let ttl_ms = Self::millis(ttl);
+        let mut entries = self.entries.write();
+        entries.retain(|_, ts| now.saturating_sub(ts.load(Ordering::Relaxed)) <= ttl_ms);
+    }
+
+    /// How long ago `topic` was last used, or `None` if it was never used.
+    #[cfg(test)]
+    fn idle_for(&self, topic: &str) -> Option<Duration> {
+        let now = self.now_millis();
+        self.entries
+            .read()
+            .get(topic)
+            .map(|ts| Duration::from_millis(now.saturating_sub(ts.load(Ordering::Relaxed))))
+    }
+
+    #[cfg(test)]
+    fn tracked_len(&self) -> usize {
+        self.entries.read().len()
+    }
+}
+
 /// Cached cluster metadata.
 #[derive(Debug, Clone)]
 struct MetadataCache {
@@ -493,8 +624,21 @@ struct MetadataCache {
     /// re-acquiring the lock.
     name_to_topic_id: AHashMap<String, [u8; 16]>,
     /// Per-topic timestamp of the last refresh that included this topic.
-    /// Used for TTL-based eviction during partial refreshes.
+    /// Used for TTL-based eviction during partial refreshes and to decide
+    /// whether an individual entry is stale (see [`MetadataCache::topic_is_fresh`]).
     topic_last_refreshed: AHashMap<String, Instant>,
+    /// The topic-level error the broker last reported for a topic, if any.
+    ///
+    /// A topic that errors is absent from `topics` (permanent errors) or
+    /// present but stale (retriable ones), and in both cases the *reason* is
+    /// what a caller needs: `TOPIC_AUTHORIZATION_FAILED` and
+    /// `UNKNOWN_TOPIC_OR_PARTITION` call for completely different handling,
+    /// and reporting both as "unknown topic" sends operators hunting for a
+    /// topic that exists and they simply cannot read. Mirrors
+    /// `Metadata.getError(topic)` in the Java client.
+    ///
+    /// Cleared for a topic as soon as it comes back without an error.
+    topic_errors: AHashMap<String, ErrorCode>,
     /// When the metadata was last updated.
     last_updated: Instant,
 }
@@ -509,6 +653,7 @@ impl MetadataCache {
             topic_ids: AHashMap::new(),
             name_to_topic_id: AHashMap::new(),
             topic_last_refreshed: AHashMap::new(),
+            topic_errors: AHashMap::new(),
             last_updated: Instant::now(),
         }
     }
@@ -595,6 +740,17 @@ pub struct ClusterMetadata {
     /// not refreshed within this duration are pruned on the next partial
     /// refresh, preventing unbounded cache growth from topic churn.
     topic_cache_ttl: Option<Duration>,
+    /// When each topic was last *used* by this client. Drives TTL eviction,
+    /// which is an idleness rule (Java's `metadata.max.idle.ms`) rather than a
+    /// refresh-recency one. See [`TopicUsageTracker`].
+    topic_usage: TopicUsageTracker,
+    /// Whether a topic-specific metadata request may ask the broker to create
+    /// topics it does not have, i.e. `allow.auto.create.topics`.
+    ///
+    /// Only ever set on requests that name topics; an all-topics refresh has
+    /// nothing to create. The broker must also have
+    /// `auto.create.topics.enable=true` for the flag to do anything.
+    auto_create_topics: bool,
 }
 
 impl ClusterMetadata {
@@ -622,6 +778,11 @@ impl ClusterMetadata {
             // want the old unbounded behaviour can opt out via
             // `with_topic_cache_ttl_disabled()`.
             topic_cache_ttl: Some(Duration::from_secs(300)),
+            topic_usage: TopicUsageTracker::new(),
+            // Off by default. Creating cluster state as a side effect of a
+            // typo'd topic name is not a default worth having; see
+            // `with_auto_create_topics` for the full reasoning.
+            auto_create_topics: false,
         }
     }
 
@@ -659,10 +820,18 @@ impl ClusterMetadata {
         self
     }
 
-    /// Set the topic cache TTL for partial refreshes.
+    /// Set the topic cache TTL for partial refreshes, i.e.
+    /// `metadata.max.idle.ms`.
     ///
-    /// During partial refreshes, cached topics that have not been refreshed
-    /// within this duration are evicted to prevent unbounded cache growth.
+    /// During partial refreshes, cached topics that have been **idle** for
+    /// longer than this duration are evicted to prevent unbounded cache
+    /// growth. A topic is idle when nothing has addressed it: producing to it,
+    /// resolving its leader, asking for its partition count, or naming it in a
+    /// metadata refresh all reset the timer, exactly as `ProducerMetadata.add`
+    /// does in the Java client. A topic that is still being *refreshed* also
+    /// survives, so an entry can never be dropped while its metadata is
+    /// current.
+    ///
     /// Full refreshes always rebuild from scratch regardless of this setting.
     ///
     /// Default: 5 minutes (matching Java's `metadata.max.idle.ms`).
@@ -681,6 +850,25 @@ impl ClusterMetadata {
     #[must_use]
     pub fn with_topic_cache_ttl_disabled(mut self) -> Self {
         self.topic_cache_ttl = None;
+        self
+    }
+
+    /// Allow the broker to create a topic this client asks about but the
+    /// cluster does not have, i.e. `allow.auto.create.topics`.
+    ///
+    /// The flag rides on topic-specific metadata requests only; an all-topics
+    /// refresh has nothing to create. The broker must additionally be
+    /// configured with `auto.create.topics.enable=true`, which is where the
+    /// decision ultimately sits.
+    ///
+    /// Defaults to `false`, unlike the Java client, which asks for
+    /// auto-creation on the producer and defaults the consumer to `true`. A
+    /// typo'd topic name that silently materialises a real topic reports
+    /// nothing until the traffic is found missing from the topic it was meant
+    /// for. Turn it on for development and test clusters.
+    #[must_use]
+    pub fn with_auto_create_topics(mut self, allow: bool) -> Self {
+        self.auto_create_topics = allow;
         self
     }
 
@@ -922,6 +1110,14 @@ impl ClusterMetadata {
         topics: Option<&[&str]>,
         force: bool,
     ) -> Result<RefreshOutcome> {
+        // Asking for a topic *is* using it. Registering the interest here — the
+        // single funnel every refresh entry point passes through — is what
+        // keeps a topic that is only ever reached via an explicit refresh
+        // (consumer assignment, leader lookup) from being evicted as idle.
+        if let Some(names) = topics {
+            self.touch_topics(names);
+        }
+
         // Coalesce concurrent calls without holding a mutex across network I/O.
         //
         // First, we atomically claim the "refresher" role, subscribe to a
@@ -1152,9 +1348,17 @@ impl ClusterMetadata {
                     crate::protocol::versions::METADATA_MIN
                 });
 
-            // Build and send metadata request
+            // Build and send metadata request.
+            //
+            // `allow_auto_topic_creation` rides only on the topic-specific
+            // form: an all-topics request names nothing the broker could
+            // create, and setting the flag there would be meaningless at best.
             let request = match topics {
-                Some(t) => MetadataRequest::for_topics(t.to_vec()),
+                Some(t) => {
+                    let mut request = MetadataRequest::for_topics(t.to_vec());
+                    request.allow_auto_topic_creation = self.auto_create_topics;
+                    request
+                }
                 None => MetadataRequest::all_topics(),
             };
 
@@ -1488,17 +1692,33 @@ impl ClusterMetadata {
 
         // Full refresh: response is authoritative — start empty.
         // Partial refresh: delta-merge into existing topics and topic_ids,
-        // optionally evicting entries older than `topic_cache_ttl`.
+        // evicting entries that have gone idle for longer than
+        // `topic_cache_ttl`.
+        //
+        // Idleness, not refresh recency, is the eviction rule (Java's
+        // `metadata.max.idle.ms`). A partial refresh names one topic, so
+        // evicting on the stamp it leaves would drop every *other* topic the
+        // client is actively producing to.
+        //
+        // An entry also survives while its metadata is still current
+        // (`topic_last_refreshed` within the TTL), so it can never be evicted
+        // inside the window it was fetched in — covering any caller that
+        // reaches the cache without going through a usage-tracking accessor.
         let mut topics = if full_refresh {
             AHashMap::new()
         } else if let Some(ttl) = self.topic_cache_ttl {
+            let active = self
+                .topic_usage
+                .active_among(ttl, old.topics.keys().map(String::as_str));
             let retained: AHashMap<_, _> = old
                 .topics
                 .iter()
                 .filter(|(name, _)| {
-                    old.topic_last_refreshed
-                        .get(*name)
-                        .is_some_and(|ts| now.duration_since(*ts) <= ttl)
+                    active.contains(name.as_str())
+                        || old
+                            .topic_last_refreshed
+                            .get(*name)
+                            .is_some_and(|ts| now.duration_since(*ts) <= ttl)
                 })
                 .map(|(k, v)| (k.clone(), Arc::clone(v)))
                 .collect();
@@ -1507,24 +1727,44 @@ impl ClusterMetadata {
                 debug!(
                     evicted,
                     ttl_secs = ttl.as_secs(),
-                    "evicted stale topics from metadata cache"
+                    "evicted idle topics from metadata cache"
                 );
             }
             retained
         } else {
             old.topics.clone()
         };
-        let mut topic_ids = if full_refresh {
+        // Keep only topic_ids whose names survived eviction. Filtering
+        // unconditionally (rather than only when a TTL is set) is what stops
+        // the UUID map outliving the topic map it indexes.
+        let mut topic_ids: AHashMap<[u8; 16], Arc<String>> = if full_refresh {
             AHashMap::new()
-        } else if self.topic_cache_ttl.is_some() {
-            // Keep only topic_ids whose names survived TTL eviction.
+        } else {
             old.topic_ids
                 .iter()
                 .filter(|(_, name)| topics.contains_key(name.as_str()))
                 .map(|(k, v)| (*k, Arc::clone(v)))
                 .collect()
+        };
+
+        // Topic-level errors the broker reported, so a caller can be told *why*
+        // a topic is missing instead of a flat "unknown topic". A full refresh
+        // is authoritative and starts empty; a partial refresh carries forward
+        // what it did not ask about, bounded by the same idleness rule that
+        // bounds the topic map itself.
+        let mut topic_errors: AHashMap<String, ErrorCode> = if full_refresh {
+            AHashMap::new()
+        } else if let Some(ttl) = self.topic_cache_ttl {
+            let active = self
+                .topic_usage
+                .active_among(ttl, old.topic_errors.keys().map(String::as_str));
+            old.topic_errors
+                .iter()
+                .filter(|(name, _)| active.contains(name.as_str()))
+                .map(|(k, v)| (k.clone(), *v))
+                .collect()
         } else {
-            old.topic_ids.clone()
+            old.topic_errors.clone()
         };
 
         // Build a reverse index (name → UUID) so we can remove the old UUID
@@ -1547,6 +1787,11 @@ impl ClusterMetadata {
             };
 
             if !topic.error_code.is_ok() {
+                // Remember the reason regardless of retriability: a caller
+                // blocked on this topic needs to distinguish "does not exist
+                // yet" from "you are not allowed to see it".
+                topic_errors.insert(topic_name.clone(), topic.error_code);
+
                 if topic.error_code.is_retriable() {
                     // Transient errors (LeaderNotAvailable, RequestTimedOut, etc.)
                     // — keep the stale cache entry so callers don't see the topic
@@ -1699,6 +1944,9 @@ impl ClusterMetadata {
                 })
                 .collect();
 
+            // The topic came back healthy: any recorded error is history.
+            topic_errors.remove(&topic_name);
+
             response_topic_names.push(topic_name.clone());
             topics.insert(
                 topic_name.clone(),
@@ -1712,29 +1960,18 @@ impl ClusterMetadata {
 
         // Build topic_last_refreshed:
         // - Full refresh: start empty; every topic comes from this response.
-        // - Partial refresh with TTL: carry forward only entries that survived
-        //   TTL eviction (with their *original* timestamps so their age is
-        //   preserved); retained topics must NOT have their clock reset.
-        // - Partial refresh without TTL: carry forward all existing entries
-        //   that are still present in the `topics` map.  Filtering against
-        //   `topics` ensures that permanently-errored topics (removed above)
-        //   don't leave orphaned entries that grow unboundedly under high
-        //   topic churn.
+        // - Partial refresh: carry forward the entries whose topic is still in
+        //   the cache, with their *original* timestamps so their age is
+        //   preserved; retained topics must NOT have their clock reset.
+        //   Filtering against `topics` is what keeps the map bounded — an
+        //   evicted or permanently-errored topic cannot leave an orphaned
+        //   timestamp behind.
         // In all cases, only topics that appear in the current response are
         // stamped with `now`; retained-from-cache topics keep their existing
-        // timestamps so TTL eviction can fire correctly on the next refresh.
+        // timestamps so per-topic staleness stays meaningful.
         let mut topic_last_refreshed = if full_refresh {
             AHashMap::with_capacity(response_topic_names.len())
-        } else if let Some(ttl) = self.topic_cache_ttl {
-            old.topic_last_refreshed
-                .iter()
-                .filter(|(name, ts)| {
-                    now.duration_since(**ts) <= ttl && topics.contains_key(name.as_str())
-                })
-                .map(|(k, v)| (k.clone(), *v))
-                .collect()
         } else {
-            // Retain only entries whose topic is still alive in the cache.
             old.topic_last_refreshed
                 .iter()
                 .filter(|(name, _)| topics.contains_key(name.as_str()))
@@ -1757,6 +1994,7 @@ impl ClusterMetadata {
             topic_ids,
             name_to_topic_id: name_to_uuid,
             topic_last_refreshed,
+            topic_errors,
             last_updated: now,
         };
 
@@ -1767,6 +2005,11 @@ impl ClusterMetadata {
         );
 
         self.cache.store(Arc::new(new_cache));
+
+        // Bound the usage tracker on the same schedule as the cache it feeds.
+        if let Some(ttl) = self.topic_cache_ttl {
+            self.topic_usage.prune(ttl);
+        }
     }
 
     /// Get broker info by ID.
@@ -1792,6 +2035,7 @@ impl ClusterMetadata {
     /// The cache stores each [`TopicInfo`] behind an `Arc`, so this is a
     /// ref-count bump regardless of how many partitions the topic has.
     pub fn topic_arc(&self, name: &str) -> Option<Arc<TopicInfo>> {
+        self.touch_topic(name);
         self.cache.load().topics.get(name).map(Arc::clone)
     }
 
@@ -1801,11 +2045,16 @@ impl ClusterMetadata {
     /// includes a `topic_id`. Returns `None` if the UUID is unknown — the
     /// caller should trigger a metadata refresh and retry.
     pub fn topic_name_for_id(&self, topic_id: &[u8; 16]) -> Option<String> {
-        self.cache
+        let name = self
+            .cache
             .load()
             .topic_ids
             .get(topic_id)
-            .map(|name| (**name).clone())
+            .map(|name| (**name).clone());
+        if let Some(name) = name.as_deref() {
+            self.touch_topic(name);
+        }
+        name
     }
 
     /// Resolve a topic name to its 16-byte UUID.
@@ -1814,6 +2063,7 @@ impl ClusterMetadata {
     /// if the topic is unknown or the broker did not return a topic ID — the
     /// caller should trigger a metadata refresh and retry.
     pub fn topic_id_for_name(&self, name: &str) -> Option<[u8; 16]> {
+        self.touch_topic(name);
         self.cache.load().name_to_topic_id.get(name).copied()
     }
 
@@ -1837,6 +2087,7 @@ impl ClusterMetadata {
 
     /// Get the leader for a topic partition.
     pub fn leader(&self, topic: &str, partition: PartitionId) -> Option<BrokerId> {
+        self.touch_topic(topic);
         self.cache
             .load()
             .topics
@@ -1849,6 +2100,7 @@ impl ClusterMetadata {
     /// The leader epoch is used for fencing stale reads after leadership changes.
     /// Returns None if the topic/partition is not found in metadata.
     pub fn leader_epoch(&self, topic: &str, partition: PartitionId) -> Option<i32> {
+        self.touch_topic(topic);
         self.cache
             .load()
             .topics
@@ -1904,6 +2156,8 @@ impl ClusterMetadata {
         if leader_id < 0 {
             return false;
         }
+        // A leader report is a live routing decision for this topic.
+        self.touch_topic(topic);
 
         let mut changed = false;
         self.cache.rcu(|current| {
@@ -1986,6 +2240,8 @@ impl ClusterMetadata {
         topic: &str,
         partition: PartitionId,
     ) -> Result<Arc<BrokerConnection>> {
+        self.touch_topic(topic);
+
         // Resolve the leader address, refreshing at most once if this topic's
         // entry is missing or stale. Everything needed for the dial is copied
         // out so no `ArcSwap` guard is held across an `.await`.
@@ -2117,13 +2373,160 @@ impl ClusterMetadata {
         self.cache.load().is_stale(self.max_age)
     }
 
-    /// Get partition count for a topic.
+    /// Get partition count for a topic from the cache, without fetching.
+    ///
+    /// Returns `None` when the topic is not cached. Callers that need the
+    /// count in order to make progress should use
+    /// [`ensure_partition_count`](Self::ensure_partition_count), which fetches
+    /// on a miss instead of reporting the topic as unknown.
     pub fn partition_count(&self, topic: &str) -> Option<usize> {
+        self.touch_topic(topic);
         self.cache
             .load()
             .topics
             .get(topic)
             .map(|t| t.partition_count())
+    }
+
+    /// Resolve the partition count for `topic`, fetching metadata for it when
+    /// the cache does not have it.
+    ///
+    /// The client's equivalent of `KafkaProducer.waitOnMetadata`. A cache miss
+    /// is not evidence that a topic does not exist: it may never have been
+    /// fetched, it may have been evicted as idle, or it may be in the middle of
+    /// being created.
+    ///
+    /// The call retries until `max_wait` elapses, so a topic that is still
+    /// being created (`UNKNOWN_TOPIC_OR_PARTITION`, `LEADER_NOT_AVAILABLE`)
+    /// resolves as soon as the cluster settles. Fatal topic errors —
+    /// `TOPIC_AUTHORIZATION_FAILED`, `INVALID_TOPIC_EXCEPTION` — are returned
+    /// immediately rather than retried into a timeout, matching
+    /// `Metadata.maybeThrowExceptionForTopic`.
+    ///
+    /// # Errors
+    ///
+    /// - [`KrafkaError::Broker`] with the code the broker reported for the
+    ///   topic, when the broker gave a reason.
+    /// - [`KrafkaError::Timeout`] when `max_wait` elapses with no answer.
+    /// - The underlying refresh error when it is not retriable.
+    pub async fn ensure_partition_count(&self, topic: &str, max_wait: Duration) -> Result<usize> {
+        // A topic with zero partitions is not usable and not final either: it
+        // is what a topic mid-creation looks like. Treat it exactly like a
+        // miss and keep waiting rather than handing a partitioner a modulus of
+        // zero.
+        //
+        // `partition_count` records the usage, which is what keeps this topic
+        // from being evicted again while the fetch is in flight.
+        if let Some(count) = self.partition_count(topic).filter(|count| *count > 0) {
+            return Ok(count);
+        }
+
+        let deadline = Instant::now() + max_wait;
+        // Between attempts, wait at least as long as the metadata rate limiter
+        // would: with rate limiting disabled there is otherwise nothing to stop
+        // a missing topic from turning into a refresh storm.
+        let attempt_spacing = self
+            .retry_backoff
+            .as_ref()
+            .map_or(DEFAULT_RETRY_BACKOFF, |policy| policy.initial_backoff);
+
+        loop {
+            // Forced: the ordinary age gate reports `AlreadyFresh` for a topic
+            // that is cached but unusable (present with no partitions, as a
+            // topic mid-creation is), and this loop exists precisely to make
+            // progress on such a topic. The rate limiter still governs it, so
+            // a burst of sends to one missing topic collapses into one request
+            // per backoff interval.
+            match self
+                .refresh_for_topics_outcome_inner(Some(&[topic]), true)
+                .await
+            {
+                Ok(RefreshOutcome::RateLimited(remaining)) => {
+                    // Another caller refreshed very recently. Wait out its
+                    // backoff rather than counting this as an attempt.
+                    let wait = remaining.min(deadline.saturating_duration_since(Instant::now()));
+                    if wait.is_zero() {
+                        break;
+                    }
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+                Ok(_) => {
+                    if let Some(count) = self.partition_count(topic).filter(|count| *count > 0) {
+                        return Ok(count);
+                    }
+                }
+                Err(e) => {
+                    if !e.is_retriable() {
+                        return Err(e);
+                    }
+                    debug!(
+                        topic,
+                        error = %e,
+                        "metadata refresh for unknown topic failed; retrying within max_wait"
+                    );
+                }
+            }
+
+            // A fatal topic error will not resolve by waiting.
+            if let Some(code) = self.topic_error(topic)
+                && !code.is_retriable()
+            {
+                return Err(KrafkaError::broker(
+                    code,
+                    format!("metadata for topic {topic} was rejected by the broker"),
+                ));
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            tokio::time::sleep(attempt_spacing.min(remaining)).await;
+        }
+
+        Err(match self.topic_error(topic) {
+            Some(code) => KrafkaError::broker(
+                code,
+                format!(
+                    "topic {topic} is still not present in cluster metadata after {} ms",
+                    max_wait.as_millis()
+                ),
+            ),
+            None => KrafkaError::timeout(format!(
+                "topic {topic} is not present in cluster metadata after {} ms",
+                max_wait.as_millis()
+            )),
+        })
+    }
+
+    /// The topic-level error the broker last reported for `topic`, if any.
+    ///
+    /// Mirrors `Metadata.getError(topic)` in the Java client. Cleared as soon
+    /// as the topic comes back healthy.
+    pub fn topic_error(&self, topic: &str) -> Option<ErrorCode> {
+        self.cache.load().topic_errors.get(topic).copied()
+    }
+
+    /// Mark `topic` as in use, resetting its idle timer.
+    ///
+    /// Every accessor that resolves a topic does this already; call it
+    /// directly only to keep a topic warm that is addressed through some other
+    /// route. No-op when TTL eviction is disabled, since nothing then consults
+    /// the idle timer.
+    pub fn touch_topic(&self, topic: &str) {
+        if let Some(ttl) = self.topic_cache_ttl {
+            self.topic_usage.touch(topic, ttl);
+        }
+    }
+
+    /// Mark several topics as in use. See [`touch_topic`](Self::touch_topic).
+    pub fn touch_topics(&self, topics: &[&str]) {
+        if let Some(ttl) = self.topic_cache_ttl {
+            for topic in topics {
+                self.topic_usage.touch(topic, ttl);
+            }
+        }
     }
 }
 
@@ -2427,6 +2830,244 @@ mod tests {
         )
         .with_topic_cache_ttl_disabled();
         assert_eq!(meta.topic_cache_ttl, None);
+    }
+
+    /// A metadata response listing `topic_names`, each with one healthy
+    /// partition on broker 1.
+    fn ok_topics_response(topic_names: &[&str]) -> MetadataResponse {
+        use crate::protocol::{MetadataBroker, MetadataPartitionResponse, MetadataTopicResponse};
+        MetadataResponse {
+            throttle_time_ms: 0,
+            brokers: vec![MetadataBroker {
+                node_id: 1,
+                host: "localhost".to_string(),
+                port: 9092,
+                rack: None,
+            }],
+            cluster_id: None,
+            controller_id: 1,
+            error_code: ErrorCode::None,
+            topics: topic_names
+                .iter()
+                .map(|name| MetadataTopicResponse {
+                    error_code: ErrorCode::None,
+                    name: Some((*name).to_string()),
+                    topic_id: None,
+                    is_internal: false,
+                    partitions: vec![MetadataPartitionResponse {
+                        error_code: ErrorCode::None,
+                        partition_index: 0,
+                        leader_id: 1,
+                        leader_epoch: 0,
+                        replica_nodes: vec![1],
+                        isr_nodes: vec![1],
+                        offline_replicas: vec![],
+                    }],
+                })
+                .collect(),
+        }
+    }
+
+    fn ttl_metadata(ttl: Duration) -> ClusterMetadata {
+        let pool = Arc::new(ConnectionPool::new(
+            crate::network::ConnectionConfig::default(),
+        ));
+        ClusterMetadata::new(
+            vec!["localhost:9092".to_string()],
+            pool,
+            Duration::from_secs(300),
+        )
+        .with_topic_cache_ttl(ttl)
+    }
+
+    /// The bug this whole mechanism exists to fix.
+    ///
+    /// A partial refresh names one topic, so only that topic gets a fresh
+    /// `topic_last_refreshed` stamp. Evicting on that stamp threw away a topic
+    /// that the client was actively producing to, purely because some *other*
+    /// topic happened to be the one that needed refreshing — and the next send
+    /// to it then failed as `unknown topic` for a topic that plainly exists.
+    ///
+    /// Eviction is an idleness rule: a topic in use stays.
+    #[test]
+    fn test_a_topic_in_use_survives_a_partial_refresh_that_does_not_name_it() {
+        let meta = ttl_metadata(Duration::from_millis(50));
+
+        meta.update_cache(ok_topics_response(&["topic-a", "topic-b"]), true);
+        // Both entries age past the TTL, so refresh recency can no longer save
+        // either of them.
+        std::thread::sleep(Duration::from_millis(80));
+
+        // ... but the client is still producing to topic-b.
+        meta.touch_topic("topic-b");
+        meta.update_cache(ok_topics_response(&["topic-a"]), false);
+
+        let cache = meta.cache.load();
+        assert!(
+            cache.topics.contains_key("topic-a"),
+            "topic-a was in the response and must be cached"
+        );
+        assert!(
+            cache.topics.contains_key("topic-b"),
+            "topic-b is in active use and must not be evicted by a refresh for topic-a"
+        );
+    }
+
+    /// The other half of the rule: idleness really does evict, so the cache
+    /// stays bounded under topic churn.
+    #[test]
+    fn test_an_idle_topic_is_evicted_by_a_partial_refresh() {
+        let meta = ttl_metadata(Duration::from_millis(50));
+
+        meta.update_cache(ok_topics_response(&["topic-a", "topic-b"]), true);
+        meta.touch_topic("topic-b");
+        std::thread::sleep(Duration::from_millis(80));
+
+        meta.update_cache(ok_topics_response(&["topic-a"]), false);
+
+        let cache = meta.cache.load();
+        assert!(cache.topics.contains_key("topic-a"));
+        assert!(
+            !cache.topics.contains_key("topic-b"),
+            "a topic idle for longer than the TTL must be evicted"
+        );
+    }
+
+    /// A topic fetched moments ago is never evicted, even if nothing has gone
+    /// through a usage-tracking accessor yet. This is the belt to the
+    /// idleness braces: no caller can lose an entry inside the window in which
+    /// it was fetched.
+    #[test]
+    fn test_a_freshly_refreshed_topic_is_not_evicted_before_it_is_used() {
+        let meta = ttl_metadata(Duration::from_secs(60));
+
+        meta.update_cache(ok_topics_response(&["topic-a", "topic-b"]), true);
+        meta.update_cache(ok_topics_response(&["topic-a"]), false);
+
+        assert!(
+            meta.cache.load().topics.contains_key("topic-b"),
+            "a topic refreshed within the TTL must survive even with no recorded use"
+        );
+    }
+
+    /// Usage is recorded by the ordinary read accessors, so a caller that only
+    /// ever asks for partition counts or leaders keeps its topics warm without
+    /// knowing the tracker exists.
+    #[test]
+    fn test_read_accessors_record_topic_usage() {
+        let meta = ttl_metadata(Duration::from_secs(60));
+        meta.update_cache(ok_topics_response(&["topic-a", "topic-b"]), true);
+
+        assert!(
+            meta.topic_usage.idle_for("topic-a").is_none(),
+            "a refresh alone is not a use"
+        );
+
+        assert_eq!(meta.partition_count("topic-a"), Some(1));
+        assert!(meta.topic_usage.idle_for("topic-a").is_some());
+
+        assert!(meta.leader("topic-b", 0).is_some());
+        assert!(meta.topic_usage.idle_for("topic-b").is_some());
+    }
+
+    /// With TTL eviction disabled there is nothing to feed, so nothing is
+    /// tracked and the tracker cannot itself become the leak.
+    #[test]
+    fn test_usage_is_not_tracked_when_ttl_eviction_is_disabled() {
+        let pool = Arc::new(ConnectionPool::new(
+            crate::network::ConnectionConfig::default(),
+        ));
+        let meta = ClusterMetadata::new(
+            vec!["localhost:9092".to_string()],
+            pool,
+            Duration::from_secs(300),
+        )
+        .with_topic_cache_ttl_disabled();
+
+        meta.touch_topic("topic-a");
+        assert_eq!(meta.topic_usage.tracked_len(), 0);
+    }
+
+    /// The usage map is pruned on every refresh and hard-capped, so a client
+    /// that addresses an unbounded stream of distinct topics cannot grow it
+    /// without limit.
+    #[test]
+    fn test_usage_tracking_is_bounded() {
+        let meta = ttl_metadata(Duration::from_millis(10));
+
+        for i in 0..(MAX_TRACKED_TOPIC_USAGE + 50) {
+            meta.touch_topic(&format!("topic-{i}"));
+        }
+        assert!(
+            meta.topic_usage.tracked_len() <= MAX_TRACKED_TOPIC_USAGE,
+            "the usage map must respect its hard cap"
+        );
+
+        std::thread::sleep(Duration::from_millis(30));
+        meta.update_cache(ok_topics_response(&["topic-a"]), false);
+        assert_eq!(
+            meta.topic_usage.tracked_len(),
+            0,
+            "entries idle beyond the TTL are pruned on refresh"
+        );
+    }
+
+    /// A topic error is remembered with its code, so a caller learns *why* a
+    /// topic is unusable instead of a flat "unknown topic" — and forgotten as
+    /// soon as the topic comes back healthy.
+    #[test]
+    fn test_topic_errors_are_recorded_and_cleared() {
+        use crate::protocol::{MetadataBroker, MetadataTopicResponse};
+
+        fn errored(topic: &str, code: ErrorCode) -> MetadataResponse {
+            MetadataResponse {
+                throttle_time_ms: 0,
+                brokers: vec![MetadataBroker {
+                    node_id: 1,
+                    host: "localhost".to_string(),
+                    port: 9092,
+                    rack: None,
+                }],
+                cluster_id: None,
+                controller_id: 1,
+                error_code: ErrorCode::None,
+                topics: vec![MetadataTopicResponse {
+                    error_code: code,
+                    name: Some(topic.to_string()),
+                    topic_id: None,
+                    is_internal: false,
+                    partitions: vec![],
+                }],
+            }
+        }
+
+        let meta = ttl_metadata(Duration::from_secs(60));
+
+        meta.update_cache(
+            errored("secret", ErrorCode::TopicAuthorizationFailed),
+            false,
+        );
+        assert_eq!(
+            meta.topic_error("secret"),
+            Some(ErrorCode::TopicAuthorizationFailed)
+        );
+
+        meta.update_cache(
+            errored("missing", ErrorCode::UnknownTopicOrPartition),
+            false,
+        );
+        assert_eq!(
+            meta.topic_error("missing"),
+            Some(ErrorCode::UnknownTopicOrPartition),
+            "a retriable topic error is recorded too: it is the reason a caller is waiting"
+        );
+
+        meta.update_cache(ok_topics_response(&["missing"]), false);
+        assert_eq!(
+            meta.topic_error("missing"),
+            None,
+            "a topic that comes back healthy has no outstanding error"
+        );
     }
 
     /// Regression test: a partial refresh must not reset `topic_last_refreshed`

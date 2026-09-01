@@ -4178,10 +4178,339 @@ async fn producer_with(
         .bootstrap_servers(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        // A send to a topic the cluster does not have now retries the metadata
+        // fetch for the whole `max_block` budget before giving up, so these
+        // tests would otherwise sit out the 60 s default.
+        .max_block(SHORT_MAX_BLOCK)
         .add_interceptor(std::sync::Arc::clone(interceptor) as std::sync::Arc<_>)
         .build()
         .await
         .expect("producer should connect")
+}
+
+/// Long enough for a metadata round trip against the in-process fake broker,
+/// short enough that a deliberately unroutable record fails fast.
+const SHORT_MAX_BLOCK: Duration = Duration::from_secs(2);
+
+/// Regression: a topic-specific metadata refresh for one topic must not make a
+/// *different* topic permanently unsendable.
+///
+/// Both topics exist in the cluster and both have been produced to. A refresh
+/// naming only `topic-a` used to evict `topic-b` — the TTL was keyed off the
+/// last *refresh* of an entry, and a partial refresh stamps only the topic it
+/// asked about — after which every send to `topic-b` failed with
+/// `unknown topic: topic-b` for the remaining life of the producer, because
+/// nothing on the send path ever asked the broker again.
+#[tokio::test]
+async fn a_partial_refresh_for_one_topic_does_not_strand_another() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("topic-a", 1);
+    broker.create_topic("topic-b", 1);
+
+    // Short ages reproduce the five-minute defaults without a five-minute test.
+    let producer = Producer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .max_block(SHORT_MAX_BLOCK)
+        .metadata_max_age(Duration::from_millis(50))
+        .metadata_topic_cache_ttl(Duration::from_millis(50))
+        .build()
+        .await
+        .expect("producer should connect");
+
+    let _ = producer
+        .send("topic-a", None, Some(b"warm-a"))
+        .await
+        .expect("warm a");
+    let _ = producer
+        .send("topic-b", None, Some(b"warm-b"))
+        .await
+        .expect("warm b");
+
+    // Both entries age past `metadata_max_age` and past the cache TTL.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    // Routing this record refreshes metadata for `topic-a` alone.
+    let _ = producer
+        .send("topic-a", None, Some(b"refresh-a"))
+        .await
+        .expect("a stale topic refreshes itself");
+
+    let _ = producer
+        .send("topic-b", None, Some(b"after-refresh"))
+        .await
+        .expect("a topic that exists must stay sendable after an unrelated refresh");
+
+    producer.close().await;
+}
+
+/// A topic that is still being produced to survives partial refreshes for a
+/// different topic, and does so *without* a metadata round trip of its own:
+/// idleness, not refresh recency, is what expires an entry.
+///
+/// `metadata_max_age` is long here on purpose, so nothing refreshes "hot"
+/// after the initial full fetch. Its only defence against eviction is that it
+/// is in use.
+#[tokio::test]
+async fn a_topic_in_active_use_is_not_evicted_by_an_unrelated_refresh() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("hot", 1);
+    broker.create_topic("cold", 1);
+
+    let producer = Producer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .max_block(SHORT_MAX_BLOCK)
+        .metadata_max_age(Duration::from_secs(30))
+        .metadata_topic_cache_ttl(Duration::from_millis(400))
+        .build()
+        .await
+        .expect("producer should connect");
+
+    for _ in 0..6 {
+        let _ = producer
+            .send("hot", None, Some(b"v"))
+            .await
+            .expect("hot send");
+        // A partial refresh naming only "cold" — the eviction pass that used
+        // to drop "hot" because "hot" was not in the response.
+        producer
+            .metadata()
+            .refresh_for_topics_forced(Some(&["cold"]))
+            .await
+            .expect("partial refresh");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+    }
+
+    // The loop runs well past the 400 ms TTL, so "hot" long ago stopped being
+    // "recently refreshed". Only its continued use keeps it in the cache.
+    assert!(
+        producer.metadata().partition_count("hot").is_some(),
+        "a topic still being produced to must never be evicted as idle"
+    );
+
+    producer.close().await;
+}
+
+/// A group-less `subscribe()` used to resolve its partitions exactly once, so
+/// a topic created afterwards was never consumed and no error ever said so.
+/// `poll()` now re-derives the assignment from metadata.
+#[tokio::test]
+async fn a_standalone_subscription_picks_up_a_topic_created_later() {
+    let broker = FakeBroker::start().await.unwrap();
+
+    let consumer = crate::consumer::Consumer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .auto_offset_reset(crate::consumer::AutoOffsetReset::Earliest)
+        .build()
+        .await
+        .expect("consumer should connect");
+
+    // The topic does not exist yet: subscribing succeeds and assigns nothing.
+    consumer
+        .subscribe(&["appears-later"])
+        .await
+        .expect("subscribe should not fail on an absent topic");
+    assert!(
+        consumer.assignment().await.is_empty(),
+        "nothing to assign while the topic does not exist"
+    );
+
+    broker.create_topic("appears-later", 2);
+
+    // An unresolved topic is retried on every poll rather than waiting out
+    // `metadata_max_age`, so a couple of polls is all it takes.
+    let mut assignment = consumer.assignment().await;
+    for _ in 0..40 {
+        let _ = consumer.poll(Duration::from_millis(50)).await;
+        assignment = consumer.assignment().await;
+        if !assignment.is_empty() {
+            break;
+        }
+        // A poll with nothing assigned returns immediately, so pace the loop
+        // past the metadata layer's refresh rate limiter.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    assert_eq!(
+        assignment.get("appears-later").map(Vec::len),
+        Some(2),
+        "both partitions of the newly created topic must be assigned, got {assignment:?}"
+    );
+
+    consumer.close().await.expect("close");
+}
+
+/// Partitions added to a subscribed topic are picked up too — the same loop,
+/// and the case that silently dropped a share of the traffic on a topic that
+/// was scaled up under a running consumer.
+#[tokio::test]
+async fn a_standalone_subscription_picks_up_new_partitions() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("grows", 1);
+
+    let consumer = crate::consumer::Consumer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .auto_offset_reset(crate::consumer::AutoOffsetReset::Earliest)
+        // Short, so the "everything already resolves" cadence fires quickly.
+        .metadata_max_age(Duration::from_millis(50))
+        .build()
+        .await
+        .expect("consumer should connect");
+
+    consumer.subscribe(&["grows"]).await.expect("subscribe");
+    assert_eq!(consumer.assignment().await["grows"].len(), 1);
+
+    assert_eq!(broker.add_partitions("grows", 4), 3);
+
+    let mut assigned = 1;
+    for _ in 0..40 {
+        let _ = consumer.poll(Duration::from_millis(50)).await;
+        assigned = consumer.assignment().await.get("grows").map_or(0, Vec::len);
+        if assigned == 4 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        assigned, 4,
+        "partitions added to a subscribed topic must be assigned"
+    );
+
+    consumer.close().await.expect("close");
+}
+
+/// `assign()` takes a topic over from the metadata-driven resolver. Without
+/// that, the next poll would widen a deliberately narrow manual assignment
+/// back to every partition of the topic.
+#[tokio::test]
+async fn assign_overrides_a_standalone_subscription_for_that_topic() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("narrow", 4);
+
+    let consumer = crate::consumer::Consumer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .auto_offset_reset(crate::consumer::AutoOffsetReset::Earliest)
+        .metadata_max_age(Duration::from_millis(50))
+        .build()
+        .await
+        .expect("consumer should connect");
+
+    consumer.subscribe(&["narrow"]).await.expect("subscribe");
+    assert_eq!(consumer.assignment().await["narrow"].len(), 4);
+
+    consumer.assign("narrow", vec![0]).await.expect("assign");
+
+    for _ in 0..5 {
+        let _ = consumer.poll(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            consumer.assignment().await["narrow"],
+            vec![0],
+            "a manual assign() must not be widened by the standalone resolver"
+        );
+    }
+
+    consumer.close().await.expect("close");
+}
+
+/// `allow.auto.create.topics` reaches the wire, and the broker acts on it: a
+/// send to a topic that does not exist yet succeeds because the metadata
+/// request asked for it to be created.
+#[tokio::test]
+async fn auto_create_topics_lets_a_send_materialise_its_topic() {
+    let broker = FakeBroker::start().await.unwrap();
+    // Deliberately no `create_topic`.
+
+    let producer = Producer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .max_block(SHORT_MAX_BLOCK)
+        .allow_auto_create_topics(true)
+        .build()
+        .await
+        .expect("producer should connect");
+
+    let metadata = producer
+        .send("created-on-demand", None, Some(b"v"))
+        .await
+        .expect("the broker creates the topic because the client asked it to");
+    assert_eq!(metadata.topic, "created-on-demand");
+
+    producer.close().await;
+}
+
+/// The default is off, so the same send fails rather than quietly bringing a
+/// topic into existence.
+#[tokio::test]
+async fn auto_create_topics_is_off_by_default() {
+    let broker = FakeBroker::start().await.unwrap();
+
+    let producer = Producer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .max_block(SHORT_MAX_BLOCK)
+        .build()
+        .await
+        .expect("producer should connect");
+
+    let error = producer
+        .send("not-created-on-demand", None, Some(b"v"))
+        .await
+        .expect_err("a typo must not materialise a topic");
+    assert!(
+        matches!(
+            error,
+            crate::error::KrafkaError::Broker {
+                code: ErrorCode::UnknownTopicOrPartition,
+                ..
+            }
+        ),
+        "expected the broker's own topic error, got: {error}"
+    );
+
+    producer.close().await;
+}
+
+/// A record addressed to a partition the topic does not have is rejected at
+/// `send()`, where the caller can see it, rather than being accepted and then
+/// failing as an unroutable batch.
+#[tokio::test]
+async fn an_out_of_range_partition_is_rejected_at_send() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("events", 2);
+
+    let producer = Producer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .max_block(SHORT_MAX_BLOCK)
+        .build()
+        .await
+        .expect("producer should connect");
+
+    let error = producer
+        .send_record(
+            crate::producer::ProducerRecord::new("events", b"v".to_vec()).with_partition(7),
+        )
+        .await
+        .expect_err("partition 7 does not exist on a 2-partition topic");
+    assert!(
+        error.to_string().contains("not in the range [0, 2)"),
+        "the error must name the valid range, got: {error}"
+    );
+
+    producer.close().await;
 }
 
 /// The whole point of `RecordContext`: what `on_send` parks comes back to
@@ -4355,7 +4684,22 @@ async fn a_record_for_an_unknown_topic_still_reaches_on_acknowledgement() {
         .send("no-such-topic", None, Some(b"v"))
         .await
         .expect_err("an unrouteable record must be rejected");
-    assert!(error.to_string().contains("unknown topic"));
+    // The broker said why, and that reason survives to the caller instead of a
+    // flat "unknown topic" that could equally have meant an evicted cache entry.
+    assert!(
+        matches!(
+            error,
+            crate::error::KrafkaError::Broker {
+                code: ErrorCode::UnknownTopicOrPartition,
+                ..
+            }
+        ),
+        "expected the broker's own topic error, got: {error}"
+    );
+    assert!(
+        error.to_string().contains("no-such-topic"),
+        "the error must name the topic, got: {error}"
+    );
 
     let acks = interceptor.acks();
     assert_eq!(acks.len(), 1, "the rejected record still owes a callback");
@@ -4366,6 +4710,112 @@ async fn a_record_for_an_unknown_topic_still_reaches_on_acknowledgement() {
         acks[0].delivery,
         crate::producer::DeliveryConfirmation::Failed
     );
+}
+
+/// `send()` is an ordinary future, so a caller may drop it —
+/// `tokio::time::timeout` is the obvious way. A record whose future was dropped
+/// mid-flight will never be delivered, so it still owes its terminal callback:
+/// the interceptor has to get its `RecordContext` back.
+///
+/// Negative control: with the obligation's `Drop` not reporting, the recorder
+/// is empty; with `Drop` treating cancellation as a krafka bug, the
+/// `debug_assert` fires and this panics.
+#[tokio::test]
+async fn a_cancelled_send_still_reaches_on_acknowledgement() {
+    let broker = FakeBroker::start().await.unwrap();
+    let interceptor = std::sync::Arc::new(RecordingInterceptor::default());
+
+    let producer = Producer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        // Long enough that the metadata retry loop is still running when the
+        // timeout below fires, so the send is cancelled rather than rejected.
+        .max_block(Duration::from_secs(30))
+        .add_interceptor(std::sync::Arc::clone(&interceptor) as std::sync::Arc<_>)
+        .build()
+        .await
+        .expect("producer should connect");
+
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(200),
+        producer.send("no-such-topic", None, Some(b"v")),
+    )
+    .await;
+    assert!(cancelled.is_err(), "the send must still be in flight");
+
+    {
+        let acks = interceptor.acks();
+        assert_eq!(
+            acks.len(),
+            1,
+            "a cancelled record still owes an acknowledgement"
+        );
+        assert_eq!(acks[0].token.as_deref(), Some("no-such-topic#0"));
+        assert!(acks[0].failed);
+        assert_eq!(acks[0].partition, crate::producer::UNKNOWN_PARTITION);
+        assert_eq!(
+            acks[0].delivery,
+            crate::producer::DeliveryConfirmation::Failed
+        );
+    }
+
+    producer.close().await;
+}
+
+/// The same guarantee across the *other* long await: the wait for buffer
+/// memory. The record has been routed by then and its context is on its way to
+/// the accumulator, so a cancellation here used to drop it inside the
+/// abandoned future with nothing to notice.
+#[tokio::test]
+async fn a_send_cancelled_waiting_for_buffer_memory_still_acknowledges() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("events", 1);
+    let interceptor = std::sync::Arc::new(RecordingInterceptor::default());
+
+    let producer = Producer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        // A budget that one record fills, so the second has to wait for it.
+        .buffer_memory(256)
+        .batch_size(256)
+        // Long enough that the first record stays buffered, holding its permit.
+        .linger(Duration::from_secs(30))
+        .max_block(Duration::from_secs(30))
+        .add_interceptor(std::sync::Arc::clone(&interceptor) as std::sync::Arc<_>)
+        .build()
+        .await
+        .expect("producer should connect");
+
+    let first = producer
+        .enqueue(crate::producer::ProducerRecord::new("events", vec![0u8; 100]).with_partition(0))
+        .await
+        .expect("the first record fits");
+
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(200),
+        producer.enqueue(
+            crate::producer::ProducerRecord::new("events", vec![1u8; 100]).with_partition(0),
+        ),
+    )
+    .await;
+    assert!(
+        cancelled.is_err(),
+        "the second record must still be waiting for memory"
+    );
+
+    {
+        let acks = interceptor.acks();
+        let cancelled_ack = acks
+            .iter()
+            .find(|a| a.token.as_deref() == Some("events#1"))
+            .expect("the cancelled record still owes an acknowledgement");
+        assert!(cancelled_ack.failed);
+    }
+
+    drop(first);
+    producer.close().await;
 }
 
 /// A batch rejected as too large is halved and both halves resubmitted. The
@@ -4450,6 +4900,7 @@ async fn the_transactional_send_path_pairs_on_send_with_on_acknowledgement() {
         .transactional_id("txn-interceptor")
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .max_block(SHORT_MAX_BLOCK)
         .add_interceptor(std::sync::Arc::clone(&interceptor) as std::sync::Arc<_>)
         .build()
         .await

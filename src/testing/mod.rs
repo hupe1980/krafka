@@ -511,6 +511,16 @@ impl FakeBroker {
         self.shared.cluster.lock().create_topic(name, partitions)
     }
 
+    /// Grow an existing topic to `partitions` partitions, as a
+    /// `CreatePartitions` admin call would.
+    ///
+    /// Returns the number of partitions added; `0` if the topic does not exist
+    /// or already has at least that many. Kafka never removes partitions, and
+    /// neither does this.
+    pub fn add_partitions(&self, topic: &str, partitions: i32) -> usize {
+        self.shared.cluster.lock().add_partitions(topic, partitions)
+    }
+
     /// Move a partition's leader to `node_id` and bump its leader epoch.
     ///
     /// Returns `false` if the topic-partition does not exist. The epoch bump is

@@ -203,8 +203,10 @@ struct ContextEntry {
 ///
 /// Every record that `on_send` observes reaches `on_acknowledgement` exactly
 /// once, with its context — including records rejected before they ever reach
-/// the accumulator (serialization failure, validation failure, unknown topic,
-/// `max.block.ms` exhaustion). Those arrive with
+/// the accumulator (serialization failure, validation failure, a topic that
+/// does not resolve within `max.block.ms`, buffer-memory exhaustion), and
+/// including a `send()` whose future the caller dropped, as a
+/// `tokio::time::timeout` or a losing `select!` branch does. Those arrive with
 /// [`DeliveryConfirmation::Failed`](crate::producer::DeliveryConfirmation::Failed),
 /// offset `-1` and, when routing never happened,
 /// [`UNKNOWN_PARTITION`](crate::producer::UNKNOWN_PARTITION) — the same values

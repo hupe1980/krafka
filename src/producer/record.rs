@@ -372,8 +372,19 @@ impl ProducerRecord {
 
     /// Split the public record into an interned topic handle and routed payload.
     pub(crate) fn into_routed_parts(self) -> RoutedRecordParts {
+        let topic = Arc::<str>::from(self.topic.as_str());
+        self.into_routed_parts_with_topic(topic)
+    }
+
+    /// As [`into_routed_parts`](Self::into_routed_parts), reusing a topic
+    /// handle the caller already holds.
+    ///
+    /// The send path interns the topic once, when the interceptor chain has
+    /// finished with the record, and both the routing and the failure-reporting
+    /// sides share that one handle.
+    pub(crate) fn into_routed_parts_with_topic(self, topic: TopicHandle) -> RoutedRecordParts {
         let Self {
-            topic,
+            topic: _,
             partition,
             key,
             value,
@@ -383,7 +394,7 @@ impl ProducerRecord {
         } = self;
 
         RoutedRecordParts {
-            topic: Arc::<str>::from(topic),
+            topic,
             partition,
             record: RoutedRecord {
                 key,

@@ -359,6 +359,12 @@ pub struct ConsumerConfig {
     /// unbounded cache growth. Defaults to 5 minutes, matching the Java
     /// client's `metadata.max.idle.ms`. `None` disables TTL eviction.
     pub(crate) metadata_topic_cache_ttl: Option<Duration>,
+    /// Whether a metadata request for a topic the cluster does not have may
+    /// ask the broker to create it, i.e. `allow.auto.create.topics`.
+    ///
+    /// Defaults to `false`. The broker must have
+    /// `auto.create.topics.enable=true` for this flag to do anything.
+    pub(crate) allow_auto_create_topics: bool,
     /// Authentication configuration (optional).
     pub(crate) auth: Option<AuthConfig>,
     /// Maximum decompressed size for record batches (compression bomb protection).
@@ -458,6 +464,7 @@ impl Default for ConsumerConfig {
             metadata_recovery_strategy: MetadataRecoveryStrategy::Rebootstrap,
             metadata_recovery_rebootstrap_trigger: Duration::from_secs(300),
             metadata_topic_cache_ttl: Some(Duration::from_secs(300)),
+            allow_auto_create_topics: false,
             auth: None,
             max_decompressed_size: crate::protocol::RecordBatch::MAX_DECOMPRESSED_SIZE,
             transport: crate::network::TransportConfig::default(),
@@ -589,6 +596,20 @@ impl ConsumerConfig {
     #[inline]
     pub fn metadata_max_age(&self) -> Duration {
         self.metadata_max_age
+    }
+
+    /// Returns the per-topic TTL for partial metadata refreshes, or `None`
+    /// when TTL eviction is disabled.
+    #[inline]
+    pub fn metadata_topic_cache_ttl(&self) -> Option<Duration> {
+        self.metadata_topic_cache_ttl
+    }
+
+    /// Returns whether the client may ask the broker to auto-create topics
+    /// (`allow.auto.create.topics`).
+    #[inline]
+    pub fn allow_auto_create_topics(&self) -> bool {
+        self.allow_auto_create_topics
     }
 
     /// Returns the most-preferred partition assignment strategy.

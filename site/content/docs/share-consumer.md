@@ -212,7 +212,8 @@ nobody.
 | `session_timeout` | Duration | `45s` | Session timeout for group membership |
 | `heartbeat_interval` | Duration | `5s` | Heartbeat interval (must be < `session_timeout`) |
 | `metadata_max_age` | Duration | `5min` | Metadata cache TTL |
-| `metadata_topic_cache_ttl` | `Option<Duration>` | `Some(5min)` | TTL for topic entries in the partial-refresh cache. `None` disables eviction; use `disable_metadata_topic_cache_ttl()` to opt out |
+| `metadata_topic_cache_ttl` | `Option<Duration>` | `Some(5min)` | How long a topic entry may sit **idle** before a partial refresh evicts it (`metadata.max.idle.ms`); any use resets the timer. `None` disables eviction; use `disable_metadata_topic_cache_ttl()` to opt out |
+| `allow_auto_create_topics` | bool | `false` | Let the broker create a subscribed topic the cluster does not have (`allow.auto.create.topics`) |
 | `metadata_recovery_strategy` | MetadataRecoveryStrategy | `Rebootstrap` | What to do when every known broker becomes unreachable (KIP-899) |
 | `metadata_recovery_rebootstrap_trigger` | Duration | `5min` | How long refreshes may keep failing before re-bootstrapping |
 | `client_rack` | `Option<String>` | `None` | Rack ID for closest-replica fetching (KIP-392) |
@@ -295,7 +296,9 @@ application needs to arbitrate poison records.
 
 ### Metadata Topic Cache TTL
 
-During a partial metadata refresh (where only the subscribed topics are re-fetched rather than the entire cluster), krafka caches each topic's metadata between refreshes. By default, a topic entry is evicted from this cache after **5 minutes** of not being successfully refreshed — matching Java's `metadata.max.idle.ms` — to prevent unbounded growth when topics are deleted or subscriptions change.
+During a partial metadata refresh (where only the subscribed topics are re-fetched rather than the entire cluster), krafka caches each topic's metadata between refreshes. By default, a topic entry is evicted from this cache after **5 minutes** of being **idle** — matching Java's `metadata.max.idle.ms` — to prevent unbounded growth when topics are deleted or subscriptions change.
+
+Idle means nothing has addressed the topic: fetching from it, resolving a leader for it, or naming it in a metadata refresh all reset the timer. A topic whose metadata is still current survives regardless.
 
 ```rust,compile
 use krafka::share_consumer::ShareConsumer;
