@@ -4712,6 +4712,112 @@ async fn a_record_for_an_unknown_topic_still_reaches_on_acknowledgement() {
     );
 }
 
+/// `send()` is an ordinary future, so a caller may drop it —
+/// `tokio::time::timeout` is the obvious way. A record whose future was dropped
+/// mid-flight will never be delivered, so it still owes its terminal callback:
+/// the interceptor has to get its `RecordContext` back.
+///
+/// Negative control: with the obligation's `Drop` not reporting, the recorder
+/// is empty; with `Drop` treating cancellation as a krafka bug, the
+/// `debug_assert` fires and this panics.
+#[tokio::test]
+async fn a_cancelled_send_still_reaches_on_acknowledgement() {
+    let broker = FakeBroker::start().await.unwrap();
+    let interceptor = std::sync::Arc::new(RecordingInterceptor::default());
+
+    let producer = Producer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        // Long enough that the metadata retry loop is still running when the
+        // timeout below fires, so the send is cancelled rather than rejected.
+        .max_block(Duration::from_secs(30))
+        .add_interceptor(std::sync::Arc::clone(&interceptor) as std::sync::Arc<_>)
+        .build()
+        .await
+        .expect("producer should connect");
+
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(200),
+        producer.send("no-such-topic", None, Some(b"v")),
+    )
+    .await;
+    assert!(cancelled.is_err(), "the send must still be in flight");
+
+    {
+        let acks = interceptor.acks();
+        assert_eq!(
+            acks.len(),
+            1,
+            "a cancelled record still owes an acknowledgement"
+        );
+        assert_eq!(acks[0].token.as_deref(), Some("no-such-topic#0"));
+        assert!(acks[0].failed);
+        assert_eq!(acks[0].partition, crate::producer::UNKNOWN_PARTITION);
+        assert_eq!(
+            acks[0].delivery,
+            crate::producer::DeliveryConfirmation::Failed
+        );
+    }
+
+    producer.close().await;
+}
+
+/// The same guarantee across the *other* long await: the wait for buffer
+/// memory. The record has been routed by then and its context is on its way to
+/// the accumulator, so a cancellation here used to drop it inside the
+/// abandoned future with nothing to notice.
+#[tokio::test]
+async fn a_send_cancelled_waiting_for_buffer_memory_still_acknowledges() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("events", 1);
+    let interceptor = std::sync::Arc::new(RecordingInterceptor::default());
+
+    let producer = Producer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        // A budget that one record fills, so the second has to wait for it.
+        .buffer_memory(256)
+        .batch_size(256)
+        // Long enough that the first record stays buffered, holding its permit.
+        .linger(Duration::from_secs(30))
+        .max_block(Duration::from_secs(30))
+        .add_interceptor(std::sync::Arc::clone(&interceptor) as std::sync::Arc<_>)
+        .build()
+        .await
+        .expect("producer should connect");
+
+    let first = producer
+        .enqueue(crate::producer::ProducerRecord::new("events", vec![0u8; 100]).with_partition(0))
+        .await
+        .expect("the first record fits");
+
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(200),
+        producer.enqueue(
+            crate::producer::ProducerRecord::new("events", vec![1u8; 100]).with_partition(0),
+        ),
+    )
+    .await;
+    assert!(
+        cancelled.is_err(),
+        "the second record must still be waiting for memory"
+    );
+
+    {
+        let acks = interceptor.acks();
+        let cancelled_ack = acks
+            .iter()
+            .find(|a| a.token.as_deref() == Some("events#1"))
+            .expect("the cancelled record still owes an acknowledgement");
+        assert!(cancelled_ack.failed);
+    }
+
+    drop(first);
+    producer.close().await;
+}
+
 /// A batch rejected as too large is halved and both halves resubmitted. The
 /// records move into *different* batches partway through their lives, so this
 /// is where a context keyed to the batch rather than the record would come

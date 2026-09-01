@@ -67,6 +67,15 @@ miss fetches instead of failing.
   while anything addresses it — producing to it, resolving its leader, asking
   for its partition count, or naming it in a refresh — and, as a second line of
   defence, while its metadata is still current.
+- **A cancelled `send()` dropped the interceptor's `RecordContext` without
+  reporting.** `send()` is an ordinary future, so
+  `tokio::time::timeout(d, producer.send(..))` or a losing `select!` branch
+  drops it — and the record's terminal callback went with it, tripping a
+  `debug_assert` in debug builds. The obligation now fires
+  `on_acknowledgement` on drop, across both long awaits on the send path
+  (resolving the topic, and waiting for buffer memory), so the documented
+  "exactly once for every record `on_send` observed" holds under cancellation
+  too.
 - **A topic with zero partitions is no longer treated as resolved.** That is
   what a topic mid-creation looks like; routing against it produced a
   partitioner call with a modulus of zero.

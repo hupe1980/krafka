@@ -1999,27 +1999,30 @@ impl TransactionalProducer {
         // Transparently apply producer-level schema encoders if configured.
         // Shared with the plain producer so the two paths cannot drift; null
         // keys and tombstone values are passed through unserialized.
-        if let Err(e) = super::apply_serializers(
-            &mut record,
-            self.key_serializer.as_deref(),
-            self.value_serializer.as_deref(),
-        )
-        .await
+        if let Err(e) = obligation
+            .suspend(super::apply_serializers(
+                &mut record,
+                self.key_serializer.as_deref(),
+                self.value_serializer.as_deref(),
+            ))
+            .await
         {
-            return Err(obligation.fail(&record.topic, UNKNOWN_PARTITION, &record.headers, e));
+            return Err(obligation.fail(UNKNOWN_PARTITION, &record.headers, e));
         }
 
         // Validate record fields against Kafka protocol wire-format limits.
         if let Err(e) = record.validate() {
-            return Err(obligation.fail(&record.topic, UNKNOWN_PARTITION, &record.headers, e));
+            return Err(obligation.fail(UNKNOWN_PARTITION, &record.headers, e));
         }
 
         if let Err(e) = self.checked_transactional_identity() {
-            return Err(obligation.fail(&record.topic, UNKNOWN_PARTITION, &record.headers, e));
+            return Err(obligation.fail(UNKNOWN_PARTITION, &record.headers, e));
         }
 
         let record_size = record.estimated_size();
-        let routed = record.into_routed_parts();
+        // The obligation already interned the topic; routing shares that handle
+        // rather than allocating a second one.
+        let routed = record.into_routed_parts_with_topic(obligation.topic());
         let topic = routed.topic;
         let record = routed.record;
 
@@ -2027,26 +2030,22 @@ impl TransactionalProducer {
         // does not have it. Shared with the plain producer, so an evicted or
         // not-yet-fetched topic recovers identically on both paths, and the
         // wait is charged against what is left of `max_block`.
-        let partition = match super::resolve_partition(
-            &self.metadata,
-            &*self.partitioner,
-            topic.as_ref(),
-            record.key_bytes(),
-            routed.partition,
-            self.config
-                .max_block
-                .saturating_sub(send_started_at.elapsed()),
-        )
-        .await
+        let partition = match obligation
+            .suspend(super::resolve_partition(
+                &self.metadata,
+                &*self.partitioner,
+                topic.as_ref(),
+                record.key_bytes(),
+                routed.partition,
+                self.config
+                    .max_block
+                    .saturating_sub(send_started_at.elapsed()),
+            ))
+            .await
         {
             Ok(partition) => partition,
             Err(error) => {
-                return Err(obligation.fail(
-                    topic.as_ref(),
-                    UNKNOWN_PARTITION,
-                    &record.headers,
-                    error,
-                ));
+                return Err(obligation.fail(UNKNOWN_PARTITION, &record.headers, error));
             }
         };
 
@@ -2065,9 +2064,11 @@ impl TransactionalProducer {
         // precede the first record. The Pending/Added states stop concurrent
         // callers from skipping the RPC while an in-flight add is outstanding.
         if self.requires_explicit_partition_registration()
-            && let Err(e) = self.add_partition_to_txn_if_needed(&topic, partition).await
+            && let Err(e) = obligation
+                .suspend(self.add_partition_to_txn_if_needed(&topic, partition))
+                .await
         {
-            return Err(obligation.fail(topic.as_ref(), partition, &record.headers, e));
+            return Err(obligation.fail(partition, &record.headers, e));
         }
 
         // Hand off to the accumulator, which batches, stamps PID/epoch/sequence
@@ -2083,7 +2084,7 @@ impl TransactionalProducer {
                 partition,
                 operation_guard,
                 send_started_at,
-                obligation.take_context(),
+                &mut obligation,
             )
             .await
             .map_err(|rejected| {
@@ -2091,12 +2092,7 @@ impl TransactionalProducer {
                 // dropped, so the obligation re-opens and is discharged as a
                 // failure that can still report the record's headers.
                 obligation.context = Some(rejected.context);
-                obligation.fail(
-                    topic.as_ref(),
-                    partition,
-                    &rejected.record.headers,
-                    rejected.error,
-                )
+                obligation.fail(partition, &rejected.record.headers, rejected.error)
             });
 
         // An enqueue failure is classified immediately; a delivery failure is
@@ -5431,6 +5427,11 @@ mod tests {
             config: TransactionalProducerConfig {
                 bootstrap_servers: address.to_string(),
                 transactional_id: "txn-test".to_string(),
+                // These tests have no broker, so every send has to resolve its
+                // topic from an unreachable cluster. The production default
+                // (60 s) would make each one sit out its caller's timeout, at
+                // whatever speed the platform refuses a connection.
+                max_block: Duration::from_millis(200),
                 ..TransactionalProducerConfig::default()
             },
             metadata,

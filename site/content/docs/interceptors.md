@@ -64,10 +64,15 @@ All methods have default no-op implementations, so you only need to override the
 `on_acknowledgement` fires **exactly once for every record `on_send` observed** —
 on success, on permanent failure, and for records rejected before they ever
 reach the accumulator (a failing serializer, failed validation, a topic that
-does not resolve, `max.block.ms` exhausted). It holds at every `linger` setting and on the
-`TransactionalProducer`, and dropping the `DeliveryHandle` does not suppress it:
-the handle discards the *caller's* view of the acknowledgement, not the
-interceptor's. The one exception is a panic inside krafka's own send task.
+does not resolve, `max.block.ms` exhausted). It holds at every `linger` setting
+and on the `TransactionalProducer`.
+
+Dropping the `DeliveryHandle` does not suppress it: the handle discards the
+*caller's* view of the acknowledgement, not the interceptor's. Nor does dropping
+the `send()` future itself — a `tokio::time::timeout` that elapses, a `select!`
+branch that loses — because a record whose future was abandoned will never be
+delivered, and the context has to come back either way. The one exception is a
+panic inside krafka's own send task.
 
 A record that failed before it was routed reports `DeliveryConfirmation::Failed`,
 offset `-1` and `krafka::producer::UNKNOWN_PARTITION`.

@@ -57,6 +57,7 @@ use crate::protocol::{
     ProduceResponse, VersionedDecode, VersionedEncode, versions,
 };
 use crate::serdes::Serializer;
+use record::TopicHandle;
 
 use self::idempotent::ErasedProducerStateStore;
 use crate::barrier::InFlightBarrier;
@@ -175,12 +176,26 @@ pub(crate) async fn resolve_partition(
 /// The guard makes the obligation a value that has to be spent: discharged by
 /// [`fail`](Self::fail), which fires the terminal callback with the error, or
 /// by [`take_context`](Self::take_context), which hands the context to the
-/// accumulator so the callback fires there. Dropping it undischarged is a bug
-/// in this crate, and `Drop` says so.
-struct SendObligation<'a> {
+/// accumulator so the callback fires there.
+///
+/// A dropped obligation still reports. `send()` is an ordinary future, so a
+/// caller may drop it — `tokio::time::timeout(d, producer.send(..))` is the
+/// obvious way — and a record whose future was dropped mid-flight is a record
+/// that will never be delivered. `Drop` therefore fires the terminal callback
+/// too, so the interceptor releases whatever it parked. Cancellation is a
+/// legitimate outcome; reaching `Drop` with no `.await` in flight is a krafka
+/// bug, and only that case asserts.
+pub(crate) struct SendObligation<'a> {
     interceptor: &'a dyn crate::interceptor::ProducerInterceptor,
+    /// The topic as the interceptor chain left it, interned once and shared
+    /// with the routing path.
+    topic: TopicHandle,
     /// `None` once discharged.
-    context: Option<crate::interceptor::RecordContext>,
+    pub(crate) context: Option<crate::interceptor::RecordContext>,
+    /// Set while the send future is parked on an `.await` this obligation
+    /// wraps. It distinguishes a cancelled send from a code path in this crate
+    /// that returned without reporting.
+    suspended: bool,
 }
 
 impl<'a> SendObligation<'a> {
@@ -197,8 +212,45 @@ impl<'a> SendObligation<'a> {
         crate::interceptor::safe_on_send(interceptor, record, &mut context);
         Self {
             interceptor,
+            // Read after `on_send`, so an interceptor that rewrites the topic
+            // is reported against the topic it chose.
+            topic: TopicHandle::from(record.topic.as_str()),
             context: Some(context),
+            suspended: false,
         }
+    }
+
+    /// An obligation nobody is owed: no interceptor ran `on_send`, so there is
+    /// nothing to report back.
+    ///
+    /// Lets the accumulator's own entry points share one code path with the
+    /// producer's without inventing a second, context-shaped parameter.
+    pub(crate) fn detached(topic: TopicHandle) -> SendObligation<'static> {
+        static NO_OP: crate::interceptor::NoOpProducerInterceptor =
+            crate::interceptor::NoOpProducerInterceptor;
+        SendObligation {
+            interceptor: &NO_OP,
+            topic,
+            context: None,
+            suspended: false,
+        }
+    }
+
+    /// The interned topic, for the routing path to reuse.
+    pub(crate) fn topic(&self) -> TopicHandle {
+        TopicHandle::clone(&self.topic)
+    }
+
+    /// Await `fut` with the obligation marked as suspended.
+    ///
+    /// If the caller drops the `send()` future while it is parked here, `Drop`
+    /// reports a cancellation instead of asserting — and still fires
+    /// `on_acknowledgement`, because the record will never be delivered.
+    pub(crate) async fn suspend<T>(&mut self, fut: impl std::future::Future<Output = T>) -> T {
+        self.suspended = true;
+        let output = fut.await;
+        self.suspended = false;
+        output
     }
 
     /// Discharge by reporting a terminal failure, returning `error` so call
@@ -207,15 +259,14 @@ impl<'a> SendObligation<'a> {
     /// Pass [`UNKNOWN_PARTITION`] when the record failed before it was routed.
     /// `headers` are the record's as of the failure — however far the chain and
     /// the serializers got before it was rejected.
-    fn fail(
+    pub(crate) fn fail(
         &mut self,
-        topic: &str,
         partition: PartitionId,
         headers: &RecordHeaders,
         error: KrafkaError,
     ) -> KrafkaError {
         if let Some(mut context) = self.context.take() {
-            let metadata = RecordMetadata::failed(topic.to_owned(), partition);
+            let metadata = RecordMetadata::failed(self.topic.to_string(), partition);
             crate::interceptor::safe_on_acknowledgement(
                 self.interceptor,
                 &metadata,
@@ -229,26 +280,53 @@ impl<'a> SendObligation<'a> {
 
     /// Discharge by handing the context to the accumulator, which owes the
     /// terminal callback from here on.
-    fn take_context(&mut self) -> crate::interceptor::RecordContext {
+    pub(crate) fn take_context(&mut self) -> crate::interceptor::RecordContext {
         self.context.take().unwrap_or_default()
     }
 }
 
 impl Drop for SendObligation<'_> {
     fn drop(&mut self) {
-        if self.context.is_some() && !std::thread::panicking() {
-            // A send path grew an early return that forgot to report. Loud in
-            // this crate's own tests, logged in production — never a panic in a
-            // user's process.
+        // Unwinding already: firing a callback into a half-torn-down stack is
+        // worse than the missed report.
+        let (Some(mut context), false) = (self.context.take(), std::thread::panicking()) else {
+            return;
+        };
+
+        let error = if self.suspended {
+            // The caller dropped the `send()` future while it was parked — a
+            // `timeout` elapsing, a `select!` branch losing. The record was
+            // never accepted and never will be, so the callback is owed here.
+            KrafkaError::invalid_state(
+                "producer send was cancelled before the record reached the accumulator",
+            )
+        } else {
+            // No await was in flight, so nothing cancelled this: a send path
+            // grew an early return that forgot to report. Loud in this crate's
+            // own tests, logged in production — never a panic in a user's
+            // process.
             debug_assert!(
                 false,
                 "krafka bug: a record ran on_send but no on_acknowledgement was reported",
             );
             tracing::error!(
-                "krafka bug: a record ran on_send but no on_acknowledgement was reported; \
-                 per-record interceptor state was dropped",
+                "krafka bug: a record ran on_send but no on_acknowledgement was reported",
             );
-        }
+            KrafkaError::invalid_state(
+                "krafka bug: a record ran on_send but no on_acknowledgement was reported",
+            )
+        };
+
+        // The headers are gone with the record; the partition was never
+        // assigned. The context is what the interceptor needs back.
+        let metadata = RecordMetadata::failed(self.topic.to_string(), UNKNOWN_PARTITION);
+        crate::interceptor::safe_on_acknowledgement(
+            self.interceptor,
+            &metadata,
+            Some(&error),
+            &[],
+            &mut context,
+        );
     }
 }
 
@@ -1024,24 +1102,27 @@ impl Producer {
         // Transparently apply producer-level schema encoders if configured.
         // Runs after the interceptor (which may set topic/key/value) but before
         // validation, so oversized encoded payloads are still caught.
-        if let Err(e) = apply_serializers(
-            &mut record,
-            self.key_serializer.as_deref(),
-            self.value_serializer.as_deref(),
-        )
-        .await
+        if let Err(e) = obligation
+            .suspend(apply_serializers(
+                &mut record,
+                self.key_serializer.as_deref(),
+                self.value_serializer.as_deref(),
+            ))
+            .await
         {
-            return Err(obligation.fail(&record.topic, UNKNOWN_PARTITION, &record.headers, e));
+            return Err(obligation.fail(UNKNOWN_PARTITION, &record.headers, e));
         }
 
         // Validate record fields against Kafka protocol wire-format limits.
         // Runs after the interceptor since interceptors can mutate the record.
         if let Err(e) = record.validate() {
-            return Err(obligation.fail(&record.topic, UNKNOWN_PARTITION, &record.headers, e));
+            return Err(obligation.fail(UNKNOWN_PARTITION, &record.headers, e));
         }
 
         let record_size = record.estimated_size();
-        let routed = record.into_routed_parts();
+        // The obligation already interned the topic; routing shares that handle
+        // rather than allocating a second one.
+        let routed = record.into_routed_parts_with_topic(obligation.topic());
         let topic = routed.topic;
         let record = routed.record;
 
@@ -1049,26 +1130,22 @@ impl Producer {
         // cache does not have it. The wait is charged against what is left of
         // `max_block`, so a topic that never resolves cannot block a send past
         // the budget the caller configured.
-        let partition = match resolve_partition(
-            &self.metadata,
-            &*self.partitioner,
-            topic.as_ref(),
-            record.key_bytes(),
-            routed.partition,
-            self.config
-                .max_block
-                .saturating_sub(send_started_at.elapsed()),
-        )
-        .await
+        let partition = match obligation
+            .suspend(resolve_partition(
+                &self.metadata,
+                &*self.partitioner,
+                topic.as_ref(),
+                record.key_bytes(),
+                routed.partition,
+                self.config
+                    .max_block
+                    .saturating_sub(send_started_at.elapsed()),
+            ))
+            .await
         {
             Ok(partition) => partition,
             Err(error) => {
-                return Err(obligation.fail(
-                    topic.as_ref(),
-                    UNKNOWN_PARTITION,
-                    &record.headers,
-                    error,
-                ));
+                return Err(obligation.fail(UNKNOWN_PARTITION, &record.headers, error));
             }
         };
 
@@ -1081,7 +1158,7 @@ impl Producer {
                 partition,
                 operation_guard,
                 send_started_at,
-                obligation.take_context(),
+                &mut obligation,
             )
             .await
         {
@@ -1091,12 +1168,7 @@ impl Producer {
             // with the partition the record had already been routed to.
             Err(rejected) => {
                 obligation.context = Some(rejected.context);
-                Err(obligation.fail(
-                    topic.as_ref(),
-                    partition,
-                    &rejected.record.headers,
-                    rejected.error,
-                ))
+                Err(obligation.fail(partition, &rejected.record.headers, rejected.error))
             }
         }
     }

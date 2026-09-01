@@ -656,6 +656,7 @@ impl RecordAccumulatorHandle {
         operation_guard: InFlightOpGuard,
         send_started_at: Instant,
     ) -> Result<RecordMetadata> {
+        let topic_for_obligation = TopicHandle::clone(&topic);
         self.enqueue_routed_with_guard(
             topic,
             record,
@@ -663,7 +664,8 @@ impl RecordAccumulatorHandle {
             partition,
             operation_guard,
             send_started_at,
-            RecordContext::new(),
+            // Nothing ran `on_send` on this path, so nobody is owed a report.
+            &mut super::SendObligation::detached(TopicHandle::clone(&topic_for_obligation)),
         )
         .await
         .map_err(|rejected| rejected.error)?
@@ -696,7 +698,7 @@ impl RecordAccumulatorHandle {
         partition: PartitionId,
         operation_guard: InFlightOpGuard,
         send_started_at: Instant,
-        interceptor_ctx: RecordContext,
+        obligation: &mut super::SendObligation<'_>,
     ) -> std::result::Result<DeliveryHandle, Box<EnqueueRejected>> {
         // `max_block` is a budget for the whole of `send()`, not for this
         // stage alone: the interceptor, serializers and the metadata fetch for
@@ -714,23 +716,29 @@ impl RecordAccumulatorHandle {
         if let Err(e) =
             check_record_admission(record_size, self.memory_capacity, self.max_request_size)
         {
-            return Err(EnqueueRejected::new(e, interceptor_ctx, record));
+            return Err(EnqueueRejected::new(e, obligation.take_context(), record));
         }
 
         // FIFO-fair reservation of `record_size` bytes from the shared pool.
         // On timeout or closed semaphore (accumulator panicked), the permit
         // future cancels cleanly with no leaked reservation.
-        let permit = match tokio::time::timeout(
-            deadline.saturating_duration_since(tokio::time::Instant::now()),
-            self.memory_permits.acquire_many(record_size as u32),
-        )
-        .await
+        //
+        // The obligation stays armed across this wait — the longest await on
+        // the send path — so a caller that drops the `send()` future here still
+        // gets its terminal callback rather than losing the interceptor's
+        // context inside the dropped future.
+        let permit = match obligation
+            .suspend(tokio::time::timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+                self.memory_permits.acquire_many(record_size as u32),
+            ))
+            .await
         {
             Ok(Ok(p)) => p,
             Ok(Err(_)) => {
                 return Err(EnqueueRejected::new(
                     KrafkaError::invalid_state("accumulator closed"),
-                    interceptor_ctx,
+                    obligation.take_context(),
                     record,
                 ));
             }
@@ -740,7 +748,7 @@ impl RecordAccumulatorHandle {
                         "producer append: max_block exceeded while waiting for buffer \
                          memory (ProducerConfig::max_block / AccumulatorConfig::max_block_ms)",
                     ),
-                    interceptor_ctx,
+                    obligation.take_context(),
                     record,
                 ));
             }
@@ -763,6 +771,11 @@ impl RecordAccumulatorHandle {
         let buffered_record_guard =
             BufferedRecordGuard::new(self.buffered_records.clone(), self.metrics.clone());
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+
+        // The handoff: from here the accumulator owns the terminal callback.
+        // `send_timeout` gives the message back on timeout or closure, so the
+        // obligation can be re-armed by the caller on those paths.
+        let interceptor_ctx = obligation.take_context();
 
         // Send the Append; on failure (timeout / closed channel),
         // `permit_reservation` drops and returns the permits to the pool
