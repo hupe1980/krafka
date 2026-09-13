@@ -78,6 +78,27 @@ that existed without ever running.
 
 ### Fixed
 
+- **`subscribe()` failed instead of retrying when the group coordinator was
+  moving.** `NOT_COORDINATOR`, `COORDINATOR_NOT_AVAILABLE` and
+  `COORDINATOR_LOAD_IN_PROGRESS` all mean "re-run FindCoordinator and try
+  again" — a freshly started or rebalancing cluster answers this way routinely,
+  and the Java client retries transparently.
+
+  krafka dropped the cached coordinator and then returned the error anyway. The
+  helper that did the invalidation returned a `bool` documented as "retriable
+  after re-discovery", and both call sites discarded it, so nothing ever made
+  the next attempt. Applications saw
+  `Failed to subscribe: Broker { code: NotCoordinator }`.
+
+  Both join paths now re-discover the coordinator and retry with jittered
+  backoff, bounded at five attempts. The KIP-848 path had the same defect in a
+  worse form — it returned the error without invalidating the cached
+  coordinator at all, so nothing downstream could recover either.
+
+  Found by the Redpanda integration suite, which is where a real coordinator
+  election actually happens. Both fixes carry a fake-broker regression test
+  verified against the defect.
+
 - **The README claimed KIP-1258 OAuth client assertion was not implemented.**
   It has been implemented and public since the `oauth-oidc` feature landed, as
   `ClientCredentials::assertion`. The same sentence now names

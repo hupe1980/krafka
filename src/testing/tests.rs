@@ -5030,3 +5030,107 @@ async fn a_rejected_record_still_reports_its_headers() {
     );
     assert!(acks[0].failed);
 }
+
+/// A coordinator election in progress must not fail `subscribe()`.
+///
+/// `NOT_COORDINATOR` on `JoinGroup` means "ask FindCoordinator again": the
+/// group moved, or the coordinator is still loading `__consumer_offsets`. A
+/// freshly started cluster answers this way routinely, and the Java client
+/// retries it transparently.
+///
+/// krafka dropped the cached coordinator and then returned the error anyway, so
+/// a routine election surfaced to the application as
+/// `Failed to subscribe: Broker { code: NotCoordinator }`. Caught by the
+/// Redpanda integration suite, which is where a real coordinator election
+/// actually happens.
+#[tokio::test]
+async fn not_coordinator_on_join_is_retried_after_rediscovery() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("events", 1);
+
+    let consumer = crate::consumer::Consumer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .group_id("analytics")
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .build()
+        .await
+        .expect("consumer should connect");
+
+    // The first JoinGroup fails the way an election in progress does.
+    broker.on_once(ApiKey::JoinGroup, |_| {
+        Control::Error(ErrorCode::NotCoordinator)
+    });
+
+    consumer
+        .subscribe(&["events"])
+        .await
+        .expect("subscribe should ride out NOT_COORDINATOR, not surface it");
+
+    assert!(
+        broker.request_count(ApiKey::JoinGroup) >= 2,
+        "the client should have retried JoinGroup after re-discovering the \
+         coordinator, but sent {} request(s)",
+        broker.request_count(ApiKey::JoinGroup)
+    );
+    assert!(
+        broker.request_count(ApiKey::FindCoordinator) >= 2,
+        "the retry must re-run FindCoordinator rather than reuse the cached \
+         coordinator, but FindCoordinator ran {} time(s)",
+        broker.request_count(ApiKey::FindCoordinator)
+    );
+}
+
+/// The same guarantee for the KIP-848 path, where the heartbeat *is* the join.
+///
+/// This path had the defect in a worse form: it returned the error without even
+/// dropping the cached coordinator, so nothing downstream could have recovered.
+#[tokio::test]
+async fn not_coordinator_on_the_kip848_join_is_retried_after_rediscovery() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("events", 1);
+
+    let consumer = crate::consumer::Consumer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .group_id("analytics-848")
+        .group_protocol(crate::consumer::GroupProtocol::Consumer)
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .build()
+        .await
+        .expect("consumer should connect");
+
+    broker.on_once(ApiKey::ConsumerGroupHeartbeat, |_| {
+        Control::Error(ErrorCode::NotCoordinator)
+    });
+
+    consumer
+        .subscribe(&["events"])
+        .await
+        .expect("subscribe should succeed");
+
+    // Under KIP-848 the heartbeat *is* the join, and it is driven by `poll()`
+    // rather than by `subscribe()`.
+    let deadline = tokio::time::Instant::now() + SETTLE;
+    while tokio::time::Instant::now() < deadline {
+        consumer
+            .poll(Duration::from_millis(50))
+            .await
+            .expect("poll should ride out NOT_COORDINATOR, not surface it");
+        if broker.request_count(ApiKey::ConsumerGroupHeartbeat) >= 2 {
+            break;
+        }
+    }
+
+    assert!(
+        broker.request_count(ApiKey::ConsumerGroupHeartbeat) >= 2,
+        "the client should have retried the heartbeat after re-discovering the \
+         coordinator, but sent {} request(s)",
+        broker.request_count(ApiKey::ConsumerGroupHeartbeat)
+    );
+    assert!(
+        broker.request_count(ApiKey::FindCoordinator) >= 2,
+        "the retry must re-run FindCoordinator, but it ran {} time(s)",
+        broker.request_count(ApiKey::FindCoordinator)
+    );
+}
