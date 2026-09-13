@@ -53,7 +53,7 @@ fn every_client_builder_accepts_a_transport_config() {
     let _ =
         |t: TransportConfig| krafka::client::KrafkaClient::builder("localhost:9092").transport(t);
 
-    #[cfg(feature = "unstable-protocol")]
+    #[cfg(feature = "share-groups")]
     let _ = |t: TransportConfig| krafka::share_consumer::ShareConsumer::builder().transport(t);
 }
 
@@ -445,7 +445,7 @@ fn client_builders_share_one_configuration_surface() {
     assert_shares_a_client!(krafka::producer::Producer::builder());
     assert_shares_a_client!(krafka::admin::AdminClient::builder());
     assert_shares_a_client!(krafka::producer::TransactionalProducer::builder());
-    #[cfg(feature = "unstable-protocol")]
+    #[cfg(feature = "share-groups")]
     assert_shares_a_client!(krafka::share_consumer::ShareConsumer::builder());
 
     assert_common_setters!(krafka::consumer::Consumer::builder());
@@ -454,7 +454,7 @@ fn client_builders_share_one_configuration_surface() {
     assert_common_setters!(krafka::producer::TransactionalProducer::builder());
     assert_common_setters!(krafka::client::KrafkaClient::builder("localhost:9092"));
 
-    #[cfg(feature = "unstable-protocol")]
+    #[cfg(feature = "share-groups")]
     assert_common_setters!(krafka::share_consumer::ShareConsumer::builder());
 }
 
@@ -478,7 +478,7 @@ fn client_builders_share_one_configuration_surface() {
 /// `xtask/config_reachability.py` now catches the first class automatically by
 /// walking the config structs. This test pins the cross-client half, which is a
 /// judgement about which settings *should* exist on both.
-#[cfg(feature = "unstable-protocol")]
+#[cfg(feature = "share-groups")]
 #[test]
 fn both_consumers_share_the_read_side_surface() {
     use std::sync::Arc;
@@ -553,7 +553,7 @@ fn every_long_lived_client_shares_one_operational_surface() {
     assert_lifecycle!(krafka::admin::AdminClient);
     assert_lifecycle!(krafka::producer::TransactionalProducer);
 
-    #[cfg(feature = "unstable-protocol")]
+    #[cfg(feature = "share-groups")]
     assert_lifecycle!(krafka::share_consumer::ShareConsumer);
 
     // Interrupting a blocked poll must exist on every consuming client.
@@ -566,7 +566,7 @@ fn every_long_lived_client_shares_one_operational_surface() {
     fn _consumer_wakeup(c: &krafka::consumer::Consumer) {
         c.wakeup();
     }
-    #[cfg(feature = "unstable-protocol")]
+    #[cfg(feature = "share-groups")]
     fn _share_wakeup(c: &krafka::share_consumer::ShareConsumer) {
         c.wakeup();
     }
@@ -575,7 +575,7 @@ fn every_long_lived_client_shares_one_operational_surface() {
     fn _txn(p: &krafka::producer::TransactionalProducer) {
         let _: krafka::producer::ProducerMetricsSnapshot = p.metrics();
     }
-    #[cfg(feature = "unstable-protocol")]
+    #[cfg(feature = "share-groups")]
     fn _share(c: &krafka::share_consumer::ShareConsumer) {
         let _: std::sync::Arc<krafka::metrics::ConsumerMetrics> = c.metrics();
     }

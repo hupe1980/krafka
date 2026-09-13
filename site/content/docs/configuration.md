@@ -175,12 +175,10 @@ response is to re-resolve it and try again — `create_topics` during a rolling
 controller restart hits this routinely. krafka refreshes metadata, reconnects,
 and retries up to `retries` times.
 
-Both settings used to be compile-time constants: five attempts spaced by a flat
-100 ms, with the documentation claiming they were `retry.backoff.ms`. Two things
-were wrong with that. The budget is about a second of real time, which is short
-for a KRaft election, and the flat sleep had **no jitter** — so every admin
-client watching one election retried in lockstep and arrived at the newly
-elected controller as a single wave.
+Backoff is exponential **with jitter**. Without it, every admin client watching
+one controller election retries in lockstep and arrives at the newly elected
+controller as a single wave. Raise `retries` if your elections routinely take
+longer than the default budget.
 
 ```rust,compile
 use krafka::admin::AdminClient;
@@ -238,13 +236,10 @@ Validation also *normalises* — a compression level is clamped into the selecte
 codec's range, for example — so the returned config may differ from what was
 set.
 
-> **There is exactly one builder per client.** krafka used to ship a second,
-> internal `*ConfigBuilder` alongside each public builder. They duplicated 72
-> methods between them and their validation had diverged — the public path,
-> the only one anybody used, silently skipped six checks including the
-> compression-codec availability test. The duplicates are gone, and
-> `tests/builder_surface.rs` asserts at compile time that every builder keeps
-> both terminals.
+> **There is exactly one builder per client**, with two terminals:
+> `build_config()` validates without a broker, `build()` validates and
+> connects. Both run the same validator, so a configuration that passes one
+> passes the other. `tests/builder_surface.rs` asserts this at compile time.
 
 ## Transport Configuration
 

@@ -2572,7 +2572,7 @@ async fn describe_features_reports_what_update_features_applied() {
 // modelled — in particular, acquisition locks never expire here, so a record
 // is redelivered only when it is explicitly released.
 
-#[cfg(feature = "unstable-protocol")]
+#[cfg(feature = "share-groups")]
 async fn share_consumer_for(
     broker: &FakeBroker,
     group_id: &str,
@@ -2581,7 +2581,7 @@ async fn share_consumer_for(
 }
 
 /// A share consumer with the short test timeouts, plus whatever `tune` adds.
-#[cfg(feature = "unstable-protocol")]
+#[cfg(feature = "share-groups")]
 async fn share_consumer_with(
     broker: &FakeBroker,
     group_id: &str,
@@ -2608,7 +2608,7 @@ async fn share_consumer_with(
 ///
 /// A share consumer's first poll is a heartbeat that returns no assignment, so
 /// a single `poll()` proving nothing is expected rather than a failure.
-#[cfg(feature = "unstable-protocol")]
+#[cfg(feature = "share-groups")]
 async fn drain_share(
     consumer: &crate::share_consumer::ShareConsumer,
     want: usize,
@@ -2632,7 +2632,7 @@ async fn drain_share(
 /// but is never incremented is worse than none, because it reads as "zero
 /// records" rather than "not measured" — so this asserts the counters against
 /// the records actually returned, not merely that they are non-zero.
-#[cfg(feature = "unstable-protocol")]
+#[cfg(feature = "share-groups")]
 #[tokio::test]
 async fn a_share_consumer_receives_records_and_counts_them() {
     let broker = FakeBroker::start().await.unwrap();
@@ -2695,7 +2695,7 @@ async fn a_share_consumer_receives_records_and_counts_them() {
 /// acknowledgement that does not advance the share-partition start offset
 /// turns every restart into a full replay, and a release that does not rewind
 /// the cursor silently drops the record the application asked to retry.
-#[cfg(feature = "unstable-protocol")]
+#[cfg(feature = "share-groups")]
 #[tokio::test]
 async fn accepting_retires_a_record_and_releasing_redelivers_it() {
     use crate::share_consumer::AcknowledgeType;
@@ -2768,7 +2768,7 @@ async fn accepting_retires_a_record_and_releasing_redelivers_it() {
 /// difference only shows once the holder leaves and the in-flight records are
 /// returned to the pool — at which point an accepted record is below the
 /// share-partition start offset and an unacknowledged one is not.
-#[cfg(feature = "unstable-protocol")]
+#[cfg(feature = "share-groups")]
 #[tokio::test]
 async fn an_accepted_record_is_not_redelivered_to_the_next_member() {
     use crate::share_consumer::{AcknowledgeType, AcknowledgementMode};
@@ -2834,7 +2834,7 @@ async fn an_accepted_record_is_not_redelivered_to_the_next_member() {
 /// share state to one member at a time. A client that ignored its assignment
 /// and fetched every partition would still pass a "did I get records?" test
 /// and fail this one.
-#[cfg(feature = "unstable-protocol")]
+#[cfg(feature = "share-groups")]
 #[tokio::test]
 async fn two_share_group_members_split_the_partitions() {
     let broker = FakeBroker::start().await.unwrap();
@@ -2920,7 +2920,7 @@ async fn two_share_group_members_split_the_partitions() {
 
 /// A poll with no subscription must be counted as an empty poll and deliver
 /// nothing.
-#[cfg(feature = "unstable-protocol")]
+#[cfg(feature = "share-groups")]
 #[tokio::test]
 async fn share_consumer_poll_metrics_are_wired() {
     let broker = FakeBroker::start().await.unwrap();
@@ -3881,7 +3881,7 @@ async fn a_commit_waits_for_an_in_flight_offset_commit() {
 /// The documented shutdown is `wakeup()` then `close()`, and `wakeup()` does
 /// not wait for the poll it interrupts to unwind, so this interleaving is the
 /// normal one rather than an exotic race.
-#[cfg(feature = "unstable-protocol")]
+#[cfg(feature = "share-groups")]
 #[tokio::test]
 async fn a_flush_waits_for_a_poll_holding_the_acknowledgements() {
     use std::sync::Arc;

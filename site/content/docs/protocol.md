@@ -40,9 +40,10 @@ precisely so a client that guessed too high can still parse the reply, so the
 fallback costs exactly one extra round trip and never fails the handshake.
 
 The default ceiling is the highest version a *released* Kafka supports, not the
-highest krafka can encode: sending v5 (KIP-1242, unreleased) to a Kafka 4.x
-broker would cost a rejected round trip on **every** connection. v5 is available
-behind the `unstable-protocol` feature for testing against unreleased builds.
+highest krafka can encode: sending v5 (KIP-1242) to a broker that does not
+advertise it would cost a rejected round trip on **every** connection. v5 is
+available behind the `unstable-protocol` feature for testing against unreleased
+builds.
 
 Negotiating v3+ rather than pinning v0 is what puts two things on the wire:
 
@@ -167,23 +168,24 @@ this range are rejected with a protocol error.
 | UpdateFeatures | 0 | 2 | Cluster feature versioning (KIP-584), v1 UpgradeType + ValidateOnly, v2 drops per-feature results |
 | GetTelemetrySubscriptions² | 0 | 0 | KIP-714 client telemetry subscription discovery |
 | PushTelemetry² | 0 | 0 | KIP-714 client telemetry push |
-| ShareGroupHeartbeat¹ | 1 | 1 | KIP-932 share group heartbeat |
-| ShareGroupDescribe¹ | 1 | 1 | KIP-932 share group description |
-| ShareFetch¹ | 1 | 2 | KIP-932 share fetch, v2 acquire mode (KIP-1206) + renew ack (KIP-1222) |
-| ShareAcknowledge¹ | 1 | 2 | KIP-932 share acknowledge, v2 renew ack (KIP-1222) |
+| ShareGroupHeartbeat | 1 | 1 | KIP-932 share group heartbeat |
+| ShareGroupDescribe | 1 | 1 | KIP-932 share group description |
+| ShareFetch | 1 | 2 | KIP-932 share fetch, v2 acquire mode (KIP-1206) + renew ack (KIP-1222) |
+| ShareAcknowledge | 1 | 2 | KIP-932 share acknowledge, v2 renew ack (KIP-1222) |
 | DescribeShareGroupOffsets | 0 | 1 | KIP-932 share-partition start offsets, v1 Lag (KIP-1226) |
 | AlterShareGroupOffsets | 0 | 0 | KIP-932 share-group offset reset (group must be empty) |
 | StreamsGroupDescribe | 0 | 0 | KIP-1071 Streams group describe — topology, members, task assignments and changelog offsets |
 | DeleteShareGroupOffsets | 0 | 0 | KIP-932 share-group offset deletion (group must be empty) |
 
-> ¹ Requires the `unstable-protocol` feature flag. Where a max is shown in
-> parentheses, that is the feature-gated ceiling.
+> ¹ Requires the `unstable-protocol` feature flag — the version Kafka marks
+> `latestVersionUnstable`. Where a max is shown in parentheses, that is the
+> feature-gated ceiling.
 >
 > ² Requires the `telemetry` feature flag.
 >
-> The share-group *offset administration* APIs (keys 90–92) are **not** behind
-> `unstable-protocol`: they are ordinary `AdminClient` operations and are
-> compiled unconditionally. Only the `ShareConsumer` itself is gated.
+> The share-group APIs are **not** behind `unstable-protocol` — Kafka marks none
+> of them unstable, and krafka negotiates them on every build. The
+> `ShareConsumer` module sits behind `share-groups`, on by default.
 >
 > `StreamsGroupDescribe` (key 89) is likewise ungated — it is an ordinary
 > `AdminClient` operation. Its sibling `StreamsGroupHeartbeat` (key 88) is

@@ -1953,8 +1953,18 @@ impl BrokerConnection {
     /// Run the connection event loop with priority handling.
     ///
     /// This is generic over the stream type, supporting both plain TCP and TLS.
-    /// High-priority requests are always checked first using try_recv,
-    /// ensuring heartbeats are never starved by backpressure on data requests.
+    /// High-priority requests are always checked first using try_recv, so a
+    /// heartbeat is never stuck behind queued produce/fetch requests.
+    ///
+    /// # Limit
+    ///
+    /// This orders **requests**, not **response bytes**. One socket per broker
+    /// carries one byte stream, so a fetch response already in flight delays
+    /// every response behind it, heartbeat included.
+    ///
+    /// Usually moot — the group coordinator is normally a different broker from
+    /// the partition leaders being fetched. It bites when they coincide, since
+    /// `ConnectionPool` keys on address: `max_response_size` bounds the stall.
     async fn run_connection_loop<R, W>(
         mut reader: R,
         mut writer: W,

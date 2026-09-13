@@ -114,10 +114,9 @@ pub const HEADER_EXCEPTION_MESSAGE: &str = "__krafka.dlq.exception.message";
 /// # Example
 ///
 /// Routing dead letters back into Kafka. This example is compiled by the test
-/// suite: the `Debug` supertrait means an implementation holding a
-/// [`Producer`] only works because `Producer`
-/// implements `Debug`, and the documented version of this pattern was wrong
-/// for two releases because nothing compiled it.
+/// suite, so it stays correct: note the `Debug` supertrait, which an
+/// implementation holding a [`Producer`] satisfies only because `Producer`
+/// itself implements `Debug`.
 ///
 /// ```rust,no_run
 /// use std::future::Future;

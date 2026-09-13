@@ -7,7 +7,9 @@ weight = 50
 slug_id = "share-consumer"
 +++
 
-Share groups ([KIP-932](https://cwiki.apache.org/confluence/display/KAFKA/KIP-932%3A+Queues+for+Kafka)) give Kafka queue-like semantics: records are acknowledged individually and a partition is not owned by one member. Stable as of Apache Kafka 4.0.
+Share groups ([KIP-932](https://cwiki.apache.org/confluence/display/KAFKA/KIP-932%3A+Queues+for+Kafka)) give Kafka queue-like semantics: records are acknowledged individually and a partition is not owned by one member.
+
+Enabled by the `share-groups` feature, which is on by default. Needs a **Kafka 4.2+** broker — KIP-932 is generally available from 4.2. Against an older broker, or Redpanda, which has no share groups, calls fail with `UnknownApiVersion` rather than degrading silently.
 
 ## Overview
 
@@ -190,9 +192,7 @@ while let Some(record) = stream.next().await {
 ## Configuration
 
 Every option below has a builder setter and a matching accessor on
-`ShareConsumerConfig`, checked in CI by `just config-reachability` — four of
-the fetch knobs were previously declared, sent on the wire, and settable by
-nobody.
+`ShareConsumerConfig`, asserted in CI by `just config-reachability`.
 
 | Option | Type | Default | Description |
 |---|---|---|---|
@@ -453,7 +453,7 @@ reference.
 
 ## Wire Protocol
 
-The share consumer uses four Kafka APIs (all feature-gated behind `unstable-protocol`):
+The share consumer uses four Kafka APIs (compiled in with the default `share-groups` feature; the wire protocol itself is negotiated on every build):
 
 | API | Key | Versions | Purpose |
 |---|---|---|---|

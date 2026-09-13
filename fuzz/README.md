@@ -19,9 +19,15 @@ rustup install nightly
 
 | Target | Description |
 |--------|-------------|
+| `fuzz_header_primitives` | Request/response headers and the protocol primitives (varints, strings, bytes, tagged fields) |
 | `fuzz_kafka_array` | `KafkaArray` decode and decode_compact with random bytes |
 | `fuzz_record_batch` | `RecordBatch` and `LazyRecordBatch` decode with random bytes |
+| `fuzz_request_encode` | Request encoding is total and deterministic — no input panics, and the same input always produces the same bytes |
 | `fuzz_response_decode` | Key response types (`ProduceResponse`, `FetchResponse`, `MetadataResponse`, `CreateTopicsResponse`, `DeleteTopicsResponse`) across multiple protocol versions |
+| `fuzz_scram` | SCRAM server-message parsing, which runs pre-authentication |
+
+`just fuzz-list` prints this list from the directory, and `just fuzz <target> [seconds]`
+runs one.
 
 ## Running
 
@@ -43,7 +49,7 @@ cargo +nightly fuzz run fuzz_kafka_array -- -max_total_time=300
 Run all targets sequentially (5 minutes each):
 
 ```sh
-for target in fuzz_kafka_array fuzz_record_batch fuzz_response_decode; do
+for target in $(just fuzz-list); do
     echo "=== Running $target ==="
     cargo +nightly fuzz run "$target" -- -max_total_time=300
 done
