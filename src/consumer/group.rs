@@ -56,6 +56,34 @@ const JOIN_GROUP_TIMEOUT_SLACK: Duration = Duration::from_secs(5);
 /// outer loop, which is unbounded and already backs off.
 const UNSTABLE_OFFSET_MAX_ATTEMPTS: u32 = 5;
 
+/// How many times `join_and_sync` re-discovers the coordinator and retries.
+///
+/// `NOT_COORDINATOR`, `COORDINATOR_NOT_AVAILABLE` and
+/// `COORDINATOR_LOAD_IN_PROGRESS` are all *retriable after re-discovery*: the
+/// group moved, or its coordinator is still loading `__consumer_offsets`. Both
+/// are ordinary states — a freshly started cluster answers this way until the
+/// coordinator is elected — and the Java client retries them transparently.
+const COORDINATOR_REDISCOVERY_MAX_ATTEMPTS: u32 = 5;
+
+/// Whether an error means "ask FindCoordinator again and retry".
+///
+/// These three codes share one remedy — re-discover the coordinator — which is
+/// why `invalidate_coordinator_on_error` drops the cached connection for all of
+/// them. They are routine rather than exceptional: a cluster that has just
+/// started, or one that has just moved a group, answers this way until the new
+/// coordinator finishes loading `__consumer_offsets`.
+fn is_coordinator_retriable(error: &KrafkaError) -> bool {
+    matches!(
+        error,
+        KrafkaError::Broker {
+            code: ErrorCode::NotCoordinator
+                | ErrorCode::CoordinatorNotAvailable
+                | ErrorCode::CoordinatorLoadInProgress,
+            ..
+        }
+    )
+}
+
 /// Whether `OffsetFetch` must ask the coordinator for **stable** offsets
 /// (KIP-447), given the consumer's isolation level.
 ///
@@ -2355,17 +2383,73 @@ impl GroupCoordinator {
     ///
     /// Deliberately does *not* start the heartbeat task, so the background task
     /// can call it without asking `stop_heartbeat_task` to terminate itself.
+    /// One `JoinGroup`/`SyncGroup` round trip, retrying coordinator errors.
+    ///
+    /// `join_group` and `sync_group` drop the cached coordinator when the
+    /// broker answers `NOT_COORDINATOR`, `COORDINATOR_NOT_AVAILABLE` or
+    /// `COORDINATOR_LOAD_IN_PROGRESS`, so the *next* attempt re-runs
+    /// `FindCoordinator`. Something has to make that next attempt: without this
+    /// loop the cache is invalidated and the error is handed to the caller
+    /// anyway, which surfaces a routine coordinator election as a failed
+    /// `subscribe()`.
+    ///
+    /// Bounded, and deliberately not tied to `rebalance_timeout`: this runs
+    /// before the member is in the group, so there is no rebalance to be late
+    /// for. Past the budget the error is surfaced — a coordinator that is still
+    /// unavailable after five backed-off attempts is not a transient.
     async fn join_and_sync(&self) -> Result<MemberAssignment> {
-        // Find coordinator if needed
-        if self.coordinator_conn.read().await.is_none() {
-            self.find_coordinator().await?;
+        let backoff = crate::util::BackoffPolicy::default();
+        let mut last_error = None;
+
+        for attempt in 0..COORDINATOR_REDISCOVERY_MAX_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(backoff.calculate_backoff(attempt)).await;
+            }
+
+            // Re-discovery happens here: `invalidate_coordinator_on_error`
+            // cleared the cache, so this runs FindCoordinator again.
+            if self.coordinator_conn.read().await.is_none() {
+                match self.find_coordinator().await {
+                    Ok(()) => {}
+                    Err(error) if is_coordinator_retriable(&error) => {
+                        debug!(
+                            "FindCoordinator for group '{}' failed with {error}; \
+                             retrying (attempt {}/{})",
+                            self.group_id,
+                            attempt + 1,
+                            COORDINATOR_REDISCOVERY_MAX_ATTEMPTS
+                        );
+                        last_error = Some(error);
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+
+            let result = match self.join_group().await {
+                Ok(join_response) => self.sync_group(&join_response).await,
+                Err(error) => Err(error),
+            };
+
+            match result {
+                Ok(assignment) => return Ok(assignment),
+                Err(error) if is_coordinator_retriable(&error) => {
+                    debug!(
+                        "Group '{}' join/sync hit {error}; re-discovering the \
+                         coordinator (attempt {}/{})",
+                        self.group_id,
+                        attempt + 1,
+                        COORDINATOR_REDISCOVERY_MAX_ATTEMPTS
+                    );
+                    last_error = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
         }
 
-        // Join group
-        let join_response = self.join_group().await?;
-
-        // Sync group
-        self.sync_group(&join_response).await
+        Err(last_error.unwrap_or_else(|| {
+            KrafkaError::broker(ErrorCode::NotCoordinator, "Failed to join group")
+        }))
     }
 
     /// Partitions this member must give up to reach `assignment`, per the
@@ -3039,6 +3123,14 @@ impl GroupCoordinator {
                         self.reset_member_identity().await;
                     }
                 }
+                // Coordinator errors mean "ask FindCoordinator again", so the
+                // cached connection must go — otherwise every retry is sent to
+                // a broker that can only answer NOT_COORDINATOR. The background
+                // heartbeat task does this on its own path; the initial join
+                // reaches here instead, and used to return the error with the
+                // stale coordinator still cached.
+                self.invalidate_coordinator_on_error(hb_response.error_code)
+                    .await;
                 return Err(KrafkaError::broker(
                     hb_response.error_code,
                     format!(
@@ -3246,9 +3338,62 @@ impl GroupCoordinator {
             None
         };
 
-        let resp = self
-            .consumer_group_heartbeat(subscribed, owned_partitions)
-            .await?;
+        // Same bounded re-discovery loop as the classic path's `join_and_sync`.
+        // Under KIP-848 the heartbeat *is* the join, so a coordinator election
+        // in progress surfaces here as a failed `subscribe()` unless something
+        // retries it.
+        let backoff = crate::util::BackoffPolicy::default();
+        let mut last_error = None;
+        let mut resp = None;
+
+        for attempt in 0..COORDINATOR_REDISCOVERY_MAX_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(backoff.calculate_backoff(attempt)).await;
+                if self.coordinator_conn.read().await.is_none() {
+                    match self.find_coordinator().await {
+                        Ok(()) => {}
+                        Err(error) if is_coordinator_retriable(&error) => {
+                            last_error = Some(error);
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+
+            match self
+                .consumer_group_heartbeat(subscribed.clone(), owned_partitions.clone())
+                .await
+            {
+                Ok(ok) => {
+                    resp = Some(ok);
+                    break;
+                }
+                Err(error) if is_coordinator_retriable(&error) => {
+                    debug!(
+                        "KIP-848 join for group '{}' hit {error}; re-discovering the \
+                         coordinator (attempt {}/{})",
+                        self.group_id,
+                        attempt + 1,
+                        COORDINATOR_REDISCOVERY_MAX_ATTEMPTS
+                    );
+                    last_error = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        let resp = match resp {
+            Some(resp) => resp,
+            None => {
+                return Err(last_error.unwrap_or_else(|| {
+                    KrafkaError::broker(
+                        ErrorCode::NotCoordinator,
+                        "ConsumerGroupHeartbeat failed: coordinator unavailable",
+                    )
+                }));
+            }
+        };
 
         // Start heartbeat task for KIP-848
         self.start_consumer_heartbeat_task(resp.heartbeat_interval_ms)

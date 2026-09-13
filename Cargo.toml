@@ -1,6 +1,6 @@
 [package]
 name = "krafka"
-version = "0.22.0"
+version = "0.23.0"
 edition = "2024"
 rust-version = "1.88"
 authors = ["hupe1980"]
@@ -85,7 +85,7 @@ serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 
 [features]
-default = ["compression", "ring"]
+default = ["compression", "ring", "share-groups"]
 # Enable pure-Rust compression codecs.
 compression = ["gzip", "snappy", "lz4"]
 # Enable all compression codecs, including zstd.
@@ -121,16 +121,21 @@ oauth-oidc = ["dep:serde", "dep:serde_json", "tokio/fs"]
 # Enable loading platform-native root certificates for TLS client verification.
 # When enabled, `TlsConfig::with_native_roots()` can use the OS trust store.
 native-tls-roots = ["dep:rustls-native-certs"]
-# Enable protocol versions that Kafka itself marks `latestVersionUnstable`, i.e.
-# versions a released broker does not advertise unless it was started with
-# `unstable.api.versions.enable=true`.
+# Enable protocol versions Kafka marks `latestVersionUnstable`: ApiVersions v5
+# (KIP-1242) and InitProducerId v6 (KIP-939). A released broker does not
+# advertise these unless started with `unstable.api.versions.enable=true`, and
+# they may change without semver notice.
 #
-# Includes ApiVersions v5 (KIP-1242), InitProducerId v6 (KIP-939 two-phase
-# commit) and the Share Consumer (KIP-932) module.
-#
-# Fetch v17/v18 are NOT in this list: they shipped in Kafka 4.0 and 4.1 as
-# stable versions and are negotiated by default.
+# Membership follows one rule — the Kafka schema marks the version unstable —
+# and `just protocol-parity` enforces it. Anything else gets its own feature.
 unstable-protocol = []
+# Enable the KIP-932 share consumer: queue semantics on a Kafka topic, with
+# per-record acknowledgement and redelivery on lock expiry.
+#
+# On by default, with the same semver promise as the rest of the crate. Needs a
+# Kafka 4.2+ broker; against anything older (including Redpanda, which has no
+# share groups) it fails with `UnknownApiVersion` rather than degrading.
+share-groups = []
 # Enable KIP-714 client telemetry APIs (GetTelemetrySubscriptions, PushTelemetry).
 telemetry = []
 # Enable the in-process fake Kafka broker in `krafka::testing`.
@@ -174,6 +179,14 @@ harness = false
 [[bench]]
 name = "protocol"
 harness = false
+
+# End-to-end send path against the in-process fake broker. A regression gate
+# (krafka vs krafka), not a comparison — see the module docs for why the fake
+# broker is adequate for that and inadequate for anything quotable.
+[[bench]]
+name = "send_path"
+harness = false
+required-features = ["test-broker"]
 
 
 [package.metadata.docs.rs]

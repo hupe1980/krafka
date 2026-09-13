@@ -245,7 +245,7 @@ let admin = AdminClient::builder()
 |--------|-------------|
 | `producer` | Batching, compression, idempotence, transactions, partitioners |
 | `consumer` | Consumer groups (classic + KIP-848), offsets, rebalancing, compacted-topic tables |
-| `share_consumer` | KIP-932 share groups — queue semantics on a Kafka topic *(`unstable-protocol`)* |
+| `share_consumer` | KIP-932 share groups — queue semantics on a Kafka topic *(`share-groups`, on by default; needs a Kafka 4.2+ broker)* |
 | `admin` | Cluster administration: topics, partitions, groups, configs, ACLs, quotas, tokens |
 | `client` | `KrafkaClient` — one connection pool and metadata cache shared by several clients |
 | `auth` | SASL PLAIN / SCRAM / OAUTHBEARER / AWS MSK IAM, TLS and mTLS |
@@ -332,11 +332,20 @@ just ci-full      # ci + supply-chain audit + Docker integration tests
 just pre-commit   # the fast subset (fmt, clippy, check)
 just install-hooks  # wire pre-commit into .git/hooks
 just t <pattern>  # run one test by name, with output
+
+just bench-baseline  # record the performance reference
+just bench-check     # fail if the send path regressed >10% since then
+just semver-check    # classify API changes against the last published release
 ```
 
 Individual recipes mirror one CI job each: `fmt-check`, `clippy`, `check`,
 `protocol-parity`, `secret-debug`, `test`, `test-ring`,
 `test-cross-platform`, `minimal-features`, `doc`, `deny`, `integration`, `msrv`.
+`just ci-job-parity` asserts that pairing holds.
+
+`bench-check` and `semver-check` sit outside `just ci`: both are slow and noisy
+on a shared runner, and pre-1.0 a detected API break is allowed rather than
+fatal.
 
 ### Checks that exist because a review found what they now catch
 
@@ -379,6 +388,26 @@ newer Kafka release deliberately:
 just refresh-protocol-snapshot 4.3   # rewrite the snapshot; review the diff
 just protocol-parity                 # see what krafka must do about it
 ```
+
+**`just ci-job-parity`** — every recipe in `just ci` has a CI job, one required
+check (`ci-success`) gates every job, and that check carries `if: always()`.
+
+The justfile being the source of truth has a blind spot: a recipe wired to no
+workflow is invisible from both sides, because each list is internally complete
+and neither is compared to the other. `just integration-sasl` ran in no workflow
+for its entire life, and `just docs-test` gated every compiled documentation
+snippet while no pull request ran it.
+
+`if: always()` is not cosmetic: GitHub leaves a required check pending forever
+when its job never runs, and reads a **skipped** required check as success.
+
+**`just bench-check`** — the send path has not regressed more than 10% against
+the recorded baseline, measured against the in-process fake broker.
+
+These are krafka-vs-krafka numbers. The harness holds a single lock and keeps
+its log in memory, so **no figure it produces is quotable** and none appears in
+this README. It is still the right tool for detecting a regression: a constant
+overhead cancels when you subtract two runs of it.
 
 **`just secret-debug`** — no credential-bearing type may derive `Debug`.
 `Debug` is the quiet way secrets reach a log aggregator: a `tracing` field, an
@@ -582,8 +611,10 @@ Broker-internal APIs (`LeaderAndIsr`, `UpdateMetadata`, `Vote`, `FetchSnapshot`,
 an `ApiVersions` response from a modern broker decodes to something readable
 rather than `Unknown(87)`.
 
-Not implemented: KIP-1071 Streams group protocol (keys 88–89) and KIP-1258
-OAuth client assertion.
+Not implemented: `StreamsGroupHeartbeat` (KIP-1071, key 88). Its request carries
+the Streams application topology, which is group-wide state — a client with no
+Streams runtime cannot send a truthful one. Its sibling `StreamsGroupDescribe`
+(key 89) *is* implemented, as `AdminClient::describe_streams_groups`.
 
 **Schema registries are out of scope**, as they are for every comparable client
 — Java's `kafka-clients` has none, librdkafka has none, franz-go keeps `pkg/sr`
@@ -661,539 +692,9 @@ what it does and, just as importantly, what it deliberately does not model.
 
 ## ⬆️ Upgrading
 
-Release-by-release detail lives in **[CHANGELOG.md](CHANGELOG.md)**.
-
-### Upgrading to 0.22
-
-**Producer topic resolution.** A `send()` to a topic the metadata cache does not
-hold now fetches metadata for it and retries until it resolves or `max_block`
-expires, instead of failing outright — the equivalent of
-`KafkaProducer.waitOnMetadata`. A topic that cannot be resolved fails with the
-broker's own error code, so match on that rather than on
-`KrafkaError::InvalidState { message: "unknown topic: …" }`:
-
-```rust
-match producer.send("maybe-missing", None, Some(b"v")).await {
-    Err(KrafkaError::Broker { code: ErrorCode::TopicAuthorizationFailed, .. }) => { /* ACLs */ }
-    Err(KrafkaError::Broker { code: ErrorCode::UnknownTopicOrPartition, .. }) => { /* absent */ }
-    _ => {}
-}
-```
-
-Alongside it: `max_block` is one budget for the whole `send()` call — metadata
-resolution *and* the wait for buffer memory — rather than restarting at the
-second; and a record addressed to a partition the topic does not have is
-rejected by `send()` with `KrafkaError::Config` naming the valid range.
-
-**`metadata_topic_cache_ttl` is an idle timeout.** Same name, default and
-opt-out; an entry is now evicted only after nothing has addressed the topic for
-the whole TTL, matching Java's `metadata.max.idle.ms`.
-
-**Group-less `subscribe()` keeps its assignment current.** `poll()` re-derives
-the partition list from metadata, so topics created after subscribing and
-partitions added later are picked up. `assign()` takes the topic it names out of
-that loop, which is what keeps a narrow manual assignment narrow. Consumers with
-a `group_id` are unaffected.
-
-**`allow_auto_create_topics`** is new on every builder
-(`allow.auto.create.topics`), defaulting to `false`. Enable it where you want
-the broker to materialise missing topics.
-
-### Upgrading to 0.21
-
-`ProducerInterceptor` gained a per-record `RecordContext`, so an interceptor can
-open a span or timer in `on_send` and finish it in `on_acknowledgement`, which
-also now receives the record's final read-only headers (the Java client's
-KIP-512). `ConsumerInterceptor` is unchanged.
-
-```rust
-impl ProducerInterceptor for LatencyInterceptor {
-    fn on_send(&self, _record: &mut ProducerRecord, ctx: &mut RecordContext) -> InterceptorResult {
-        ctx.insert(SendStart(Instant::now()));
-        Ok(())
-    }
-
-    fn on_acknowledgement(
-        &self,
-        _metadata: &RecordMetadata,
-        _error: Option<&KrafkaError>,
-        _headers: &RecordHeaders,
-        ctx: &mut RecordContext,
-    ) -> InterceptorResult {
-        if let Some(SendStart(t)) = ctx.take::<SendStart>() {
-            record_latency(t.elapsed());
-        }
-        Ok(())
-    }
-}
-```
-
-If you need neither, add `_headers: &RecordHeaders` and
-`_ctx: &mut RecordContext` to the signatures and change nothing else.
-
-`on_acknowledgement` now fires for **every** record `on_send` saw, including
-those rejected before the accumulator — a failed serializer, failed validation,
-an unrouteable topic, `max.block.ms` exhausted. Those report
-`UNKNOWN_PARTITION`, offset `-1` and `DeliveryConfirmation::Failed`, where
-before they produced no callback at all. See the
-[Interceptors Guide](https://hupe1980.github.io/krafka/docs/interceptors/).
-
-### Upgrading to 0.20
-
-Null is now representable on the produce path, so krafka can write tombstones.
-Three public shapes changed:
-
-| Before | After |
-|---|---|
-| `ProducerRecord::value: Bytes` | `ProducerRecord::value: Option<Bytes>` |
-| `ProducerRecord::headers: Vec<(String, Bytes)>` | `Vec<(String, Option<Bytes>)>` |
-| `send(topic, key, value: &[u8])` | `send(topic, key, value: Option<&[u8]>)` |
-
-Wrap the value you pass in `Some(...)` (`send`, `send_with_headers`,
-`TransactionalProducer::send`), and header values likewise —
-`ProducerRecord::with_header` still takes a plain value. `None` is a tombstone:
-see [Tombstones and Compacted Topics](https://hupe1980.github.io/krafka/docs/producer/#tombstones-and-compacted-topics).
-
-### Upgrading to 0.19
-
-No code changes required — 0.19 is a correctness release and every public
-signature is unchanged. Behaviour differs in ways you may notice:
-
-- A cooperative rebalance that moves a partition between two live members now
-  takes **two generations** (revoke, then assign) instead of one, matching the
-  Java client. The extra round is what closes a window where both members
-  briefly consumed the same partition.
-- A transactional `commit_transaction()`/`abort_transaction()` that fails no
-  longer reverts a `Prepared` or `CommitIndeterminate` transaction to
-  `InTransaction` — each failure now returns to the state it entered from, so
-  a 2PC-prepared transaction stays frozen and an indeterminate commit stays
-  commit-only.
-- A `ProduceResponse` that fails to decode is reported as the decode error it
-  is, rather than triggering a batch split-and-resend.
-- `ProtocolErrorKind` has a new `FrameTooLarge` variant (the enum is
-  `#[non_exhaustive]`, so `match` arms with a wildcard are unaffected).
-
-### Upgrading to 0.18
-
-#### Breaking — the producer has one send path
-
-`ProducerConfig::max_in_flight` and `ProducerBuilder::max_in_flight` are gone,
-on both the plain and the transactional producer. Delete the call; there is
-nothing to replace it with, and the guarantee it was supposed to buy is now
-structural.
-
-krafka had two send paths. `linger > 0` used the record accumulator; `linger =
-0` — **the default** — used a second, unbatched implementation that duplicated
-the retry, sequence-recovery, leader-hint and dead-letter logic. That path is
-deleted. Every send now goes through the accumulator, at every `linger`
-setting, which fixes two things at once:
-
-- **`linger = 0` batches.** It always meant "do not *wait* for more records",
-  never "do not batch". The accumulator dispatches immediately when the
-  partition's wire is free and coalesces whatever arrives during the round trip
-  into the next batch, dispatched the instant the acknowledgement lands. 200
-  concurrent sends to one partition now leave as **3** Produce requests instead
-  of 200 — with no added latency, because the first record never waits.
-- **Concurrent sends to one partition can no longer break an idempotent
-  producer.** The old path let up to `max_in_flight` requests race onto the wire
-  with no per-partition ordering, so sequences could arrive out of order and the
-  broker's `OUT_OF_ORDER_SEQUENCE_NUMBER` would fail the producer permanently
-  with a "recreate the producer" error. Since idempotence is on by default and
-  `Arc<Producer>` shared across tasks is the documented pattern, that was
-  reachable from the default configuration. The accumulator keeps exactly one
-  batch per partition on the wire, in seal order, so sequence order and wire
-  order cannot diverge.
-
-That per-partition guarantee is why there is no `max.in.flight ≤ 5` rule to
-observe. The per-connection ceiling that remains is a transport concern:
-`TransportConfig::max_in_flight_requests`.
-
-#### Breaking — the compacted-topic builder is gone, and reads committed
-
-`CompactedTopicConsumerBuilder` is replaced by
-`CompactedTopicConsumer::from_consumer_builder(ConsumerBuilder, topic)`. The old
-builder owned a hand-picked subset of nine consumer settings, and every setting
-it omitted was unreachable through it — including `isolation_level`, so the type
-most likely to be pointed at transactional data could not ask for
-`read_committed` and could materialise a table from records that were later
-aborted.
-
-The new constructor imposes three settings as requirements of materialising a
-table: `auto_offset_reset = Earliest`, `enable_auto_commit = false`, and
-**`isolation_level = ReadCommitted`**. The last is a behaviour change, and
-deliberate: anyone relying on the old default was reading aborted records into a
-table. It costs nothing on a topic with no transactions. Use `from_consumer`
-with a hand-built `Consumer` to read uncommitted state on purpose.
-
-#### Breaking — the SOCKS5 proxy lives on `TransportConfig`
-
-`ProducerConfig::proxy` and its four siblings are gone; `TransportConfig::proxy`
-replaces them. Every client builder keeps `.proxy(..)` as a shorthand that
-writes into its transport config, so there is one storage location and no
-precedence rule.
-
-This was a trap, not an omission: `TransportConfig`'s own documentation
-described it as carrying "the SOCKS5 route" and warned that a client left on the
-default transport gets "no proxy" — describing a capability the type did not
-have. A downstream project mapped its transport settings onto the type, which is
-what the name invites, and shipped a producer that silently bypassed the proxy
-its deployment required.
-
-#### Breaking — share-consumer settings take `Duration`
-
-`ShareConsumerBuilder::fetch_max_wait_ms(i32)` is now
-`fetch_max_wait(Duration)` — it was the only timeout in the crate taking raw
-milliseconds. `TransactionalProducerConfig` stores `transaction_timeout` as a
-`Duration` internally too; its public setter and accessor are unchanged.
-
-#### Breaking — deserialization failures are typed and no longer lose records
-
-A key or value deserializer that returned an error used to fail the poll
-*after* the fetch position had advanced, so the records in that batch were
-skipped permanently — silent loss with nothing in the logs. Now the batch is
-put back in the receive buffer (where the commit clamp holds the committed
-offset behind it) and the poll fails with a new variant:
-
-```rust
-match consumer.poll(timeout).await {
-    Err(KrafkaError::RecordDeserialization { topic, partition, offset, .. }) => {
-        // Nothing was consumed; skip the poison record explicitly.
-        consumer.seek(&topic, partition, offset + 1).await?;
-    }
-    other => { other?; }
-}
-```
-
-`KrafkaError` gained `RecordDeserialization { topic, partition, offset, part,
-message }`. Match arms over `KrafkaError` may need a new branch. Equivalent to
-the Java client's `RecordDeserializationException`.
-
-Deserialization also now runs **before** the consumer interceptor, so
-`on_consume` sees application-level values — the mirror image of the producer,
-where `on_send` sees the record before serialization, and the same order the
-Java client uses.
-
-#### New — `enqueue()`: separate ordering from durability
-
-```rust
-// Ordering is fixed by these calls returning, not by how the handles are awaited.
-let mut acks = FuturesUnordered::new();
-for record in batch {
-    acks.push(producer.enqueue(record).await?);
-}
-while let Some(metadata) = acks.next().await { metadata?; }
-```
-
-`Producer::enqueue` and `TransactionalProducer::enqueue` return a
-`DeliveryHandle` — Java's `Producer.send()` shape. **Produce order is enqueue
-order**, whatever order the handles are polled in.
-
-`send_record` cannot offer that, because it does its append somewhere inside its
-own polling: N of them polled concurrently append in *poll* order, and under
-buffer-memory backpressure the two diverge. Pipelining on top of it was possible
-but required polling every outstanding future in submission order on every wake
-— O(window) per wake, with the sweep itself being the ordering guarantee.
-`send_record` remains, and is now `enqueue(record).await?.await`.
-
-`FakeBroker` gained `committed_records()` / `all_records()`, read straight from
-the broker's log — no consumer, no bounded poll loop. The difference between the
-two is what an exactly-once test is actually asserting.
-
-**KIP-939 two-phase commit** (`unstable-protocol`) closes the gap the previous
-review named as the largest remaining one. Kafka transactions are atomic within
-Kafka and with nothing else; a service that must write to Kafka *and* a database
-— either both or neither — now can. `two_phase_commit(true)` stops the
-coordinator applying `transaction.max.timeout.ms`, `prepare_transaction()`
-flushes and freezes the transaction, and after a crash
-`init_transactions_keeping_prepared()` + `complete_transaction(stored)` resolves
-it against the state the external coordinator recorded.
-
-`NewTopic::with_replica_assignment` makes manual replica placement expressible
-— it was sent as an empty list unconditionally, ruling out rack-aware placement
-and layout mirroring. `list_consumer_groups` takes a `GroupListing` so state and
-type filters are applied by the *broker* rather than by your loop, and
-`create_delegation_token` takes an `owner`, completing KIP-373's on-behalf-of
-half.
-
-`ShareConsumer::acquisition_lock_timeout()` surfaces the KIP-1222 lock duration
-the broker reports on every `ShareFetch`. Without it `AcknowledgeType::Renew`
-was documented, reachable, and impossible to schedule: the deadline it extends
-is a broker-side setting no client can read from its own configuration.
-
-`OffsetSpec` gained `MaxTimestamp`, `EarliestLocal` and `LatestTiered`
-(KIP-734, KIP-405, KIP-1005). krafka already negotiated `ListOffsets` v11, so
-these were questions the wire could answer and the API could not ask — including
-"where does local storage end", which is how you find out whether a scan is
-about to pull from object storage. `describe_consumer_group_offsets` gained an
-`OffsetVisibility` for the same KIP-447 reason as the consumer fix above.
-
-`AdminClient` gained `retries` / `retry_backoff`. Its controller-routing retries
-were compile-time constants — five attempts, flat 100 ms, no jitter — while the
-docstring claimed they were `retry.backoff.ms`. A second of budget is short for
-a KRaft election, and a flat sleep means every admin client watching one
-election arrives at the new controller as a single wave.
-
-#### New — the share consumer catches up with the subscription consumer
-
-Five `ShareConsumer` settings were declared, documented, and sent on the wire
-with **no builder setter**: `fetch_min_bytes`, `fetch_max_bytes`, `max_records`
-and `batch_size` — the four knobs KIP-932 exposes for tuning a share fetch —
-plus `metadata_recovery_rebootstrap_trigger`. Every krafka share consumer in
-existence sent the same four numbers. They are settable now, and
-`ShareConsumerConfig` gained 17 accessors (it had 6 where `ConsumerConfig` has
-34, which made `build_config()` largely unreadable).
-
-`ShareConsumer` also accepts `key_deserializer` / `value_deserializer` now. It
-returns the same `ConsumerRecord` as the subscription consumer, so it takes the
-same hook; previously a share-group application had to decode schema framing by
-hand. Because a share consumer cannot `seek()` past a poison record, its remedy
-is `acknowledge_by_offset(topic, partition, offset, AcknowledgeType::Reject)` —
-so deserialization deliberately runs *after* the record is registered, which is
-what makes that call legal.
-
-`TransportConfig` gained `socket_send_buffer` / `socket_receive_buffer`
-(`SO_SNDBUF` / `SO_RCVBUF`) for the same reason: declared on
-`ConnectionConfig`, readable, applied to the real socket via `socket2` — and
-settable by nobody, so every krafka connection took the OS default. On a
-high bandwidth-delay-product link that is the throughput ceiling.
-
-Three new CI gates exist so this class of defect cannot recur:
-
-- **`just config-reachability`** walks every config struct's *fields* and
-  requires each to have a builder setter and a public accessor, or a documented
-  exception. `tests/builder_surface.rs` proves named methods exist; only a
-  field-driven check can prove nothing was forgotten. It covers 149 fields
-  across 8 configs and found the socket-buffer gap above the moment it was
-  pointed at the transport layer.
-- **`just protocol-reachability`** is its mirror image on the wire: every `pub`
-  field of every response struct must be read by client code outside the
-  protocol layer, or carry a documented reason for being decode-only. This is
-  the shape of the two most severe defects in the crate's history —
-  `last_stable_offset` and KIP-1222's `acquisition_lock_timeout_ms` were both
-  decoded correctly, round-tripped in the codec's own tests, and read by
-  nobody. From the codec's side they look finished; from the client's side the
-  information never arrives.
-- **`rustdoc::broken_intra_doc_links` is denied**, with a second `just doc`
-  pass over private items. Fifteen links resolved to nothing and rendered as
-  plain text, one of them to a type deleted several releases ago.
-
-#### Fixed
-
-- **`OffsetFetch` never asked for stable offsets (KIP-447).** A
-  `read_committed` consumer resuming after a crash could read a committed
-  offset that a transaction had staged but not committed. If that transaction
-  then aborted, the consumer had already resumed past records it was supposed
-  to reprocess — silent data loss on the exactly-once recovery path. The flag
-  now follows the isolation level, and the `UNSTABLE_OFFSET_COMMIT` answer it
-  unlocks is retried rather than silently dropped (a dropped partition reads as
-  "never committed", i.e. `auto.offset.reset`).
-- **`recv()` could deliver a partition's records out of order.** `poll()` parks
-  its undelivered surplus at the back of the receive buffer; `recv()` appended
-  *its* undelivered remainder there too, behind records from higher offsets in
-  the same partitions. A fetch yielding more than `max_poll_records` for one
-  partition therefore handed the application offsets 501+ before offsets 2–500.
-  The remainder is now reinserted at the front.
-- **A Fetch v13+ response naming an unknown topic UUID was logged as discarded
-  but not discarded.** Its partitions kept an empty topic name, so watermarks,
-  log-start offsets and preferred replicas were recorded under `("", partition)`
-  — state belonging to no topic and colliding across topics.
-- **A producer-ID reset racing a batch could silently disable idempotence.**
-  Sequence allocation now goes through the checked path that verifies the
-  identity under the same lock, so a batch can no longer be stamped with
-  producer ID `-1` and written non-idempotently with no error anywhere.
-- **`delivery_timeout` excluded backpressure again.** The clock is charged from
-  `send()` entry — including the up-to-`max_block` wait for buffer memory — by
-  pulling the batch's deadline back to its earliest record's entry time.
-- **Steady-state logging dropped from `info!` to `debug!`.** Every
-  `ConsumerGroupHeartbeat`, every auto-commit and every committed-offset fetch
-  logged at `info!`, so an idle consumer group produced a line every few seconds
-  per member at the default subscriber level.
-
-#### Performance
-
-- Batching at the default configuration (above) is the large one.
-- An idle producer no longer wakes the runtime 1 000 times a second. The
-  accumulator's loop drove a fixed 1 ms tick, affordable when only `linger > 0`
-  producers had one; now every producer does, so it sleeps until the earliest
-  open batch's linger deadline instead.
-- The delivery hot path no longer allocates a `String` per record. `pause()`
-  checks, the stale-response filter and buffer purges probed a
-  `HashSet<(String, PartitionId)>` by building an owned key for every record;
-  they now compare borrowed names against a set that is empty in the common
-  case.
-
-### Upgrading to 0.17
-
-#### Breaking — schema registry moved out
-
-`krafka::schema_registry` is gone, with the `schema-registry` and
-`aws-glue-schema-registry` features. The registry client now lives in
-[`schemreg`](https://crates.io/crates/schemreg), which additionally supports
-Apicurio and ships Avro / Protobuf / JSON codecs krafka never had.
-
-Every comparable client draws the line here — Java's `kafka-clients` has no
-registry support, librdkafka has none, franz-go keeps `pkg/sr` out of `kgo`. A
-registry is a different service; coupling it to the protocol client meant a
-registry API change could force a Kafka client release.
-
-What krafka keeps is the hook, generalised:
-
-- `SchemaEncoder` / `SchemaDecoder` → **`krafka::serdes::Serializer` /
-  `Deserializer`** (`encode` → `serialize`, `decode` → `deserialize`).
-- `key_encoder` / `value_encoder` → **`key_serializer` / `value_serializer`**;
-  `key_decoder` / `value_decoder` → **`key_deserializer` / `value_deserializer`**.
-- `KrafkaError::SchemaRegistry` → **`KrafkaError::Http`**.
-
-Since the traits are plain `Bytes -> Bytes`, they now cover encryption and
-compression as well as schema framing. The ~20-line `schemreg` adapter is in the
-[Cookbook](https://hupe1980.github.io/krafka/docs/cookbook/#use-a-schema-registry).
-
-#### Breaking — consumer offset accessors
-
-- **`Consumer::cached_end_offset` is isolation-aware.** Under `read_committed`
-  it returns the **last stable offset** rather than the high watermark, because
-  the broker will not deliver a record at or above the LSO. Use the new
-  `cached_high_watermark()` if you specifically want the log-end offset.
-  `read_uncommitted` (the default) is unchanged.
-- **`Consumer::position()` reports the delivered offset, not the read-ahead.**
-  It is the value a commit writes, so `position()` and `commit()` cannot
-  disagree. The read-ahead value is the new `fetch_position()`.
-
-#### Fixed
-
-- **A `seek()` could move the committed offset *backwards*.** Every reposition
-  path left already-fetched records in the receive buffer, and a commit is
-  clamped down to the lowest still-buffered offset — correct on its own, and
-  what stops an undelivered record from being acknowledged. After
-  `seek_to_end()` on a partition with buffered offset 100 and a new position of
-  5 000, the next commit wrote **100**. Via `auto.offset.reset` the clamped
-  offset could be one the log no longer holds, producing a reset →
-  `OFFSET_OUT_OF_RANGE` loop that never converged.
-- **`read_committed` reported permanent phantom lag.** `last_stable_offset` was
-  decoded from every fetch response and never read, so `lag()`,
-  `is_caught_up()` and the `lag` metrics compared against the high watermark. An
-  open transaction kept a fully drained consumer reporting a backlog it could
-  never close, and `is_caught_up()` could never return `true`.
-- **`pause()` was bypassed by `recv()` / `batch_recv()`.** `poll()` withheld
-  paused partitions; the buffer drain did not, so the same client gave two
-  answers depending on which read API was used. Withheld records are held, not
-  discarded — the fetch position has already advanced past them.
-- **A commit marker could end a `read_committed` abort filter early.** The
-  aborted-transaction filter deactivated on *any* control batch without reading
-  the marker's type field, so aborted records could reach the application.
-- **A transactional commit could orphan a record into the next transaction.**
-  `commit_transaction()` drained the accumulator before closing the transaction
-  to new records, so a concurrent `send()` could slip in behind the flush and
-  stay buffered until after `EndTxn` — landing in the *following* transaction,
-  and vanishing if that one aborted.
-- **A commit could write `EndTxn` while `send_offsets_to_transaction` was still
-  in flight**, committing the consumer's offsets outside the transaction. The
-  output records stayed atomic with each other but not with the position that
-  produced them.
-- **`assign()` leaked state for partitions it dropped.** Narrowing a manual
-  assignment left the old partitions' positions, watermarks and buffered
-  records behind — and the stale buffer entry dragged back the commit for the
-  partitions still being consumed.
-- **A share-consumer flush could strand acknowledgements.** `poll()` holds the
-  pending acks out of the map for the duration of its `ShareFetch`, so a
-  concurrent `commit_sync()` or `close()` flushed an empty map and reported
-  success. The documented `wakeup()` → `close()` shutdown hits exactly that
-  window. Both flush paths now wait for in-flight polls first.
-
-#### Changed
-
-- **Lag counts records read ahead into the buffer** — fetched is not delivered.
-  `position()`, `lag()`, `current_lag()`, `is_caught_up()` and `commit()` are
-  now all derived from one boundary.
-
-#### Faster
-
-- **Fetch responses are read ahead into a prefetch buffer.** A 50 MB response
-  was fully decoded and then truncated to 500 records, with the surplus dropped
-  and re-decoded next poll — roughly **100× the necessary decode work per poll**
-  on a 50-partition assignment. Each fetch now decodes one delivery's worth plus
-  the buffer's free capacity and *parks* the surplus, so the next poll is served
-  from memory with no Fetch on the wire: half the round trips, and network
-  latency out of every other poll.
-- **Partition fetch order is a real round robin.** Fairness previously depended
-  on unspecified `HashMap` iteration order; partitions now rotate by one
-  position per poll, matching the Java client's `PartitionStates.moveToEnd`.
-
-#### New
-
-- `Consumer::cached_high_watermark` and `Consumer::cached_last_stable_offset` —
-  the gap between them is the volume of in-flight transactional data.
-- `Consumer::fetch_position` — where the next fetch starts, as opposed to where
-  delivery is.
-- **`KafkaDeadLetterQueue`** — the DLQ implementation everyone was writing by
-  hand. Attaches provenance headers, drops the source partition index, and
-  counts what it could not save.
-- **`krafka::prelude`** — one glob import for the common types.
-- **`krafka::interceptor::CommitOffsets`** — names the map `on_commit` takes,
-  so implementors no longer need `ahash` in their own manifest.
-
-#### Documentation
-
-- **`just docs-test` compiles the guide snippets.** It was referenced by the
-  doc tooling for two releases without existing; 192 of 321 Rust blocks are now
-  compile-checked in CI. It found broken examples in the README and Getting
-  Started on its first run — including the admin quick-start, which chained a
-  method onto a `Result`.
-
-### Upgrading to 0.16
-
-### Breaking
-
-- **`AwsMskIamCredentials::with_session_token` is now a builder method**, not a
-  four-argument constructor. Build with
-  `AwsMskIamCredentials::new(id, secret, region).with_session_token(token)`.
-  The old form fails to compile rather than changing meaning.
-
-### Fixed — three settings that silently did nothing
-
-- **`compression_level` was dropped on the batching path.** It applied only at
-  `linger = 0`, so the throughput-tuned configuration — and every
-  `TransactionalProducer`, which always batches — encoded at the codec's
-  default. Now applied on both paths and on both producers.
-- **`dead_letter_queue` was direct-send only.** Configuring a DLQ alongside any
-  batching silently disabled it. Now invoked on both paths, and on the
-  transactional producer.
-- **`close()` tore down a *shared* connection pool.** A `Producer`, `Consumer`
-  or `TransactionalProducer` built with `.with_client(..)` called `close_all()`
-  unconditionally, killing every sibling client's connections. Every client now
-  reports `owns_pool()` and leaves a borrowed pool to its `KrafkaClient`.
-  `SecureConnectionConfigBuilder::tls()` likewise lost its TLS configuration if
-  called before a SASL setter; order no longer matters.
-
-### New
-
-- **`AuthConfig::with_tls(TlsConfig)`** — every SASL mechanism composes with
-  TLS through one method. `SASL_SSL` + SCRAM, the default secured listener on
-  most managed Kafka offerings, was previously unreachable from outside the
-  crate. `sasl_scram_sha256_ssl` / `sasl_scram_sha512_ssl` added for symmetry;
-  `AuthConfig::from_env` gained `KAFKA_SSL_*` material and the `OAUTHBEARER`
-  and `AWS_MSK_IAM` mechanisms.
-- **`AwsMskIamCredentials::with_region` and `from_env_with_region`** — change
-  the region without losing the session token, and load keys from the
-  environment with the region from your own configuration.
-- **`TransactionalProducerBuilder` reaches parity with `ProducerBuilder`** —
-  `build_config()`, `compression_level`, `topic_compression`,
-  `delivery_timeout`, `dead_letter_queue`, `interceptor`/`add_interceptor`,
-  `state_store`, `with_client`, the metadata cache TTLs and
-  `sasl_oauthbearer_provider`. `acks` and `idempotent` stay excluded because
-  transactions fix both.
-- **`TransactionalProducer::flush()`** — so code generic over "a producer" need
-  not special-case which one it holds.
-- **`ShareConsumerBuilder::with_client`** — the one client that could not share
-  a `KrafkaClient`'s pool now can.
-- **OAUTHBEARER token-lifecycle metrics** — `oauth_token_fetches`,
-  `oauth_token_fetch_failures`, `oauth_token_fetch_latency` and
-  `oauth_token_expiry_epoch_ms` on `ConnectionMetrics`, plus a `WARN` on every
-  failed fetch. A misconfigured `token_endpoint` is no longer indistinguishable
-  from an unreachable broker.
-- **The fake broker serves the full transaction protocol** — KIP-360 fencing,
-  commit/abort control batches, `read_committed` isolation, TV1 and KIP-890
-  TV2. Exactly-once is now testable without Docker.
+krafka is pre-1.0: a **minor** bump may carry breaking changes, and every one
+is listed in the `Breaking` section of that release in
+[CHANGELOG.md](CHANGELOG.md).
 
 ## 📚 Documentation
 

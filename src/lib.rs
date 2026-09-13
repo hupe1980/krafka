@@ -106,7 +106,8 @@
 //! | `oauth-oidc` | no | Built-in OIDC token provider for SASL/OAUTHBEARER: the `client_credentials` grant (KIP-768) and RFC 7523 client assertions (KIP-1258). Adds no cryptography dependency — assertions are supplied pre-signed. |
 //! | `socks5` | no | SOCKS5 proxy support via `tokio-socks`. |
 //! | `telemetry` | no | OpenTelemetry exporter for producer/consumer metrics. |
-//! | `unstable-protocol` | no | Enables protocol versions Kafka marks `latestVersionUnstable` — a released broker does not advertise them without `unstable.api.versions.enable=true`. Covers `ApiVersions` v5 (KIP-1242), `InitProducerId` v6 (KIP-939) and the Share Consumer (KIP-932). APIs under this feature may change without semver notice. |
+//! | `share-groups` | **yes** | KIP-932 share consumer: queue semantics on a Kafka topic. GA in Apache Kafka 4.2; needs a 4.2+ broker. Same semver promise as the rest of the crate. |
+//! | `unstable-protocol` | no | Enables protocol versions Kafka marks `latestVersionUnstable` — a released broker does not advertise them without `unstable.api.versions.enable=true`. Covers `ApiVersions` v5 (KIP-1242) and `InitProducerId` v6 (KIP-939). APIs under this feature may change without semver notice. |
 //! | `ring` | **yes** | rustls crypto backend using `ring` (pure Rust). |
 //! | `rustls-aws-lc-rs` | no | rustls crypto backend using `aws-lc-rs`. Preferred on AWS Graviton and for FIPS deployments. |
 //! | `native-tls-roots` | no | Load platform-native root certificates via `rustls-native-certs`. |
@@ -212,8 +213,8 @@ pub mod producer;
 #[doc(hidden)]
 pub mod protocol;
 pub mod serdes;
-#[cfg(feature = "unstable-protocol")]
-#[cfg_attr(docsrs, doc(cfg(feature = "unstable-protocol")))]
+#[cfg(feature = "share-groups")]
+#[cfg_attr(docsrs, doc(cfg(feature = "share-groups")))]
 pub mod share_consumer;
 #[cfg(feature = "telemetry")]
 #[cfg_attr(docsrs, doc(cfg(feature = "telemetry")))]

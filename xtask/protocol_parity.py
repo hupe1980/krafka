@@ -369,7 +369,31 @@ def main() -> int:
                 f"client will not negotiate"
             )
 
-        # 5. flexible boundary
+        # 5. the `unstable-protocol` gate earns its keep
+        #
+        # This is the check that stops R18 recurring. `unstable-protocol` means
+        # exactly one thing — "Kafka marks this version latestVersionUnstable" —
+        # and that fact is machine-readable right here in the snapshot. Before
+        # this check the rule lived in a comment, which is how the KIP-932 share
+        # consumer sat behind the gate for two releases after Kafka 4.2 made it
+        # generally available: the gate was accurate when written, upstream
+        # moved, and nothing compared the two.
+        #
+        # A row gated on `unstable-protocol` whose ceiling the stable Kafka
+        # already offers is gating nothing: every user has to opt into a feature
+        # flagged "may change without semver notice" to reach a version their
+        # broker advertises by default.
+        if row["unstable_gated"] and row["max"] <= stable_max:
+            errors.append(
+                f"{api}: v{row['max']} is gated behind `unstable-protocol`, but "
+                f"Kafka {kafka_ref} ships v{stable_max} as stable "
+                f"(latestVersionUnstable={spec['latest_version_unstable']}). The gate "
+                f"means 'Kafka marks this latestVersionUnstable' and nothing else — "
+                f"remove the cfg, or move the surface to its own feature the way "
+                f"`share-groups` did."
+            )
+
+        # 6. flexible boundary
         flexible = krafka_flexible_versions().get(api)
         expected = spec["flexible_from"]
         if flexible is not None:

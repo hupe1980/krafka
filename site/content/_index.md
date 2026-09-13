@@ -23,7 +23,7 @@ zstd is the single exception, and it is opt-in.
 title = "The safety posture is enforced, not claimed"
 body = """
 Unsafe code is denied crate-wide, as are panic, unwrap and expect, across \
-~133 000 lines. A malformed broker response cannot panic the process; every \
+~148 000 lines. A malformed broker response cannot panic the process; every \
 allocation from untrusted input is bounded twice, by the declared count and \
 by the bytes actually available.
 """
@@ -49,7 +49,7 @@ a reported success.
 [[extra.highlights]]
 label = "Protocol"
 value = "Kafka 4.3"
-note = "64 APIs, CI-diffed against Kafka's schemas"
+note = "65 APIs, CI-diffed against Kafka's schemas"
 
 [[extra.highlights]]
 label = "Unsafe blocks"
@@ -167,11 +167,11 @@ A page that lists only strengths is a page you cannot calibrate against, so:
 - **No GSSAPI/Kerberos.** A deliberate boundary, and the one SASL mechanism
   librdkafka has that krafka does not.
 - **Tokio only.** `rskafka` is runtime-agnostic; krafka is not.
-- **No published end-to-end throughput benchmark.** There are criterion
-  micro-benchmarks for the protocol layer, but no measured number against
-  `rust-rdkafka` on a real cluster. Until there is, treat performance claims
-  here as architectural reasoning rather than evidence — which is why the word
-  "fastest" appears nowhere on this page. See
+- **No published throughput number.** Criterion micro-benchmarks cover the
+  protocol layer and a regression gate guards the send path, but neither
+  produces a figure comparable against `rust-rdkafka` on a real cluster. Treat
+  performance claims here as architectural reasoning rather than evidence —
+  which is why the word "fastest" appears nowhere on this page. See
   [Performance](@/docs/performance.md) for what is and is not measured.
 - **Assertion signing is your job.** krafka sources a signed JWT from a file or
   a callback rather than choosing an RSA implementation for you.

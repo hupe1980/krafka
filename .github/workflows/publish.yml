@@ -19,8 +19,36 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # A crates.io version is permanent: a yanked number is burned and can never
+  # be reused. So the tag is gated on the *same* evidence a pull request is,
+  # not on a lighter subset.
+  #
+  # This used to be two `cargo test` invocations and nothing else — no protocol
+  # parity, no reachability checks, no secret-Debug scan, no cargo-deny, no
+  # integration suite. The mitigating assumption was that a tag is cut from a
+  # green `main`, which was never actually enforced anywhere.
+  #
+  # `just ci` is the full local gate; the Docker suites stay out of it because
+  # they need a broker, and they have already run on this commit via ci.yml.
+  verify:
+    name: Verify release gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: extractions/setup-just@v3
+      - run: just ci
+      - name: Supply chain
+        run: |
+          cargo install --locked cargo-deny || true
+          cargo deny check advisories bans licenses sources
+
   publish:
     name: Publish
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

@@ -169,6 +169,57 @@ jobs:
       - uses: extractions/setup-just@v3
       - run: just doc
 
+  # The gate behind every ```rust,compile block in README.md and
+  # site/content/docs/. It was in `just ci` — and therefore in the release
+  # recipe — for its whole life without ever running in a workflow, so a pull
+  # request could break every documented sample and stay green. That is the
+  # same shape as the SASL suite, which was runnable locally long before
+  # anyone noticed it had never run in CI.
+  #
+  # `doc_api.py` checks that names resolve; it cannot check that a call has
+  # the right shape. This compiles the snippets instead.
+  # Asserts that every recipe in `just ci` has a job here, that the
+  # `ci-success` aggregator needs every job, and that it carries
+  # `if: always()`. Closes the class that `docs-test` and `integration-sasl`
+  # were both instances of.
+  ci-job-parity:
+    name: CI job parity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: extractions/setup-just@v3
+      - run: just ci-job-parity
+
+  docs-test:
+    name: Documentation snippets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: extractions/setup-just@v3
+      - run: just docs-test
+
+  # Classifies API changes against the last published release. Pre-1.0 this
+  # reports rather than blocks (D1 allows a minor bump to break), but the
+  # output is what the CHANGELOG's Breaking section owes the reader — and
+  # until now nothing checked that list was complete.
+  semver:
+    name: SemVer classification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: extractions/setup-just@v3
+      # A prebuilt binary rather than `cargo install`, which takes minutes.
+      # The check itself runs through the justfile so CI and a developer's
+      # machine cannot drift (D22).
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks
+      - run: just semver-check
+
   supply-chain:
     name: Supply chain (cargo-deny)
     runs-on: ubuntu-latest
@@ -281,3 +332,63 @@ jobs:
       # Here the job's toolchain already *is* 1.88, so the plain command is
       # both simpler and a genuine check that the pinned toolchain builds.
       - run: cargo check
+
+  # ── The single required status check ────────────────────────────────────────
+  #
+  # Branch protection names THIS job and nothing else. Without it, every job
+  # above has to be listed by hand in the repository settings, and a newly
+  # added job is not required by default — it runs, it can fail, and the merge
+  # button stays green until somebody remembers to go and add it.
+  #
+  # Two GitHub behaviours make the obvious implementation wrong, and both are
+  # guarded against here:
+  #
+  #   1. A required check whose job never runs stays *pending* forever, so the
+  #      pull request can never merge. `if: always()` makes this job run even
+  #      when a dependency failed or was skipped.
+  #   2. GitHub reads a *skipped* required check as **success**. So this job
+  #      must not simply skip on failure — it has to run and then fail
+  #      explicitly, which is what the `contains(needs.*.result, ...)` test
+  #      below does. Checking `success()` would not be enough either, because
+  #      a skipped dependency does not make `success()` false.
+  #
+  # `needs` is exhaustive on purpose. `just ci-job-parity` asserts that this
+  # list matches the jobs actually defined in this file, so adding a job
+  # without wiring it here fails the build rather than silently going
+  # unrequired.
+  ci-success:
+    name: CI
+    if: always()
+    runs-on: ubuntu-latest
+    needs:
+      - fmt
+      - clippy
+      - check
+      - test
+      - test-ring
+      - minimal-features
+      - cross-platform
+      - protocol-parity
+      - secret-debug
+      - version-check
+      - test-reachability
+      - config-reachability
+      - protocol-reachability
+      - ci-job-parity
+      - doc
+      - docs-test
+      - semver
+      - supply-chain
+      - integration
+      - integration-sasl
+      - integration-redpanda
+      - msrv
+    steps:
+      - name: Verify every job succeeded
+        run: |
+          echo "Results: ${{ join(needs.*.result, ', ') }}"
+          if ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped') }}; then
+            echo "::error::At least one CI job did not succeed."
+            exit 1
+          fi
+          echo "All CI jobs succeeded."

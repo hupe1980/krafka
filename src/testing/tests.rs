@@ -2572,7 +2572,7 @@ async fn describe_features_reports_what_update_features_applied() {
 // modelled — in particular, acquisition locks never expire here, so a record
 // is redelivered only when it is explicitly released.
 
-#[cfg(feature = "unstable-protocol")]
+#[cfg(feature = "share-groups")]
 async fn share_consumer_for(
     broker: &FakeBroker,
     group_id: &str,
@@ -2581,7 +2581,7 @@ async fn share_consumer_for(
 }
 
 /// A share consumer with the short test timeouts, plus whatever `tune` adds.
-#[cfg(feature = "unstable-protocol")]
+#[cfg(feature = "share-groups")]
 async fn share_consumer_with(
     broker: &FakeBroker,
     group_id: &str,
@@ -2608,7 +2608,7 @@ async fn share_consumer_with(
 ///
 /// A share consumer's first poll is a heartbeat that returns no assignment, so
 /// a single `poll()` proving nothing is expected rather than a failure.
-#[cfg(feature = "unstable-protocol")]
+#[cfg(feature = "share-groups")]
 async fn drain_share(
     consumer: &crate::share_consumer::ShareConsumer,
     want: usize,
@@ -2632,7 +2632,7 @@ async fn drain_share(
 /// but is never incremented is worse than none, because it reads as "zero
 /// records" rather than "not measured" — so this asserts the counters against
 /// the records actually returned, not merely that they are non-zero.
-#[cfg(feature = "unstable-protocol")]
+#[cfg(feature = "share-groups")]
 #[tokio::test]
 async fn a_share_consumer_receives_records_and_counts_them() {
     let broker = FakeBroker::start().await.unwrap();
@@ -2695,7 +2695,7 @@ async fn a_share_consumer_receives_records_and_counts_them() {
 /// acknowledgement that does not advance the share-partition start offset
 /// turns every restart into a full replay, and a release that does not rewind
 /// the cursor silently drops the record the application asked to retry.
-#[cfg(feature = "unstable-protocol")]
+#[cfg(feature = "share-groups")]
 #[tokio::test]
 async fn accepting_retires_a_record_and_releasing_redelivers_it() {
     use crate::share_consumer::AcknowledgeType;
@@ -2768,7 +2768,7 @@ async fn accepting_retires_a_record_and_releasing_redelivers_it() {
 /// difference only shows once the holder leaves and the in-flight records are
 /// returned to the pool — at which point an accepted record is below the
 /// share-partition start offset and an unacknowledged one is not.
-#[cfg(feature = "unstable-protocol")]
+#[cfg(feature = "share-groups")]
 #[tokio::test]
 async fn an_accepted_record_is_not_redelivered_to_the_next_member() {
     use crate::share_consumer::{AcknowledgeType, AcknowledgementMode};
@@ -2834,7 +2834,7 @@ async fn an_accepted_record_is_not_redelivered_to_the_next_member() {
 /// share state to one member at a time. A client that ignored its assignment
 /// and fetched every partition would still pass a "did I get records?" test
 /// and fail this one.
-#[cfg(feature = "unstable-protocol")]
+#[cfg(feature = "share-groups")]
 #[tokio::test]
 async fn two_share_group_members_split_the_partitions() {
     let broker = FakeBroker::start().await.unwrap();
@@ -2920,7 +2920,7 @@ async fn two_share_group_members_split_the_partitions() {
 
 /// A poll with no subscription must be counted as an empty poll and deliver
 /// nothing.
-#[cfg(feature = "unstable-protocol")]
+#[cfg(feature = "share-groups")]
 #[tokio::test]
 async fn share_consumer_poll_metrics_are_wired() {
     let broker = FakeBroker::start().await.unwrap();
@@ -3881,7 +3881,7 @@ async fn a_commit_waits_for_an_in_flight_offset_commit() {
 /// The documented shutdown is `wakeup()` then `close()`, and `wakeup()` does
 /// not wait for the poll it interrupts to unwind, so this interleaving is the
 /// normal one rather than an exotic race.
-#[cfg(feature = "unstable-protocol")]
+#[cfg(feature = "share-groups")]
 #[tokio::test]
 async fn a_flush_waits_for_a_poll_holding_the_acknowledgements() {
     use std::sync::Arc;
@@ -5029,4 +5029,108 @@ async fn a_rejected_record_still_reports_its_headers() {
         "a pre-accumulator rejection must still report the record's headers"
     );
     assert!(acks[0].failed);
+}
+
+/// A coordinator election in progress must not fail `subscribe()`.
+///
+/// `NOT_COORDINATOR` on `JoinGroup` means "ask FindCoordinator again": the
+/// group moved, or the coordinator is still loading `__consumer_offsets`. A
+/// freshly started cluster answers this way routinely, and the Java client
+/// retries it transparently.
+///
+/// krafka dropped the cached coordinator and then returned the error anyway, so
+/// a routine election surfaced to the application as
+/// `Failed to subscribe: Broker { code: NotCoordinator }`. Caught by the
+/// Redpanda integration suite, which is where a real coordinator election
+/// actually happens.
+#[tokio::test]
+async fn not_coordinator_on_join_is_retried_after_rediscovery() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("events", 1);
+
+    let consumer = crate::consumer::Consumer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .group_id("analytics")
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .build()
+        .await
+        .expect("consumer should connect");
+
+    // The first JoinGroup fails the way an election in progress does.
+    broker.on_once(ApiKey::JoinGroup, |_| {
+        Control::Error(ErrorCode::NotCoordinator)
+    });
+
+    consumer
+        .subscribe(&["events"])
+        .await
+        .expect("subscribe should ride out NOT_COORDINATOR, not surface it");
+
+    assert!(
+        broker.request_count(ApiKey::JoinGroup) >= 2,
+        "the client should have retried JoinGroup after re-discovering the \
+         coordinator, but sent {} request(s)",
+        broker.request_count(ApiKey::JoinGroup)
+    );
+    assert!(
+        broker.request_count(ApiKey::FindCoordinator) >= 2,
+        "the retry must re-run FindCoordinator rather than reuse the cached \
+         coordinator, but FindCoordinator ran {} time(s)",
+        broker.request_count(ApiKey::FindCoordinator)
+    );
+}
+
+/// The same guarantee for the KIP-848 path, where the heartbeat *is* the join.
+///
+/// This path had the defect in a worse form: it returned the error without even
+/// dropping the cached coordinator, so nothing downstream could have recovered.
+#[tokio::test]
+async fn not_coordinator_on_the_kip848_join_is_retried_after_rediscovery() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("events", 1);
+
+    let consumer = crate::consumer::Consumer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .group_id("analytics-848")
+        .group_protocol(crate::consumer::GroupProtocol::Consumer)
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .build()
+        .await
+        .expect("consumer should connect");
+
+    broker.on_once(ApiKey::ConsumerGroupHeartbeat, |_| {
+        Control::Error(ErrorCode::NotCoordinator)
+    });
+
+    consumer
+        .subscribe(&["events"])
+        .await
+        .expect("subscribe should succeed");
+
+    // Under KIP-848 the heartbeat *is* the join, and it is driven by `poll()`
+    // rather than by `subscribe()`.
+    let deadline = tokio::time::Instant::now() + SETTLE;
+    while tokio::time::Instant::now() < deadline {
+        consumer
+            .poll(Duration::from_millis(50))
+            .await
+            .expect("poll should ride out NOT_COORDINATOR, not surface it");
+        if broker.request_count(ApiKey::ConsumerGroupHeartbeat) >= 2 {
+            break;
+        }
+    }
+
+    assert!(
+        broker.request_count(ApiKey::ConsumerGroupHeartbeat) >= 2,
+        "the client should have retried the heartbeat after re-discovering the \
+         coordinator, but sent {} request(s)",
+        broker.request_count(ApiKey::ConsumerGroupHeartbeat)
+    );
+    assert!(
+        broker.request_count(ApiKey::FindCoordinator) >= 2,
+        "the retry must re-run FindCoordinator, but it ran {} time(s)",
+        broker.request_count(ApiKey::FindCoordinator)
+    );
 }

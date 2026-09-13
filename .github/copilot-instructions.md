@@ -7,10 +7,12 @@ Pure-Rust async Kafka client. Tokio runtime, edition 2024, MSRV 1.88.
 ## Build & Test
 
 ```sh
-cargo fmt && cargo clippy --all-targets && cargo test --lib
+just pre-commit    # fmt, clippy, check — after every change
+just ci            # everything CI runs, except the Docker suites
 ```
 
-Run this after every change. All three must be clean before considering work done.
+The justfile is the single source of truth for what the checks are; CI calls the
+same recipes. Do not hand-roll the equivalent cargo commands.
 
 ## Architecture
 
@@ -45,7 +47,7 @@ This is not optional — apply it before declaring a task complete.
 ## PR Review Readiness
 
 Before submitting, verify:
-1. `cargo fmt && cargo clippy --all-targets` — zero warnings
-2. `cargo test --lib` — all pass
+1. `just ci` — clean, including the reachability and parity gates
+2. Touching the send path, accumulator or codec → also `just bench-check`
 3. Changed public API → update `site/content/docs/` in the same commit
 4. New metric → present in struct, Prometheus export, snapshot, reset, and `site/content/docs/metrics.md`

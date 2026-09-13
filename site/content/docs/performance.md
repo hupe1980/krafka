@@ -14,23 +14,30 @@ murmur2, record-batch encode/decode, and the partitioners. These are
 **micro-benchmarks**. They are the right tool for catching a regression in one
 function and the wrong tool for answering "how fast is this client".
 
-**There is deliberately no end-to-end throughput benchmark, and no published
-comparison against other clients.** That is an open gap, not an oversight — see
-the note below on what it would take to close it honestly.
+**There is no published comparison against other clients, and no absolute
+throughput figure anywhere in this documentation.** That is a standard, not an
+oversight — see *What a credible benchmark would require* below.
 
-### Why the in-process broker cannot serve as a benchmark peer
+`just bench-check` does gate the producer send path against a stored baseline,
+using `benches/send_path.rs` and `krafka::testing::FakeBroker`.
 
-An end-to-end benchmark driving the real client against
-`krafka::testing::FakeBroker` was built and then removed, because it measured
-the wrong thing. The giveaway: with the fake broker as the peer, all five
-compression codecs reported the same throughput to within noise. A benchmark
-that cannot separate gzip from lz4 is not measuring compression — the fake
-broker's per-request handling dominated, so the numbers described the test
-double rather than the client.
+### What the fake broker can and cannot measure
 
-The fake broker is an excellent correctness harness and a poor performance one.
-It holds a single lock across request handling and keeps its log in memory; it
-was never built to be fast.
+It cannot rank two things **within** one run. With the fake broker as the peer,
+all five compression codecs report the same throughput to within noise: its
+per-request handling dominates, so the numbers describe the test double rather
+than the client. A benchmark that cannot separate gzip from lz4 is not measuring
+compression.
+
+It can detect that krafka got slower **across** two runs. The harness contributes
+a large constant, and a constant cancels when you subtract two runs of it. That
+is the whole of what `bench-check` claims: it fails when a measurement regresses
+by more than 10% with a confidence interval excluding zero, and it produces no
+figure that means anything on its own.
+
+So: use it to catch a regression, never to quote a number. The fake broker holds
+a single lock across request handling and keeps its log in memory; it is an
+excellent correctness harness and a poor performance one.
 
 ### What a credible benchmark would require
 
@@ -43,11 +50,11 @@ was never built to be fast.
 - **Percentiles from a verified histogram.** The OpenMessaging Benchmark carried
   a histogram bug that invalidated published latency percentiles for years.
 
-The ecosystem's history here is cautionary rather than encouraging: franz-go
-withdrew its own "4× faster" claims from its README. Until krafka can meet the
-bar above, this documentation describes the *design* choices that should make it
-fast — zero-copy buffers, per-partition pipelining, batching, lock-free metrics
-— and claims no measured outcome.
+The ecosystem's history here is cautionary: franz-go withdrew its own "4× faster"
+claims from its README. Until krafka can meet the bar above, this documentation
+describes the *design* choices that should make it fast — zero-copy buffers,
+per-partition pipelining, batching, lock-free metrics — and claims no measured
+outcome.
 
 ## Request Priority Channels
 
@@ -59,7 +66,17 @@ Each connection maintains two channels:
 - **High-priority channel**: Heartbeats, metadata refreshes, coordinator discovery
 - **Normal-priority channel**: Produce, fetch, and other data requests
 
-The connection task always checks the high-priority channel first, ensuring time-sensitive requests are never starved by data traffic.
+The connection task always checks the high-priority channel first, so a heartbeat is never
+stuck behind queued produce/fetch **requests**.
+
+**This orders requests, not response bytes.** One socket per broker carries one byte stream,
+so a large fetch response already in flight delays every response behind it, heartbeat
+included. Usually moot — the coordinator is normally a different broker from the partition
+leaders you fetch from — but the pool keys on address, so on a single-broker cluster (and
+often on small ones) they share a connection.
+
+If you see session timeouts on a small cluster with large fetches, lower
+`max_response_size`: it bounds the worst-case stall directly.
 
 ### Priority Assignment
 

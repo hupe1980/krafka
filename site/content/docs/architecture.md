@@ -547,7 +547,7 @@ All krafka types are designed for concurrent use:
 
 - `Producer`: `Send + Sync` - can be shared across tasks
 - `Consumer`: `Send + Sync` - can be shared across tasks
-- `ShareConsumer`: `Send + Sync` - can be shared across tasks (unstable-protocol feature)
+- `ShareConsumer`: `Send + Sync` - can be shared across tasks (`share-groups` feature, on by default)
 - `AdminClient`: `Send + Sync` - can be shared across tasks
 
 Internal state is protected by:

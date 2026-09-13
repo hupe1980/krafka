@@ -11,6 +11,119 @@ Entries before 0.17.0 were reconstructed from the release history and the
 `Upgrading` sections that previously lived in `README.md`. They are summaries,
 not a complete record.
 
+## [0.23.0] — 2026-09-13
+
+Share groups stopped being experimental in Apache Kafka 4.2, and krafka kept
+hiding them behind a feature flag called `unstable-protocol` for two more
+releases. The flag was accurate when written and nothing caught it when
+upstream moved, because no check here can test a sentence about Apache Kafka.
+
+This release fixes that, makes the class unrepeatable, and wires up three gates
+that existed without ever running.
+
+### Breaking
+
+- **The KIP-932 share consumer moved from `unstable-protocol` to its own
+  `share-groups` feature, on by default.** A build that enabled
+  `unstable-protocol` only to reach `ShareConsumer` no longer needs it; a build
+  that does not want the module turns off a default feature. The APIs are
+  unchanged.
+
+  The gate contradicted its own data: every share API is marked stable in
+  krafka's vendored Kafka 4.3 snapshot, the version table negotiates all of
+  them unconditionally on every build, and `lib.rs` described the feature as
+  covering versions Kafka marks `latestVersionUnstable` — which no share API
+  is. Only the API that could reach the protocol was hidden.
+
+  `share-groups` carries the same semver promise as the rest of the crate and
+  needs a Kafka 4.2+ broker.
+
+- **`unstable-protocol` now means exactly one thing**: versions Kafka's message
+  schema marks `latestVersionUnstable` — `ApiVersions` v5 (KIP-1242) and
+  `InitProducerId` v6 (KIP-939). `just protocol-parity` enforces the rule, so a
+  stable version can no longer be gated behind it.
+
+### Added
+
+- **A performance regression gate.** `benches/send_path.rs` measures the
+  producer send path end to end against the in-process fake broker, and
+  `just bench-check` fails when a mean regression exceeds 10% *and* the 95%
+  confidence interval excludes zero.
+
+  There was previously no throughput or latency measurement anywhere: a change
+  that halved producer throughput passed every gate. The fake broker cannot
+  support a *published* figure and none is produced — but a regression gate
+  compares krafka against krafka, and a constant harness overhead cancels
+  between runs. Not part of `just ci`: slow and noisy on a shared runner.
+
+- **`just ci-job-parity`** — asserts every recipe in `just ci` has a CI job,
+  that the new `ci-success` aggregator needs every job, and that it carries
+  `if: always()`. GitHub reads a *skipped* required check as success, so an
+  aggregator without it inverts the rule it enforces.
+
+- **A `ci-success` aggregating status check.** `ci.yml` had 19 jobs and no
+  `needs:`, so branch protection named each by hand and a newly added job was
+  not required by default. Branch protection should now require `CI` alone.
+
+- **A `docs-test` CI job.** The gate behind every compiled documentation
+  snippet was in `just ci` — and in the release recipe — while no pull request
+  ever ran it.
+
+- **`just semver-check` and a `semver` CI job**, running `cargo-semver-checks`
+  against the last published release. Pre-1.0 it reports rather than blocks,
+  but the output is what the `Breaking` section owes the reader.
+
+- **A `verify` job gating `publish.yml` on `just ci` and `cargo deny`.** The
+  release workflow previously ran two `cargo test` invocations and published.
+
+### Fixed
+
+- **`subscribe()` failed instead of retrying when the group coordinator was
+  moving.** `NOT_COORDINATOR`, `COORDINATOR_NOT_AVAILABLE` and
+  `COORDINATOR_LOAD_IN_PROGRESS` all mean "re-run FindCoordinator and try
+  again" — a freshly started or rebalancing cluster answers this way routinely,
+  and the Java client retries transparently.
+
+  krafka dropped the cached coordinator and then returned the error anyway. The
+  helper that did the invalidation returned a `bool` documented as "retriable
+  after re-discovery", and both call sites discarded it, so nothing ever made
+  the next attempt. Applications saw
+  `Failed to subscribe: Broker { code: NotCoordinator }`.
+
+  Both join paths now re-discover the coordinator and retry with jittered
+  backoff, bounded at five attempts. The KIP-848 path had the same defect in a
+  worse form — it returned the error without invalidating the cached
+  coordinator at all, so nothing downstream could recover either.
+
+  Found by the Redpanda integration suite, which is where a real coordinator
+  election actually happens. Both fixes carry a fake-broker regression test
+  verified against the defect.
+
+- **The README claimed KIP-1258 OAuth client assertion was not implemented.**
+  It has been implemented and public since the `oauth-oidc` feature landed, as
+  `ClientCredentials::assertion`. The same sentence now names
+  `StreamsGroupHeartbeat` (key 88) as the only KIP-1071 gap, and notes that
+  `StreamsGroupDescribe` (key 89) is implemented.
+
+- **The share-consumer guide said share groups were "stable as of Apache Kafka
+  4.0".** They reached general availability in 4.2. The protocol reference also
+  still flagged the four share APIs as requiring `unstable-protocol`.
+
+- **Documentation corrections.** The README's 536-line upgrade history is gone —
+  every version it covered is in this file. The performance guide now describes
+  the send-path regression gate and why the same fake-broker harness is wrong
+  for ranking codecs within a run and right for detecting a regression across
+  runs. `fuzz/README.md` documented three of six fuzz targets.
+
+- **The request-priority documentation overstated what it delivers.** Priority
+  channels order requests; they cannot reorder response bytes already on the
+  wire. One socket per broker carries one byte stream, so a large fetch
+  response delays every response behind it, heartbeat included. Usually moot,
+  since the coordinator is normally a different broker from the partition
+  leaders being fetched — but `ConnectionPool` keys on address, so on a
+  single-broker cluster they share a connection. `max_response_size` bounds the
+  stall and is now named as the lever.
+
 ## [0.22.0] — 2026-09-01
 
 A long-lived producer could permanently lose a topic it was actively writing

@@ -1,8 +1,9 @@
 //! Share consumer implementation (KIP-932).
 //!
-//! > ⚠️ **Unstable**: This module requires the `unstable-protocol` feature flag.
-//! > APIs may change without semver notice until KIP-932 is finalized in a stable
-//! > Kafka release.
+//! > Requires the `share-groups` feature (on by default) and a Kafka **4.2+**
+//! > broker — KIP-932 reached general availability in Kafka 4.2. Against an
+//! > older broker, or Redpanda, which has no share groups, calls fail with
+//! > `UnknownApiVersion`.
 //!
 //! Share groups provide queue-like semantics on top of Kafka topics. Multiple
 //! consumers in the same share group receive non-overlapping subsets of records

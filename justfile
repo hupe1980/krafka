@@ -45,7 +45,7 @@ default:
 # Ordered cheapest-first so a formatting slip fails in seconds rather than
 # after a full test run.
 [doc("Everything CI runs (no Docker suites)")]
-ci: fmt-check clippy check protocol-parity protocol-reachability secret-debug test-reachability config-reachability version-check site-check docs-test test-ring test minimal-features doc
+ci: fmt-check clippy check protocol-parity protocol-reachability secret-debug test-reachability config-reachability version-check ci-job-parity site-check docs-test test-ring test minimal-features doc
     @echo ""
     @echo "✓ ci passed — Docker suites not included, run 'just integration' for those"
 
@@ -174,6 +174,15 @@ protocol-reachability:
 [doc("krafka's version is consistent everywhere it appears")]
 version-check:
     python3 xtask/version_check.py
+
+# Every check in `just ci` has a CI job, and one required check gates them all.
+#
+# A recipe wired to no workflow is invisible from both sides — it happened to
+# `integration-sasl` and `docs-test`. Also asserts the aggregator carries
+# `if: always()`, since GitHub reads a *skipped* required check as success.
+[doc("Every `just ci` check has a CI job, all gated by one required check")]
+ci-job-parity:
+    python3 xtask/ci_job_parity.py
 
 # Structural invariants for the documentation site.
 #
@@ -326,6 +335,31 @@ integration-matrix versions="3.9.0 4.0.0 4.1.0 4.2.0 4.3.0":
     done
     echo "✓ integration-matrix passed for: {{versions}}"
 
+# Classify this release's API changes against the last published version.
+#
+# Pre-1.0 this reports rather than blocks: a minor bump may carry breaking
+# changes, so a detected break is not a failure — it is a line the CHANGELOG's
+# `Breaking` section owes the reader. At 1.0 this becomes a hard gate.
+[doc("Classify API changes against the last published release")]
+semver-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! command -v cargo-semver-checks >/dev/null 2>&1; then
+        echo "⊘ cargo-semver-checks not installed — skipping."
+        echo "  Install with: cargo install --locked cargo-semver-checks"
+        exit 0
+    fi
+    # `--baseline-version` compares against the published crate rather than a
+    # git ref, so it answers the question a user actually has: "does upgrading
+    # from the last release break me?"
+    cargo semver-checks check-release --all-features || {
+        echo ""
+        echo "▲ Breaking changes detected."
+        echo "  Pre-1.0 this is allowed (D1) — but every one of them must appear"
+        echo "  in the Breaking section of CHANGELOG.md before the tag."
+        exit 0
+    }
+
 # Check that the crate still builds on its declared MSRV.
 msrv:
     #!/usr/bin/env bash
@@ -359,6 +393,24 @@ watch:
 # Run the criterion benchmarks.
 bench:
     cargo bench --all-features
+
+# Record the performance reference the regression gate compares against.
+#
+# Run this on a known-good commit, then `just bench-check` after a change.
+[doc("Record the benchmark baseline")]
+bench-baseline:
+    cargo bench --bench send_path --features test-broker -- --warm-up-time 1 --measurement-time 5
+
+# Fail if a benchmark regressed against the previous run.
+#
+# krafka-vs-krafka against the fake broker: no figure here is quotable as
+# absolute performance, but a constant harness overhead cancels between runs,
+# so a real regression still shows. Not in `just ci` — slow and noisy on a
+# shared runner. Run it when touching the send path, accumulator, or codec.
+[doc("Fail if a benchmark regressed against the previous run")]
+bench-check:
+    cargo bench --bench send_path --features test-broker -- --warm-up-time 1 --measurement-time 5
+    python3 xtask/bench_check.py
 
 # Run one fuzz target. Requires a nightly toolchain and cargo-fuzz.
 #

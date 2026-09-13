@@ -1348,10 +1348,8 @@ impl Producer {
     /// Get producer metrics.
     ///
     /// Synchronous, like every other metrics accessor in this crate: the
-    /// counters are atomics and the connection count is a lock-free read. It
-    /// used to be `async` with no `await`, which meant a Prometheus scrape
-    /// handler or a signal handler could read `Consumer::metrics()` but not
-    /// this one.
+    /// counters are atomics and the connection count is a lock-free read, so a
+    /// Prometheus scrape handler or a signal handler can call this directly.
     pub fn metrics(&self) -> ProducerMetricsSnapshot {
         ProducerMetricsSnapshot {
             connections: self.pool.len(),
