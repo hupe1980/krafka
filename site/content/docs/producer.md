@@ -718,7 +718,7 @@ let producer = Producer::builder()
 ```
 
 > **Idempotent by default (KIP-679):** Since Kafka 3.0, idempotent production is the default.
-> The regular `Producer` now obtains a Producer ID via `InitProducerId` at startup,
+> The regular `Producer` obtains a Producer ID via `InitProducerId` at startup,
 > tracks sequence numbers per partition, and de-duplicates retries automatically.
 > `acks = All` is required when idempotent is enabled. Unlike the Java client
 > and librdkafka there is no in-flight-request limit to observe: krafka keeps

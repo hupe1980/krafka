@@ -27,13 +27,24 @@ information simply never arrives.
 
 # What it checks
 
-Every `pub` field of every `*Response*` struct under `src/protocol/messages/`
-must be *named* somewhere outside the protocol layer — in the consumer,
+Every `pub` field of every response struct under `src/protocol/messages/` must
+be *named* somewhere outside the protocol layer — in the consumer,
 producer, admin, share-consumer or telemetry code — with test modules stripped,
 so a field kept alive only by its own round-trip test does not count as read.
 
+A response struct here means a `*Response*` struct **or any struct it contains**.
+Nesting was the hole this check shipped with: `DescribeGroupMember::member_assignment`
+held every classic consumer group's partition assignment, was decoded for every
+DescribeGroups version, and was dropped on the floor by the admin mapping — one
+level below where the check was looking.
+
+Types the crate returns to callers verbatim are exempt, and listed in
+PASSTHROUGH. For those the field is not dropped: it is the caller's to read, and
+naming it in client code would prove nothing. The exemption is transitive, since
+handing back a struct hands back everything inside it.
+
 Fields that are legitimately decode-only are listed in ALLOW with a reason.
-Keep that list short and keep the reasons specific: "not needed yet" is how the
+Keep both lists short and keep the reasons specific: "not needed yet" is how the
 next `last_stable_offset` gets in.
 
 # What it deliberately does not check
@@ -67,18 +78,57 @@ ALLOW = {
     "endpoint_type": "krafka routes to the controller by node id, never by endpoint type",
 }
 
+# struct name -> the public API that returns it to callers unchanged.
+PASSTHROUGH = {
+    # `AdminClient::describe_streams_groups` returns the decoded groups as they
+    # came off the wire — topology, tasks, offsets and all. Nothing is mapped,
+    # so nothing can be dropped.
+    "DescribedStreamsGroup": "returned verbatim by AdminClient::describe_streams_groups",
+}
+
 MESSAGES = "src/protocol/messages"
 
 
-def response_fields() -> dict[str, set[str]]:
-    """`pub` fields of every `*Response*` struct, mapped to where they appear."""
-    found: dict[str, set[str]] = {}
+def structs() -> dict[str, tuple[str, str]]:
+    """Every `pub struct` under `src/protocol/messages/`: name -> (file, body)."""
+    found: dict[str, tuple[str, str]] = {}
     for path in sorted((ROOT / MESSAGES).glob("*.rs")):
         source = path.read_text()
-        for match in re.finditer(r"pub struct (\w*Response\w*) \{(.*?)\n\}", source, re.S):
-            struct, body = match.group(1), match.group(2)
-            for field in re.findall(r"^\s+pub (\w+):", body, re.M):
-                found.setdefault(field, set()).add(f"{path.name}::{struct}")
+        for match in re.finditer(r"pub struct (\w+) \{(.*?)\n\}", source, re.S):
+            found[match.group(1)] = (path.name, match.group(2))
+    return found
+
+
+def contained(roots: list[str], defs: dict[str, tuple[str, str]]) -> set[str]:
+    """`roots` plus every struct reachable through their field types."""
+    seen: set[str] = set()
+    stack = list(roots)
+    while stack:
+        name = stack.pop()
+        if name in seen or name not in defs:
+            continue
+        seen.add(name)
+        for referenced in re.findall(r"\b([A-Z]\w+)\b", defs[name][1]):
+            if referenced in defs and referenced not in seen:
+                stack.append(referenced)
+    return seen
+
+
+def response_fields() -> dict[str, set[str]]:
+    """`pub` fields of every response struct, mapped to where they appear.
+
+    A response struct is a `*Response*` struct or anything one contains, minus
+    the types the crate hands to callers whole.
+    """
+    defs = structs()
+    reachable = contained([name for name in defs if "Response" in name], defs)
+    passthrough = contained([name for name in PASSTHROUGH if name in defs], defs)
+
+    found: dict[str, set[str]] = {}
+    for struct in sorted(reachable - passthrough):
+        file_name, body = defs[struct]
+        for field in re.findall(r"^\s+pub (\w+):", body, re.M):
+            found.setdefault(field, set()).add(f"{file_name}::{struct}")
     return found
 
 
@@ -112,11 +162,13 @@ def main() -> int:
     ]
 
     stale = sorted(set(ALLOW) - set(fields))
+    stale += sorted(name for name in PASSTHROUGH if name not in structs())
     if stale:
         print("Protocol reachability check FAILED\n", file=sys.stderr)
         for field in stale:
             print(
-                f"  - ALLOW names `{field}`, which is no longer a response field.\n"
+                f"  - `{field}` is named by ALLOW or PASSTHROUGH but is no longer "
+                "a response field or struct.\n"
                 "    Remove the entry from xtask/protocol_reachability.py.\n",
                 file=sys.stderr,
             )
@@ -138,7 +190,8 @@ def main() -> int:
 
     print(
         f"✓ Protocol reachability: {len(fields)} response fields, "
-        f"every one read by client code ({len(ALLOW)} documented decode-only)"
+        f"every one read by client code ({len(ALLOW)} documented decode-only, "
+        f"{len(PASSTHROUGH)} type(s) returned verbatim)"
     )
     return 0
 

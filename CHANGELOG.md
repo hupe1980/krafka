@@ -11,6 +11,68 @@ Entries before 0.17.0 were reconstructed from the release history and the
 `Upgrading` sections that previously lived in `README.md`. They are summaries,
 not a complete record.
 
+## [0.24.0] — 2026-09-15
+
+A classic consumer group's subscription and assignment travel as opaque blobs
+that the coordinator stores and never parses. krafka decoded them on the
+consumer's own sync path and nowhere else, so everything the admin API reported
+about a classic group stopped at "a member exists".
+
+### Breaking
+
+- **`ConsumerGroupMember::assignment`, `subscribed_topic_names` and `rack_id`
+  are now populated for classic groups.** They were documented as KIP-848-only
+  and hardcoded to `None`. Code that treated `None` as "this is a classic group"
+  must now read `group_type`.
+
+  `None` on these fields means *unknown*: a group whose embedded protocol is not
+  `consumer` (Connect and Streams use the same fields for their own formats), or
+  a blob that failed to decode — it is written by another client, so a bad one
+  is logged and skipped rather than failing the describe. `Some(vec![])` means
+  the member owns or subscribes to nothing. `TopicPartitionAssignment::topic_id`
+  is all-zero on this path, because the classic protocol carries topic names
+  only, and `target_assignment` stays `None`, because that protocol has no
+  target assignment distinct from the current one.
+
+- **`DescribeClusterBrokerInfo` gained `is_fenced`** (KIP-1073). The field was
+  decoded from DescribeCluster v2 and dropped by the mapping, so a broker that
+  was registered but not serving looked identical to a healthy one.
+
+- **A malformed subscription or assignment blob is now an error.** Both decoders
+  previously stopped at the first byte that was not there and returned what they
+  had. A truncated assignment therefore made a consumer silently own fewer
+  partitions than the leader granted it — lag on an unconsumed partition, with
+  nothing logged. Callers that describe a whole group degrade one member instead
+  of failing the call.
+
+### Added
+
+- **`protocol::ConsumerProtocolSubscription` and
+  `ConsumerProtocolAssignment`**, with encoders and decoders for versions 0–3.
+  The consumer's sync path, its join path and the admin describe share one
+  implementation of each wire format instead of three partial ones. A version
+  above the newest known is parsed with the newest known schema, matching the
+  Java client.
+
+- **The classic subscription now carries `generation_id` (v2) and the
+  configured `client_rack` (v3).** krafka sent v0 or v1 only, so a rack-aware
+  leader (KIP-881) could not place a krafka member near its replicas, and a
+  cooperative leader resolving two members' claims to the same partition had no
+  generation to compare. The KIP-848 heartbeat had always sent both.
+
+- **`FakeBroker` serves `DescribeGroups` v4**, returning the subscription and
+  assignment blobs verbatim and tracking classic group state (`Empty`,
+  `CompletingRebalance`, `Stable`). `Control::Error` works on it too, so the
+  per-group error path is reachable without a cluster.
+
+### Fixed
+
+- **`xtask/protocol_reachability.py` now checks nested response structs.** It
+  only looked at `*Response*` structs, one level above where
+  `DescribeGroupMember::member_assignment` and `is_fenced` were being dropped.
+  Types the crate returns to callers verbatim are exempt via a new `PASSTHROUGH`
+  list.
+
 ## [0.23.0] — 2026-09-13
 
 Share groups stopped being experimental in Apache Kafka 4.2, and krafka kept

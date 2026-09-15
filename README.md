@@ -666,9 +666,9 @@ let admin = AdminClient::builder()
 *older* API range so the client's degradation branches are reachable.
 
 It serves the produce/fetch path, both group protocols — classic and KIP-848
-with real revoke-before-assign reconciliation — KIP-932 share groups with the
-share-partition state machine, KIP-584 feature administration, and the full
-transaction protocol.
+with real revoke-before-assign reconciliation — `DescribeGroups` and
+`StreamsGroupDescribe`, KIP-932 share groups with the share-partition state
+machine, KIP-584 feature administration, and the full transaction protocol.
 
 Transactions are modelled end to end, which is what makes exactly-once testable
 without a cluster: `InitProducerId` returns a stable producer ID per

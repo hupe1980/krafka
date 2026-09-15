@@ -799,6 +799,33 @@ impl SyncGroupReq {
     }
 }
 
+/// DescribeGroups request, v4 wire format.
+///
+/// Mirrors `DescribeGroupsRequest::encode_v3` (v3 and v4 share a request
+/// layout; only the response gained a field).
+#[derive(Debug, Clone)]
+pub(crate) struct DescribeGroupsReq {
+    /// Groups to describe.
+    pub groups: Vec<String>,
+    /// Whether the caller asked for the authorized-operations bitfield.
+    pub include_authorized_operations: bool,
+}
+
+impl DescribeGroupsReq {
+    pub(crate) fn read(buf: &mut impl Buf) -> Result<Self> {
+        let count = read_array_len(buf)?;
+        let mut groups = Vec::with_capacity(count);
+        for _ in 0..count {
+            groups.push(read_string(buf)?);
+        }
+        let include_authorized_operations = i8::decode(buf)? != 0;
+        Ok(Self {
+            groups,
+            include_authorized_operations,
+        })
+    }
+}
+
 /// Heartbeat request, v3 wire format.
 ///
 /// Mirrors `HeartbeatRequest::encode_v3`.

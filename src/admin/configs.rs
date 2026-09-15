@@ -400,6 +400,7 @@ impl AdminClient {
                     host: b.host,
                     port: b.port,
                     rack: b.rack,
+                    is_fenced: b.is_fenced,
                 })
                 .collect(),
             cluster_authorized_operations: response.cluster_authorized_operations,

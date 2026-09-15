@@ -5134,3 +5134,139 @@ async fn not_coordinator_on_the_kip848_join_is_retried_after_rediscovery() {
         broker.request_count(ApiKey::FindCoordinator)
     );
 }
+
+// ---------------------------------------------------------------------------
+// Describing a classic group
+// ---------------------------------------------------------------------------
+
+/// A classic group's subscription and assignment travel as opaque blobs the
+/// coordinator stores and returns unchanged. `describe_consumer_groups` has to
+/// decode them, or an operator can see that a member exists and nothing about
+/// what it is doing.
+#[tokio::test]
+async fn describing_a_classic_group_reports_what_its_member_owns() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("events", 3);
+
+    let consumer = crate::consumer::Consumer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .group_id("reporting")
+        .client_rack("us-east-1a")
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .build()
+        .await
+        .expect("consumer should connect");
+
+    consumer
+        .subscribe(&["events"])
+        .await
+        .expect("subscribe should succeed");
+
+    assert!(
+        broker.wait_for_requests(ApiKey::SyncGroup, 1, SETTLE).await,
+        "the consumer must complete a join and a sync before it owns anything"
+    );
+
+    let admin = admin_for(&broker).await;
+    let described = admin
+        .describe_consumer_groups(vec!["reporting".to_string()])
+        .await
+        .expect("describe should succeed");
+
+    let group = described.first().expect("the group should be described");
+    assert_eq!(group.group_type, crate::admin::GroupType::Classic);
+    assert_eq!(group.state, "Stable");
+
+    let member = group
+        .members
+        .first()
+        .expect("the group should have a member");
+    assert_eq!(
+        member.subscribed_topic_names.as_deref(),
+        Some(["events".to_string()].as_slice()),
+        "the subscription blob must be decoded, not dropped"
+    );
+    assert_eq!(
+        member.rack_id.as_deref(),
+        Some("us-east-1a"),
+        "a classic member's rack reaches the group leader in its subscription, \
+         so a describe can report it too"
+    );
+
+    let assignment = member
+        .assignment
+        .as_ref()
+        .expect("the assignment blob must be decoded, not reported as unknown");
+    assert_eq!(assignment.len(), 1);
+    assert_eq!(assignment[0].topic_name, "events");
+    assert_eq!(
+        assignment[0].partitions,
+        vec![0, 1, 2],
+        "the only member of the group owns every partition"
+    );
+    assert!(
+        member.target_assignment.is_none(),
+        "the classic protocol has no target assignment distinct from the current one"
+    );
+}
+
+/// An `Empty` group is a live group with no members, not a missing one: the
+/// describe must still report it, with its committed offsets intact.
+#[tokio::test]
+async fn describing_a_group_whose_members_all_left_reports_it_as_empty() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("events", 1);
+
+    let consumer = crate::consumer::Consumer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .group_id("departed")
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .build()
+        .await
+        .expect("consumer should connect");
+
+    consumer
+        .subscribe(&["events"])
+        .await
+        .expect("subscribe should succeed");
+    assert!(broker.wait_for_requests(ApiKey::SyncGroup, 1, SETTLE).await);
+
+    consumer
+        .close()
+        .await
+        .expect("close should leave the group");
+
+    let admin = admin_for(&broker).await;
+    let described = admin
+        .describe_consumer_groups(vec!["departed".to_string()])
+        .await
+        .expect("describe should succeed");
+
+    let group = described.first().expect("the group should be described");
+    assert_eq!(group.state, "Empty");
+    assert!(group.members.is_empty());
+    assert!(group.error.is_none(), "an empty group is not an error");
+}
+
+/// DescribeGroups reports failures per group. One unauthorized group must
+/// surface on that group and leave the call — and the other groups in it —
+/// intact.
+#[tokio::test]
+async fn a_per_group_describe_failure_does_not_fail_the_call() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.on(ApiKey::DescribeGroups, |_| {
+        Control::Error(ErrorCode::GroupAuthorizationFailed)
+    });
+
+    let admin = admin_for(&broker).await;
+    let described = admin
+        .describe_consumer_groups(vec!["forbidden".to_string()])
+        .await
+        .expect("a per-group error is reported, not returned as a call failure");
+
+    let group = described.first().expect("the group should be described");
+    assert_eq!(group.error.as_deref(), Some("GroupAuthorizationFailed"));
+    assert!(group.members.is_empty());
+}

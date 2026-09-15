@@ -208,6 +208,11 @@ pub struct GroupMember {
     pub group_instance_id: Option<String>,
     /// Subscription metadata the member sent in JoinGroup.
     pub metadata: Bytes,
+    /// Client ID from the request header that joined, as DescribeGroups
+    /// reports it.
+    pub client_id: String,
+    /// Client host, as DescribeGroups reports it.
+    pub client_host: String,
 }
 
 /// A committed offset for one topic-partition in one group.
@@ -240,6 +245,8 @@ pub struct GroupState {
     pub offsets: HashMap<(String, i32), CommittedOffset>,
     /// Counter behind generated member IDs.
     pub member_seq: u32,
+    /// Classic group state, as DescribeGroups reports it.
+    pub state: ClassicGroupState,
     /// KIP-848 members, keyed by client-generated member ID.
     ///
     /// Separate from [`Self::members`], which models the classic
@@ -250,6 +257,33 @@ pub struct GroupState {
     /// Epoch the whole group is on. Bumped whenever the set of members or
     /// their subscriptions changes, which is what forces reconciliation.
     pub group_epoch: i32,
+}
+
+/// Lifecycle state of a classic (JoinGroup/SyncGroup) group.
+///
+/// Only the states this harness can actually reach are modelled: there is no
+/// `PreparingRebalance`, because a join here completes within the one request
+/// that triggered it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ClassicGroupState {
+    /// No members.
+    #[default]
+    Empty,
+    /// Members have joined; the leader has not distributed assignments yet.
+    CompletingRebalance,
+    /// Assignments distributed.
+    Stable,
+}
+
+impl ClassicGroupState {
+    /// The name Kafka puts on the wire.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Empty => "Empty",
+            Self::CompletingRebalance => "CompletingRebalance",
+            Self::Stable => "Stable",
+        }
+    }
 }
 
 /// One KIP-848 member's coordinator-side state.

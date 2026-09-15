@@ -53,7 +53,7 @@ fuzz_target!(|data: &[u8]| {
         }};
     }
 
-    match api % 62 {
+    match api % 64 {
         0 => fuzz_decode!(ProduceResponse, 3, 11),
         1 => fuzz_decode!(FetchResponse, 4, 15),
         2 => fuzz_decode!(MetadataResponse, 1, 13),
@@ -117,6 +117,17 @@ fuzz_target!(|data: &[u8]| {
         59 => fuzz_decode!(AlterUserScramCredentialsResponse, 0, 1),
         60 => fuzz_decode!(WriteTxnMarkersResponse, 1, 2),
         61 => fuzz_decode!(UpdateFeaturesResponse, 0, 2),
+        // ── Embedded consumer protocol ─────────────────────────────────────
+        //
+        // Not responses, and not versioned by the caller: these blobs carry
+        // their own version and are written by another *client*, so they are
+        // the least trustworthy bytes the client parses.
+        62 => {
+            let _ = krafka::protocol::decode_consumer_protocol_subscription(&buf);
+        }
+        63 => {
+            let _ = krafka::protocol::decode_consumer_protocol_assignment(&buf);
+        }
         _ => unreachable!(),
     }
 });

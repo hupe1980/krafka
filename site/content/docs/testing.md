@@ -233,7 +233,10 @@ protocols:
   KIP-890's TV2 is selected by finalizing `transaction.version` — see above.
 
 - **Classic** — `JoinGroup`, `SyncGroup`, `Heartbeat`, `LeaveGroup`,
-  `OffsetCommit`, `OffsetFetch`.
+  `OffsetCommit`, `OffsetFetch`, and `DescribeGroups` v4. The describe returns
+  the subscription and assignment blobs exactly as the members and the group
+  leader wrote them, so a client decoding them is decoding bytes a real broker
+  would have handed back unchanged.
 - **KIP-848** — `ConsumerGroupHeartbeat` v1 with real revoke-before-assign
   reconciliation: a partition moves to its new owner strictly after the
   previous owner confirms releasing it, so no two members ever believe they own

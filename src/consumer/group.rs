@@ -12,7 +12,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info, warn};
 
@@ -21,15 +21,18 @@ use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
 use crate::metadata::ClusterMetadata;
 use crate::network::{BrokerConnection, ConnectionPool};
 use crate::protocol::{
-    ApiKey, ConsumerGroupHeartbeatRequest, ConsumerGroupHeartbeatResponse,
-    ConsumerGroupTopicPartitions, FindCoordinatorRequest, FindCoordinatorResponse,
+    ApiKey, CONSUMER_PROTOCOL_TYPE, ConsumerGroupHeartbeatRequest, ConsumerGroupHeartbeatResponse,
+    ConsumerGroupTopicPartitions, ConsumerProtocolAssignment, ConsumerProtocolSubscription,
+    ConsumerProtocolTopicPartitions, FindCoordinatorRequest, FindCoordinatorResponse,
     HeartbeatRequest, HeartbeatResponse, JoinGroupRequest, JoinGroupRequestProtocol,
     JoinGroupResponse, JoinGroupResponseMember, LeaveGroupMember, LeaveGroupRequest,
     LeaveGroupResponse, ListOffsetsRequest, ListOffsetsRequestPartition, ListOffsetsRequestTopic,
-    ListOffsetsResponse, MAX_DECODE_ARRAY_LEN, OffsetCommitRequest, OffsetCommitRequestPartition,
+    ListOffsetsResponse, OffsetCommitRequest, OffsetCommitRequestPartition,
     OffsetCommitRequestTopic, OffsetCommitResponse, OffsetFetchRequest, OffsetFetchRequestTopic,
     OffsetFetchResponse, SyncGroupRequest, SyncGroupRequestAssignment, SyncGroupResponse,
-    VersionedDecode, VersionedEncode,
+    VersionedDecode, VersionedEncode, decode_consumer_protocol_assignment,
+    decode_consumer_protocol_subscription, encode_consumer_protocol_assignment,
+    encode_consumer_protocol_subscription,
     versions::{
         CONSUMER_GROUP_HEARTBEAT_MAX, CONSUMER_GROUP_HEARTBEAT_MIN, FIND_COORDINATOR_MAX,
         FIND_COORDINATOR_MIN, HEARTBEAT_MAX, HEARTBEAT_MIN, JOIN_GROUP_MAX, JOIN_GROUP_MIN,
@@ -1551,7 +1554,7 @@ impl GroupCoordinator {
             rejoin_in_flight: tokio::sync::watch::Sender::new(false),
             heartbeat_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             subscribed_topics: RwLock::new(Vec::new()),
-            protocol_type: "consumer".to_string(),
+            protocol_type: CONSUMER_PROTOCOL_TYPE.to_string(),
             assignment_strategies: vec![
                 crate::consumer::config::PartitionAssignmentStrategy::Range,
             ],
@@ -2021,7 +2024,10 @@ impl GroupCoordinator {
     pub async fn join_group(&self) -> Result<JoinGroupResponse> {
         let conn = self.get_coordinator_connection().await?;
 
-        let member_id = self.inner.read().await.member_id.clone();
+        let (member_id, generation_id) = {
+            let inner = self.inner.read().await;
+            (inner.member_id.clone(), inner.generation_id)
+        };
         let topics = self.subscribed_topics.read().await.clone();
         let owned_partitions = if self.is_cooperative() {
             self.sticky_assignor
@@ -2034,8 +2040,10 @@ impl GroupCoordinator {
             HashMap::new()
         };
 
-        // Build consumer protocol metadata
-        let metadata = self.encode_consumer_metadata(&topics, &owned_partitions)?;
+        // Build consumer protocol metadata.
+        let subscription = self.build_subscription(&topics, &owned_partitions, generation_id);
+        let mut metadata = BytesMut::new();
+        encode_consumer_protocol_subscription(&subscription, &mut metadata)?;
 
         let request = JoinGroupRequest {
             group_id: self.group_id.clone(),
@@ -4907,265 +4915,64 @@ impl GroupCoordinator {
         *self.member_epoch.write().await = 0;
     }
 
-    /// Encode consumer protocol metadata.
+    /// Build this member's `ConsumerProtocolSubscription`.
     ///
-    /// For cooperative-sticky, encodes version 1 metadata which includes owned
-    /// partitions. This allows the leader to know each member's current assignment
-    /// for computing incremental revocations.
-    fn encode_consumer_metadata(
+    /// The version is the lowest one that can carry everything this member has
+    /// to say, because a lower version is understood by more peers:
+    ///
+    /// * **v0** — topics only.
+    /// * **v2** — cooperative rebalancing (KIP-429). `owned_partitions` is what
+    ///   lets the leader revoke incrementally instead of revoking everything,
+    ///   and `generation_id` is how a leader resolves two members claiming the
+    ///   same partition: the older claim loses.
+    /// * **v3** — a rack is configured (KIP-881). A rack-aware leader cannot
+    ///   place this member near its replicas without it.
+    ///
+    /// Topics and owned partitions are sorted, so an unchanged subscription
+    /// encodes to identical bytes and the broker does not read a spurious
+    /// metadata change between generations.
+    fn build_subscription(
         &self,
         topics: &[String],
         owned_partitions: &HashMap<String, Vec<PartitionId>>,
-    ) -> Result<BytesMut> {
-        let mut buf = BytesMut::new();
-
-        if self.is_cooperative() {
-            // Version 1: includes owned partitions for cooperative protocol
-            buf.put_i16(1);
-        } else {
-            // Version 0: topics only
-            buf.put_i16(0);
-        }
-
-        // Topics array — sorted for deterministic encoding so the broker
-        // does not detect spurious metadata changes between generations.
-        let mut sorted_topics: Vec<&String> = topics.iter().collect();
+        generation_id: i32,
+    ) -> ConsumerProtocolSubscription {
+        let mut sorted_topics = topics.to_vec();
         sorted_topics.sort();
-        buf.put_i32(crate::protocol::array_len_i32(sorted_topics.len())?);
-        for topic in &sorted_topics {
-            let topic_len = i16::try_from(topic.len()).map_err(|_| {
-                KrafkaError::protocol_kind(
-                    ProtocolErrorKind::InvalidLength,
-                    format!(
-                        "topic name '{}' exceeds Kafka i16 length limit ({} bytes)",
-                        topic,
-                        topic.len()
-                    ),
-                )
-            })?;
-            buf.put_i16(topic_len);
-            buf.put_slice(topic.as_bytes());
-        }
-        // User data (empty)
-        buf.put_i32(-1);
+
+        let mut subscription = ConsumerProtocolSubscription::new(sorted_topics);
 
         if self.is_cooperative() {
-            // Owned partitions (version 1+) — sorted for deterministic encoding.
-            let mut sorted_owned: Vec<(&String, &Vec<PartitionId>)> =
-                owned_partitions.iter().collect();
-            sorted_owned.sort_by_key(|(topic, _)| topic.as_str());
-            buf.put_i32(crate::protocol::array_len_i32(sorted_owned.len())?);
-            for (topic, partitions) in &sorted_owned {
-                let topic_len = i16::try_from(topic.len()).map_err(|_| {
-                    KrafkaError::protocol_kind(
-                        ProtocolErrorKind::InvalidLength,
-                        format!("topic name '{}' exceeds Kafka i16 length limit", topic),
-                    )
-                })?;
-                buf.put_i16(topic_len);
-                buf.put_slice(topic.as_bytes());
-                let mut sorted_parts = partitions.to_vec();
-                sorted_parts.sort();
-                buf.put_i32(crate::protocol::array_len_i32(sorted_parts.len())?);
-                for &p in &sorted_parts {
-                    buf.put_i32(p);
-                }
-            }
+            let mut owned: Vec<ConsumerProtocolTopicPartitions> = owned_partitions
+                .iter()
+                .map(|(topic, partitions)| {
+                    let mut partitions = partitions.clone();
+                    partitions.sort_unstable();
+                    ConsumerProtocolTopicPartitions {
+                        topic: topic.clone(),
+                        partitions,
+                    }
+                })
+                .collect();
+            owned.sort_by(|a, b| a.topic.cmp(&b.topic));
+            subscription = subscription
+                .with_owned_partitions(owned)
+                .with_generation_id(generation_id);
         }
 
-        Ok(buf)
+        if let Some(rack) = &self.client_rack {
+            subscription = subscription.with_rack_id(rack.clone());
+        }
+
+        subscription
     }
 
-    /// Decode consumer protocol metadata from JoinGroup member metadata.
-    ///
-    /// Returns the subscribed topics and, for version >= 1, the owned partitions.
-    fn decode_consumer_metadata(data: &[u8]) -> (Vec<String>, HashMap<String, Vec<PartitionId>>) {
-        if data.len() < 2 {
-            return (Vec::new(), HashMap::new());
-        }
-        let mut buf = data;
-
-        let version = buf.get_i16();
-
-        // Decode topics
-        let mut topics = Vec::new();
-        if buf.remaining() >= 4 {
-            let topic_count = buf.get_i32();
-            let count = topic_count.max(0) as usize;
-            if count > 10_000 {
-                warn!(
-                    "decode_consumer_metadata: topic count {} exceeds cap, returning early",
-                    count
-                );
-                return (topics, HashMap::new());
-            }
-            let safe_count = count.min(buf.remaining() / 2);
-            for _ in 0..safe_count {
-                if buf.remaining() < 2 {
-                    return (topics, HashMap::new());
-                }
-                let len = buf.get_i16();
-                if len < 0 || buf.remaining() < len as usize {
-                    return (topics, HashMap::new());
-                }
-                match String::from_utf8(buf.copy_to_bytes(len as usize).to_vec()) {
-                    Ok(t) => topics.push(t),
-                    Err(e) => {
-                        warn!("decode_consumer_metadata: invalid UTF-8 in topic name: {e}");
-                        return (topics, HashMap::new());
-                    }
-                }
-            }
-        }
-
-        // Skip user_data
-        if buf.remaining() >= 4 {
-            let user_data_len = buf.get_i32();
-            if user_data_len > 0 {
-                if buf.remaining() < user_data_len as usize {
-                    return (topics, HashMap::new());
-                }
-                buf.advance(user_data_len as usize);
-            }
-        }
-
-        // Decode owned partitions (version 1+)
-        let mut owned = HashMap::new();
-        if version >= 1 && buf.remaining() >= 4 {
-            let topic_count = buf.get_i32();
-            let count = topic_count.max(0) as usize;
-            if count > 10_000 {
-                warn!(
-                    "decode_consumer_metadata: owned topic count {} exceeds cap, returning early",
-                    count
-                );
-                return (topics, owned);
-            }
-            let safe_topic_count = count.min(buf.remaining() / 6);
-            for _ in 0..safe_topic_count {
-                if buf.remaining() < 2 {
-                    return (topics, owned);
-                }
-                let len = buf.get_i16();
-                if len < 0 || buf.remaining() < len as usize {
-                    return (topics, owned);
-                }
-                let topic = match String::from_utf8(buf.copy_to_bytes(len as usize).to_vec()) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        warn!("decode_consumer_metadata: invalid UTF-8 in owned topic name: {e}");
-                        return (topics, owned);
-                    }
-                };
-                if buf.remaining() < 4 {
-                    return (topics, owned);
-                }
-                let part_count = buf.get_i32();
-                let pcount = part_count.max(0) as usize;
-                if pcount > 10_000 {
-                    warn!(
-                        "decode_consumer_metadata: partition count {} for '{}' exceeds cap, returning early",
-                        pcount, topic
-                    );
-                    return (topics, owned);
-                }
-                let safe_part_count = pcount.min(buf.remaining() / 4);
-                let mut parts = Vec::with_capacity(safe_part_count);
-                for _ in 0..safe_part_count {
-                    if buf.remaining() < 4 {
-                        return (topics, owned);
-                    }
-                    parts.push(buf.get_i32());
-                }
-                owned.insert(topic, parts);
-            }
-        }
-
-        (topics, owned)
-    }
-
-    /// Decode consumer assignment from SyncGroup response.
+    /// Decode the `ConsumerProtocolAssignment` blob from a SyncGroup response.
     fn decode_consumer_assignment(&self, data: &Bytes) -> Result<MemberAssignment> {
-        if data.is_empty() {
-            return Ok(MemberAssignment::empty());
-        }
-
-        let mut buf = data.clone();
-        if buf.remaining() < 2 {
-            return Ok(MemberAssignment::empty());
-        }
-
-        // Version
-        let _version = buf.get_i16();
-
-        // Topics array
-        if buf.remaining() < 4 {
-            return Ok(MemberAssignment::empty());
-        }
-        let topic_count = buf.get_i32();
-        if topic_count < 0 {
-            return Ok(MemberAssignment::empty());
-        }
-        // Cap iteration by max array length and remaining buffer to prevent allocation DoS
-        let safe_topic_count = (topic_count as usize)
-            .min(MAX_DECODE_ARRAY_LEN)
-            .min(buf.remaining() / 6);
-        if safe_topic_count < topic_count as usize {
-            warn!(
-                "assignment topic count {} exceeds buffer capacity, decoding {} topics",
-                topic_count, safe_topic_count
-            );
-        }
-
         let mut assignment = MemberAssignment::empty();
-
-        for _ in 0..safe_topic_count {
-            if buf.remaining() < 2 {
-                break;
-            }
-            let topic_len_i16 = buf.get_i16();
-            if topic_len_i16 < 0 {
-                break;
-            }
-            let topic_len = topic_len_i16 as usize;
-            if buf.remaining() < topic_len {
-                break;
-            }
-            let topic = String::from_utf8(buf.copy_to_bytes(topic_len).to_vec()).map_err(|e| {
-                KrafkaError::protocol_kind(
-                    ProtocolErrorKind::InvalidUtf8,
-                    format!("invalid UTF-8 in assignment topic name: {e}"),
-                )
-            })?;
-
-            if buf.remaining() < 4 {
-                break;
-            }
-            let partition_count = buf.get_i32();
-            if partition_count < 0 {
-                break;
-            }
-            let safe_partition_count = (partition_count as usize)
-                .min(MAX_DECODE_ARRAY_LEN)
-                .min(buf.remaining() / 4);
-            if safe_partition_count < partition_count as usize {
-                warn!(
-                    "assignment partition count {} for '{}' exceeds buffer/cap, decoding {}",
-                    partition_count, topic, safe_partition_count
-                );
-            }
-            let mut partitions = Vec::with_capacity(safe_partition_count);
-
-            for _ in 0..safe_partition_count {
-                if buf.remaining() < 4 {
-                    break;
-                }
-                partitions.push(buf.get_i32());
-            }
-
-            assignment.add(topic, partitions);
+        for tp in decode_consumer_protocol_assignment(data)?.assigned_partitions {
+            assignment.add(tp.topic, tp.partitions);
         }
-
         Ok(assignment)
     }
 
@@ -5200,22 +5007,54 @@ impl GroupCoordinator {
             let current_member_ids: HashSet<&str> =
                 members.iter().map(|m| m.member_id.as_str()).collect();
             self.sticky_assignor.retain_members(&current_member_ids);
+
+            // Claims by generation, so a partition claimed twice can be settled
+            // by which claim is newer rather than by iteration order.
+            let mut claims: HashMap<(String, PartitionId), (String, i32)> = HashMap::new();
+
             for m in members {
-                let (_member_topics, owned) = Self::decode_consumer_metadata(&m.metadata);
-                for (topic, parts) in &owned {
-                    for &p in parts {
-                        // Two members claiming the same partition would mean the
-                        // group is already split-brained; keep the first claim and
-                        // let the withholding below resolve it conservatively.
-                        previous_owner
-                            .entry((topic.clone(), p))
-                            .or_insert_with(|| m.member_id.clone());
+                let subscription =
+                    decode_consumer_protocol_subscription(&m.metadata).map_err(|e| {
+                        KrafkaError::protocol_kind(
+                            ProtocolErrorKind::Malformed,
+                            format!(
+                                "member '{}' sent an undecodable subscription: {e}",
+                                m.member_id
+                            ),
+                        )
+                    })?;
+
+                let mut owned: HashMap<String, Vec<PartitionId>> = HashMap::new();
+                for tp in subscription.owned_partitions {
+                    for &p in &tp.partitions {
+                        // Two members claiming the same partition means one of
+                        // them is running on a stale generation — a group that
+                        // is already split-brained. The higher generation wins;
+                        // the withholding below resolves the rest
+                        // conservatively.
+                        match claims.entry((tp.topic.clone(), p)) {
+                            std::collections::hash_map::Entry::Vacant(slot) => {
+                                slot.insert((m.member_id.clone(), subscription.generation_id));
+                            }
+                            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                                if subscription.generation_id > slot.get().1 {
+                                    slot.insert((m.member_id.clone(), subscription.generation_id));
+                                }
+                            }
+                        }
                     }
+                    owned.insert(tp.topic, tp.partitions);
                 }
+
                 let assignment = MemberAssignment { partitions: owned };
                 self.sticky_assignor
                     .record_assignment(&m.member_id, &assignment);
             }
+
+            previous_owner = claims
+                .into_iter()
+                .map(|(key, (member_id, _generation))| (key, member_id))
+                .collect();
         }
 
         // Convert to GroupMember for assignor
@@ -5330,33 +5169,32 @@ impl GroupCoordinator {
         }
     }
 
-    /// Encode consumer assignment for SyncGroup request.
+    /// Encode one member's assignment for the SyncGroup request.
+    ///
+    /// Written at v0: the `ConsumerProtocolAssignment` field set has not
+    /// changed since v0, so the lowest version is also the most widely
+    /// understood. Topics and partitions are sorted so the same assignment
+    /// always produces the same bytes.
     fn encode_consumer_assignment(&self, assignment: &MemberAssignment) -> Result<BytesMut> {
+        let mut assigned: Vec<ConsumerProtocolTopicPartitions> = assignment
+            .partitions
+            .iter()
+            .map(|(topic, partitions)| {
+                let mut partitions = partitions.clone();
+                partitions.sort_unstable();
+                ConsumerProtocolTopicPartitions {
+                    topic: topic.clone(),
+                    partitions,
+                }
+            })
+            .collect();
+        assigned.sort_by(|a, b| a.topic.cmp(&b.topic));
+
         let mut buf = BytesMut::new();
-        // Version
-        buf.put_i16(0);
-        // Topics array
-        buf.put_i32(crate::protocol::array_len_i32(assignment.partitions.len())?);
-        for (topic, partitions) in &assignment.partitions {
-            let topic_len = i16::try_from(topic.len()).map_err(|_| {
-                KrafkaError::protocol_kind(
-                    ProtocolErrorKind::InvalidLength,
-                    format!(
-                        "topic name '{}' exceeds Kafka i16 length limit ({} bytes)",
-                        topic,
-                        topic.len()
-                    ),
-                )
-            })?;
-            buf.put_i16(topic_len);
-            buf.put_slice(topic.as_bytes());
-            buf.put_i32(crate::protocol::array_len_i32(partitions.len())?);
-            for &partition in partitions {
-                buf.put_i32(partition);
-            }
-        }
-        // User data (empty)
-        buf.put_i32(-1);
+        encode_consumer_protocol_assignment(
+            &ConsumerProtocolAssignment::new(0, assigned),
+            &mut buf,
+        )?;
         Ok(buf)
     }
 
@@ -5384,6 +5222,9 @@ impl std::fmt::Debug for GroupCoordinator {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    use bytes::BufMut;
+
+    use crate::protocol::{CONSUMER_PROTOCOL_V2, CONSUMER_PROTOCOL_V3};
 
     // ── KIP-447: stable committed offsets ─────────────────────────────────
     //
@@ -6626,78 +6467,115 @@ mod tests {
         }
     }
 
+    /// Round-trip a subscription the way JoinGroup does: build it, encode it,
+    /// and decode it back the way the group leader will.
+    fn round_trip(subscription: &ConsumerProtocolSubscription) -> ConsumerProtocolSubscription {
+        let mut buf = BytesMut::new();
+        encode_consumer_protocol_subscription(subscription, &mut buf)
+            .expect("subscription must encode");
+        decode_consumer_protocol_subscription(&buf.freeze()).expect("subscription must decode")
+    }
+
     #[test]
-    fn test_encode_decode_consumer_metadata_v0() {
+    fn an_eager_member_subscribes_at_v0() {
         let coordinator =
             test_coordinator(crate::consumer::config::PartitionAssignmentStrategy::Range);
 
         let topics = vec!["topic1".to_string(), "topic2".to_string()];
-        let owned = HashMap::new();
-        let encoded = coordinator
-            .encode_consumer_metadata(&topics, &owned)
-            .unwrap();
+        let subscription = coordinator.build_subscription(&topics, &HashMap::new(), -1);
 
-        let (decoded_topics, decoded_owned) = GroupCoordinator::decode_consumer_metadata(&encoded);
+        // v0 is understood by every peer, and an eager member has nothing else
+        // to say: it revokes everything before SyncGroup.
+        assert_eq!(subscription.version, 0);
 
-        assert_eq!(decoded_topics, topics);
-        assert!(decoded_owned.is_empty());
+        let decoded = round_trip(&subscription);
+        assert_eq!(decoded.topics, topics);
+        assert!(decoded.owned_partitions.is_empty());
+        assert_eq!(decoded.generation_id, -1);
+        assert_eq!(decoded.rack_id, None);
     }
 
+    /// Cooperative rebalancing needs both v1 fields *and* the v2 generation:
+    /// without the generation a leader cannot tell which of two members
+    /// claiming the same partition is the stale one.
     #[test]
-    fn test_encode_decode_consumer_metadata_v1_with_owned() {
+    fn a_cooperative_member_reports_owned_partitions_and_its_generation() {
         let coordinator = test_coordinator(
             crate::consumer::config::PartitionAssignmentStrategy::CooperativeSticky,
         );
 
         let topics = vec!["topic1".to_string(), "topic2".to_string()];
         let mut owned = HashMap::new();
-        owned.insert("topic1".to_string(), vec![0, 1, 2]);
+        owned.insert("topic1".to_string(), vec![2, 0, 1]);
         owned.insert("topic2".to_string(), vec![0]);
 
-        let encoded = coordinator
-            .encode_consumer_metadata(&topics, &owned)
-            .unwrap();
+        let subscription = coordinator.build_subscription(&topics, &owned, 7);
+        assert_eq!(subscription.version, CONSUMER_PROTOCOL_V2);
 
-        let (decoded_topics, decoded_owned) = GroupCoordinator::decode_consumer_metadata(&encoded);
-
-        assert_eq!(decoded_topics, topics);
-        assert_eq!(decoded_owned.len(), 2);
-        assert_eq!(decoded_owned.get("topic1").unwrap(), &vec![0, 1, 2]);
-        assert_eq!(decoded_owned.get("topic2").unwrap(), &vec![0]);
-    }
-
-    #[test]
-    fn test_encode_decode_consumer_metadata_v1_empty_owned() {
-        let coordinator = test_coordinator(
-            crate::consumer::config::PartitionAssignmentStrategy::CooperativeSticky,
+        let decoded = round_trip(&subscription);
+        assert_eq!(decoded.topics, topics);
+        assert_eq!(decoded.generation_id, 7);
+        assert_eq!(
+            decoded.owned_partitions,
+            vec![
+                ConsumerProtocolTopicPartitions {
+                    topic: "topic1".to_string(),
+                    partitions: vec![0, 1, 2],
+                },
+                ConsumerProtocolTopicPartitions {
+                    topic: "topic2".to_string(),
+                    partitions: vec![0],
+                },
+            ],
+            "topics and partitions must be sorted, so an unchanged subscription \
+             encodes to identical bytes"
         );
+    }
 
-        let topics = vec!["topic1".to_string()];
-        let owned = HashMap::new();
+    /// A rack-aware leader (KIP-881) cannot place a member near its replicas
+    /// unless the member says where it is. The KIP-848 heartbeat has always
+    /// carried `client_rack`; the classic subscription must too.
+    #[test]
+    fn a_configured_rack_reaches_the_group_leader() {
+        let coordinator =
+            test_coordinator(crate::consumer::config::PartitionAssignmentStrategy::Range)
+                .with_client_rack(Some("us-east-1a".to_string()));
 
-        let encoded = coordinator
-            .encode_consumer_metadata(&topics, &owned)
-            .unwrap();
+        let subscription =
+            coordinator.build_subscription(&["topic1".to_string()], &HashMap::new(), -1);
+        assert_eq!(subscription.version, CONSUMER_PROTOCOL_V3);
 
-        let (decoded_topics, decoded_owned) = GroupCoordinator::decode_consumer_metadata(&encoded);
+        let decoded = round_trip(&subscription);
+        assert_eq!(decoded.rack_id.as_deref(), Some("us-east-1a"));
+    }
 
-        assert_eq!(decoded_topics, vec!["topic1".to_string()]);
-        assert!(decoded_owned.is_empty());
+    /// Without a rack there is nothing to gain from a higher version, and a
+    /// lower one is understood by more peers.
+    #[test]
+    fn no_rack_means_no_version_bump() {
+        let coordinator =
+            test_coordinator(crate::consumer::config::PartitionAssignmentStrategy::Range);
+
+        let subscription =
+            coordinator.build_subscription(&["topic1".to_string()], &HashMap::new(), -1);
+
+        assert_eq!(subscription.version, 0);
     }
 
     #[test]
-    fn test_decode_consumer_metadata_empty() {
-        let (topics, owned) = GroupCoordinator::decode_consumer_metadata(&[]);
-        assert!(topics.is_empty());
-        assert!(owned.is_empty());
+    fn an_empty_subscription_blob_decodes_to_an_empty_subscription() {
+        let decoded = decode_consumer_protocol_subscription(&Bytes::new())
+            .expect("an empty blob is not an error");
+        assert!(decoded.topics.is_empty());
+        assert!(decoded.owned_partitions.is_empty());
     }
 
+    /// A subscription that ends mid-field is a protocol error, not an empty
+    /// subscription: silently reading it as "subscribed to nothing" would let
+    /// the leader assign this member's partitions to someone else.
     #[test]
-    fn test_decode_consumer_metadata_truncated() {
-        // Only version byte, no topics
-        let (topics, owned) = GroupCoordinator::decode_consumer_metadata(&[0, 0]);
-        assert!(topics.is_empty());
-        assert!(owned.is_empty());
+    fn a_truncated_subscription_blob_is_an_error() {
+        assert!(decode_consumer_protocol_subscription(&Bytes::from_static(&[0, 0])).is_err());
     }
 
     #[test]
@@ -6947,11 +6825,11 @@ mod tests {
         assert!(sorted.contains(&("t2".to_string(), 0)));
     }
 
+    /// A partition count far larger than the bytes behind it must neither
+    /// pre-allocate for the claim nor loop toward it — it must fail on the
+    /// first byte that is not there.
     #[test]
-    fn test_decode_consumer_metadata_overcounted_partitions() {
-        // Build v1 metadata where owned partitions claim 5000 entries
-        // but only 3 fit in the buffer. The safe loop bound must cap iteration
-        // based on remaining bytes (5000 is within the hard cap of 10,000).
+    fn an_overcounted_partition_array_is_rejected_without_allocating_for_it() {
         let mut buf = BytesMut::new();
         buf.put_i16(1); // version 1
         buf.put_i32(1); // 1 subscribed topic
@@ -6960,21 +6838,25 @@ mod tests {
         buf.put_slice(topic);
         buf.put_i32(-1); // no user data
 
-        // Owned partitions section
-        buf.put_i32(1); // 1 owned topic
+        // Owned partitions: claims 5 000 partitions, ships 3.
+        buf.put_i32(1);
         let owned_topic = b"test";
         buf.put_i16(i16::try_from(owned_topic.len()).unwrap());
         buf.put_slice(owned_topic);
-        buf.put_i32(5_000); // claim 5000 partitions
-        buf.put_i32(0); // only 3 actual partition values
+        buf.put_i32(5_000);
+        buf.put_i32(0);
         buf.put_i32(1);
         buf.put_i32(2);
 
-        let (topics, owned) = GroupCoordinator::decode_consumer_metadata(&buf);
-        assert_eq!(topics, vec!["sub".to_string()]);
-        // Should decode only the 3 partitions that fit, not spin 1M times
-        let parts = owned.get("test").unwrap();
-        assert_eq!(parts, &[0, 1, 2]);
+        let err = decode_consumer_protocol_subscription(&buf.freeze())
+            .expect_err("a claim the buffer cannot back must not be believed");
+        assert!(
+            matches!(
+                err.protocol_error_kind(),
+                Some(crate::error::ProtocolErrorKind::TruncatedFrame)
+            ),
+            "expected a truncated-frame error, got {err:?}"
+        );
     }
 
     #[test]

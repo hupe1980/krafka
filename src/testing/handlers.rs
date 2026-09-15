@@ -20,7 +20,9 @@ use crate::error::{ErrorCode, Result};
 use crate::protocol::ApiKey;
 use crate::protocol::{Encode, KafkaString, TaggedField, TryEncode};
 
-use super::state::{ClusterState, CommittedOffset, GroupMember, TransactionState};
+use super::state::{
+    ClassicGroupState, ClusterState, CommittedOffset, GroupMember, TransactionState,
+};
 use super::wire::*;
 
 /// The single API version the fake broker speaks for each supported API.
@@ -86,18 +88,24 @@ pub(crate) fn supported_versions() -> Vec<(ApiKey, i16)> {
         (ApiKey::UpdateFeatures, 2),
         // KIP-1071, describe half only — see `streams_group_describe`.
         (ApiKey::StreamsGroupDescribe, 0),
+        // v4 is the newest non-flexible DescribeGroups, and the newest one
+        // carrying `group_instance_id`. v5+ only adds compact encodings and
+        // (v6) a per-group error message.
+        (ApiKey::DescribeGroups, 4),
     ]
 }
 
 /// Serve one request, writing the response body (no header) into `out`.
 ///
 /// `node_id` is the broker the request arrived at, which is what lets the
-/// handlers detect misrouted requests.
+/// handlers detect misrouted requests. `client_id` is the one from the request
+/// header, which the group APIs record and report back.
 pub(crate) fn dispatch(
     api_key: ApiKey,
     api_version: i16,
     body: &mut Bytes,
     node_id: i32,
+    client_id: Option<&str>,
     state: &mut ClusterState,
     out: &mut BytesMut,
 ) -> Result<()> {
@@ -108,7 +116,7 @@ pub(crate) fn dispatch(
         ApiKey::Fetch => fetch(body, node_id, state, out),
         ApiKey::ListOffsets => list_offsets(body, node_id, state, out),
         ApiKey::FindCoordinator => find_coordinator(body, state, out),
-        ApiKey::JoinGroup => join_group(body, node_id, state, out),
+        ApiKey::JoinGroup => join_group(body, node_id, client_id, state, out),
         ApiKey::SyncGroup => sync_group(body, node_id, state, out),
         ApiKey::Heartbeat => heartbeat(body, node_id, state, out),
         ApiKey::LeaveGroup => leave_group(body, node_id, state, out),
@@ -127,6 +135,7 @@ pub(crate) fn dispatch(
         ApiKey::ShareAcknowledge => share_acknowledge(body, api_version, node_id, state, out),
         ApiKey::UpdateFeatures => update_features(body, api_version, node_id, state, out),
         ApiKey::StreamsGroupDescribe => streams_group_describe(body, node_id, state, out),
+        ApiKey::DescribeGroups => describe_groups(body, node_id, state, out),
         other => Err(crate::error::KrafkaError::protocol_kind(
             crate::error::ProtocolErrorKind::UnknownApiVersion,
             format!("fake broker has no handler for {other:?}"),
@@ -342,6 +351,21 @@ pub(crate) fn dispatch_error(
             for name in &req.topic_names {
                 write_nullable_string(out, Some(name))?;
                 write_error(out, code);
+            }
+            Ok(())
+        }
+        ApiKey::DescribeGroups => {
+            let req = DescribeGroupsReq::read(body)?;
+            out.put_i32(0);
+            write_array_len(out, req.groups.len())?;
+            for group_id in &req.groups {
+                write_error(out, code);
+                write_string(out, group_id)?;
+                write_string(out, "")?; // group_state
+                write_string(out, "")?; // protocol_type
+                write_string(out, "")?; // protocol_data
+                write_array_len(out, 0)?; // members
+                out.put_i32(i32::MIN); // authorized_operations
             }
             Ok(())
         }
@@ -1463,6 +1487,7 @@ fn coordinator_check(state: &ClusterState, group_id: &str, node_id: i32) -> Opti
 fn join_group(
     body: &mut Bytes,
     node_id: i32,
+    client_id: Option<&str>,
     state: &mut ClusterState,
     out: &mut BytesMut,
 ) -> Result<()> {
@@ -1503,9 +1528,12 @@ fn join_group(
         member_id: member_id.clone(),
         group_instance_id: req.group_instance_id.clone(),
         metadata: metadata.clone(),
+        client_id: client_id.unwrap_or_default().to_string(),
+        client_host: "/127.0.0.1".to_string(),
     }];
     group.leader = member_id.clone();
     group.assignments.clear();
+    group.state = ClassicGroupState::CompletingRebalance;
 
     let generation_id = group.generation_id;
     let members = group.members.clone();
@@ -1551,6 +1579,9 @@ fn sync_group(
             .assignments
             .insert(assignment.member_id.clone(), assignment.assignment.clone());
     }
+    if !group.members.is_empty() {
+        group.state = ClassicGroupState::Stable;
+    }
     let assignment = group
         .assignments
         .get(&req.member_id)
@@ -1561,6 +1592,81 @@ fn sync_group(
     write_error(out, ErrorCode::None);
     write_nullable_bytes(out, Some(&assignment))
 }
+
+/// DescribeGroups (Key 15), v4.
+///
+/// Reports each member's subscription and assignment exactly as the coordinator
+/// holds them: the opaque blobs the members and the group leader wrote. The
+/// harness never parses them, which is the point — a client that decodes them
+/// is decoding bytes a real broker would have handed back unchanged.
+fn describe_groups(
+    body: &mut Bytes,
+    node_id: i32,
+    state: &mut ClusterState,
+    out: &mut BytesMut,
+) -> Result<()> {
+    let req = DescribeGroupsReq::read(body)?;
+
+    out.put_i32(0); // throttle_time_ms
+    write_array_len(out, req.groups.len())?;
+
+    for group_id in &req.groups {
+        // Like every group API, this one belongs to the coordinator.
+        if let Some(code) = coordinator_check(state, group_id, node_id) {
+            write_error(out, code);
+            write_string(out, group_id)?;
+            write_string(out, "")?; // group_state
+            write_string(out, "")?; // protocol_type
+            write_string(out, "")?; // protocol_data
+            write_array_len(out, 0)?;
+            out.put_i32(i32::MIN); // authorized_operations
+            continue;
+        }
+
+        let Some(group) = state.groups.get(group_id) else {
+            // A group that was never created is reported as Dead with no
+            // members, which is what a real coordinator does — not an error.
+            write_error(out, ErrorCode::None);
+            write_string(out, group_id)?;
+            write_string(out, "Dead")?;
+            write_string(out, "")?;
+            write_string(out, "")?;
+            write_array_len(out, 0)?;
+            out.put_i32(i32::MIN);
+            continue;
+        };
+
+        write_error(out, ErrorCode::None);
+        write_string(out, group_id)?;
+        write_string(out, group.state.as_str())?;
+        write_string(out, &group.protocol_type)?;
+        write_string(out, group.protocol_name.as_deref().unwrap_or(""))?;
+
+        write_array_len(out, group.members.len())?;
+        for member in &group.members {
+            write_string(out, &member.member_id)?;
+            write_nullable_string(out, member.group_instance_id.as_deref())?;
+            write_string(out, &member.client_id)?;
+            write_string(out, &member.client_host)?;
+            write_nullable_bytes(out, Some(&member.metadata))?;
+            let assignment = group.assignments.get(&member.member_id);
+            write_nullable_bytes(out, Some(assignment.unwrap_or(&EMPTY_ASSIGNMENT)))?;
+        }
+
+        out.put_i32(if req.include_authorized_operations {
+            // Every operation this harness models is permitted.
+            i32::MAX
+        } else {
+            i32::MIN
+        });
+    }
+
+    Ok(())
+}
+
+/// What the coordinator stores for a member that has joined but not yet been
+/// given an assignment.
+const EMPTY_ASSIGNMENT: Bytes = Bytes::from_static(&[]);
 
 fn heartbeat(
     body: &mut Bytes,
@@ -1604,6 +1710,10 @@ fn leave_group(
         group
             .members
             .retain(|m| !req.members.iter().any(|(id, _)| *id == m.member_id));
+        if group.members.is_empty() {
+            group.state = ClassicGroupState::Empty;
+            group.assignments.clear();
+        }
     }
 
     out.put_i32(0); // throttle_time_ms

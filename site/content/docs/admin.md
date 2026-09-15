@@ -661,6 +661,19 @@ for group in &descriptions {
             member.member_id, member.client_id, member.client_host,
             member.instance_id
         );
+        let topics = member.subscribed_topic_names.as_deref().unwrap_or(&[]);
+        println!("      subscribed to {:?}", topics);
+
+        match &member.assignment {
+            Some(assignment) => {
+                for tp in assignment {
+                    println!("      owns {} {:?}", tp.topic_name, tp.partitions);
+                }
+            }
+            // Unknown, not empty: a group whose embedded protocol is not
+            // `consumer` (Connect, Streams), or a blob that failed to decode.
+            None => println!("      assignment unavailable"),
+        }
     }
     if let Some(error) = &group.error {
         println!("  Error: {}", error);
@@ -668,10 +681,12 @@ for group in &descriptions {
 }
 ```
 
-> **Note:** Classic-protocol groups return `protocol_type` and `assignor` but
-> no epoch or assignment details. KIP-848 groups return `group_epoch`,
-> `assignment_epoch`, per-member subscriptions, and topic-UUID-based
-> current/target assignments.
+Both group types report each member's subscription and current assignment:
+KIP-848 groups carry them as protocol fields, classic groups as embedded blobs
+that krafka decodes. Only KIP-848 groups report `group_epoch`,
+`assignment_epoch`, `member_epoch`, `subscribed_topic_regex`,
+`target_assignment`, and topic UUIDs — a classic assignment carries topic names
+only, so its `topic_id` is all-zero.
 
 ### Listing Consumer Groups
 
