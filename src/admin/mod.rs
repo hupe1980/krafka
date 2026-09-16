@@ -599,7 +599,7 @@ pub struct ConsumerGroupMember {
     pub member_id: String,
     /// Group instance ID / instance ID (static membership).
     pub instance_id: Option<String>,
-    /// Rack ID (KIP-848 groups only).
+    /// Rack the member runs in, when it reports one (KIP-881).
     pub rack_id: Option<String>,
     /// Current member epoch (KIP-848 groups only).
     pub member_epoch: Option<i32>,
@@ -607,13 +607,22 @@ pub struct ConsumerGroupMember {
     pub client_id: String,
     /// Client host.
     pub client_host: String,
-    /// Subscribed topic names (KIP-848 groups only).
+    /// Subscribed topic names, for both group types.
+    ///
+    /// `None` on the same terms as [`assignment`](Self::assignment).
     pub subscribed_topic_names: Option<Vec<String>>,
     /// Subscribed topic regex (KIP-848 groups only).
     pub subscribed_topic_regex: Option<String>,
-    /// Current partition assignment (KIP-848 groups only).
+    /// Current partition assignment, for both group types.
+    ///
+    /// `None` means unknown: a classic group whose embedded protocol is not
+    /// `consumer` (Connect, Streams), or whose blob could not be decoded.
+    /// `Some(vec![])` means the member owns nothing right now.
     pub assignment: Option<Vec<TopicPartitionAssignment>>,
     /// Target partition assignment (KIP-848 groups only).
+    ///
+    /// The classic protocol has no target assignment separate from the current
+    /// one, so this is always `None` there.
     pub target_assignment: Option<Vec<TopicPartitionAssignment>>,
     /// Member type (KIP-848 groups only). -1 = unknown, 0 = classic, 1 = consumer.
     pub member_type: Option<i8>,
@@ -623,7 +632,7 @@ pub struct ConsumerGroupMember {
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct TopicPartitionAssignment {
-    /// Topic ID (UUID).
+    /// Topic ID (UUID). All-zero for classic groups, which carry names only.
     pub topic_id: [u8; 16],
     /// Topic name.
     pub topic_name: String,
@@ -1159,6 +1168,10 @@ pub struct DescribeClusterBrokerInfo {
     pub port: i32,
     /// Rack (if assigned).
     pub rack: Option<String>,
+    /// Whether the broker is fenced: registered with the controller but not
+    /// serving (KIP-1073, DescribeCluster v2+). Always `false` against a
+    /// broker too old to report it.
+    pub is_fenced: bool,
 }
 
 /// Kafka admin client for cluster administration.

@@ -7,11 +7,13 @@ use tracing::{debug, info, warn};
 
 use crate::error::{KrafkaError, ProtocolErrorKind, Result};
 use crate::protocol::{
-    ApiKey, ConsumerGroupDescribeRequest, ConsumerGroupDescribeResponse, DeleteRecordsPartition,
-    DeleteRecordsRequest, DeleteRecordsResponse, DeleteRecordsTopic, DescribeGroupsRequest,
-    DescribeGroupsResponse, ListGroupsRequest, ListGroupsResponse, OffsetForLeaderEpochPartition,
-    OffsetForLeaderEpochRequest, OffsetForLeaderEpochResponse, OffsetForLeaderEpochTopic,
-    VersionedDecode, VersionedEncode, validate_topic_name, versions,
+    ApiKey, CONSUMER_PROTOCOL_TYPE, ConsumerGroupDescribeRequest, ConsumerGroupDescribeResponse,
+    DeleteRecordsPartition, DeleteRecordsRequest, DeleteRecordsResponse, DeleteRecordsTopic,
+    DescribeGroupsRequest, DescribeGroupsResponse, ListGroupsRequest, ListGroupsResponse,
+    OffsetForLeaderEpochPartition, OffsetForLeaderEpochRequest, OffsetForLeaderEpochResponse,
+    OffsetForLeaderEpochTopic, VersionedDecode, VersionedEncode,
+    decode_consumer_protocol_assignment, decode_consumer_protocol_subscription,
+    validate_topic_name, versions,
 };
 
 #[allow(clippy::wildcard_imports)]
@@ -293,31 +295,41 @@ impl AdminClient {
                         g.group_state,
                         g.members.len()
                     );
+                    let group_id = g.group_id;
+                    let protocol_type = g.protocol_type;
                     let classic_desc = ConsumerGroupDescription {
-                        group_id: g.group_id,
-                        group_type: GroupType::Classic,
-                        state: g.group_state,
-                        protocol_type: Some(g.protocol_type),
-                        assignor: Some(g.protocol_data),
-                        group_epoch: None,
-                        assignment_epoch: None,
                         members: g
                             .members
                             .into_iter()
-                            .map(|m| ConsumerGroupMember {
-                                member_id: m.member_id,
-                                instance_id: m.group_instance_id,
-                                rack_id: None,
-                                member_epoch: None,
-                                client_id: m.client_id,
-                                client_host: m.client_host,
-                                subscribed_topic_names: None,
-                                subscribed_topic_regex: None,
-                                assignment: None,
-                                target_assignment: None,
-                                member_type: None,
+                            .map(|m| {
+                                let decoded = classic_member_protocol(
+                                    &group_id,
+                                    &m.member_id,
+                                    &protocol_type,
+                                    &m,
+                                );
+                                ConsumerGroupMember {
+                                    member_id: m.member_id,
+                                    instance_id: m.group_instance_id,
+                                    rack_id: decoded.rack_id,
+                                    member_epoch: None,
+                                    client_id: m.client_id,
+                                    client_host: m.client_host,
+                                    subscribed_topic_names: decoded.subscribed_topic_names,
+                                    subscribed_topic_regex: None,
+                                    assignment: decoded.assignment,
+                                    target_assignment: None,
+                                    member_type: None,
+                                }
                             })
                             .collect(),
+                        group_id,
+                        group_type: GroupType::Classic,
+                        state: g.group_state,
+                        protocol_type: Some(protocol_type),
+                        assignor: Some(g.protocol_data),
+                        group_epoch: None,
+                        assignment_epoch: None,
                         authorized_operations: None,
                         error: if g.error_code.is_ok() {
                             None
@@ -799,11 +811,100 @@ impl AdminClient {
     // ── Delegation Tokens ────────────────────────────────────────────────
 }
 
+/// Decode one classic group member's embedded protocol blobs.
+///
+/// `DescribeGroups` (Key 15) returns a classic member's subscription and
+/// assignment as opaque `bytes`: the coordinator stores what the member and the
+/// group leader wrote and never parses either.
+///
+/// Both results are `None` when the value is *unknown*, which is not the same
+/// as empty:
+///
+/// * The group's embedded protocol is not `consumer`. Connect and Streams put
+///   their own formats in these fields, and reading one as a consumer
+///   subscription would invent topic names out of unrelated bytes.
+/// * The blob is malformed. It is written by another client, so a bad one is
+///   logged and skipped rather than failing the describe for the whole group.
+///
+/// `Some(vec![])` means the member subscribes to nothing, or owns no partitions
+/// right now — it has joined but not yet completed a rebalance.
+fn classic_member_protocol(
+    group_id: &str,
+    member_id: &str,
+    protocol_type: &str,
+    member: &crate::protocol::DescribeGroupMember,
+) -> ClassicMemberProtocol {
+    if protocol_type != CONSUMER_PROTOCOL_TYPE {
+        return ClassicMemberProtocol::default();
+    }
+
+    let subscription = match decode_consumer_protocol_subscription(&member.member_metadata) {
+        Ok(subscription) => Some(subscription),
+        Err(e) => {
+            warn!(
+                "failed to decode subscription for member '{}' of classic group '{}': {}",
+                member_id, group_id, e
+            );
+            None
+        }
+    };
+
+    let assignment = match decode_consumer_protocol_assignment(&member.member_assignment) {
+        Ok(assignment) => Some(
+            assignment
+                .assigned_partitions
+                .into_iter()
+                .map(topic_partition_assignment)
+                .collect(),
+        ),
+        Err(e) => {
+            warn!(
+                "failed to decode assignment for member '{}' of classic group '{}': {}",
+                member_id, group_id, e
+            );
+            None
+        }
+    };
+
+    ClassicMemberProtocol {
+        rack_id: subscription.as_ref().and_then(|s| s.rack_id.clone()),
+        subscribed_topic_names: subscription.map(|s| s.topics),
+        assignment,
+    }
+}
+
+/// What [`classic_member_protocol`] recovered from a member's blobs.
+#[derive(Default)]
+struct ClassicMemberProtocol {
+    /// Topics from the `ConsumerProtocolSubscription`.
+    subscribed_topic_names: Option<Vec<String>>,
+    /// Rack from the subscription (v3+, KIP-881).
+    rack_id: Option<String>,
+    /// Partitions from the `ConsumerProtocolAssignment`.
+    assignment: Option<Vec<TopicPartitionAssignment>>,
+}
+
+/// The classic protocol carries topic names only, so the topic ID is all-zero.
+fn topic_partition_assignment(
+    tp: crate::protocol::ConsumerProtocolTopicPartitions,
+) -> TopicPartitionAssignment {
+    TopicPartitionAssignment {
+        topic_id: [0u8; 16],
+        topic_name: tp.topic,
+        partitions: tp.partitions,
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    use bytes::BufMut;
+
     use super::*;
     use crate::error::ErrorCode;
+    use crate::protocol::{
+        ConsumerProtocolAssignment, ConsumerProtocolSubscription, ConsumerProtocolTopicPartitions,
+    };
 
     #[test]
     fn test_list_groups_request_encodes_empty_filters_as_no_filter() {
@@ -861,6 +962,129 @@ mod tests {
         assert!(!needs_fallback(ErrorCode::GroupAuthorizationFailed));
         assert!(!needs_fallback(ErrorCode::CoordinatorNotAvailable));
         assert!(!needs_fallback(ErrorCode::None));
+    }
+
+    /// Build the member the way the coordinator stores one: a subscription it
+    /// was given at JoinGroup, an assignment the leader wrote at SyncGroup.
+    fn classic_member(
+        subscription: &ConsumerProtocolSubscription,
+        assigned: &[(&str, &[i32])],
+    ) -> crate::protocol::DescribeGroupMember {
+        let mut metadata = bytes::BytesMut::new();
+        crate::protocol::encode_consumer_protocol_subscription(subscription, &mut metadata)
+            .expect("subscription must encode");
+
+        let assignment = ConsumerProtocolAssignment::new(
+            0,
+            assigned
+                .iter()
+                .map(|(topic, partitions)| ConsumerProtocolTopicPartitions {
+                    topic: (*topic).to_string(),
+                    partitions: partitions.to_vec(),
+                })
+                .collect(),
+        );
+        let mut assignment_bytes = bytes::BytesMut::new();
+        crate::protocol::encode_consumer_protocol_assignment(&assignment, &mut assignment_bytes)
+            .expect("assignment must encode");
+
+        crate::protocol::DescribeGroupMember {
+            member_id: "m1".to_string(),
+            group_instance_id: None,
+            client_id: "c1".to_string(),
+            client_host: "/127.0.0.1".to_string(),
+            member_metadata: metadata.freeze(),
+            member_assignment: assignment_bytes.freeze(),
+        }
+    }
+
+    /// DescribeGroups hands a classic member's subscription and assignment back
+    /// as opaque bytes. Both must be decoded here, or every caller has to
+    /// reimplement two wire formats to learn what the group is doing.
+    #[test]
+    fn a_classic_member_reports_its_subscription_and_its_assignment() {
+        let subscription =
+            ConsumerProtocolSubscription::new(vec!["orders".to_string(), "payments".to_string()])
+                .with_rack_id("us-east-1a");
+        let member = classic_member(&subscription, &[("orders", &[0, 3]), ("payments", &[1])]);
+
+        let decoded = classic_member_protocol("g1", "m1", "consumer", &member);
+
+        assert_eq!(
+            decoded.subscribed_topic_names.as_deref(),
+            Some(["orders".to_string(), "payments".to_string()].as_slice())
+        );
+        assert_eq!(decoded.rack_id.as_deref(), Some("us-east-1a"));
+
+        let assignment = decoded.assignment.expect("the assignment must decode");
+        assert_eq!(assignment.len(), 2);
+        assert_eq!(assignment[0].topic_name, "orders");
+        assert_eq!(assignment[0].partitions, vec![0, 3]);
+        assert_eq!(assignment[1].topic_name, "payments");
+        assert_eq!(assignment[1].partitions, vec![1]);
+        // The classic protocol carries no topic IDs.
+        assert_eq!(assignment[0].topic_id, [0u8; 16]);
+    }
+
+    /// Connect and Streams put their own formats in the same two fields.
+    /// Reading one as a consumer blob would invent topic names out of unrelated
+    /// bytes, so an unknown embedded protocol stays `None` — unknown.
+    #[test]
+    fn a_non_consumer_protocol_is_not_decoded() {
+        let subscription = ConsumerProtocolSubscription::new(vec!["orders".to_string()]);
+        let member = classic_member(&subscription, &[("orders", &[0])]);
+
+        for protocol_type in ["connect", ""] {
+            let decoded = classic_member_protocol("g1", "m1", protocol_type, &member);
+            assert!(decoded.assignment.is_none());
+            assert!(decoded.subscribed_topic_names.is_none());
+        }
+    }
+
+    /// A member that owns nothing must be distinguishable from one whose
+    /// assignment could not be read: `Some(vec![])` versus `None`.
+    #[test]
+    fn a_member_mid_rebalance_owns_nothing_rather_than_unknown() {
+        let subscription = ConsumerProtocolSubscription::new(vec!["orders".to_string()]);
+        let mut member = classic_member(&subscription, &[]);
+        // What the coordinator stores for a member that has joined but not yet
+        // been given an assignment.
+        member.member_assignment = bytes::Bytes::new();
+
+        let decoded = classic_member_protocol("g1", "m1", "consumer", &member);
+
+        assert!(
+            decoded.assignment.is_some_and(|a| a.is_empty()),
+            "an empty assignment blob means the member owns nothing, not that \
+             we could not read it"
+        );
+        assert_eq!(
+            decoded.subscribed_topic_names.as_deref(),
+            Some(["orders".to_string()].as_slice())
+        );
+    }
+
+    /// The blobs are written by other clients, so one bad member must not fail
+    /// the describe for the whole group — and must not be reported as empty
+    /// either.
+    #[test]
+    fn a_malformed_blob_degrades_to_unknown() {
+        let subscription = ConsumerProtocolSubscription::new(vec!["orders".to_string()]);
+        let mut member = classic_member(&subscription, &[("orders", &[0])]);
+        // A topic name that is not valid UTF-8.
+        let mut bad = bytes::BytesMut::new();
+        bad.put_i16(0);
+        bad.put_i32(1);
+        bad.put_i16(2);
+        bad.put_slice(&[0xff, 0xfe]);
+        bad.put_i32(0);
+        member.member_assignment = bad.freeze();
+
+        let decoded = classic_member_protocol("g1", "m1", "consumer", &member);
+
+        assert!(decoded.assignment.is_none());
+        // The subscription is still readable, and still reported.
+        assert!(decoded.subscribed_topic_names.is_some());
     }
 
     #[test]

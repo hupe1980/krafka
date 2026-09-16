@@ -24,6 +24,8 @@
 //! - [`describe_configs`] — DescribeConfigs
 //! - [`incremental_alter_configs`] — IncrementalAlterConfigs
 //! - [`consumer_group_describe`] — ConsumerGroupDescribe (Key 69, KIP-848)
+//! - [`consumer_protocol`] — the embedded `ConsumerProtocolAssignment` blob
+//!   carried by classic groups
 //! - [`delete_groups`] — DeleteGroups (Key 42)
 //! - [`describe_cluster`] — DescribeCluster (Key 60)
 //! - [`describe_groups`] — DescribeGroups (Key 15)
@@ -140,6 +142,9 @@ pub use acl::*;
 
 mod consumer_group_describe;
 pub use consumer_group_describe::*;
+
+mod consumer_protocol;
+pub use consumer_protocol::*;
 
 mod delete_groups;
 pub use delete_groups::*;

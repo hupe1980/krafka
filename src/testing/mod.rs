@@ -120,7 +120,8 @@ use crate::protocol::{Decode, KafkaString, TaggedFields};
 use crate::protocol::{RequestHeader, ResponseHeader};
 
 pub use state::{
-    BrokerNode, ClusterState, CommittedOffset, GroupMember, GroupState, PartitionState, TopicState,
+    BrokerNode, ClassicGroupState, ClusterState, CommittedOffset, GroupMember, GroupState,
+    PartitionState, TopicState,
 };
 
 /// Largest request frame the fake broker will accept, as a guard against a
@@ -996,6 +997,7 @@ async fn serve(mut stream: TcpStream, node_id: i32, shared: Arc<Shared>) -> Resu
                     header.api_version,
                     &mut frame,
                     node_id,
+                    header.client_id.as_deref(),
                     &mut cluster,
                     &mut body,
                 )
