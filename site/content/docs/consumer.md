@@ -1196,7 +1196,7 @@ krafka implements [KIP-227](https://cwiki.apache.org/confluence/display/KAFKA/KI
 
 - `FetchSessionIdNotFound` or `InvalidFetchSessionEpoch` errors automatically reset the session
 - The next fetch sends a full request to re-establish the session
-- All sessions are reset on consumer group rebalance
+- On rebalance, `unsubscribe()` and `close()`, every session is closed on its broker (epoch -1), so the broker frees the slot at once
 
 Fetch sessions are enabled automatically when the broker supports Fetch API v7+. No configuration is needed.
 

@@ -205,6 +205,7 @@ broker.request_count(ApiKey::Metadata);          // how many times
 broker.request_nodes(ApiKey::UpdateFeatures);    // which brokers, in order
 broker.requests();                               // every recorded request
 broker.clear_requests();                         // reset between phases
+broker.share_session_closes();                   // final-epoch share session closes, and via which API
 
 // Wait for the client to act, rather than sleeping and hoping.
 broker.wait_for_requests(ApiKey::Fetch, 3, Duration::from_secs(5)).await;

@@ -1501,6 +1501,8 @@ pub(crate) struct ShareFetchReq {
     pub group_id: Option<String>,
     /// Member ID.
     pub member_id: Option<String>,
+    /// Share session epoch; `-1` closes the session.
+    pub share_session_epoch: i32,
     /// Maximum records the broker may acquire for this request.
     pub max_records: i32,
     /// Requested topic-partitions, with any piggybacked acknowledgements.
@@ -1511,7 +1513,7 @@ impl ShareFetchReq {
     pub(crate) fn read(buf: &mut impl Buf, version: i16) -> Result<Self> {
         let group_id = read_compact_nullable_string(buf)?;
         let member_id = read_compact_nullable_string(buf)?;
-        let _share_session_epoch = i32::decode(buf)?;
+        let share_session_epoch = i32::decode(buf)?;
         let _max_wait_ms = i32::decode(buf)?;
         let _min_bytes = i32::decode(buf)?;
         let _max_bytes = i32::decode(buf)?;
@@ -1542,6 +1544,7 @@ impl ShareFetchReq {
         Ok(Self {
             group_id,
             member_id,
+            share_session_epoch,
             max_records,
             topics,
         })
@@ -1555,6 +1558,8 @@ pub(crate) struct ShareAcknowledgeReq {
     pub group_id: Option<String>,
     /// Member ID.
     pub member_id: Option<String>,
+    /// Share session epoch; `-1` closes the session.
+    pub share_session_epoch: i32,
     /// Acknowledged topic-partitions.
     pub topics: Vec<ShareTopicPartitionAcks>,
 }
@@ -1563,7 +1568,7 @@ impl ShareAcknowledgeReq {
     pub(crate) fn read(buf: &mut impl Buf, version: i16) -> Result<Self> {
         let group_id = read_compact_nullable_string(buf)?;
         let member_id = read_compact_nullable_string(buf)?;
-        let _share_session_epoch = i32::decode(buf)?;
+        let share_session_epoch = i32::decode(buf)?;
         if version >= 2 {
             let _is_renew_ack = i8::decode(buf)?;
         }
@@ -1572,6 +1577,7 @@ impl ShareAcknowledgeReq {
         Ok(Self {
             group_id,
             member_id,
+            share_session_epoch,
             topics,
         })
     }

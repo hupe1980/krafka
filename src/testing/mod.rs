@@ -121,7 +121,7 @@ use crate::protocol::{RequestHeader, ResponseHeader};
 
 pub use state::{
     BrokerNode, ClassicGroupState, ClusterState, CommittedOffset, GroupMember, GroupState,
-    PartitionState, TopicState,
+    PartitionState, ShareSessionClose, TopicState,
 };
 
 /// Largest request frame the fake broker will accept, as a guard against a
@@ -641,6 +641,11 @@ impl FakeBroker {
             .get(group_id)
             .and_then(|g| g.offsets.get(&(topic.to_string(), partition)))
             .map(|c| c.offset)
+    }
+
+    /// Share sessions clients closed with the final epoch, in arrival order.
+    pub fn share_session_closes(&self) -> Vec<ShareSessionClose> {
+        self.shared.cluster.lock().share_session_closes.clone()
     }
 
     /// Offset the next record appended to a partition will receive, which for

@@ -349,6 +349,21 @@ pub struct ShareGroupState {
     pub partitions: HashMap<(String, i32), SharePartitionState>,
 }
 
+/// A share session a client closed with the final epoch (`-1`), and the API
+/// it used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ShareSessionClose {
+    /// `ShareFetch` or `ShareAcknowledge`.
+    pub api_key: ApiKey,
+    /// The broker whose session was closed.
+    pub node_id: i32,
+    /// Share group ID.
+    pub group_id: String,
+    /// Member that closed the session.
+    pub member_id: String,
+}
+
 /// One share-group member's coordinator-side state.
 #[derive(Debug, Clone, Default)]
 pub struct ShareMemberState {
@@ -549,6 +564,8 @@ pub struct ClusterState {
     /// a real hazard, and each was covered only by a test that re-implemented
     /// the condition.
     pub api_version_overrides: HashMap<ApiKey, (i16, i16)>,
+    /// Share sessions closed with the final epoch, in arrival order.
+    pub share_session_closes: Vec<ShareSessionClose>,
     /// Counter behind generated topic UUIDs.
     topic_id_seq: u64,
 }
@@ -578,6 +595,7 @@ impl ClusterState {
             finalized_features: HashMap::new(),
             finalized_features_epoch: 0,
             api_version_overrides: HashMap::new(),
+            share_session_closes: Vec::new(),
             group_coordinators: HashMap::new(),
             txn_coordinators: HashMap::new(),
             auto_create_topics: true,

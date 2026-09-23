@@ -11,6 +11,8 @@
 //!   so the TV probe must land on **TV1** and the explicit
 //!   `AddPartitionsToTxn` path must work end to end
 //! - admin: create/list/delete topics, describe cluster
+//! - consumer close: the fetch-session close must be answered, so closing a
+//!   consumer does not wedge a connection shared through a `KrafkaClient`
 //!
 //! These tests require Docker and are ignored by default:
 //!
@@ -353,4 +355,83 @@ async fn redpanda_transactions_fall_back_to_tv1() {
 
     consumer.close().await.expect("consumer close");
     producer.close().await;
+}
+
+/// Closing a consumer leaves the connection it shares usable: Redpanda must
+/// answer the fetch-session close (it ignores one with `max_wait_ms = 0`).
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn redpanda_consumer_close_does_not_wedge_shared_connection() {
+    use krafka::client::KrafkaClient;
+    use krafka::consumer::{AutoOffsetReset, Consumer};
+    use krafka::producer::Producer;
+    use std::time::Instant;
+
+    let (_container, bootstrap_servers) = redpanda_container().await;
+    let topic = "rp-close-shared";
+    create_topic(&bootstrap_servers, topic, 1).await;
+
+    // A short request timeout keeps a regression from hiding behind a slow
+    // but eventually successful close.
+    let request_timeout = Duration::from_secs(10);
+    let client = KrafkaClient::builder(&bootstrap_servers)
+        .request_timeout(request_timeout)
+        .build()
+        .await
+        .expect("Failed to create client");
+    let producer = Producer::builder()
+        .with_client(&client)
+        .build()
+        .await
+        .expect("Failed to create producer");
+    let _ = producer
+        .send(topic, Some(b"k"), Some(b"before-close"))
+        .await
+        .expect("Failed to send message");
+
+    let consumer = Consumer::builder()
+        .with_client(&client)
+        .group_id("rp-close-shared-group")
+        .auto_offset_reset(AutoOffsetReset::Earliest)
+        .build()
+        .await
+        .expect("Failed to create consumer");
+    consumer
+        .subscribe(&[topic])
+        .await
+        .expect("Failed to subscribe");
+    let records = poll_for_records(&consumer, 1, Duration::from_secs(2), 10).await;
+    assert!(!records.is_empty(), "Expected at least one record");
+    // One more round so the broker has an established incremental session.
+    consumer
+        .poll(Duration::from_millis(300))
+        .await
+        .expect("poll failed");
+
+    let started = Instant::now();
+    consumer.close().await.expect("consumer close");
+    let close_took = started.elapsed();
+    assert!(
+        close_took < Duration::from_secs(5),
+        "close() took {close_took:?}: the fetch-session close went unanswered"
+    );
+
+    // The shared connection must still serve requests.
+    let started = Instant::now();
+    let metadata = tokio::time::timeout(
+        request_timeout,
+        producer.send(topic, Some(b"k"), Some(b"after-close")),
+    )
+    .await
+    .expect("produce after consumer close hung on the shared connection")
+    .expect("produce after consumer close failed");
+    assert!(metadata.offset >= 1);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "produce after close took {:?}",
+        started.elapsed()
+    );
+
+    producer.close().await;
+    drop(client);
 }

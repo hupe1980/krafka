@@ -189,6 +189,12 @@ deliberately not offered: the idempotent producer's ordering guarantee bounds
 reordering *per connection*, so a partition's in-flight batches must all travel
 the same socket.
 
+A request that times out fails its caller, but the connection stays open and a
+late response is discarded. Because responses arrive in request order, a request
+still unanswered one further `request_timeout` after its deadline blocks
+everything behind it: the connection is then closed, pending requests fail with
+a retriable network error, and the next request reconnects.
+
 ### Priority Channels
 
 Each connection maintains two request channels to prevent consumer group ejection during backpressure:
@@ -414,7 +420,8 @@ On each `poll()`, the consumer computes a diff against the previous state:
   leader epoch) maintain session continuity
 
 If the broker returns `FetchSessionIdNotFound` or `InvalidFetchSessionEpoch`, the session is reset
-and the next poll sends a full fetch. All sessions are cleared on consumer group rebalance.
+and the next poll sends a full fetch. On rebalance, `unsubscribe()` and `close()`, every session
+is closed on its broker with a final-epoch fetch carrying the consumer's fetch settings.
 
 ### Consumer Group Protocol
 

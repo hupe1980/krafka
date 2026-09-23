@@ -345,6 +345,8 @@ The share consumer discovers its group coordinator via `FindCoordinator` (key ty
 - A `NOT_COORDINATOR` error is received
 - `unsubscribe()` or `close()` is called
 
+`subscribe()` retries `NOT_COORDINATOR`, `COORDINATOR_NOT_AVAILABLE` and `COORDINATOR_LOAD_IN_PROGRESS` with backoff (up to five attempts), so a coordinator that is still loading does not fail it.
+
 ## Lifecycle
 
 ```rust
@@ -358,7 +360,7 @@ let consumer = ShareConsumer::builder()
 // Subscribe
 consumer.subscribe(&["topic1", "topic2"]).await?;
 
-// Consume
+// Consume (waits up to the timeout, including for the first assignment)
 let records = consumer.poll(Duration::from_secs(1)).await?;
 
 // Unsubscribe (leaves group, generates a new member ID)
@@ -374,10 +376,11 @@ consumer.close().await?;
 
 1. **Implicit mode**: all pending accept acks are converted to **releases** so acquired records return to the pool for redelivery by other consumers.
 2. **Explicit mode**: pending acks (accept/release/reject) are flushed as-is.
-3. Sends and validates a leave-group heartbeat.
-4. Clears all local state and closes connections.
+3. Closes each broker's share session with a final-epoch `ShareAcknowledge` (best-effort, all brokers at once).
+4. Sends and validates a leave-group heartbeat.
+5. Clears all local state and closes connections.
 
-Use `close_with_timeout(duration)` to bound each cleanup phase. If a phase exceeds `duration / 2`, it returns `Err(KrafkaError::Timeout)` but still closes local state and connections.
+Use `close_with_timeout(duration)` to bound the whole close by `duration`: the ack flush gets `duration / 2`, and session close plus leave-group share the other half, with session close capped at `duration / 4`. A flush or leave that runs out returns `Err(KrafkaError::Timeout)`, but local state and connections are still closed.
 
 ### Wakeup & Cancellation
 
