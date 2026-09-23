@@ -258,6 +258,7 @@ accompanied by a `warn!` naming the topic, partition and offset.
 | `high_priority_bypass_yields_total` | Counter | Forced normal-priority drain steps after exhausting the high-priority bypass budget |
 | `throttle_delays_total` | Counter | Normal-priority requests delayed due to broker throttling |
 | `throttle_delay_ms_total` | Counter | Total broker-throttle delay applied to normal-priority requests, in milliseconds |
+| `stalled_connections_total` | Counter | Connections closed because a timed-out request was never answered |
 | `active_connections` | Gauge | Current active connections |
 | `connect_latency_seconds` | Summary | Connection establishment latency |
 | `tls_handshake_latency_seconds` | Summary | TLS handshake latency (populated for TLS connections only) |

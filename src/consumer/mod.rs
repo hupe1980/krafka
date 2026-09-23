@@ -78,6 +78,7 @@ pub use config::{
     AutoOffsetReset, ConsumerConfig, GroupProtocol, IsolationLevel, PartitionAssignmentStrategy,
 };
 use group::ErasedRebalanceListener;
+pub(crate) use group::{COORDINATOR_REDISCOVERY_MAX_ATTEMPTS, is_coordinator_retriable};
 pub use group::{
     ConsumerGroup, ConsumerRebalanceListener, CooperativeStickyAssignor, GroupCoordinator,
     GroupMember, GroupState, HeartbeatController, HeartbeatStatus, MemberAssignment,
@@ -2302,54 +2303,80 @@ impl Consumer {
     /// logged and ignored: the local state is cleared regardless, and an
     /// unreleased session is a resource-usage problem rather than a
     /// correctness one.
+    ///
+    /// Closes go to all brokers concurrently.
     async fn close_fetch_sessions(&self) {
         // `close_all` clears local state and returns the sessions that were
         // actually established. The sync guard must be released before any
         // await.
         let closes = self.fetch_sessions.lock().close_all();
+        if closes.is_empty() {
+            return;
+        }
 
-        for close in closes {
-            let Some(broker) = self.metadata.broker(close.broker_id) else {
-                continue;
-            };
-            let Ok(conn) = self
-                .pool
-                .get_connection_by_id(close.broker_id, broker.address())
-                .await
-            else {
-                continue;
-            };
-            // Fetch sessions only exist from v7 onward.
-            let Some(version) = conn.negotiate_api_version(ApiKey::Fetch, versions::FETCH_MAX, 7)
-            else {
-                continue;
-            };
+        futures::future::join_all(
+            closes
+                .into_iter()
+                .map(|close| self.send_fetch_session_close(close)),
+        )
+        .await;
+    }
 
-            let request = FetchRequest {
-                replica_id: -1,
-                max_wait_ms: 0,
-                min_bytes: 0,
-                max_bytes: 0,
-                isolation_level: self.config.isolation_level.to_i8(),
-                session_id: close.session_id,
-                session_epoch: close.session_epoch,
-                topics: Vec::new(),
-                forgotten_topics: Vec::new(),
-                rack_id: self.config.client_rack.clone().unwrap_or_default(),
-            };
+    /// Send one final-epoch `Fetch` releasing a broker's session.
+    async fn send_fetch_session_close(&self, close: fetch_session::FetchSessionClose) {
+        let Some(broker) = self.metadata.broker(close.broker_id) else {
+            return;
+        };
+        let Ok(conn) = self
+            .pool
+            .get_connection_by_id(close.broker_id, broker.address())
+            .await
+        else {
+            return;
+        };
+        // Fetch sessions only exist from v7 onward.
+        let Some(version) = conn.negotiate_api_version(ApiKey::Fetch, versions::FETCH_MAX, 7)
+        else {
+            return;
+        };
 
-            if let Err(e) = conn
-                .send_request(ApiKey::Fetch, version, |buf| {
-                    request.encode_versioned(version, buf)
-                })
-                .await
-            {
-                debug!(
-                    broker_id = close.broker_id,
-                    session_id = close.session_id,
-                    "Failed to close fetch session: {e}"
-                );
-            }
+        let request = Self::fetch_session_close_request(&self.config, &close);
+
+        if let Err(e) = conn
+            .send_request(ApiKey::Fetch, version, |buf| {
+                request.encode_versioned(version, buf)
+            })
+            .await
+        {
+            debug!(
+                broker_id = close.broker_id,
+                session_id = close.session_id,
+                "Failed to close fetch session: {e}"
+            );
+        }
+    }
+
+    /// Build the final-epoch `Fetch` that closes a fetch session.
+    ///
+    /// Carries the configured wait and size limits, as the Java client does.
+    /// Redpanda never answers a close with `max_wait_ms = 0`, which would block
+    /// every later response on the connection; it holds this one for
+    /// `fetch_max_wait`, while Apache Kafka answers at once.
+    fn fetch_session_close_request(
+        config: &ConsumerConfig,
+        close: &fetch_session::FetchSessionClose,
+    ) -> FetchRequest {
+        FetchRequest {
+            replica_id: -1,
+            max_wait_ms: crate::util::duration_to_millis_i32(config.fetch_max_wait),
+            min_bytes: config.fetch_min_bytes,
+            max_bytes: config.fetch_max_bytes,
+            isolation_level: config.isolation_level.to_i8(),
+            session_id: close.session_id,
+            session_epoch: close.session_epoch,
+            topics: Vec::new(),
+            forgotten_topics: Vec::new(),
+            rack_id: config.client_rack.clone().unwrap_or_default(),
         }
     }
 
@@ -10274,5 +10301,35 @@ mod tests {
         // The stale update left the position alone, so its epoch must not be
         // recorded either.
         assert_eq!(offsets[&("t".to_string(), 1)], 200);
+    }
+
+    /// The fetch-session close carries the configured limits, never
+    /// `max_wait_ms = 0`, which Redpanda does not answer.
+    #[test]
+    fn test_fetch_session_close_request_uses_configured_fetch_limits() {
+        let config = ConsumerConfig {
+            fetch_max_wait: Duration::from_millis(250),
+            fetch_min_bytes: 7,
+            fetch_max_bytes: 1_048_576,
+            client_rack: Some("rack-a".to_string()),
+            ..ConsumerConfig::default()
+        };
+        let close = fetch_session::FetchSessionClose {
+            broker_id: 3,
+            session_id: 42,
+            session_epoch: fetch_session::FINAL_EPOCH,
+        };
+
+        let request = Consumer::fetch_session_close_request(&config, &close);
+
+        assert_eq!(request.max_wait_ms, 250);
+        assert!(request.max_wait_ms > 0);
+        assert_eq!(request.min_bytes, 7);
+        assert_eq!(request.max_bytes, 1_048_576);
+        assert_eq!(request.session_id, 42);
+        assert_eq!(request.session_epoch, fetch_session::FINAL_EPOCH);
+        assert!(request.topics.is_empty());
+        assert!(request.forgotten_topics.is_empty());
+        assert_eq!(request.rack_id, "rack-a");
     }
 }

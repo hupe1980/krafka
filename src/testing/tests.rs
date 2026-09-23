@@ -840,6 +840,40 @@ async fn producer_for(broker: &FakeBroker) -> Producer {
         .expect("producer should connect to the fake broker")
 }
 
+/// A swallowed request closes its connection after the grace period, so the
+/// producer's retry reconnects instead of queuing behind it.
+#[tokio::test]
+async fn a_swallowed_request_does_not_wedge_the_connection() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("events", 1);
+    let producer = producer_for(&broker).await;
+
+    // Establish the connection, then have the broker swallow the next Produce.
+    let _ = producer
+        .send("events", None, Some(b"first"))
+        .await
+        .expect("send should be acknowledged");
+    broker.on_once(ApiKey::Produce, |_| Control::Silence);
+
+    // One timeout, one grace period and a reconnect, with room to spare —
+    // far below the delivery timeout a wedged connection would run into.
+    let metadata = tokio::time::timeout(
+        SHORT_REQUEST_TIMEOUT * 5,
+        producer.send("events", None, Some(b"second")),
+    )
+    .await
+    .expect("the retry must not hang on the wedged connection")
+    .expect("the retry must succeed on a fresh connection");
+    assert_eq!(metadata.offset, 1);
+    assert_eq!(
+        producer.connection_metrics().snapshot().stalled_connections,
+        1,
+        "the swallowed request must be what closed the connection"
+    );
+
+    producer.close().await;
+}
+
 /// A record batch that fails its CRC must reach the application as an error,
 /// and must not silently stall the partition.
 ///
@@ -2686,6 +2720,187 @@ async fn a_share_consumer_receives_records_and_counts_them() {
     );
 
     let _ = consumer.close().await;
+}
+
+/// `subscribe()` retries `FindCoordinator` while the coordinator is loading.
+#[cfg(feature = "share-groups")]
+#[tokio::test]
+async fn share_subscribe_retries_while_find_coordinator_is_unavailable() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("events", 1);
+    let consumer = share_consumer_for(&broker, "loading-group").await;
+
+    broker.on_once(ApiKey::FindCoordinator, |_| {
+        Control::Error(ErrorCode::CoordinatorNotAvailable)
+    });
+
+    consumer
+        .subscribe(&["events"])
+        .await
+        .expect("subscribe should ride out COORDINATOR_NOT_AVAILABLE, not surface it");
+    assert!(
+        broker.request_count(ApiKey::FindCoordinator) >= 2,
+        "FindCoordinator must be retried, ran {} time(s)",
+        broker.request_count(ApiKey::FindCoordinator)
+    );
+    let _ = consumer.close().await;
+}
+
+/// `subscribe()` re-discovers and retries on a coordinator error from the
+/// joining heartbeat.
+#[cfg(feature = "share-groups")]
+#[tokio::test]
+async fn share_subscribe_retries_a_coordinator_error_on_the_joining_heartbeat() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("events", 1);
+    let consumer = share_consumer_for(&broker, "electing-group").await;
+
+    broker.on_once(ApiKey::ShareGroupHeartbeat, |_| {
+        Control::Error(ErrorCode::CoordinatorLoadInProgress)
+    });
+
+    consumer
+        .subscribe(&["events"])
+        .await
+        .expect("subscribe should ride out COORDINATOR_LOAD_IN_PROGRESS");
+    assert!(
+        broker.request_count(ApiKey::ShareGroupHeartbeat) >= 2,
+        "the joining heartbeat must be retried"
+    );
+    assert!(
+        broker.request_count(ApiKey::FindCoordinator) >= 2,
+        "the retry must re-discover the coordinator"
+    );
+    let _ = consumer.close().await;
+}
+
+/// `poll(timeout)` without an assignment waits out the timeout. Two members
+/// share one partition, so one stays unassigned.
+#[cfg(feature = "share-groups")]
+#[tokio::test]
+async fn an_unassigned_share_member_waits_out_its_poll_timeout() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("events", 1);
+
+    let a = share_consumer_for(&broker, "crowded-group").await;
+    let b = share_consumer_for(&broker, "crowded-group").await;
+    a.subscribe(&["events"]).await.unwrap();
+    b.subscribe(&["events"]).await.unwrap();
+
+    // Let both settle, then pick the member the partition did not go to.
+    let settle = tokio::time::Instant::now() + SETTLE;
+    let idle = loop {
+        let _ = a.poll(Duration::from_millis(100)).await;
+        let _ = b.poll(Duration::from_millis(100)).await;
+        let (a_has, b_has) = (
+            !a.assignment().await.is_empty(),
+            !b.assignment().await.is_empty(),
+        );
+        if a_has != b_has {
+            break if a_has { &b } else { &a };
+        }
+        assert!(
+            tokio::time::Instant::now() < settle,
+            "expected exactly one member to own the only partition"
+        );
+    };
+
+    let timeout = Duration::from_millis(600);
+    let started = std::time::Instant::now();
+    let records = idle.poll(timeout).await.expect("poll should succeed");
+    let took = started.elapsed();
+    assert!(records.is_empty());
+    assert!(
+        took >= timeout - Duration::from_millis(50),
+        "an unassigned poll({timeout:?}) returned after {took:?}"
+    );
+
+    // wakeup() ends the wait.
+    let waker = idle.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        waker.wakeup();
+    });
+    let started = std::time::Instant::now();
+    let woken = idle.poll(Duration::from_secs(10)).await;
+    assert!(woken.is_err(), "wakeup() must interrupt the wait");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "wakeup() took {:?} to interrupt the wait",
+        started.elapsed()
+    );
+
+    let _ = a.close().await;
+    let _ = b.close().await;
+}
+
+/// `close()` ends each share session with a final-epoch `ShareAcknowledge`,
+/// as the Java client does.
+#[cfg(feature = "share-groups")]
+#[tokio::test]
+async fn closing_a_share_consumer_closes_each_session_with_share_acknowledge() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("events", 1);
+
+    let producer = producer_for(&broker).await;
+    let _ = producer
+        .send("events", None, Some(b"v"))
+        .await
+        .expect("send should be acknowledged");
+    producer.close().await;
+
+    let consumer = share_consumer_for(&broker, "close-group").await;
+    consumer.subscribe(&["events"]).await.unwrap();
+    assert_eq!(drain_share(&consumer, 1).await.len(), 1);
+    assert!(
+        broker.share_session_closes().is_empty(),
+        "nothing closed yet"
+    );
+
+    consumer.close().await.expect("close should succeed");
+
+    let closes = broker.share_session_closes();
+    assert_eq!(
+        closes.len(),
+        1,
+        "one established session, one close: {closes:?}"
+    );
+    assert_eq!(closes[0].api_key, ApiKey::ShareAcknowledge);
+    assert_eq!(closes[0].group_id, "close-group");
+    assert!(!closes[0].member_id.is_empty());
+}
+
+/// `close_with_timeout` stays within its budget when a broker never answers
+/// the session close.
+#[cfg(feature = "share-groups")]
+#[tokio::test]
+async fn share_close_with_timeout_is_bounded_when_the_session_close_goes_unanswered() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("events", 1);
+
+    let producer = producer_for(&broker).await;
+    let _ = producer
+        .send("events", None, Some(b"v"))
+        .await
+        .expect("send should be acknowledged");
+    producer.close().await;
+
+    let consumer = share_consumer_for(&broker, "bounded-close-group").await;
+    consumer.subscribe(&["events"]).await.unwrap();
+    assert_eq!(drain_share(&consumer, 1).await.len(), 1);
+
+    broker.on(ApiKey::ShareAcknowledge, |_| Control::Silence);
+
+    // Well under SHORT_REQUEST_TIMEOUT, so waiting out one request would show.
+    let budget = Duration::from_secs(1);
+    let started = std::time::Instant::now();
+    let _ = consumer.close_with_timeout(budget).await;
+    let took = started.elapsed();
+    assert!(
+        took < budget + Duration::from_millis(500),
+        "close_with_timeout({budget:?}) took {took:?}"
+    );
+    assert!(consumer.is_closed());
 }
 
 /// Accepted records must not be redelivered, and released records must be.

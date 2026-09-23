@@ -21,7 +21,8 @@ use crate::protocol::ApiKey;
 use crate::protocol::{Encode, KafkaString, TaggedField, TryEncode};
 
 use super::state::{
-    ClassicGroupState, ClusterState, CommittedOffset, GroupMember, TransactionState,
+    ClassicGroupState, ClusterState, CommittedOffset, GroupMember, ShareSessionClose,
+    TransactionState,
 };
 use super::wire::*;
 
@@ -201,6 +202,12 @@ pub(crate) fn dispatch_error(
             out.put_i32(HEARTBEAT_INTERVAL_MS);
             write_heartbeat_assignment(out, None)?;
             write_empty_tagged_fields(out)
+        }
+        ApiKey::ShareGroupHeartbeat => {
+            // Same response shape as the KIP-848 heartbeat; every error is
+            // top-level.
+            let req = ShareGroupHeartbeatReq::read(body)?;
+            write_heartbeat_error(out, code, Some(&req.member_id), 0)
         }
         ApiKey::Metadata => {
             let req = MetadataReq::read_v12(body)?;
@@ -2567,6 +2574,25 @@ fn required_share_identity(
     Some(group.to_string())
 }
 
+/// Record a request that closes its share session (epoch `-1`).
+fn record_share_session_close(
+    state: &mut ClusterState,
+    api_key: ApiKey,
+    node_id: i32,
+    group_id: &str,
+    member_id: Option<&str>,
+    share_session_epoch: i32,
+) {
+    if share_session_epoch == -1 {
+        state.share_session_closes.push(ShareSessionClose {
+            api_key,
+            node_id,
+            group_id: group_id.to_string(),
+            member_id: member_id.unwrap_or_default().to_string(),
+        });
+    }
+}
+
 /// Serve a `ShareFetch` (API key 78, v1).
 ///
 /// Acknowledgements piggybacked on the request are applied *before* records
@@ -2589,6 +2615,14 @@ fn share_fetch(
         write_compact_array_len(out, 0)?; // node_endpoints
         return write_empty_tagged_fields(out);
     };
+    record_share_session_close(
+        state,
+        ApiKey::ShareFetch,
+        node_id,
+        &group_id,
+        req.member_id.as_deref(),
+        req.share_session_epoch,
+    );
 
     out.put_i32(0); // throttle_time_ms
     write_error(out, ErrorCode::None);
@@ -2784,6 +2818,14 @@ fn share_acknowledge(
         write_compact_array_len(out, 0)?; // node_endpoints
         return write_empty_tagged_fields(out);
     };
+    record_share_session_close(
+        state,
+        ApiKey::ShareAcknowledge,
+        node_id,
+        &group_id,
+        req.member_id.as_deref(),
+        req.share_session_epoch,
+    );
 
     out.put_i32(0); // throttle_time_ms
     write_error(out, ErrorCode::None);

@@ -1250,6 +1250,11 @@ impl MetricsVisitable for ConnectionMetrics {
             "Total broker-throttle delay applied to normal-priority requests in milliseconds",
             self.throttle_delay_ms.get(),
         );
+        exporter.export_counter(
+            &format!("{prefix}_stalled_connections"),
+            "Connections closed because a timed-out request was never answered",
+            self.stalled_connections.get(),
+        );
         exporter.export_gauge(
             &format!("{prefix}_active_connections"),
             "Current active connections",
@@ -1502,6 +1507,7 @@ impl KrafkaMetrics {
         self.connection.high_priority_bypass_yields.reset();
         self.connection.throttle_delays.reset();
         self.connection.throttle_delay_ms.reset();
+        self.connection.stalled_connections.reset();
         self.connection.active_connections.set(0);
         self.connection.connect_latency.reset();
         self.connection.tls_handshake_latency.reset();
@@ -2088,7 +2094,10 @@ pub struct ConsumerMetricsSnapshot {
 }
 
 /// Connection pool metrics.
+///
+/// Build one with [`Default::default`]; new counters may be added.
 #[derive(Debug, Default)]
+#[non_exhaustive]
 pub struct ConnectionMetrics {
     /// Number of connections created.
     pub connections_created: Counter,
@@ -2109,6 +2118,10 @@ pub struct ConnectionMetrics {
     pub throttle_delays: Counter,
     /// Total broker-throttle delay applied to normal-priority requests, in milliseconds.
     pub throttle_delay_ms: Counter,
+    /// Connections closed because the broker stopped answering: a timed-out
+    /// request was still unanswered a further `request_timeout` after its
+    /// deadline, blocking every response behind it.
+    pub stalled_connections: Counter,
     /// Current active connections.
     pub active_connections: Gauge,
     /// Connection establishment latency.
@@ -2199,6 +2212,12 @@ impl ConnectionMetrics {
         self.throttle_delay_ms.add(millis);
     }
 
+    /// Record a connection closed because the broker stopped answering.
+    #[inline]
+    pub fn record_stalled_connection(&self) {
+        self.stalled_connections.inc();
+    }
+
     /// Record a completed TLS handshake duration.
     #[inline]
     pub fn record_tls_handshake(&self, duration: Duration) {
@@ -2242,6 +2261,7 @@ impl ConnectionMetrics {
             high_priority_bypass_yields: self.high_priority_bypass_yields.get(),
             throttle_delays: self.throttle_delays.get(),
             throttle_delay_ms: self.throttle_delay_ms.get(),
+            stalled_connections: self.stalled_connections.get(),
             active_connections: self.active_connections.get(),
             connect_latency: self.connect_latency.snapshot(),
             tls_handshake_latency: self.tls_handshake_latency.snapshot(),
@@ -2275,6 +2295,10 @@ pub struct ConnectionMetricsSnapshot {
     pub throttle_delays: u64,
     /// Total broker-throttle delay applied to normal-priority requests, in milliseconds.
     pub throttle_delay_ms: u64,
+    /// Connections closed because the broker stopped answering.
+    ///
+    /// See [`ConnectionMetrics::stalled_connections`].
+    pub stalled_connections: u64,
     /// Current active connections.
     pub active_connections: u64,
     /// Connection latency statistics.
@@ -2497,6 +2521,7 @@ mod tests {
         metrics.record_high_priority_bypass();
         metrics.record_high_priority_bypass_yield();
         metrics.record_throttle_delay(Duration::from_millis(25));
+        metrics.record_stalled_connection();
 
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.connections_created, 2);
@@ -2509,6 +2534,7 @@ mod tests {
         assert_eq!(snapshot.high_priority_bypass_yields, 1);
         assert_eq!(snapshot.throttle_delays, 1);
         assert_eq!(snapshot.throttle_delay_ms, 25);
+        assert_eq!(snapshot.stalled_connections, 1);
     }
 
     #[test]

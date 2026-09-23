@@ -109,7 +109,7 @@ impl ShareSessionCache {
 
     /// Return the IDs of all brokers with an established session.
     ///
-    /// Used during close to send FINAL_EPOCH ShareFetch requests that
+    /// Used during close to send FINAL_EPOCH ShareAcknowledge requests that
     /// allow brokers to release server-side session state promptly.
     pub fn established_broker_ids(&self) -> Vec<BrokerId> {
         self.sessions

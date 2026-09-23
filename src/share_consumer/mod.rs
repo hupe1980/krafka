@@ -570,6 +570,9 @@ struct ShareConsumerInner {
     /// Signalled by `wakeup()` so a `poll()` already blocked on a `ShareFetch`
     /// is interrupted instead of having to run to completion.
     wakeup_notify: Notify,
+    /// Signalled when a non-empty assignment is installed, and on close; wakes
+    /// a `poll()` waiting for an assignment.
+    assignment_notify: Notify,
     /// Tracks polls that have started but not finished.
     ///
     /// `poll()` drains every pending acknowledgement into a `PendingAckGuard`
@@ -732,6 +735,7 @@ impl ShareConsumer {
             heartbeat_task: SyncMutex::new(None),
             wakeup_flag: AtomicBool::new(false),
             wakeup_notify: Notify::new(),
+            assignment_notify: Notify::new(),
             in_flight_polls: Arc::new(InFlightBarrier::new()),
             acquisition_lock_timeout_ms: AtomicI32::new(-1),
             key_deserializer,
@@ -773,8 +777,7 @@ impl ShareConsumer {
         }
 
         // Discover the coordinator and send the initial heartbeat.
-        self.ensure_coordinator().await?;
-        self.send_heartbeat(true).await?;
+        self.join_with_coordinator_retry().await?;
 
         // Spawn the background heartbeat task if not already running.
         // The task sends periodic heartbeats independent of poll() so the
@@ -848,6 +851,41 @@ impl ShareConsumer {
         result
     }
 
+    /// Wait until this member has an assignment, or `deadline` passes
+    /// (`None`). `wakeup()` and `close()` end the wait with their usual errors.
+    async fn wait_for_assignment(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<HashMap<String, Vec<PartitionId>>>> {
+        loop {
+            // Register interest before checking, so an assignment installed
+            // between the check and the wait is not missed.
+            let assigned = self.0.assignment_notify.notified();
+            let woken = self.0.wakeup_notify.notified();
+            tokio::pin!(assigned, woken);
+            assigned.as_mut().enable();
+            woken.as_mut().enable();
+
+            let assignments = self.0.assignments.read().await.clone();
+            if !assignments.is_empty() {
+                return Ok(Some(assignments));
+            }
+            if self.0.closed.load(Ordering::SeqCst) {
+                return Err(KrafkaError::invalid_state("share consumer is closed"));
+            }
+            if self.0.wakeup_flag.swap(false, Ordering::AcqRel) {
+                return Err(KrafkaError::invalid_state("wakeup() was called"));
+            }
+
+            tokio::select! {
+                biased;
+                () = &mut woken => {}
+                () = &mut assigned => {}
+                () = tokio::time::sleep_until(deadline) => return Ok(None),
+            }
+        }
+    }
+
     /// Shared implementation of [`poll()`](Self::poll) and [`recv()`](Self::recv).
     ///
     /// `max_records` bounds how many records are returned to the caller. Every
@@ -859,6 +897,7 @@ impl ShareConsumer {
         timeout: Duration,
         max_records: usize,
     ) -> Result<Vec<ConsumerRecord>> {
+        let deadline = tokio::time::Instant::now() + timeout;
         if self.0.closed.load(Ordering::SeqCst) {
             return Err(KrafkaError::invalid_state("share consumer is closed"));
         }
@@ -941,10 +980,17 @@ impl ShareConsumer {
             }
         }
 
-        let assignments = self.0.assignments.read().await.clone();
-        if assignments.is_empty() || skip_fetch_due_to_buffer_cap {
+        if skip_fetch_due_to_buffer_cap {
             return Ok(Vec::new());
         }
+
+        // Without an assignment, wait for one rather than return at once, which
+        // would spin `loop { poll(t) }`; then fetch with the time left.
+        let assignments = match self.wait_for_assignment(deadline).await? {
+            Some(assignments) => assignments,
+            None => return Ok(Vec::new()),
+        };
+        let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
 
         // Group partitions by leader broker.
         let mut partitions_by_broker: HashMap<BrokerId, Vec<(String, PartitionId, [u8; 16])>> =
@@ -1901,9 +1947,9 @@ impl ShareConsumer {
                 return Ok(None);
             }
 
-            // A poll can return empty immediately (no assignment yet, buffer
-            // cap reached, heartbeat-only cycle). Pace the retry so an idle or
-            // unassigned consumer cannot spin the CPU.
+            // A poll can still return empty early (buffer cap reached, or the
+            // consumer closed underneath it). Pace the retry so an idle
+            // consumer cannot spin the CPU.
             let elapsed = started.elapsed();
             if elapsed < RECV_EMPTY_POLL_BACKOFF {
                 tokio::time::sleep(RECV_EMPTY_POLL_BACKOFF - elapsed).await;
@@ -1971,6 +2017,8 @@ impl ShareConsumer {
         if self.0.closed.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
+        // Wake a poll() still waiting for its first assignment.
+        self.0.assignment_notify.notify_waiters();
 
         // Stop the background heartbeat task immediately so it does not
         // race with the leave-group heartbeat sent below.
@@ -2069,14 +2117,17 @@ impl ShareConsumer {
 
     /// Close the consumer with a per-phase timeout.
     ///
-    /// Equivalent to [`close()`](Self::close) but each cleanup phase
-    /// (ack flush, leave-group) is individually limited to `timeout / 2`.
+    /// Equivalent to [`close()`](Self::close), bounded by `timeout`: the ack
+    /// flush gets `timeout / 2`, and session close (at most `timeout / 4`) and
+    /// leave-group share the rest.
     /// Any cleanup error is returned after local state has been released.
     /// Idempotent.
     pub async fn close_with_timeout(&self, timeout: Duration) -> Result<()> {
         if self.0.closed.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
+        // Wake a poll() still waiting for its first assignment.
+        self.0.assignment_notify.notify_waiters();
 
         if let Some(handle) = self
             .0
@@ -2104,9 +2155,15 @@ impl ShareConsumer {
             .await
             .unwrap_or_else(|_| Err(KrafkaError::timeout("ack flush timed out during close")));
 
-        self.close_share_sessions().await;
+        let leave_deadline = tokio::time::Instant::now() + phase;
+        if tokio::time::timeout(phase / 2, self.close_share_sessions())
+            .await
+            .is_err()
+        {
+            debug!("close_share_sessions timed out during close; brokers will expire the sessions");
+        }
 
-        let leave_result = tokio::time::timeout(phase, self.leave_group())
+        let leave_result = tokio::time::timeout_at(leave_deadline, self.leave_group())
             .await
             .unwrap_or_else(|_| Err(KrafkaError::timeout("leave-group timed out during close")));
 
@@ -2479,7 +2536,52 @@ impl ShareConsumer {
             .collect()
     }
 
+    /// Discover the coordinator and send the joining heartbeat, retrying
+    /// coordinator errors with backoff, as the consumer's join does.
+    ///
+    /// `NOT_COORDINATOR`, `COORDINATOR_NOT_AVAILABLE` and
+    /// `COORDINATOR_LOAD_IN_PROGRESS` are routine while a coordinator loads.
+    /// The heartbeat drops the cached coordinator on them, so each retry
+    /// re-discovers it.
+    async fn join_with_coordinator_retry(&self) -> Result<()> {
+        let backoff = crate::util::BackoffPolicy::default();
+        let mut last_error = None;
+
+        for attempt in 0..crate::consumer::COORDINATOR_REDISCOVERY_MAX_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(backoff.calculate_backoff(attempt)).await;
+            }
+            let result = match self.ensure_coordinator().await {
+                Ok(()) => self.send_heartbeat(true).await,
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) if crate::consumer::is_coordinator_retriable(&error) => {
+                    debug!(
+                        "Share group '{}' join hit {error}; re-discovering the coordinator \
+                         (attempt {}/{})",
+                        self.0.config.group_id,
+                        attempt + 1,
+                        crate::consumer::COORDINATOR_REDISCOVERY_MAX_ATTEMPTS
+                    );
+                    last_error = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            KrafkaError::broker(
+                ErrorCode::CoordinatorNotAvailable,
+                "could not join the share group",
+            )
+        }))
+    }
+
     /// Discover the share group coordinator via FindCoordinator.
+    ///
+    /// If no broker names the coordinator, returns the last broker or network
+    /// error.
     async fn ensure_coordinator(&self) -> Result<()> {
         if self.0.coordinator_id.read().await.is_some() {
             return Ok(());
@@ -2492,6 +2594,7 @@ impl ShareConsumer {
 
         // Try each broker until we find the coordinator.
         let request = FindCoordinatorRequest::for_group(&self.0.config.group_id);
+        let mut last_error: Option<KrafkaError> = None;
         for broker in &brokers {
             let conn = match self
                 .0
@@ -2500,7 +2603,10 @@ impl ShareConsumer {
                 .await
             {
                 Ok(c) => c,
-                Err(_) => continue,
+                Err(e) => {
+                    last_error = Some(e);
+                    continue;
+                }
             };
 
             let version = match conn.negotiate_api_version(
@@ -2522,6 +2628,7 @@ impl ShareConsumer {
                 Ok(b) => b,
                 Err(e) => {
                     debug!("FindCoordinator via broker {} failed: {e}", broker.id());
+                    last_error = Some(e);
                     continue;
                 }
             };
@@ -2544,12 +2651,26 @@ impl ShareConsumer {
                 "FindCoordinator returned {:?} for group '{}', trying next broker",
                 response.error_code, self.0.config.group_id
             );
+            last_error = Some(KrafkaError::broker(
+                response.error_code,
+                response
+                    .error_message
+                    .filter(|m| !m.is_empty())
+                    .unwrap_or_else(|| {
+                        format!(
+                            "could not discover coordinator for share group '{}'",
+                            self.0.config.group_id
+                        )
+                    }),
+            ));
         }
 
-        Err(KrafkaError::invalid_state(format!(
-            "could not discover coordinator for share group '{}'",
-            self.0.config.group_id
-        )))
+        Err(last_error.unwrap_or_else(|| {
+            KrafkaError::invalid_state(format!(
+                "could not discover coordinator for share group '{}'",
+                self.0.config.group_id
+            ))
+        }))
     }
 
     /// Send a ShareGroupHeartbeat to the coordinator.
@@ -2730,7 +2851,11 @@ impl ShareConsumer {
             self.0.share_sessions.lock().await.reset_all();
         }
 
+        let assigned = !new_assignments.is_empty();
         *self.0.assignments.write().await = new_assignments;
+        if assigned {
+            self.0.assignment_notify.notify_waiters();
+        }
     }
 
     /// Send a ShareAcknowledge request for pending acks.
@@ -3042,12 +3167,12 @@ impl ShareConsumer {
         Ok(())
     }
 
-    /// Send `ShareFetch` with `share_session_epoch = FINAL_EPOCH` (-1) to each
-    /// broker that has an established session, allowing the broker to release
-    /// server-side session state immediately instead of waiting for timeout.
+    /// Close every established share session so its broker frees it at once.
     ///
-    /// This is a best-effort operation: errors are logged at `debug!` level
-    /// and do not prevent the consumer from closing.
+    /// Sends an empty `ShareAcknowledge` at `FINAL_EPOCH`, as the Java client
+    /// does; unlike `ShareFetch` it has no wait or size fields. Brokers reject
+    /// `ShareAcknowledge` at the initial epoch, which established sessions are
+    /// past. Concurrent across brokers and best-effort: failures are logged.
     async fn close_share_sessions(&self) {
         let broker_ids = {
             let sessions = self.0.share_sessions.lock().await;
@@ -3058,60 +3183,75 @@ impl ShareConsumer {
         }
 
         let member_id = (**self.0.member_id.load()).clone();
-        let group_id = &self.0.config.group_id;
+        futures::future::join_all(
+            broker_ids
+                .into_iter()
+                .map(|broker_id| self.close_share_session(broker_id, &member_id)),
+        )
+        .await;
+    }
 
-        for broker_id in broker_ids {
-            let broker_addr = match self.0.metadata.broker(broker_id) {
-                Some(b) => b.address().to_string(),
-                None => continue,
-            };
-
-            let conn = match self
-                .0
-                .pool
-                .get_connection_by_id(broker_id, &broker_addr)
-                .await
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    debug!("close_share_sessions: connection to broker {broker_id} failed: {e}");
-                    continue;
-                }
-            };
-
-            let version = match conn.negotiate_api_version(
-                ApiKey::ShareFetch,
-                versions::SHARE_FETCH_MAX,
-                versions::SHARE_FETCH_MIN,
-            ) {
-                Some(v) => v,
-                None => continue,
-            };
-
-            let request = ShareFetchRequest {
-                group_id: Some(group_id.clone()),
-                member_id: Some(member_id.clone()),
-                share_session_epoch: FINAL_EPOCH,
-                max_wait_ms: 0,
-                min_bytes: 0,
-                max_bytes: 0,
-                max_records: 0,
-                batch_size: 0,
-                topics: Vec::new(),
-                forgotten_topics: Vec::new(),
-            };
-
-            if let Err(e) = conn
-                .send_request(ApiKey::ShareFetch, version, |buf| match version {
-                    2 => request.encode_v2(buf, 0, false),
-                    _ => request.encode_v1(buf),
-                })
-                .await
-            {
-                debug!("close_share_sessions: FINAL_EPOCH to broker {broker_id} failed: {e}");
-            } else {
-                debug!("close_share_sessions: sent FINAL_EPOCH to broker {broker_id}");
+    /// Send the final-epoch `ShareAcknowledge` closing one broker's session.
+    async fn close_share_session(&self, broker_id: BrokerId, member_id: &str) {
+        let Some(broker) = self.0.metadata.broker(broker_id) else {
+            return;
+        };
+        let conn = match self
+            .0
+            .pool
+            .get_connection_by_id(broker_id, broker.address())
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                debug!("close_share_sessions: connection to broker {broker_id} failed: {e}");
+                return;
             }
+        };
+        let Some(version) = conn.negotiate_api_version(
+            ApiKey::ShareAcknowledge,
+            versions::SHARE_ACKNOWLEDGE_MAX,
+            versions::SHARE_ACKNOWLEDGE_MIN,
+        ) else {
+            return;
+        };
+
+        let request = Self::share_session_close_request(&self.0.config.group_id, member_id);
+        let result = conn
+            .send_request(ApiKey::ShareAcknowledge, version, |buf| match version {
+                2 => request.encode_v2(buf, false),
+                _ => request.encode_v1(buf),
+            })
+            .await
+            .and_then(|buf| {
+                crate::protocol::ShareAcknowledgeResponse::decode_versioned(
+                    version,
+                    &mut buf.as_ref(),
+                )
+            });
+
+        match result {
+            Ok(response) if response.error_code.is_ok() => {
+                debug!("close_share_sessions: closed session on broker {broker_id}");
+            }
+            Ok(response) => debug!(
+                "close_share_sessions: broker {broker_id} rejected the close: {:?} {}",
+                response.error_code,
+                response.error_message.unwrap_or_default()
+            ),
+            Err(e) => {
+                debug!("close_share_sessions: FINAL_EPOCH to broker {broker_id} failed: {e}");
+            }
+        }
+    }
+
+    /// Build the empty, final-epoch `ShareAcknowledge` that closes a session.
+    fn share_session_close_request(group_id: &str, member_id: &str) -> ShareAcknowledgeRequest {
+        ShareAcknowledgeRequest {
+            group_id: Some(group_id.to_string()),
+            member_id: Some(member_id.to_string()),
+            share_session_epoch: FINAL_EPOCH,
+            topics: Vec::new(),
         }
     }
 
@@ -3667,6 +3807,7 @@ mod tests {
             heartbeat_task: SyncMutex::new(None),
             wakeup_flag: AtomicBool::new(false),
             wakeup_notify: Notify::new(),
+            assignment_notify: Notify::new(),
             in_flight_polls: Arc::new(InFlightBarrier::new()),
             acquisition_lock_timeout_ms: AtomicI32::new(-1),
             key_deserializer: None,

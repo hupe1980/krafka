@@ -11,6 +11,46 @@ Entries before 0.17.0 were reconstructed from the release history and the
 `Upgrading` sections that previously lived in `README.md`. They are summaries,
 not a complete record.
 
+## [0.25.0] — 2026-09-23
+
+A broker that never answers one request blocks every later response on that
+connection. Redpanda does this to the fetch-session close `Consumer::close()`
+sent; the close is fixed, and the connection layer now recovers from any
+swallowed request.
+
+### Breaking
+
+- **`ConnectionMetrics` is `#[non_exhaustive]`** and gained
+  `stalled_connections`. Build it with `ConnectionMetrics::default()`; reading
+  fields and `snapshot()` are unaffected.
+
+### Fixed
+
+- **Consumer fetch-session close is answered by Redpanda.** It sent
+  `max_wait_ms = 0`, which Redpanda ignores, wedging the connection — for the
+  whole process with a shared `KrafkaClient`. It now carries the configured
+  fetch wait and sizes, like the Java client, and goes to all brokers at once.
+- **A silent broker no longer wedges a connection.** A request still
+  unanswered one `request_timeout` after timing out closes the connection;
+  pending requests fail retriably and the next one reconnects.
+- **`ShareConsumer` closes share sessions with `ShareAcknowledge`**, like the
+  Java client, concurrently across brokers, and logs a broker's rejection.
+- **`ShareConsumer::close_with_timeout` stays within its timeout.** Session
+  close was unbounded and sequential; it now gets at most a quarter of it.
+- **`ShareConsumer::subscribe()` retries while the coordinator loads**
+  (`NOT_COORDINATOR`, `COORDINATOR_NOT_AVAILABLE`,
+  `COORDINATOR_LOAD_IN_PROGRESS`, up to five attempts). A failed discovery
+  returns the broker's error instead of `InvalidState`.
+- **`ShareConsumer::poll(timeout)` waits while unassigned** instead of
+  returning at once, then fetches with the time left.
+
+### Added
+
+- `ConnectionMetrics::stalled_connections`
+  (`krafka_connection_stalled_connections_total`).
+- `FakeBroker::share_session_closes()` and `ShareSessionClose`.
+- `Control::Error` on the fake broker covers `ShareGroupHeartbeat`.
+
 ## [0.24.0] — 2026-09-15
 
 A classic consumer group's subscription and assignment travel as opaque blobs
@@ -1515,7 +1555,10 @@ Initial development: wire protocol, producer, consumer, admin client,
 authentication (SASL PLAIN / SCRAM / OAUTHBEARER / AWS MSK IAM), TLS,
 compression codecs, schema registry integration and the metrics layer.
 
-[Unreleased]: https://github.com/hupe1980/krafka/compare/v0.22.0...HEAD
+[Unreleased]: https://github.com/hupe1980/krafka/compare/v0.25.0...HEAD
+[0.25.0]: https://github.com/hupe1980/krafka/compare/v0.24.0...v0.25.0
+[0.24.0]: https://github.com/hupe1980/krafka/compare/v0.23.0...v0.24.0
+[0.23.0]: https://github.com/hupe1980/krafka/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/hupe1980/krafka/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/hupe1980/krafka/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/hupe1980/krafka/compare/v0.19.1...v0.20.0

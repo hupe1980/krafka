@@ -66,7 +66,7 @@ const UNSTABLE_OFFSET_MAX_ATTEMPTS: u32 = 5;
 /// group moved, or its coordinator is still loading `__consumer_offsets`. Both
 /// are ordinary states — a freshly started cluster answers this way until the
 /// coordinator is elected — and the Java client retries them transparently.
-const COORDINATOR_REDISCOVERY_MAX_ATTEMPTS: u32 = 5;
+pub(crate) const COORDINATOR_REDISCOVERY_MAX_ATTEMPTS: u32 = 5;
 
 /// Whether an error means "ask FindCoordinator again and retry".
 ///
@@ -75,7 +75,7 @@ const COORDINATOR_REDISCOVERY_MAX_ATTEMPTS: u32 = 5;
 /// them. They are routine rather than exceptional: a cluster that has just
 /// started, or one that has just moved a group, answers this way until the new
 /// coordinator finishes loading `__consumer_offsets`.
-fn is_coordinator_retriable(error: &KrafkaError) -> bool {
+pub(crate) fn is_coordinator_retriable(error: &KrafkaError) -> bool {
     matches!(
         error,
         KrafkaError::Broker {

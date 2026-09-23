@@ -913,6 +913,20 @@ fn connection_closed_error() -> KrafkaError {
     ))
 }
 
+/// The error pending requests fail with when a stalled connection is closed.
+///
+/// Retriable: the broker went silent on this one socket, and a fresh
+/// connection is the fix.
+fn stalled_connection_error(correlation_id: CorrelationId, grace: Duration) -> KrafkaError {
+    KrafkaError::network(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!(
+            "connection stalled: request {correlation_id} still unanswered {grace:?} after it \
+             timed out, and responses behind it cannot arrive; connection closed"
+        ),
+    ))
+}
+
 /// Feature levels reported by a broker in its `ApiVersions` response (KIP-584).
 ///
 /// Populated during the connection handshake when the broker accepted
@@ -2007,6 +2021,14 @@ impl BrokerConnection {
         let mut timed_out: std::collections::VecDeque<CorrelationId> =
             std::collections::VecDeque::new();
 
+        // Stall detection. Responses arrive in request order, so a request the
+        // broker never answers blocks every response behind it. A timed-out
+        // request gets one more `request_timeout` for its late response; if
+        // none arrives the connection is closed and the next request
+        // reconnects. Java and librdkafka close at the first timeout; the
+        // grace spares a merely slow broker a reconnect storm.
+        let mut stall_checks: DelayQueue<CorrelationId> = DelayQueue::new();
+
         // Reader task sends decoded response frames to this loop via a bounded
         // channel.  The capacity matches max_in_flight_requests: the broker
         // can only send responses for outstanding requests, so this cap is
@@ -2224,6 +2246,7 @@ impl BrokerConnection {
                             timed_out.pop_front();
                         }
                         timed_out.push_back(id);
+                        stall_checks.insert(id, request_timeout);
                         warn!(
                             correlation_id = id,
                             "Request timed out after {:?}", request_timeout
@@ -2231,6 +2254,31 @@ impl BrokerConnection {
                         let _ = req.response_tx.send(Err(KrafkaError::timeout(format!(
                             "request {id} timed out after {request_timeout:?}"
                         ))));
+                    }
+                }
+
+                // A timed-out request is still unanswered after its grace
+                // period: nothing sent after it can be answered either.
+                Some(expired) = std::future::poll_fn(|cx| {
+                    use futures_core::Stream;
+                    std::pin::Pin::new(&mut stall_checks).poll_next(cx)
+                }) => {
+                    consecutive_high_priority_commands = 0;
+                    let id = expired.into_inner();
+                    // Absent means the late response arrived (or a later
+                    // timeout evicted the ID, and that one has its own check).
+                    if timed_out.contains(&id) {
+                        metrics.record_stalled_connection();
+                        warn!(
+                            correlation_id = id,
+                            broker = broker_address,
+                            in_flight = pending.len(),
+                            "Broker has not answered a timed-out request within a further {:?}; \
+                             closing the stalled connection",
+                            request_timeout
+                        );
+                        terminal_error = Some(stalled_connection_error(id, request_timeout));
+                        break;
                     }
                 }
 
@@ -5158,6 +5206,147 @@ mod tests {
              connection's request_timeout, got: {:?}",
             result.unwrap_err()
         );
+    }
+
+    /// Spawn the event loop over an in-memory duplex and return the broker
+    /// side, the normal-priority sender, the metrics and the loop's handle.
+    ///
+    /// The high-priority sender is returned too: dropping it closes that
+    /// channel, which the loop treats as a shutdown.
+    #[allow(clippy::type_complexity)]
+    fn spawn_stall_test_loop(
+        request_timeout: Duration,
+    ) -> (
+        tokio::io::DuplexStream,
+        mpsc::Sender<ConnectionCommand>,
+        mpsc::Sender<ConnectionCommand>,
+        Arc<ConnectionMetrics>,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        let (client, server) = tokio::io::duplex(4096);
+        let (reader, writer) = tokio::io::split(client);
+        let (high_tx, high_rx) = mpsc::channel(4);
+        let (normal_tx, normal_rx) = mpsc::channel(4);
+        let metrics = Arc::new(ConnectionMetrics::default());
+        let handle = tokio::spawn(BrokerConnection::run_connection_loop(
+            reader,
+            writer,
+            ConnectionLoopParams {
+                address: "test-broker".to_string(),
+                high_priority_rx: high_rx,
+                normal_priority_rx: normal_rx,
+                request_timeout,
+                stats: Arc::new(ConnectionStats::default()),
+                metrics: metrics.clone(),
+                max_response_size: crate::protocol::MAX_MESSAGE_SIZE,
+                max_in_flight_requests: 256,
+                max_high_priority_bypasses: 4,
+            },
+        ));
+        (server, normal_tx, high_tx, metrics, handle)
+    }
+
+    fn stall_test_request(
+        correlation_id: i32,
+        timeout: Duration,
+    ) -> (ConnectionCommand, oneshot::Receiver<Result<Bytes>>) {
+        let (response_tx, response_rx) = oneshot::channel();
+        let cmd = ConnectionCommand::Request {
+            data: Bytes::from_static(b"test"),
+            correlation_id,
+            api_key: ApiKey::Produce,
+            api_version: 0,
+            response_tx,
+            timeout,
+            permit: test_permit(),
+        };
+        (cmd, response_rx)
+    }
+
+    /// A request still unanswered one `request_timeout` after timing out
+    /// closes the connection, failing everything queued behind it retriably.
+    #[tokio::test]
+    async fn test_unanswered_timed_out_request_closes_stalled_connection() {
+        use tokio::io::AsyncReadExt;
+
+        let request_timeout = Duration::from_millis(100);
+        let (mut server, normal_tx, _high_tx, metrics, handle) =
+            spawn_stall_test_loop(request_timeout);
+
+        // The request the broker swallows.
+        let (cmd, swallowed_rx) = stall_test_request(1, request_timeout);
+        normal_tx.send(cmd).await.unwrap();
+        let mut buf = [0u8; 4];
+        server.read_exact(&mut buf).await.unwrap();
+        let err = swallowed_rx.await.unwrap().unwrap_err();
+        assert!(matches!(err, KrafkaError::Timeout { .. }), "got: {err:?}");
+
+        // A request queued behind it, with a budget far longer than the grace.
+        let (cmd, behind_rx) = stall_test_request(2, Duration::from_secs(30));
+        normal_tx.send(cmd).await.unwrap();
+
+        let started = std::time::Instant::now();
+        let err = tokio::time::timeout(Duration::from_secs(5), behind_rx)
+            .await
+            .expect("the stalled connection must be closed within the grace period")
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "must not wait out the request's own 30s budget"
+        );
+        assert!(
+            err.is_retriable(),
+            "a stalled connection must fail retriably: {err:?}"
+        );
+        assert!(err.to_string().contains("stalled"), "got: {err}");
+
+        handle
+            .await
+            .unwrap()
+            .expect_err("the loop exits with the stall error");
+        assert_eq!(metrics.snapshot().stalled_connections, 1);
+    }
+
+    /// A late response inside the grace period keeps the connection.
+    #[tokio::test]
+    async fn test_late_response_within_grace_keeps_connection() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let request_timeout = Duration::from_millis(300);
+        let (mut server, normal_tx, _high_tx, metrics, handle) =
+            spawn_stall_test_loop(request_timeout);
+
+        let (cmd, late_rx) = stall_test_request(1, request_timeout);
+        normal_tx.send(cmd).await.unwrap();
+        let mut buf = [0u8; 4];
+        server.read_exact(&mut buf).await.unwrap();
+        late_rx.await.unwrap().unwrap_err();
+
+        // Answer after the timeout, well inside the grace period.
+        server.write_all(&4i32.to_be_bytes()).await.unwrap();
+        server.write_all(&1i32.to_be_bytes()).await.unwrap();
+        server.flush().await.unwrap();
+
+        // Outlive the grace period, then use the connection again.
+        tokio::time::sleep(request_timeout * 2).await;
+        assert!(
+            !handle.is_finished(),
+            "a late answer must not close the connection"
+        );
+
+        let (cmd, next_rx) = stall_test_request(2, request_timeout);
+        normal_tx.send(cmd).await.unwrap();
+        server.read_exact(&mut buf).await.unwrap();
+        server.write_all(&4i32.to_be_bytes()).await.unwrap();
+        server.write_all(&2i32.to_be_bytes()).await.unwrap();
+        server.flush().await.unwrap();
+
+        next_rx
+            .await
+            .unwrap()
+            .expect("the connection must still serve requests");
+        assert_eq!(metrics.snapshot().stalled_connections, 0);
     }
 
     // ── Connection loss / backpressure must be retriable ───────────────
