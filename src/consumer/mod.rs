@@ -78,6 +78,7 @@ pub use config::{
     AutoOffsetReset, ConsumerConfig, GroupProtocol, IsolationLevel, PartitionAssignmentStrategy,
 };
 use group::ErasedRebalanceListener;
+#[cfg(feature = "share-groups")]
 pub(crate) use group::{COORDINATOR_REDISCOVERY_MAX_ATTEMPTS, is_coordinator_retriable};
 pub use group::{
     ConsumerGroup, ConsumerRebalanceListener, CooperativeStickyAssignor, GroupCoordinator,
