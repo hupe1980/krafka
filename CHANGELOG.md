@@ -11,6 +11,20 @@ Entries before 0.17.0 were reconstructed from the release history and the
 `Upgrading` sections that previously lived in `README.md`. They are summaries,
 not a complete record.
 
+## [0.26.0] — 2026-10-05
+
+### Added
+
+- **Passphrase-encrypted client keys** (`ssl.key.password`), behind the new
+  `tls-encrypted-keys` feature: `TlsConfig::with_client_key_password()` and
+  `KAFKA_SSL_KEY_PASSWORD`. Decrypts PKCS#8 PBES2 keys (PBKDF2-HMAC-SHA-2 or
+  scrypt, AES-CBC).
+
+### Fixed
+
+- **An encrypted client key is reported as encrypted**, with the setting or
+  conversion command that fixes it, instead of `no items found`.
+
 ## [0.25.0] — 2026-09-23
 
 A broker that never answers one request blocks every later response on that
@@ -1555,7 +1569,8 @@ Initial development: wire protocol, producer, consumer, admin client,
 authentication (SASL PLAIN / SCRAM / OAUTHBEARER / AWS MSK IAM), TLS,
 compression codecs, schema registry integration and the metrics layer.
 
-[Unreleased]: https://github.com/hupe1980/krafka/compare/v0.25.0...HEAD
+[Unreleased]: https://github.com/hupe1980/krafka/compare/v0.26.0...HEAD
+[0.26.0]: https://github.com/hupe1980/krafka/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/hupe1980/krafka/compare/v0.24.0...v0.25.0
 [0.24.0]: https://github.com/hupe1980/krafka/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/hupe1980/krafka/compare/v0.22.0...v0.23.0

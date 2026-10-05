@@ -1,6 +1,6 @@
 [package]
 name = "krafka"
-version = "0.25.0"
+version = "0.26.0"
 edition = "2024"
 rust-version = "1.88"
 authors = ["hupe1980"]
@@ -66,6 +66,8 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["loggin
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 webpki-roots = "1"
 rustls-native-certs = { version = "0.8", optional = true }
+# Decrypts passphrase-protected PKCS#8 client keys (optional).
+pkcs8 = { version = "0.10", optional = true, default-features = false, features = ["std", "encryption", "pem"] }
 
 # AWS SDK for MSK IAM authentication (optional)
 # Note: The aws-config crate adds ~2-3 MB to binary size (release build).
@@ -121,6 +123,13 @@ oauth-oidc = ["dep:serde", "dep:serde_json", "tokio/fs"]
 # Enable loading platform-native root certificates for TLS client verification.
 # When enabled, `TlsConfig::with_native_roots()` can use the OS trust store.
 native-tls-roots = ["dep:rustls-native-certs"]
+# Enable passphrase-encrypted client private keys (`ssl.key.password`):
+# `TlsConfig::with_client_key_password()` and `KAFKA_SSL_KEY_PASSWORD`.
+#
+# Decrypts PEM `ENCRYPTED PRIVATE KEY` (PKCS#8 PBES2: PBKDF2 with HMAC-SHA-2,
+# or scrypt; AES-CBC), what OpenSSL 1.1+ writes by default. Adds the RustCrypto
+# `pkcs8` stack, a second crypto implementation beside the TLS backend.
+tls-encrypted-keys = ["dep:pkcs8"]
 # Enable protocol versions Kafka marks `latestVersionUnstable`: ApiVersions v5
 # (KIP-1242) and InitProducerId v6 (KIP-939). A released broker does not
 # advertise these unless started with `unstable.api.versions.enable=true`, and

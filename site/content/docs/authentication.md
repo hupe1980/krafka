@@ -518,6 +518,47 @@ let tls_config = TlsConfig::new()
     .with_client_cert("/path/to/client.pem", "/path/to/client-key.pem");
 ```
 
+#### Encrypted private keys
+
+A passphrase-protected client key (the Java client's and librdkafka's
+`ssl.key.password`) needs the `tls-encrypted-keys` feature:
+
+```sh
+cargo add krafka --features tls-encrypted-keys
+```
+
+```rust,compile
+use krafka::auth::TlsConfig;
+
+let tls_config = TlsConfig::new()
+    .with_ca_cert("/path/to/ca.pem")
+    .with_client_cert("/path/to/client.pem", "/path/to/client-key.pem")
+    .with_client_key_password("passphrase");
+```
+
+The key must be PEM `ENCRYPTED PRIVATE KEY`: PKCS#8 PBES2 with PBKDF2
+(HMAC-SHA-2) or scrypt, and AES-CBC. That is what OpenSSL 1.1+ writes by
+default, for example with `openssl genpkey … -aes256`. Other formats fail with
+an error naming the conversion:
+
+| Key | Result |
+|---|---|
+| `ENCRYPTED PRIVATE KEY`, PBES2 with PBKDF2-HMAC-SHA-2 or scrypt | decrypted |
+| Legacy OpenSSL encryption (`Proc-Type: 4,ENCRYPTED`) | rejected |
+| PBES2 with PBKDF2-HMAC-SHA-1, or PBES1 (DES, RC2, MD5) | rejected |
+| Unencrypted | loaded; a passphrase is ignored |
+
+Convert a rejected key with:
+
+```sh
+openssl pkcs8 -topk8 -v2 aes256 -in old.key -out client-key.pem
+```
+
+The passphrase stays in memory for the life of the config, because
+[certificate rotation](#certificate-rotation-kip-1288) reads the key file again,
+and is zeroized when the config is dropped. A rotated key must use the same
+passphrase.
+
 ### SNI Hostname
 
 For servers behind load balancers or proxies:
@@ -766,6 +807,7 @@ The implementation uses AWS Signature v4 signing:
 | `ca_cert_path` | `Option<String>` | Path to CA certificate PEM file |
 | `client_cert_path` | `Option<String>` | Path to client certificate PEM file |
 | `client_key_path` | `Option<String>` | Path to client private key PEM file |
+| `client_key_password` | `Option<Zeroizing<String>>` | Passphrase for an encrypted client key (`tls-encrypted-keys` feature); redacted in `Debug` |
 | `use_native_roots` | `bool` | Whether to load root certificates from the platform trust store |
 | `verify_server_cert` | `bool` | Whether to verify server certificates (default: true) |
 | `sni_hostname` | `Option<String>` | SNI hostname for TLS handshake |
@@ -833,11 +875,12 @@ manager should build the `AuthConfig` directly.
 | `KAFKA_SSL_CA_LOCATION` | CA bundle to pin (replaces the WebPKI roots) |
 | `KAFKA_SSL_CERTIFICATE_LOCATION` | client certificate for mTLS; requires the key too |
 | `KAFKA_SSL_KEY_LOCATION` | client private key for mTLS; requires the certificate too |
+| `KAFKA_SSL_KEY_PASSWORD` | passphrase for an encrypted client key; requires the key and the `tls-encrypted-keys` feature |
 | `KAFKA_SSL_SNI_HOSTNAME` | SNI override |
 
 `AWS_MSK_IAM` takes its credentials from `AwsMskIamCredentials::from_env()`.
-Setting only one half of the client-certificate pair is an error rather than a
-silently ignored setting. There is deliberately no environment variable that
+Setting only one half of the client-certificate pair, or a key passphrase
+without a key, is an error rather than a silently ignored setting. There is deliberately no environment variable that
 disables certificate verification — use `TlsConfig::insecure()` in code if you
 need that.
 
