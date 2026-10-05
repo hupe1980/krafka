@@ -32,7 +32,7 @@ ring_features := "compression-all,aws-msk,oauth-oidc,native-tls-roots,tls-encryp
 cross_platform_features := "compression,oauth-oidc,tls-encrypted-keys,unstable-protocol,telemetry,socks5,test-broker,ring"
 
 # Minimum supported Rust version, mirroring `rust-version` in Cargo.toml.
-msrv := "1.88"
+msrv := "1.95"
 
 # Default recipe: show what is available.
 default:

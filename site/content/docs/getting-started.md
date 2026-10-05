@@ -16,7 +16,7 @@ cargo add tokio --features full
 
 ## Prerequisites
 
-- Rust 1.88 or later (MSRV 1.88)
+- Rust 1.95 or later (MSRV 1.95)
 - **Apache Kafka 3.9 or later** (older brokers are not supported)
 - A running Kafka cluster (or use Docker)
 

@@ -162,7 +162,7 @@ impl Gauge {
     pub fn dec(&self) {
         let result = self
             .value
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 if v == 0 { None } else { Some(v - 1) }
             });
         if result.is_err() {

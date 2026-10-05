@@ -13,6 +13,10 @@ not a complete record.
 
 ## [0.26.0] — 2026-10-05
 
+### Breaking
+
+- **MSRV is 1.95** (was 1.88).
+
 ### Added
 
 - **Passphrase-encrypted client keys** (`ssl.key.password`), behind the new

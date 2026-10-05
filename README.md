@@ -3,7 +3,7 @@
 [![CI](https://github.com/hupe1980/krafka/actions/workflows/ci.yml/badge.svg)](https://github.com/hupe1980/krafka/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/krafka.svg)](https://crates.io/crates/krafka)
 [![Documentation](https://docs.rs/krafka/badge.svg)](https://docs.rs/krafka)
-[![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](https://github.com/rust-lang/rust/releases/tag/1.88.0)
+[![MSRV](https://img.shields.io/badge/MSRV-1.95-blue.svg)](https://github.com/rust-lang/rust/releases/tag/1.95.0)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 
 A pure-Rust, async-native Apache Kafka client. No librdkafka, no C toolchain,
