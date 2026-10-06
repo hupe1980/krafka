@@ -255,7 +255,11 @@ fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
 ///
 /// On Unix, warns if the file is group- or world-accessible
 /// (permissions `& 0o077 != 0`).
-fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
+///
+/// An `ENCRYPTED PRIVATE KEY` section is decrypted with `password` (see
+/// [`decrypt_pkcs8_key`]). Legacy OpenSSL encryption is rejected with the
+/// command that converts it, rather than surfacing as a parse failure.
+fn load_private_key(path: &str, password: Option<&str>) -> Result<PrivateKeyDer<'static>> {
     use std::io::Read as _;
 
     let mut file = File::open(Path::new(path))
@@ -283,8 +287,106 @@ fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
     file.read_to_end(&mut pem)
         .map_err(|e| KrafkaError::config(format!("Failed to read key file {path}: {e}")))?;
 
+    // Checked first: the legacy format keeps an ordinary `… PRIVATE KEY`
+    // label, so the parser below would fail on its headers instead.
+    if contains(&pem, LEGACY_ENCRYPTED_HEADER) {
+        return Err(KrafkaError::config(format!(
+            "Private key file {path} uses legacy OpenSSL encryption (Proc-Type: 4,ENCRYPTED), \
+             which is not supported; convert it to encrypted PKCS#8 with \
+             `openssl pkcs8 -topk8 -v2 aes256 -in {path} -out <new-key-file>`"
+        )));
+    }
+
+    if contains(&pem, ENCRYPTED_PKCS8_BEGIN) {
+        return decrypt_pkcs8_key(path, &pem, password);
+    }
+
     PrivateKeyDer::from_pem_slice(&pem)
         .map_err(|e| KrafkaError::config(format!("Failed to parse private key file {path}: {e}")))
+}
+
+/// PEM boundaries of a PKCS#8 `EncryptedPrivateKeyInfo` (RFC 7468 §11).
+const ENCRYPTED_PKCS8_BEGIN: &[u8] = b"-----BEGIN ENCRYPTED PRIVATE KEY-----";
+#[cfg(feature = "tls-encrypted-keys")]
+const ENCRYPTED_PKCS8_END: &[u8] = b"-----END ENCRYPTED PRIVATE KEY-----";
+/// RFC 1421 header marking a legacy OpenSSL-encrypted key.
+const LEGACY_ENCRYPTED_HEADER: &[u8] = b"Proc-Type: 4,ENCRYPTED";
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    find(haystack, needle).is_some()
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Decrypt the `ENCRYPTED PRIVATE KEY` section of `pem` with `password`.
+///
+/// Supports PBES2 with PBKDF2 (HMAC-SHA-224/256/384/512) or scrypt, and
+/// AES-128/192/256-CBC. PBES1 schemes and the HMAC-SHA-1 PRF stay disabled
+/// (the `pkcs8` crate's `*-insecure` features); the error names the
+/// conversion command instead.
+#[cfg(feature = "tls-encrypted-keys")]
+fn decrypt_pkcs8_key(
+    path: &str,
+    pem: &[u8],
+    password: Option<&str>,
+) -> Result<PrivateKeyDer<'static>> {
+    use pkcs8::EncryptedPrivateKeyInfo;
+    use pkcs8::der::Document;
+    use rustls::pki_types::PrivatePkcs8KeyDer;
+
+    let password = password.ok_or_else(|| {
+        KrafkaError::config(format!(
+            "Private key file {path} is encrypted; set its passphrase with \
+             TlsConfig::with_client_key_password or KAFKA_SSL_KEY_PASSWORD"
+        ))
+    })?;
+
+    let malformed = || {
+        KrafkaError::config(format!(
+            "Failed to parse private key file {path}: malformed ENCRYPTED PRIVATE KEY section"
+        ))
+    };
+    let start = find(pem, ENCRYPTED_PKCS8_BEGIN).ok_or_else(malformed)?;
+    let end = find(&pem[start..], ENCRYPTED_PKCS8_END)
+        .map(|i| start + i + ENCRYPTED_PKCS8_END.len())
+        .ok_or_else(malformed)?;
+    let section = std::str::from_utf8(&pem[start..end]).map_err(|_| malformed())?;
+
+    let (_, document) = Document::from_pem(section).map_err(|e| {
+        KrafkaError::config(format!("Failed to parse private key file {path}: {e}"))
+    })?;
+    let info = EncryptedPrivateKeyInfo::try_from(document.as_bytes()).map_err(|e| {
+        KrafkaError::config(format!("Failed to parse private key file {path}: {e}"))
+    })?;
+
+    // A wrong passphrase and an unsupported scheme are indistinguishable to
+    // the caller fixing it, so the message covers both.
+    let decrypted = info.decrypt(password).map_err(|e| {
+        KrafkaError::config(format!(
+            "Failed to decrypt private key file {path} ({e}): check the passphrase; \
+             supported encryption is PKCS#8 PBES2 (PBKDF2 with HMAC-SHA-2, or scrypt) \
+             with AES-CBC — re-encrypt other keys with `openssl pkcs8 -topk8 -v2 aes256`"
+        ))
+    })?;
+
+    // `decrypted` is a `SecretDocument`, zeroized on drop.
+    Ok(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+        decrypted.as_bytes().to_vec(),
+    )))
+}
+
+#[cfg(not(feature = "tls-encrypted-keys"))]
+fn decrypt_pkcs8_key(
+    path: &str,
+    _pem: &[u8],
+    _password: Option<&str>,
+) -> Result<PrivateKeyDer<'static>> {
+    Err(KrafkaError::config(format!(
+        "Private key file {path} is encrypted; decrypting it requires the \
+         'tls-encrypted-keys' crate feature"
+    )))
 }
 
 /// Load root certificate store.
@@ -369,7 +471,8 @@ fn load_client_auth(
 ) -> Result<Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>> {
     if let (Some(cert_path), Some(key_path)) = (&config.client_cert_path, &config.client_key_path) {
         let certs = load_certs(cert_path)?;
-        let key = load_private_key(key_path)?;
+        let password = config.client_key_password.as_deref().map(String::as_str);
+        let key = load_private_key(key_path, password)?;
         Ok(Some((certs, key)))
     } else {
         Ok(None)
@@ -536,7 +639,7 @@ mod tests {
 
     #[test]
     fn test_load_private_key_nonexistent() {
-        let result = load_private_key("/nonexistent/path/key.pem");
+        let result = load_private_key("/nonexistent/path/key.pem", None);
         assert!(result.is_err());
     }
 
@@ -590,5 +693,105 @@ mod tests {
         assert!(ServerName::try_from(ipv4).is_ok());
         assert!(ServerName::try_from(ipv6).is_ok());
         assert!(ServerName::try_from(dns).is_ok());
+    }
+
+    /// Fixtures from OpenSSL 3: one P-256 key with a self-signed certificate,
+    /// and that key in each encryption format (passphrase `krafka-test`).
+    fn testdata(name: &str) -> String {
+        format!("{}/src/auth/testdata/{name}", env!("CARGO_MANIFEST_DIR"))
+    }
+
+    fn client_auth_config(key: &str, password: Option<&str>) -> TlsConfig {
+        let mut config = TlsConfig::new().with_client_cert(testdata("client.pem"), testdata(key));
+        config.client_key_password = password.map(|p| zeroize::Zeroizing::new(p.to_string()));
+        config
+    }
+
+    fn client_auth_error(key: &str, password: Option<&str>) -> String {
+        setup_crypto_provider();
+        build_tls_config_sync(&client_auth_config(key, password))
+            .expect_err("loading the client key must fail")
+            .to_string()
+    }
+
+    #[test]
+    fn unencrypted_key_ignores_a_passphrase() {
+        setup_crypto_provider();
+        for password in [None, Some("krafka-test")] {
+            build_tls_config_sync(&client_auth_config("client.key", password))
+                .expect("an unencrypted key loads with or without a passphrase");
+        }
+    }
+
+    /// Without this, the parser skips the unknown label and reports
+    /// "no items found", which reads as an empty or wrong file.
+    #[test]
+    #[cfg(not(feature = "tls-encrypted-keys"))]
+    fn encrypted_key_without_the_feature_names_the_feature() {
+        let err = client_auth_error("client-pbes2.key", None);
+        assert!(err.contains("tls-encrypted-keys"), "got: {err}");
+    }
+
+    #[test]
+    fn legacy_encrypted_key_names_the_conversion() {
+        let err = client_auth_error("client-legacy.key", Some("krafka-test"));
+        assert!(err.contains("Proc-Type"), "got: {err}");
+        assert!(err.contains("openssl pkcs8 -topk8"), "got: {err}");
+    }
+
+    /// The key must match the certificate, or rustls rejects the pair; a
+    /// successful build therefore proves the decrypted bytes are the key.
+    #[test]
+    #[cfg(feature = "tls-encrypted-keys")]
+    fn encrypted_pkcs8_keys_decrypt() {
+        setup_crypto_provider();
+        for key in ["client-pbes2.key", "client-scrypt.key"] {
+            build_tls_config_sync(&client_auth_config(key, Some("krafka-test")))
+                .unwrap_or_else(|e| panic!("{key} must decrypt: {e}"));
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "tls-encrypted-keys")]
+    fn encrypted_key_in_a_bundle_with_its_certificate_decrypts() {
+        setup_crypto_provider();
+        let dir = std::env::temp_dir().join(format!("krafka-tls-bundle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bundle = dir.join("bundle.pem");
+        let mut pem = std::fs::read(testdata("client.pem")).unwrap();
+        pem.extend(std::fs::read(testdata("client-pbes2.key")).unwrap());
+        std::fs::write(&bundle, pem).unwrap();
+
+        let path = bundle.to_str().unwrap();
+        let mut config = TlsConfig::new().with_client_cert(path, path);
+        config.client_key_password = Some(zeroize::Zeroizing::new("krafka-test".to_string()));
+        let result = build_tls_config_sync(&config);
+
+        std::fs::remove_dir_all(&dir).ok();
+        result.expect("the key section of a certificate bundle must decrypt");
+    }
+
+    #[test]
+    #[cfg(feature = "tls-encrypted-keys")]
+    fn encrypted_key_without_a_passphrase_names_both_settings() {
+        let err = client_auth_error("client-pbes2.key", None);
+        assert!(err.contains("with_client_key_password"), "got: {err}");
+        assert!(err.contains("KAFKA_SSL_KEY_PASSWORD"), "got: {err}");
+    }
+
+    #[test]
+    #[cfg(feature = "tls-encrypted-keys")]
+    fn wrong_passphrase_is_reported_as_such() {
+        let err = client_auth_error("client-pbes2.key", Some("wrong"));
+        assert!(err.contains("check the passphrase"), "got: {err}");
+    }
+
+    /// PBKDF2 with HMAC-SHA-1 needs the `pkcs8` crate's `sha1-insecure`
+    /// feature, which stays off.
+    #[test]
+    #[cfg(feature = "tls-encrypted-keys")]
+    fn sha1_prf_is_rejected_with_the_conversion() {
+        let err = client_auth_error("client-pbes2-sha1.key", Some("krafka-test"));
+        assert!(err.contains("openssl pkcs8 -topk8"), "got: {err}");
     }
 }

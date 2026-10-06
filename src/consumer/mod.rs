@@ -813,7 +813,7 @@ fn control_batch_is_abort(batch: &RecordBatch) -> bool {
 fn claim_record_budget(budget: &std::sync::atomic::AtomicUsize, want: usize) -> usize {
     use std::sync::atomic::Ordering;
     let mut granted = 0;
-    let _ = budget.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+    let _ = budget.try_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
         granted = remaining.min(want);
         if granted == 0 {
             None

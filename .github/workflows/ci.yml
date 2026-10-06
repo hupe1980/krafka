@@ -319,17 +319,17 @@ jobs:
         timeout-minutes: 30
 
   msrv:
-    name: MSRV (1.88)
+    name: MSRV (1.95)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.88"
+          toolchain: "1.95"
       - uses: Swatinem/rust-cache@v2
-      # Not `just msrv`: that recipe shells out to `rustup run 1.88` so a
+      # Not `just msrv`: that recipe shells out to `rustup run 1.95` so a
       # developer can check the MSRV without switching their default toolchain.
-      # Here the job's toolchain already *is* 1.88, so the plain command is
+      # Here the job's toolchain already *is* 1.95, so the plain command is
       # both simpler and a genuine check that the pinned toolchain builds.
       - run: cargo check
 

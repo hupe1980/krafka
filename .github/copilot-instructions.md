@@ -2,7 +2,7 @@
 
 ## Project
 
-Pure-Rust async Kafka client. Tokio runtime, edition 2024, MSRV 1.88.
+Pure-Rust async Kafka client. Tokio runtime, edition 2024, MSRV 1.95.
 
 ## Build & Test
 

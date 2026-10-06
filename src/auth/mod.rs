@@ -547,7 +547,7 @@ impl fmt::Debug for AwsMskIamCredentials {
 /// Use [`TlsConfig::new()`] or [`Default::default()`] to construct.
 /// For insecure mode (local development / self-signed certificates without a
 /// CA bundle), use [`TlsConfig::insecure()`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TlsConfig {
     /// Path to CA certificate file.
     pub(crate) ca_cert_path: Option<String>,
@@ -555,6 +555,11 @@ pub struct TlsConfig {
     pub(crate) client_cert_path: Option<String>,
     /// Path to client private key file.
     pub(crate) client_key_path: Option<String>,
+    /// Passphrase for an encrypted client private key (zeroized on drop).
+    ///
+    /// Kept for the lifetime of the config because certificate reloads read
+    /// the key file again.
+    pub(crate) client_key_password: Option<Zeroizing<String>>,
     /// Whether to load root certificates from the platform trust store.
     pub(crate) use_native_roots: bool,
     /// Whether to verify server certificates (defaults to `true`).
@@ -575,11 +580,30 @@ impl Default for TlsConfig {
             ca_cert_path: None,
             client_cert_path: None,
             client_key_path: None,
+            client_key_password: None,
             use_native_roots: false,
             verify_server_cert: true,
             sni_hostname: None,
             alpn_protocols: Vec::new(),
         }
+    }
+}
+
+impl fmt::Debug for TlsConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TlsConfig")
+            .field("ca_cert_path", &self.ca_cert_path)
+            .field("client_cert_path", &self.client_cert_path)
+            .field("client_key_path", &self.client_key_path)
+            .field(
+                "client_key_password",
+                &self.client_key_password.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("use_native_roots", &self.use_native_roots)
+            .field("verify_server_cert", &self.verify_server_cert)
+            .field("sni_hostname", &self.sni_hostname)
+            .field("alpn_protocols", &self.alpn_protocols)
+            .finish()
     }
 }
 
@@ -642,6 +666,34 @@ impl TlsConfig {
     ) -> Self {
         self.client_cert_path = Some(cert_path.into());
         self.client_key_path = Some(key_path.into());
+        self
+    }
+
+    /// Set the passphrase for an encrypted client private key.
+    ///
+    /// The Java client's and librdkafka's `ssl.key.password`. Requires the
+    /// `tls-encrypted-keys` crate feature.
+    ///
+    /// The key must be PEM `ENCRYPTED PRIVATE KEY` (PKCS#8 PBES2: PBKDF2 with
+    /// HMAC-SHA-2, or scrypt; AES-CBC), which OpenSSL 1.1+ writes by default.
+    /// Legacy OpenSSL encryption (`Proc-Type: 4,ENCRYPTED`) and PBKDF2 with
+    /// HMAC-SHA-1 are rejected; re-encrypt such keys with
+    /// `openssl pkcs8 -topk8 -v2 aes256`.
+    ///
+    /// An unencrypted key ignores the passphrase.
+    ///
+    /// ```rust
+    /// use krafka::auth::TlsConfig;
+    ///
+    /// let tls = TlsConfig::new()
+    ///     .with_ca_cert("/etc/kafka/ca.pem")
+    ///     .with_client_cert("/etc/kafka/client.pem", "/etc/kafka/client.key")
+    ///     .with_client_key_password("passphrase");
+    /// ```
+    #[cfg(feature = "tls-encrypted-keys")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "tls-encrypted-keys")))]
+    pub fn with_client_key_password(mut self, password: impl Into<String>) -> Self {
+        self.client_key_password = Some(Zeroizing::new(password.into()));
         self
     }
 
@@ -1232,6 +1284,7 @@ impl AuthConfig {
     /// | `KAFKA_SSL_CA_LOCATION` | [`TlsConfig::with_ca_cert`] — pins this CA bundle |
     /// | `KAFKA_SSL_CERTIFICATE_LOCATION` | client certificate (mTLS); requires the key too |
     /// | `KAFKA_SSL_KEY_LOCATION` | client private key (mTLS); requires the certificate too |
+    /// | `KAFKA_SSL_KEY_PASSWORD` | [`TlsConfig::with_client_key_password`] — requires the key and the `tls-encrypted-keys` feature |
     /// | `KAFKA_SSL_SNI_HOSTNAME` | [`TlsConfig::with_sni_hostname`] |
     ///
     /// Unset TLS variables leave [`TlsConfig::new()`] defaults, which verify
@@ -1341,6 +1394,9 @@ impl AuthConfig {
             std::env::var("KAFKA_SSL_CA_LOCATION").ok(),
             std::env::var("KAFKA_SSL_CERTIFICATE_LOCATION").ok(),
             std::env::var("KAFKA_SSL_KEY_LOCATION").ok(),
+            std::env::var("KAFKA_SSL_KEY_PASSWORD")
+                .ok()
+                .map(Zeroizing::new),
             std::env::var("KAFKA_SSL_SNI_HOSTNAME").ok(),
         )
     }
@@ -1353,6 +1409,7 @@ impl AuthConfig {
         ca: Option<String>,
         cert: Option<String>,
         key: Option<String>,
+        key_password: Option<Zeroizing<String>>,
         sni: Option<String>,
     ) -> crate::Result<TlsConfig> {
         let mut tls = TlsConfig::new();
@@ -1365,6 +1422,14 @@ impl AuthConfig {
         // silently ignoring a lone certificate path would present no client
         // identity to a broker that requires one, and the resulting handshake
         // failure names neither variable.
+        // Same reasoning for a passphrase with no key to decrypt.
+        if key_password.is_some() && key.is_none() {
+            return Err(crate::error::KrafkaError::config(
+                "KAFKA_SSL_KEY_PASSWORD is set without KAFKA_SSL_KEY_LOCATION; \
+                 a key passphrase needs the key it decrypts",
+            ));
+        }
+
         match (cert, key) {
             (Some(cert), Some(key)) => tls = tls.with_client_cert(cert, key),
             (Some(_), None) => {
@@ -1380,6 +1445,20 @@ impl AuthConfig {
                 ));
             }
             (None, None) => {}
+        }
+
+        if let Some(password) = key_password {
+            #[cfg(feature = "tls-encrypted-keys")]
+            {
+                tls.client_key_password = Some(password);
+            }
+            #[cfg(not(feature = "tls-encrypted-keys"))]
+            {
+                drop(password);
+                return Err(crate::error::KrafkaError::config(
+                    "KAFKA_SSL_KEY_PASSWORD requires the 'tls-encrypted-keys' crate feature",
+                ));
+            }
         }
 
         if let Some(sni) = sni {
@@ -1600,6 +1679,7 @@ mod tests {
             Some("/etc/kafka/client.pem".to_string()),
             None,
             None,
+            None,
         )
         .expect_err("a certificate without a key must be rejected");
         assert!(
@@ -1611,6 +1691,7 @@ mod tests {
             None,
             None,
             Some("/etc/kafka/client.key".to_string()),
+            None,
             None,
         )
         .expect_err("a key without a certificate must be rejected");
@@ -1631,6 +1712,7 @@ mod tests {
             Some("/etc/kafka/ca.pem".to_string()),
             Some("/etc/kafka/client.pem".to_string()),
             Some("/etc/kafka/client.key".to_string()),
+            None,
             Some("broker.internal".to_string()),
         )
         .expect("a complete TLS environment is valid");
@@ -1643,6 +1725,55 @@ mod tests {
             tls.verify_server_cert(),
             "no environment variable may disable verification"
         );
+    }
+
+    #[test]
+    fn a_key_passphrase_without_a_key_is_rejected() {
+        let err = AuthConfig::tls_config_from_parts(
+            None,
+            None,
+            None,
+            Some(Zeroizing::new("secret".to_string())),
+            None,
+        )
+        .expect_err("a passphrase without a key must be rejected");
+        assert!(
+            err.to_string().contains("KAFKA_SSL_KEY_LOCATION"),
+            "the error must name the missing variable, got: {err}"
+        );
+    }
+
+    fn tls_with_key_passphrase() -> crate::Result<TlsConfig> {
+        AuthConfig::tls_config_from_parts(
+            None,
+            Some("/etc/kafka/client.pem".to_string()),
+            Some("/etc/kafka/client.key".to_string()),
+            Some(Zeroizing::new("secret".to_string())),
+            None,
+        )
+    }
+
+    #[test]
+    #[cfg(feature = "tls-encrypted-keys")]
+    fn key_passphrase_reaches_the_config_and_is_redacted() {
+        let tls = tls_with_key_passphrase().expect("a passphrase with its key is valid");
+        assert_eq!(
+            tls.client_key_password.as_deref().map(String::as_str),
+            Some("secret")
+        );
+
+        let debug = format!("{tls:?}");
+        assert!(!debug.contains("secret"), "passphrase leaked: {debug}");
+        assert!(debug.contains("[REDACTED]"), "got: {debug}");
+    }
+
+    /// Ignoring the variable would fail later as "key is encrypted", hiding
+    /// that the passphrase was supplied and only the feature is missing.
+    #[test]
+    #[cfg(not(feature = "tls-encrypted-keys"))]
+    fn key_passphrase_without_the_feature_is_rejected() {
+        let err = tls_with_key_passphrase().expect_err("the feature is required");
+        assert!(err.to_string().contains("tls-encrypted-keys"), "got: {err}");
     }
 
     /// Every mechanism `KAFKA_SASL_MECHANISM` accepts must compose with TLS.

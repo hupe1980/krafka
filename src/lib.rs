@@ -111,6 +111,7 @@
 //! | `ring` | **yes** | rustls crypto backend using `ring` (pure Rust). |
 //! | `rustls-aws-lc-rs` | no | rustls crypto backend using `aws-lc-rs`. Preferred on AWS Graviton and for FIPS deployments. |
 //! | `native-tls-roots` | no | Load platform-native root certificates via `rustls-native-certs`. |
+//! | `tls-encrypted-keys` | no | Passphrase-encrypted PKCS#8 client keys (`ssl.key.password`) via the RustCrypto `pkcs8` crate. |
 //! | `test-broker` | no | In-process fake Kafka broker for testing your own code against a real client. Not for production builds. |
 //!
 //! ## TLS crypto backend
