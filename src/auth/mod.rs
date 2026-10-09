@@ -859,11 +859,14 @@ impl AuthConfig {
     ///
     /// # Example
     ///
+    /// With the `aws-msk` feature, `AwsMskIamCredentials::from_default_chain`
+    /// resolves credentials through the AWS SDK default chain.
+    ///
     /// ```rust,no_run
     /// use krafka::auth::{AuthConfig, AwsMskIamCredentials};
     ///
     /// let config = AuthConfig::aws_msk_iam_provider(|| async {
-    ///     AwsMskIamCredentials::from_default_chain("us-east-1").await
+    ///     AwsMskIamCredentials::from_env_with_region("us-east-1")
     /// });
     /// ```
     pub fn aws_msk_iam_provider(
