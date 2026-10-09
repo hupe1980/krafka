@@ -35,7 +35,7 @@ tracing = "0.1.41"
 # Compression
 flate2 = "1"                                          # gzip
 snap = "1"                                            # snappy
-lz4_flex = "0.11.6"                                   # lz4
+lz4_flex = "0.14.0"                                   # lz4
 ruzstd = "0.8"                                        # zstd decode (pure Rust, always on)
 zstd = { version = "0.13", optional = true }          # zstd encode (requires C toolchain via zstd-sys)
 
