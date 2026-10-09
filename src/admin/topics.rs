@@ -1,609 +1,752 @@
-//! AdminClient operation group: topics.
+//! Topics: create, delete, add partitions, list, describe.
 
-use std::time::Duration;
+use std::collections::{HashMap, HashSet};
 
-use tracing::info;
-
-use crate::error::{KrafkaError, ProtocolErrorKind, Result};
+use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
+use crate::metadata::TopicInfo;
 use crate::protocol::{
-    ApiKey, CreatableTopic, CreatableTopicConfig, CreatePartitionsRequest,
-    CreatePartitionsResponse, CreatePartitionsTopic, CreateTopicsRequest, CreateTopicsResponse,
-    DeleteTopicState, DeleteTopicsRequest, DeleteTopicsResponse, VersionedDecode, VersionedEncode,
-    validate_topic_name, validate_topic_names, versions,
+    ApiKey, CreatableReplicaAssignment, CreatableTopic, CreatableTopicConfig,
+    CreatePartitionsRequest, CreatePartitionsResponse, CreatePartitionsTopic, CreateTopicsRequest,
+    CreateTopicsResponse, DeleteTopicState, DeleteTopicsRequest, DeleteTopicsResponse,
+    DescribeTopicPartitionsCursor, DescribeTopicPartitionsRequest, DescribeTopicPartitionsResponse,
+    validate_topic_name, versions,
 };
+use crate::{BrokerId, PartitionId};
 
-#[allow(clippy::wildcard_imports)]
-use super::*;
-use crate::protocol::CreatableReplicaAssignment;
+use super::driver::{Mode, Target, answer, exchange, negotiate};
+use super::{AdminClient, validate_topics};
 
-/// Translate a [`NewTopic`]'s replica placement into the wire form.
-///
-/// Sorted by partition index so the request is byte-deterministic — a
-/// `HashMap` iterates in an unspecified order, and a request whose bytes change
-/// between runs is one nobody can diff against a packet capture.
-fn replica_assignments(topic: &NewTopic) -> Vec<CreatableReplicaAssignment> {
-    if topic.replica_assignments.is_empty() {
-        return Vec::new();
+/// Partitions per `DescribeTopicPartitions` page.
+const RESPONSE_PARTITION_LIMIT: i32 = 2000;
+
+/// Bound on `DescribeTopicPartitions` pages, so a broker returning a cursor
+/// that never advances cannot keep the call looping.
+const MAX_DESCRIBE_PAGES: usize = 10_000;
+
+/// A topic to create.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct NewTopic {
+    /// Topic name.
+    pub name: String,
+    /// Number of partitions; `-1` for the broker default.
+    pub num_partitions: i32,
+    /// Replication factor; `-1` for the broker default.
+    pub replication_factor: i16,
+    /// Topic configuration overrides.
+    pub configs: HashMap<String, String>,
+    /// Explicit replica placement: partition index → broker IDs, the first
+    /// being the preferred leader. Empty lets the controller place replicas.
+    pub replica_assignments: HashMap<i32, Vec<i32>>,
+}
+
+impl NewTopic {
+    /// A topic with `num_partitions` partitions of `replication_factor`
+    /// replicas each; `-1` for either means the broker default.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `name` is empty or longer than 249 bytes, or if
+    /// `num_partitions` or `replication_factor` is zero or less than -1.
+    pub fn new(
+        name: impl Into<String>,
+        num_partitions: i32,
+        replication_factor: i16,
+    ) -> Result<Self> {
+        let name = name.into();
+        validate_topic_name(&name)?;
+        if num_partitions == 0 || num_partitions < -1 {
+            return Err(KrafkaError::config(format!(
+                "num_partitions must be positive or -1, got {num_partitions}"
+            )));
+        }
+        if replication_factor == 0 || replication_factor < -1 {
+            return Err(KrafkaError::config(format!(
+                "replication_factor must be positive or -1, got {replication_factor}"
+            )));
+        }
+        Ok(Self {
+            name,
+            num_partitions,
+            replication_factor,
+            configs: HashMap::new(),
+            replica_assignments: HashMap::new(),
+        })
     }
-    let mut assignments: Vec<CreatableReplicaAssignment> = topic
-        .replica_assignments
-        .iter()
-        .map(
-            |(&partition_index, broker_ids)| CreatableReplicaAssignment {
-                partition_index,
-                broker_ids: broker_ids.clone(),
-            },
-        )
-        .collect();
-    assignments.sort_unstable_by_key(|a| a.partition_index);
-    assignments
+
+    /// A topic with an explicit replica placement.
+    ///
+    /// `assignments` maps partition index to the broker IDs that hold its
+    /// replicas, the first being the preferred leader. Partition count and
+    /// replication factor follow from the map.
+    ///
+    /// ```rust,no_run
+    /// use krafka::admin::NewTopic;
+    /// use std::collections::HashMap;
+    ///
+    /// # fn example() -> Result<(), krafka::error::KrafkaError> {
+    /// let topic = NewTopic::with_replica_assignment(
+    ///     "orders",
+    ///     HashMap::from([(0, vec![1, 4]), (1, vec![2, 5]), (2, vec![3, 6])]),
+    /// )?;
+    /// # let _ = topic;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `name` is invalid, if `assignments` is empty, if a
+    /// partition has no replicas, or if partitions have different replica
+    /// counts.
+    pub fn with_replica_assignment(
+        name: impl Into<String>,
+        assignments: HashMap<i32, Vec<i32>>,
+    ) -> Result<Self> {
+        let name = name.into();
+        validate_topic_name(&name)?;
+        if assignments.is_empty() {
+            return Err(KrafkaError::config(
+                "replica assignment must name at least one partition",
+            ));
+        }
+        let mut replication_factor = None;
+        for (partition, brokers) in &assignments {
+            if brokers.is_empty() {
+                return Err(KrafkaError::config(format!(
+                    "partition {partition} has no replicas"
+                )));
+            }
+            match replication_factor {
+                None => replication_factor = Some(brokers.len()),
+                Some(expected) if expected != brokers.len() => {
+                    return Err(KrafkaError::config(format!(
+                        "every partition must have the same replication factor; \
+                         partition {partition} has {} where an earlier one has {expected}",
+                        brokers.len()
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(Self {
+            name,
+            // Kafka rejects a request that carries both an assignment and a
+            // count.
+            num_partitions: -1,
+            replication_factor: -1,
+            configs: HashMap::new(),
+            replica_assignments: assignments,
+        })
+    }
+
+    /// Add a configuration override.
+    #[must_use]
+    pub fn with_config(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.configs.insert(key.into(), value.into());
+        self
+    }
+
+    fn to_wire(&self) -> CreatableTopic {
+        let mut assignments: Vec<CreatableReplicaAssignment> = self
+            .replica_assignments
+            .iter()
+            .map(
+                |(&partition_index, broker_ids)| CreatableReplicaAssignment {
+                    partition_index,
+                    broker_ids: broker_ids.clone(),
+                },
+            )
+            .collect();
+        // Sorted so the request bytes are deterministic.
+        assignments.sort_unstable_by_key(|a| a.partition_index);
+        let mut configs: Vec<CreatableTopicConfig> = self
+            .configs
+            .iter()
+            .map(|(name, value)| CreatableTopicConfig {
+                name: name.clone(),
+                value: Some(value.clone()),
+            })
+            .collect();
+        configs.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        CreatableTopic {
+            name: self.name.clone(),
+            num_partitions: self.num_partitions,
+            replication_factor: self.replication_factor,
+            assignments,
+            configs,
+        }
+    }
+}
+
+admin_options! {
+    /// Options for [`AdminClient::create_topics`].
+    CreateTopicsOptions {
+        /// Validate the request without creating anything.
+        validate_only: bool,
+    }
+}
+
+admin_options! {
+    /// Options for [`AdminClient::delete_topics`].
+    DeleteTopicsOptions {}
+}
+
+admin_options! {
+    /// Options for [`AdminClient::create_partitions`].
+    CreatePartitionsOptions {
+        /// Validate the request without adding partitions.
+        validate_only: bool,
+    }
+}
+
+admin_options! {
+    /// Options for [`AdminClient::list_topics`].
+    ListTopicsOptions {
+        /// Include internal topics such as `__consumer_offsets`.
+        include_internal: bool,
+    }
+}
+
+admin_options! {
+    /// Options for [`AdminClient::describe_topics`].
+    DescribeTopicsOptions {}
+}
+
+/// A described topic.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct TopicDescription {
+    /// Topic name.
+    pub name: String,
+    /// Topic ID; all zeros when the broker reported none.
+    pub topic_id: [u8; 16],
+    /// Whether the topic is internal.
+    pub is_internal: bool,
+    /// Partitions, ordered by index.
+    pub partitions: Vec<PartitionDescription>,
+    /// Authorized operations bitfield, when the broker reported one.
+    pub authorized_operations: Option<i32>,
+}
+
+/// A described partition.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct PartitionDescription {
+    /// Partition index.
+    pub partition: PartitionId,
+    /// Leader broker; `None` while the partition has no leader.
+    pub leader: Option<BrokerId>,
+    /// Leader epoch; `None` when unknown.
+    pub leader_epoch: Option<i32>,
+    /// Replica broker IDs.
+    pub replicas: Vec<BrokerId>,
+    /// In-sync replica broker IDs.
+    pub isr: Vec<BrokerId>,
+    /// Offline replica broker IDs.
+    pub offline_replicas: Vec<BrokerId>,
+    /// Eligible leader replicas (KIP-966); `None` when the broker did not
+    /// report them.
+    pub eligible_leader_replicas: Option<Vec<BrokerId>>,
+    /// Last known eligible leader replicas (KIP-966).
+    pub last_known_elr: Option<Vec<BrokerId>>,
+}
+
+impl TopicDescription {
+    fn from_metadata(info: &TopicInfo) -> Self {
+        let mut partitions: Vec<PartitionDescription> = info
+            .partitions_iter()
+            .map(|p| PartitionDescription {
+                partition: p.partition,
+                leader: (p.leader >= 0).then_some(p.leader),
+                leader_epoch: (p.leader_epoch >= 0).then_some(p.leader_epoch),
+                replicas: p.replicas.clone(),
+                isr: p.isr.clone(),
+                offline_replicas: p.offline_replicas.clone(),
+                eligible_leader_replicas: None,
+                last_known_elr: None,
+            })
+            .collect();
+        partitions.sort_unstable_by_key(|p| p.partition);
+        Self {
+            name: info.name.clone(),
+            topic_id: info.topic_id,
+            is_internal: info.is_internal,
+            partitions,
+            authorized_operations: None,
+        }
+    }
+}
+
+/// Reject a request naming the same item twice.
+fn unique<'a>(what: &str, names: impl IntoIterator<Item = &'a str>) -> Result<()> {
+    let mut seen = HashSet::new();
+    for name in names {
+        if !seen.insert(name) {
+            return Err(KrafkaError::config(format!(
+                "{what} '{name}' appears more than once"
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl AdminClient {
-    /// Create topics.
+    /// Create topics (controller).
     ///
-    /// `CreateTopics` is a **controller-only** API. The request is routed to the
-    /// current controller and re-issued against a freshly resolved controller if
-    /// the broker answers `NOT_CONTROLLER` — see
-    /// [`get_controller_connection`](AdminClient::get_controller_connection).
-    /// A `NOT_CONTROLLER` that survives every retry is returned as an `Err`, not
-    /// as an `Ok` carrying a per-topic error string.
+    /// Returns a result per topic name. An existing topic is
+    /// `Err(KrafkaError::Broker { code: ErrorCode::TopicAlreadyExists, .. })`.
     ///
-    /// Returns `Ok(results)` when the RPC succeeds.  **An `Ok` return does not
-    /// mean every topic was created** — inspect each
-    /// [`CreateTopicResult::error`] for per-topic failures. Every requested
-    /// topic is guaranteed to appear in the result: a topic the broker omits
-    /// from its response is reported with an explicit error rather than
-    /// silently vanishing.
+    /// # Errors
     ///
-    /// # Parameters
-    ///
-    /// * `topics` — Descriptions of the topics to create.
-    /// * `timeout` — How long the broker should wait for the creation to complete.
-    /// * `validate_only` — When `true`, the broker validates the request but does **not**
-    ///   create any topics. Useful for pre-flight checks. Requires CreateTopics v2+
-    ///   (Kafka 0.11+); all modern brokers support this.
+    /// The call fails for a closed client or a topic named twice.
     pub async fn create_topics(
         &self,
-        topics: Vec<NewTopic>,
-        timeout: Duration,
-        validate_only: bool,
-    ) -> Result<Vec<CreateTopicResult>> {
-        self.check_not_closed()?;
-        validate_topic_names(topics.iter().map(|t| t.name.as_str()))?;
-
-        let requested: Vec<String> = topics.iter().map(|t| t.name.clone()).collect();
-        let timeout_ms = crate::util::duration_to_millis_i32(timeout);
-
-        let results = self
-            .with_controller("CreateTopics", |conn| {
-                let topics = &topics;
-                async move {
+        topics: impl IntoIterator<Item = NewTopic>,
+        options: CreateTopicsOptions,
+    ) -> Result<HashMap<String, Result<()>>> {
+        let topics: HashMap<String, NewTopic> = {
+            let list: Vec<NewTopic> = topics.into_iter().collect();
+            unique("topic", list.iter().map(|t| t.name.as_str()))?;
+            list.into_iter().map(|t| (t.name.clone(), t)).collect()
+        };
+        let call = self.call("CreateTopics", Mode::Write, options.timeout)?;
+        let validate_only = options.validate_only;
+        let topics = &topics;
+        let call_ref = &call;
+        Ok(call
+            .fan_out(
+                topics.keys().cloned().collect(),
+                |_| Target::Controller,
+                |conn, names| async move {
                     let request = CreateTopicsRequest {
-                        topics: topics
-                            .iter()
-                            .map(|t| CreatableTopic {
-                                name: t.name.clone(),
-                                num_partitions: t.num_partitions,
-                                replication_factor: t.replication_factor,
-                                assignments: replica_assignments(t),
-                                configs: t
-                                    .configs
-                                    .iter()
-                                    .map(|(k, v)| CreatableTopicConfig {
-                                        name: k.clone(),
-                                        value: Some(v.clone()),
-                                    })
-                                    .collect(),
-                            })
-                            .collect(),
-                        timeout_ms,
+                        topics: names.iter().map(|n| topics[n].to_wire()).collect(),
+                        timeout_ms: call_ref.remaining_ms(),
                         validate_only,
                     };
-
-                    let version = conn
-                        .negotiate_api_version(
-                            ApiKey::CreateTopics,
-                            versions::CREATE_TOPICS_MAX,
-                            versions::CREATE_TOPICS_MIN,
-                        )
-                        .ok_or_else(|| {
-                            KrafkaError::protocol_kind(
-                                ProtocolErrorKind::UnknownApiVersion,
-                                "no mutually supported CreateTopics API version",
-                            )
-                        })?;
-
-                    let response_bytes = conn
-                        .send_request(ApiKey::CreateTopics, version, |buf| {
-                            request.encode_versioned(version, buf)
-                        })
-                        .await?;
-
-                    let mut buf = response_bytes;
-                    let response = CreateTopicsResponse::decode_versioned(version, &mut buf)?;
-
-                    // If *any* topic reports a controller move, the whole batch
-                    // must be re-sent to the new controller.
-                    if let Some(t) = response
+                    let version = negotiate(
+                        &conn,
+                        ApiKey::CreateTopics,
+                        versions::CREATE_TOPICS_MIN,
+                        versions::CREATE_TOPICS_MAX,
+                    )?;
+                    let response: CreateTopicsResponse =
+                        exchange(&conn, ApiKey::CreateTopics, version, &request).await?;
+                    Ok(response
                         .topics
-                        .iter()
-                        .find(|t| super::is_controller_moved(t.error_code))
-                    {
-                        return Ok(ControllerAttempt::NotController(t.error_code));
-                    }
-
-                    Ok(ControllerAttempt::Done(response.topics))
-                }
-            })
-            .await?;
-
-        // Reconcile against the request so a topic the broker did not mention
-        // surfaces as an explicit error instead of disappearing.
-        let results = reconcile_topic_results(
-            &requested,
-            results.into_iter().map(|t| {
-                let error = if t.error_code.is_ok() {
-                    None
-                } else {
-                    Some(
-                        t.error_message
-                            .unwrap_or_else(|| format!("{:?}", t.error_code)),
-                    )
-                };
-                (t.name, error)
-            }),
-            |name, error| CreateTopicResult { name, error },
-        );
-
-        let failed = results.iter().filter(|r| r.error.is_some()).count();
-        let succeeded = results.len() - failed;
-        if validate_only {
-            info!(
-                "Validated {succeeded}/{} topic(s) ({failed} rejected)",
-                results.len()
-            );
-        } else {
-            info!(
-                "Created {succeeded}/{} topic(s) ({failed} failed)",
-                results.len()
-            );
-        }
-        Ok(results)
+                        .into_iter()
+                        .map(|t| (t.name, answer(t.error_code, t.error_message)))
+                        .collect())
+                },
+            )
+            .await)
     }
 
-    /// Delete topics.
+    /// Delete topics (controller).
     ///
-    /// `DeleteTopics` is a **controller-only** API; see
-    /// [`create_topics`](Self::create_topics) for how controller routing and
-    /// `NOT_CONTROLLER` retries work.
+    /// Returns a result per topic name.
     ///
-    /// Returns `Ok(results)` when the RPC succeeds.  **An `Ok` return does not
-    /// mean every topic was deleted** — inspect each
-    /// [`DeleteTopicResult::error`] for per-topic failures. Topics omitted by
-    /// the broker are reported with an explicit error.
-    pub async fn delete_topics(
+    /// # Errors
+    ///
+    /// The call fails for a closed client or an invalid topic name.
+    pub async fn delete_topics<I, S>(
         &self,
-        topics: Vec<String>,
-        timeout: Duration,
-    ) -> Result<Vec<DeleteTopicResult>> {
-        self.check_not_closed()?;
-        // H6: reject oversize topic names at ingress so we never reach the
-        // panicking `KafkaString::encode` path.
-        validate_topic_names(topics.iter().map(String::as_str))?;
-
-        let timeout_ms = crate::util::duration_to_millis_i32(timeout);
-
-        let responses = self
-            .with_controller("DeleteTopics", |conn| {
-                let topics = &topics;
-                async move {
-                    // Populate both fields so the correct one is used regardless
-                    // of the negotiated version (v1–v5 use topic_names, v6+ use
-                    // topics).
+        topics: I,
+        options: DeleteTopicsOptions,
+    ) -> Result<HashMap<String, Result<()>>>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let names: Vec<String> = topics.into_iter().map(|s| s.as_ref().to_string()).collect();
+        validate_topics(names.iter().map(String::as_str))?;
+        unique("topic", names.iter().map(String::as_str))?;
+        let call = self.call("DeleteTopics", Mode::Write, options.timeout)?;
+        let call_ref = &call;
+        Ok(call
+            .fan_out(
+                names,
+                |_| Target::Controller,
+                |conn, names| async move {
+                    // v1–v5 read `topic_names`, v6+ read `topics`.
                     let request = DeleteTopicsRequest {
-                        topic_names: topics.clone(),
-                        topics: topics
+                        topic_names: names.clone(),
+                        topics: names
                             .iter()
                             .map(|name| DeleteTopicState {
                                 name: Some(name.clone()),
-                                // Null UUID: deletion by topic name, not UUID.
-                                topic_id: [0u8; 16],
+                                topic_id: [0; 16],
                             })
                             .collect(),
-                        timeout_ms,
+                        timeout_ms: call_ref.remaining_ms(),
                     };
-
-                    let version = conn
-                        .negotiate_api_version(
-                            ApiKey::DeleteTopics,
-                            versions::DELETE_TOPICS_MAX,
-                            versions::DELETE_TOPICS_MIN,
-                        )
-                        .ok_or_else(|| {
-                            KrafkaError::protocol_kind(
-                                ProtocolErrorKind::UnknownApiVersion,
-                                "no mutually supported DeleteTopics API version",
-                            )
-                        })?;
-
-                    let response_bytes = conn
-                        .send_request(ApiKey::DeleteTopics, version, |buf| {
-                            request.encode_versioned(version, buf)
-                        })
-                        .await?;
-
-                    let mut buf = response_bytes;
-                    let response = DeleteTopicsResponse::decode_versioned(version, &mut buf)?;
-
-                    if let Some(r) = response
+                    let version = negotiate(
+                        &conn,
+                        ApiKey::DeleteTopics,
+                        versions::DELETE_TOPICS_MIN,
+                        versions::DELETE_TOPICS_MAX,
+                    )?;
+                    let response: DeleteTopicsResponse =
+                        exchange(&conn, ApiKey::DeleteTopics, version, &request).await?;
+                    Ok(response
                         .responses
-                        .iter()
-                        .find(|r| super::is_controller_moved(r.error_code))
-                    {
-                        return Ok(ControllerAttempt::NotController(r.error_code));
-                    }
-
-                    Ok(ControllerAttempt::Done(response.responses))
-                }
-            })
-            .await?;
-
-        let results = reconcile_topic_results(
-            &topics,
-            responses.into_iter().map(|r| {
-                let error = if r.error_code.is_ok() {
-                    None
-                } else {
-                    Some(
-                        r.error_message
-                            .unwrap_or_else(|| format!("{:?}", r.error_code)),
-                    )
-                };
-                (r.name.unwrap_or_default(), error)
-            }),
-            |name, error| DeleteTopicResult { name, error },
-        );
-
-        let failed = results.iter().filter(|r| r.error.is_some()).count();
-        info!(
-            "Deleted {}/{} topic(s) ({failed} failed)",
-            results.len() - failed,
-            results.len()
-        );
-        Ok(results)
+                        .into_iter()
+                        .map(|r| {
+                            (
+                                r.name.unwrap_or_default(),
+                                answer(r.error_code, r.error_message),
+                            )
+                        })
+                        .collect())
+                },
+            )
+            .await)
     }
 
-    /// Increase the number of partitions for a topic.
+    /// Raise topics' partition counts to the given **totals** (controller).
     ///
-    /// Note: Partition count can only be increased, never decreased.
+    /// Partition counts only grow. Returns a result per topic.
     ///
-    /// `CreatePartitions` is a **controller-only** API; see
-    /// [`create_topics`](Self::create_topics) for how controller routing and
-    /// `NOT_CONTROLLER` retries work.
+    /// ```rust,no_run
+    /// # use krafka::admin::{AdminClient, CreatePartitionsOptions};
+    /// # async fn example(admin: &AdminClient) -> Result<(), krafka::error::KrafkaError> {
+    /// let results = admin
+    ///     .create_partitions([("orders", 12)], CreatePartitionsOptions::default())
+    ///     .await?;
+    /// # let _ = results;
+    /// # Ok(())
+    /// # }
+    /// ```
     ///
-    /// # Parameters
+    /// # Errors
     ///
-    /// * `topic` — Topic to expand.
-    /// * `new_total_count` — The **total** partition count after the increase.
-    /// * `timeout` — How long the broker should wait for the change to complete.
-    /// * `validate_only` — When `true`, the broker validates the request but
-    ///   does **not** create any partitions.
-    pub async fn create_partitions(
+    /// The call fails for a closed client, an invalid topic name, or a topic
+    /// named twice.
+    pub async fn create_partitions<I, S>(
         &self,
-        topic: impl Into<String>,
-        new_total_count: i32,
-        timeout: Duration,
-        validate_only: bool,
-    ) -> Result<CreatePartitionsResult> {
-        self.check_not_closed()?;
-        let topic_name = topic.into();
-        // H6: reject oversize topic names at ingress so we never reach the
-        // panicking `KafkaString::encode` path.
-        validate_topic_name(&topic_name)?;
-
-        let timeout_ms = crate::util::duration_to_millis_i32(timeout);
-
-        let results = self
-            .with_controller("CreatePartitions", |conn| {
-                let topic_name = &topic_name;
-                async move {
+        totals: I,
+        options: CreatePartitionsOptions,
+    ) -> Result<HashMap<String, Result<()>>>
+    where
+        I: IntoIterator<Item = (S, i32)>,
+        S: AsRef<str>,
+    {
+        let totals: Vec<(String, i32)> = totals
+            .into_iter()
+            .map(|(name, count)| (name.as_ref().to_string(), count))
+            .collect();
+        validate_topics(totals.iter().map(|(name, _)| name.as_str()))?;
+        unique("topic", totals.iter().map(|(name, _)| name.as_str()))?;
+        let totals: HashMap<String, i32> = totals.into_iter().collect();
+        let call = self.call("CreatePartitions", Mode::Write, options.timeout)?;
+        let validate_only = options.validate_only;
+        let totals = &totals;
+        let call_ref = &call;
+        Ok(call
+            .fan_out(
+                totals.keys().cloned().collect(),
+                |_| Target::Controller,
+                |conn, names| async move {
                     let request = CreatePartitionsRequest {
-                        topics: vec![CreatePartitionsTopic {
-                            name: topic_name.clone(),
-                            count: new_total_count,
-                            assignments: None,
-                        }],
-                        timeout_ms,
+                        topics: names
+                            .iter()
+                            .map(|name| CreatePartitionsTopic {
+                                name: name.clone(),
+                                count: totals[name],
+                                assignments: None,
+                            })
+                            .collect(),
+                        timeout_ms: call_ref.remaining_ms(),
                         validate_only,
                     };
-
-                    let version = conn
-                        .negotiate_api_version(
-                            ApiKey::CreatePartitions,
-                            versions::CREATE_PARTITIONS_MAX,
-                            versions::CREATE_PARTITIONS_MIN,
-                        )
-                        .ok_or_else(|| {
-                            KrafkaError::protocol_kind(
-                                ProtocolErrorKind::UnknownApiVersion,
-                                "no mutually supported CreatePartitions API version",
-                            )
-                        })?;
-
-                    let response_bytes = conn
-                        .send_request(ApiKey::CreatePartitions, version, |buf| {
-                            request.encode_versioned(version, buf)
-                        })
-                        .await?;
-
-                    let mut buf = response_bytes;
-                    let response = CreatePartitionsResponse::decode_versioned(version, &mut buf)?;
-
-                    if let Some(r) = response
+                    let version = negotiate(
+                        &conn,
+                        ApiKey::CreatePartitions,
+                        versions::CREATE_PARTITIONS_MIN,
+                        versions::CREATE_PARTITIONS_MAX,
+                    )?;
+                    let response: CreatePartitionsResponse =
+                        exchange(&conn, ApiKey::CreatePartitions, version, &request).await?;
+                    Ok(response
                         .results
-                        .iter()
-                        .find(|r| super::is_controller_moved(r.error_code))
-                    {
-                        return Ok(ControllerAttempt::NotController(r.error_code));
-                    }
-
-                    Ok(ControllerAttempt::Done(response.results))
-                }
-            })
-            .await?;
-
-        let result = results
-            .into_iter()
-            .next()
-            .map(|r| CreatePartitionsResult {
-                topic: r.name,
-                error: if r.error_code.is_ok() {
-                    None
-                } else {
-                    Some(
-                        r.error_message
-                            .unwrap_or_else(|| format!("{:?}", r.error_code)),
-                    )
+                        .into_iter()
+                        .map(|r| (r.name, answer(r.error_code, r.error_message)))
+                        .collect())
                 },
-            })
-            .unwrap_or(CreatePartitionsResult {
-                topic: topic_name.clone(),
-                error: Some("no response received".to_string()),
-            });
+            )
+            .await)
+    }
 
-        if result.error.is_none() {
-            if validate_only {
-                info!("Validated partition increase for topic {topic_name} to {new_total_count}");
-            } else {
-                info!("Increased partitions for topic {topic_name} to {new_total_count}");
-            }
-        }
-        Ok(result)
+    /// List the cluster's topic names from a fresh metadata fetch.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the metadata fetch fails or the deadline passes.
+    pub async fn list_topics(&self, options: ListTopicsOptions) -> Result<Vec<String>> {
+        let call = self.call("ListTopics", Mode::Read, options.timeout)?;
+        tokio::time::timeout(call.remaining(), self.metadata.refresh())
+            .await
+            .map_err(|_| KrafkaError::timeout("ListTopics"))??;
+        let mut names: Vec<String> = self
+            .metadata
+            .topics_arc()
+            .into_iter()
+            .filter(|t| options.include_internal || !t.is_internal)
+            .map(|t| t.name.clone())
+            .collect();
+        names.sort_unstable();
+        Ok(names)
+    }
+
+    /// Describe topics: partitions, leaders, replicas, ISR and, on brokers
+    /// with `DescribeTopicPartitions` (KIP-966), eligible leader replicas.
+    ///
+    /// Returns a result per topic; a missing topic is
+    /// `Err(KrafkaError::Broker { code: ErrorCode::UnknownTopicOrPartition, .. })`.
+    ///
+    /// # Errors
+    ///
+    /// The call fails for a closed client or an invalid topic name.
+    pub async fn describe_topics<I, S>(
+        &self,
+        topics: I,
+        options: DescribeTopicsOptions,
+    ) -> Result<HashMap<String, Result<TopicDescription>>>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut names: Vec<String> = topics.into_iter().map(|s| s.as_ref().to_string()).collect();
+        validate_topics(names.iter().map(String::as_str))?;
+        names.sort_unstable();
+        names.dedup();
+        let call = self.call("DescribeTopics", Mode::Read, options.timeout)?;
+        Ok(call
+            .fan_out(
+                names,
+                |_| Target::AnyBroker,
+                |conn, names| async move {
+                    match conn.negotiate_api_version(
+                        ApiKey::DescribeTopicPartitions,
+                        versions::DESCRIBE_TOPIC_PARTITIONS_MAX,
+                        versions::DESCRIBE_TOPIC_PARTITIONS_MIN,
+                    ) {
+                        Some(version) => describe_topic_partitions(&conn, version, names).await,
+                        None => self.describe_topics_from_metadata(names).await,
+                    }
+                },
+            )
+            .await)
+    }
+
+    /// Describe topics from a metadata fetch, for brokers without
+    /// `DescribeTopicPartitions`.
+    async fn describe_topics_from_metadata(
+        &self,
+        names: Vec<String>,
+    ) -> Result<Vec<(String, Result<TopicDescription>)>> {
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        self.metadata.force_refresh(Some(&refs)).await?;
+        Ok(names
+            .into_iter()
+            .map(|name| {
+                let result = match self.metadata.topic_arc(&name) {
+                    Some(info) => Ok(TopicDescription::from_metadata(&info)),
+                    None => Err(KrafkaError::broker(
+                        self.metadata
+                            .topic_error(&name)
+                            .unwrap_or(ErrorCode::UnknownTopicOrPartition),
+                        format!("topic {name} is not in the cluster metadata"),
+                    )),
+                };
+                (name, result)
+            })
+            .collect())
     }
 }
 
-/// Reconcile a broker's per-topic results against the topics that were
-/// requested.
-///
-/// Kafka is expected to echo one entry per requested topic, but nothing in the
-/// protocol enforces it. Without this reconciliation a topic the broker omitted
-/// would simply be missing from the returned `Vec`, and a caller that iterates
-/// the results and finds no error would conclude the operation succeeded for
-/// every topic it asked about.
-///
-/// Entries the broker returned for topics that were *not* requested are kept —
-/// dropping them would hide information — and appended after the requested set.
-fn reconcile_topic_results<T>(
-    requested: &[String],
-    responses: impl Iterator<Item = (String, Option<String>)>,
-    build: impl Fn(String, Option<String>) -> T,
-) -> Vec<T> {
-    let mut by_name: std::collections::HashMap<String, Option<String>> =
-        std::collections::HashMap::new();
-    let mut extra: Vec<(String, Option<String>)> = Vec::new();
+/// Describe `names` with `DescribeTopicPartitions`, following the cursor
+/// across pages.
+async fn describe_topic_partitions(
+    conn: &crate::network::BrokerConnection,
+    version: i16,
+    names: Vec<String>,
+) -> Result<Vec<(String, Result<TopicDescription>)>> {
+    let mut described: HashMap<String, Result<TopicDescription>> = HashMap::new();
+    let mut cursor: Option<DescribeTopicPartitionsCursor> = None;
 
-    for (name, error) in responses {
-        if requested.contains(&name) {
-            by_name.insert(name, error);
-        } else {
-            extra.push((name, error));
+    for _ in 0..MAX_DESCRIBE_PAGES {
+        let request = DescribeTopicPartitionsRequest {
+            topics: names.clone(),
+            response_partition_limit: RESPONSE_PARTITION_LIMIT,
+            cursor: cursor.clone(),
+        };
+        let response: DescribeTopicPartitionsResponse =
+            exchange(conn, ApiKey::DescribeTopicPartitions, version, &request).await?;
+
+        for t in response.topics {
+            let Some(name) = t.name else { continue };
+            if !t.error_code.is_ok() {
+                described.insert(
+                    name,
+                    Err(KrafkaError::broker(
+                        t.error_code,
+                        format!("{:?}", t.error_code),
+                    )),
+                );
+                continue;
+            }
+            let entry = described.entry(name.clone()).or_insert_with(|| {
+                Ok(TopicDescription {
+                    name,
+                    topic_id: t.topic_id,
+                    is_internal: t.is_internal,
+                    partitions: Vec::new(),
+                    authorized_operations: (t.topic_authorized_operations != i32::MIN)
+                        .then_some(t.topic_authorized_operations),
+                })
+            });
+            if let Ok(description) = entry {
+                description
+                    .partitions
+                    .extend(t.partitions.into_iter().map(|p| PartitionDescription {
+                        partition: p.partition_index,
+                        leader: (p.error_code.is_ok() && p.leader_id >= 0).then_some(p.leader_id),
+                        leader_epoch: (p.leader_epoch >= 0).then_some(p.leader_epoch),
+                        replicas: p.replica_nodes,
+                        isr: p.isr_nodes,
+                        offline_replicas: p.offline_replicas,
+                        eligible_leader_replicas: p.eligible_leader_replicas,
+                        last_known_elr: p.last_known_elr,
+                    }));
+            }
+        }
+
+        match response.next_cursor {
+            None => {
+                return Ok(names
+                    .into_iter()
+                    .map(|name| {
+                        let result = described.remove(&name).unwrap_or_else(|| {
+                            Err(KrafkaError::broker(
+                                ErrorCode::UnknownTopicOrPartition,
+                                format!("topic {name} was not described"),
+                            ))
+                        });
+                        let result = result.map(|mut d| {
+                            d.partitions.sort_unstable_by_key(|p| p.partition);
+                            d
+                        });
+                        (name, result)
+                    })
+                    .collect());
+            }
+            Some(next) => {
+                if cursor.as_ref().is_some_and(|prev| {
+                    prev.topic_name == next.topic_name
+                        && prev.partition_index == next.partition_index
+                }) {
+                    break;
+                }
+                cursor = Some(next);
+            }
         }
     }
 
-    let mut out: Vec<T> = requested
-        .iter()
-        .map(|name| {
-            let error = by_name
-                .remove(name)
-                .unwrap_or_else(|| Some("broker returned no result for this topic".to_string()));
-            build(name.clone(), error)
-        })
-        .collect();
-
-    out.extend(extra.into_iter().map(|(name, error)| build(name, error)));
-    out
+    Err(KrafkaError::protocol_kind(
+        ProtocolErrorKind::Malformed,
+        "DescribeTopicPartitions returned a cursor that does not advance",
+    ))
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::protocol::VersionedEncode;
 
-    fn results(pairs: &[(&str, Option<&str>)]) -> Vec<(String, Option<String>)> {
-        pairs
-            .iter()
-            .map(|(n, e)| ((*n).to_string(), e.map(str::to_string)))
-            .collect()
-    }
-
-    fn reconcile(requested: &[&str], responded: &[(&str, Option<&str>)]) -> Vec<CreateTopicResult> {
-        let requested: Vec<String> = requested.iter().map(|s| (*s).to_string()).collect();
-        reconcile_topic_results(&requested, results(responded).into_iter(), |name, error| {
-            CreateTopicResult { name, error }
-        })
+    #[test]
+    fn test_new_topic() {
+        let topic = NewTopic::new("test-topic", 3, 2)
+            .unwrap()
+            .with_config("cleanup.policy", "compact")
+            .with_config("retention.ms", "86400000");
+        assert_eq!(topic.name, "test-topic");
+        assert_eq!(topic.num_partitions, 3);
+        assert_eq!(topic.replication_factor, 2);
+        assert_eq!(topic.configs.len(), 2);
     }
 
     #[test]
-    fn test_reconcile_passes_through_matching_results() {
-        let out = reconcile(&["a", "b"], &[("a", None), ("b", Some("boom"))]);
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0].name, "a");
-        assert!(out[0].error.is_none());
-        assert_eq!(out[1].name, "b");
-        assert_eq!(out[1].error.as_deref(), Some("boom"));
+    fn test_new_topic_validation() {
+        assert!(NewTopic::new("t", 1, 1).is_ok());
+        assert!(NewTopic::new("t", -1, -1).is_ok());
+        assert!(NewTopic::new("t", 0, 1).is_err());
+        assert!(NewTopic::new("t", -2, 1).is_err());
+        assert!(NewTopic::new("t", 1, 0).is_err());
+        assert!(NewTopic::new("t", 1, -2).is_err());
     }
 
-    /// The core defect: a topic the broker omits from its response must not
-    /// silently vanish. A caller iterating the results and finding no error
-    /// would otherwise believe every requested topic was created.
     #[test]
-    fn test_reconcile_reports_topics_the_broker_omitted() {
-        let out = reconcile(&["a", "b", "c"], &[("a", None), ("c", None)]);
+    fn test_new_topic_name_validation_rejects_empty_and_oversize() {
+        assert!(NewTopic::new("", 1, 1).is_err());
+        assert!(NewTopic::new("x".repeat(250), 1, 1).is_err());
+        assert!(NewTopic::new("x".repeat(249), 1, 1).is_ok());
+    }
 
-        assert_eq!(out.len(), 3, "every requested topic must be represented");
-        let b = out
-            .iter()
-            .find(|r| r.name == "b")
-            .expect("b must be present");
-        assert!(
-            b.error.is_some(),
-            "an omitted topic must carry an explicit error, not be dropped"
+    #[test]
+    fn replica_assignment_is_expressible_and_validated() {
+        let topic = NewTopic::with_replica_assignment(
+            "orders",
+            HashMap::from([(1, vec![2, 5]), (0, vec![1, 4])]),
+        )
+        .expect("a uniform assignment is valid");
+        assert_eq!(topic.num_partitions, -1);
+        assert_eq!(topic.replication_factor, -1);
+        let wire = topic.to_wire();
+        assert_eq!(
+            wire.assignments
+                .iter()
+                .map(|a| a.partition_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1],
+            "assignments are sorted so the request is deterministic"
         );
-        assert!(b.error.as_deref().unwrap().contains("no result"));
+
+        let ragged = NewTopic::with_replica_assignment(
+            "orders",
+            HashMap::from([(0, vec![1, 4]), (1, vec![2])]),
+        )
+        .expect_err("a ragged replication factor must be rejected");
+        assert!(ragged.to_string().contains("replication factor"));
+        let empty = NewTopic::with_replica_assignment("orders", HashMap::from([(0, Vec::new())]))
+            .expect_err("a partition with no replicas must be rejected");
+        assert!(empty.to_string().contains("partition 0"));
+        NewTopic::with_replica_assignment("orders", HashMap::new())
+            .expect_err("an empty assignment names no partitions");
     }
 
     #[test]
-    fn test_reconcile_preserves_request_order() {
-        let out = reconcile(&["z", "y", "x"], &[("x", None), ("y", None), ("z", None)]);
-        let names: Vec<&str> = out.iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(names, vec!["z", "y", "x"]);
-    }
-
-    /// Unexpected extras are surfaced rather than discarded — dropping them
-    /// would hide information about what the broker actually did.
-    #[test]
-    fn test_reconcile_keeps_unrequested_extras() {
-        let out = reconcile(&["a"], &[("a", None), ("surprise", Some("err"))]);
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0].name, "a");
-        assert_eq!(out[1].name, "surprise");
-        assert_eq!(out[1].error.as_deref(), Some("err"));
-    }
-
-    #[test]
-    fn test_reconcile_empty_response_marks_all_missing() {
-        let out = reconcile(&["a", "b"], &[]);
-        assert_eq!(out.len(), 2);
-        assert!(out.iter().all(|r| r.error.is_some()));
-    }
-
-    #[test]
-    fn test_reconcile_empty_request_is_empty() {
-        let out = reconcile(&[], &[]);
-        assert!(out.is_empty());
-    }
-
-    #[test]
-    fn test_reconcile_builds_delete_results_too() {
-        let requested = vec!["t".to_string()];
-        let out: Vec<DeleteTopicResult> =
-            reconcile_topic_results(&requested, std::iter::empty(), |name, error| {
-                DeleteTopicResult { name, error }
-            });
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].name, "t");
-        assert!(out[0].error.is_some());
-    }
-
-    // ── Request construction ──
-
-    #[test]
-    fn test_create_topics_request_carries_configs_and_validate_only() {
+    fn create_topics_request_encodes() {
         let topic = NewTopic::new("orders", 6, 3)
             .unwrap()
             .with_config("cleanup.policy", "compact");
-
         let request = CreateTopicsRequest {
-            topics: vec![CreatableTopic {
-                name: topic.name.clone(),
-                num_partitions: topic.num_partitions,
-                replication_factor: topic.replication_factor,
-                assignments: Vec::new(),
-                configs: topic
-                    .configs
-                    .iter()
-                    .map(|(k, v)| CreatableTopicConfig {
-                        name: k.clone(),
-                        value: Some(v.clone()),
-                    })
-                    .collect(),
-            }],
+            topics: vec![topic.to_wire()],
             timeout_ms: 30_000,
             validate_only: true,
         };
-
-        assert!(request.validate_only);
-        assert_eq!(request.topics[0].num_partitions, 6);
-        assert_eq!(request.topics[0].replication_factor, 3);
-        assert_eq!(request.topics[0].configs.len(), 1);
-
         let mut buf = Vec::new();
         request
             .encode_versioned(versions::CREATE_TOPICS_MAX, &mut buf)
-            .expect("CreateTopics must encode at the max supported version");
+            .unwrap();
         assert!(!buf.is_empty());
     }
 
-    /// `create_partitions` must be able to express a dry run; hardcoding
-    /// `validate_only: false` made the advertised pre-flight check unusable.
     #[test]
-    fn test_create_partitions_request_supports_validate_only() {
-        for validate_only in [false, true] {
-            let request = CreatePartitionsRequest {
-                topics: vec![CreatePartitionsTopic {
-                    name: "orders".into(),
-                    count: 12,
-                    assignments: None,
-                }],
-                timeout_ms: 5_000,
-                validate_only,
-            };
-            assert_eq!(request.validate_only, validate_only);
-
-            let mut buf = Vec::new();
-            request
-                .encode_versioned(versions::CREATE_PARTITIONS_MAX, &mut buf)
-                .expect("CreatePartitions must encode");
-            assert!(!buf.is_empty());
-        }
-    }
-
-    #[test]
-    fn test_delete_topics_request_populates_both_name_forms() {
-        let names = vec!["a".to_string(), "b".to_string()];
-        let request = DeleteTopicsRequest {
-            topic_names: names.clone(),
-            topics: names
-                .iter()
-                .map(|n| DeleteTopicState {
-                    name: Some(n.clone()),
-                    topic_id: [0u8; 16],
-                })
-                .collect(),
-            timeout_ms: 1_000,
-        };
-
-        // v1–v5 read `topic_names`; v6+ read `topics`. Both must be populated
-        // so the negotiated version always finds its field.
-        assert_eq!(request.topic_names.len(), 2);
-        assert_eq!(request.topics.len(), 2);
-        assert_eq!(request.topics[0].topic_id, [0u8; 16]);
-
-        let mut buf = Vec::new();
-        request
-            .encode_versioned(versions::DELETE_TOPICS_MAX, &mut buf)
-            .expect("DeleteTopics must encode");
-        assert!(!buf.is_empty());
+    fn a_name_given_twice_is_an_invalid_argument() {
+        assert!(unique("topic", ["a", "b"]).is_ok());
+        let err = unique("topic", ["a", "b", "a"]).unwrap_err();
+        assert!(matches!(err, KrafkaError::Config { .. }));
     }
 }

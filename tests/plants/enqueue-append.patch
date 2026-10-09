@@ -1,0 +1,15 @@
+diff -ruN a/src/producer/mod.rs b/src/producer/mod.rs
+--- a/src/producer/mod.rs
++++ b/src/producer/mod.rs
+@@ -295,7 +295,10 @@
+         )
+         .await
+     {
+-        Ok(handle) => Ok(handle),
++        Ok(handle) => {
++            tokio::task::yield_now().await;
++            Ok(handle)
++        }
+         // The context comes back rather than being dropped, so the obligation
+         // is re-opened and discharged with the partition already chosen.
+         Err(rejected) => {

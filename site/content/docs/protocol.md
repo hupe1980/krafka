@@ -13,13 +13,13 @@ krafka implements the Kafka wire protocol with support for:
 
 - Automatic API version negotiation
 - Multiple protocol versions per API
-- All standard compression codecs
-- Zero-copy message handling
+- All standard compression codecs, decoded in pure Rust
+- Decoded records that share the fetched buffer
 
 ## Version Negotiation
 
-On connection, krafka automatically fetches the broker's supported API versions and stores them.
-This enables dynamic version negotiation for optimal compatibility and feature usage.
+On connection, krafka fetches the broker's supported API versions and picks,
+per request, the highest version both sides support.
 
 ### How It Works
 
@@ -31,46 +31,23 @@ This enables dynamic version negotiation for optimal compatibility and feature u
 
 ### Bootstrapping `ApiVersions` itself
 
-`ApiVersions` is the one API whose version cannot be negotiated from a previous
-`ApiVersions` response — it *is* the negotiation. krafka therefore sends
-`versions::API_VERSIONS_MAX` (v4 by default) and, if the broker answers
-`UNSUPPORTED_VERSION`, retries at the ceiling that rejection advertises. The
-protocol mandates that a rejection is encoded with the **v0** response layout
-precisely so a client that guessed too high can still parse the reply, so the
-fallback costs exactly one extra round trip and never fails the handshake.
+krafka sends `ApiVersions` at its own ceiling (v4; v5 with the
+`unstable-protocol` feature). A broker that answers `UNSUPPORTED_VERSION`
+encodes the rejection in the v0 layout with its own range, and krafka retries
+once at that ceiling.
 
-The default ceiling is the highest version a *released* Kafka supports, not the
-highest krafka can encode: sending v5 (KIP-1242) to a broker that does not
-advertise it would cost a rejected round trip on **every** connection. v5 is
-available behind the `unstable-protocol` feature for testing against unreleased
-builds.
-
-Negotiating v3+ rather than pinning v0 is what puts two things on the wire:
+v3 and later carry:
 
 - **KIP-511** — `ClientSoftwareName` / `ClientSoftwareVersion`, which is how a
   broker's `client.software.name` / `client.software.version` metrics identify
   krafka. These fields do not exist below v3.
 - **KIP-584** — `SupportedFeatures` and `FinalizedFeatures`, carried in v3+
-  tagged fields. krafka caches them per connection; read them with
-  [`BrokerConnection::broker_features()`], which exposes
-  `finalized_level(name)` and `supported_range(name)` so callers can gate
-  optional behaviour on a cluster-wide feature level without a second round
-  trip.
+  tagged fields. krafka caches them per connection and reads them itself — the
+  transactional producer picks its transaction protocol from the finalized
+  `transaction.version`. Applications read them with
+  [`AdminClient::describe_features`](@/docs/admin.md#features-kip-584).
 
-[`BrokerConnection::broker_features()`]: https://docs.rs/krafka/latest/krafka/network/struct.BrokerConnection.html#method.broker_features
-
-### Using Version Negotiation
-
-```rust
-use krafka::protocol::ApiKey;
-
-// negotiate_api_version(api_key, max, min) clamps to client MIN..MAX and broker range.
-let fetch_version = conn
-    .negotiate_api_version(ApiKey::Fetch, 12, 4)
-    .await
-    .expect("broker does not support any usable Fetch version");
-println!("Using Fetch v{}", fetch_version);
-```
+Negotiation is internal: the connection layer is not part of the public API.
 
 ### Leader epochs end to end (KIP-320)
 
@@ -79,33 +56,25 @@ position everywhere it goes. krafka sends it on all three legs:
 
 | Leg | Field | What it buys |
 |---|---|---|
-| `Fetch` | `current_leader_epoch`, `last_fetched_epoch` | The broker reports `diverging_epoch` when the client's log no longer matches its own. |
+| `Fetch` | `current_leader_epoch`, `last_fetched_epoch` | The broker reports `diverging_epoch` when the client's log diverges from its own. |
 | `ListOffsets` | `current_leader_epoch` | A reset resolved against a stale leader is rejected with `FENCED_LEADER_EPOCH` instead of returning an offset from a log the client cannot vouch for. |
 | `OffsetCommit` → `OffsetFetch` | `committed_leader_epoch` | The check survives a restart or a rebalance: the next owner of the partition resumes with the epoch the position was read at. |
 
-Missing any one leg silently degrades the guarantee rather than breaking
-visibly — the client keeps working and simply stops noticing truncation. The
-commit leg is the easiest to overlook, because its absence is invisible until a
-consumer restarts.
+A fenced `ListOffsets` refreshes metadata before the retry.
 
-A fenced `ListOffsets` forces a metadata refresh before the retry, so the
-epoch check converges instead of failing identically forever.
-
-`-1` remains the correct value where the client genuinely has no epoch: a
-position that came from a `seek()` or an offset reset, or an offset set
-administratively through `AdminClient::alter_consumer_group_offsets`. Inventing
-one there would defeat the check it feeds.
+The epoch is `-1` where the client has none: a position from a `seek()` or an
+offset reset, or an offset set through
+`AdminClient::alter_consumer_group_offsets`.
 
 ### Minimum Broker Version
 
-krafka **requires Apache Kafka 3.9 or later**. The MIN constants for all APIs
-are set so that pre-3.9 protocol features (e.g., Metadata v0, Produce v0-v2,
-Fetch v0-v3) are no longer supported. Connecting to an older broker will fail
-version negotiation for most APIs.
+krafka **requires Apache Kafka 3.9 or later**. Each API's minimum version is
+one a Kafka 3.9 broker accepts (for example Metadata v1, Produce v3, Fetch v4),
+so an older broker fails version negotiation for most APIs.
 
 ### Client Supported Versions
 
-Every API has a `MIN` and `MAX` constant in `krafka::protocol::versions`.
+Every API has a minimum and a maximum supported version.
 The client only encodes/decodes versions within `[MIN, MAX]`; versions outside
 this range are rejected with a protocol error.
 
@@ -166,8 +135,8 @@ this range are rejected with a protocol error.
 | ConsumerGroupDescribe | 0 | 1 | KIP-848 group description |
 | DescribeTopicPartitions | 0 | 0 | Topic partition metadata (KIP-966) |
 | UpdateFeatures | 0 | 2 | Cluster feature versioning (KIP-584), v1 UpgradeType + ValidateOnly, v2 drops per-feature results |
-| GetTelemetrySubscriptions² | 0 | 0 | KIP-714 client telemetry subscription discovery |
-| PushTelemetry² | 0 | 0 | KIP-714 client telemetry push |
+| GetTelemetrySubscriptions | 0 | 0 | KIP-714 client telemetry subscription discovery |
+| PushTelemetry | 0 | 0 | KIP-714 client telemetry push |
 | ShareGroupHeartbeat | 1 | 1 | KIP-932 share group heartbeat |
 | ShareGroupDescribe | 1 | 1 | KIP-932 share group description |
 | ShareFetch | 1 | 2 | KIP-932 share fetch, v2 acquire mode (KIP-1206) + renew ack (KIP-1222) |
@@ -181,53 +150,43 @@ this range are rejected with a protocol error.
 > `latestVersionUnstable`. Where a max is shown in parentheses, that is the
 > feature-gated ceiling.
 >
-> ² Requires the `telemetry` feature flag.
->
 > The share-group APIs are **not** behind `unstable-protocol` — Kafka marks none
-> of them unstable, and krafka negotiates them on every build. The
-> `ShareConsumer` module sits behind `share-groups`, on by default.
+> of them unstable, and krafka negotiates them on every build.
 >
-> `StreamsGroupDescribe` (key 89) is likewise ungated — it is an ordinary
-> `AdminClient` operation. Its sibling `StreamsGroupHeartbeat` (key 88) is
-> **deliberately not implemented**: see below.
+> `StreamsGroupDescribe` (key 89) is likewise ungated; see
+> [Admin Client → Streams groups](@/docs/admin.md#streams-groups-kip-1071).
+> `StreamsGroupHeartbeat` (key 88) is not implemented: its request carries the
+> application topology, which only a Streams runtime can supply.
 
-### KIP-1071: why only the describe half
+### How the table is checked
 
-KIP-1071 adds two APIs, and krafka implements exactly one of them.
+Two checks, both in CI.
 
-`StreamsGroupHeartbeat` (key 88) is a Streams **runtime** API. Its request
-carries the application topology — subtopologies, repartition topics, changelog
-topics — and the coordinator assigns tasks from it. Sending it requires *being*
-a Streams runtime. A client that fabricated a topology would not merely be
-wrong locally: the topology is group-wide state, so it would corrupt what every
-real member of that group is assigned from. krafka has no Streams layer, so it
-does not send this.
+**Against the crate**, `just site-check` compares every row above with the
+`api_versions!` table in `src/protocol/mod.rs`, which defines the `MIN` and
+`MAX` constants the client negotiates with: an implemented API missing from
+this page, a different minimum, a ceiling the page does not mention, or a row
+for an API the crate does not implement fails it.
 
-`StreamsGroupDescribe` (key 89) is purely observational and is what an operator
-actually needs — see
-[Admin Client → Streams Groups](@/docs/admin.md).
-
-### How this table stays honest
-
-Two mechanisms, neither of which is "someone remembered".
-
-**Within the crate**, the rows above are generated from the same `api_versions!`
-macro tokens that initialise the `*_MIN` / `*_MAX` constants, so the published
-table cannot understate or overstate what the client negotiates.
-
-**Against Kafka**, `just protocol-parity` diffs the table against Apache Kafka's
-own message schemas and fails CI on any of five conditions:
+**Against Kafka**, `just protocol-parity` (`xtask/protocol_parity.py`) diffs the
+`api_versions!` table against Apache Kafka's own message schemas and fails on
+any of six conditions:
 
 | Check | Catches |
 |-------|---------|
-| Name and key agree | A protocol rename applied to one place only — e.g. `ListClientMetricsResources` → `ListConfigResources` in Kafka 4.1 |
-| MIN is still valid | A version Kafka removed in a major release, which every broker now rejects |
-| MAX does not overstate | An ungated row naming a version Kafka marks `latestVersionUnstable` |
-| MAX does not understate | A stable Kafka version this client silently declines to negotiate |
-| Flexible boundary matches | An off-by-one in `ApiKey::flexible_version()`, which would make every request unparseable |
+| 1. Name and key agree | An API missing from Kafka's schemas under that name, or a different API key |
+| 2. MIN is still valid | A minimum below Kafka's floor: a version Kafka removed in a major release, which every broker rejects |
+| 3. MAX does not overstate | An ungated row reaching a version Kafka marks `latestVersionUnstable` |
+| 4. MAX does not understate | A stable Kafka version the client does not negotiate, unless the API is in `DELIBERATE_GAPS` |
+| 5. The `unstable-protocol` gate is needed | A row gated on `unstable-protocol` whose ceiling Kafka already ships as stable |
+| 6. Flexible boundary matches | An off-by-one in `ApiKey::flexible_version()`, which decides the header version and every compact field |
 
-The check reads a vendored snapshot (`xtask/kafka_protocol_snapshot.json`), so
-it needs no network and cannot flake. Track a newer Kafka release deliberately:
+It also fails when Kafka has an API with neither a row in `api_versions!` nor
+an entry in `DELIBERATE_GAPS`, and when Kafka has removed an API the client
+still negotiates.
+
+The check reads a vendored snapshot (`xtask/kafka_protocol_snapshot.json`) and
+needs no network. To track a newer Kafka release:
 
 ```sh
 just refresh-protocol-snapshot 4.3   # rewrite the snapshot; review the diff
@@ -238,41 +197,122 @@ Deliberate omissions live in a `DELIBERATE_GAPS` table in the script, each with
 a written reason — broker-internal APIs, the KIP-1071 Streams protocol, the
 legacy `AlterConfigs` that `IncrementalAlterConfigs` supersedes.
 
-#### Why some ceilings stop short
+#### Unstable versions
 
-A schema marked `latestVersionUnstable: true` is **not advertised by a released
-broker** unless it was started with `unstable.api.versions.enable=true`, so
-implementing it buys nothing and costs a rejected round trip on every
-connection.
+A released broker advertises a version marked `latestVersionUnstable` only with
+`unstable.api.versions.enable=true`. Such versions sit behind the
+`unstable-protocol` feature: in Kafka 4.3 that is `InitProducerId` v6 (KIP-939
+two-phase commit). `ApiVersions` v5 (KIP-1242), which no released Kafka
+has, is gated the same way.
 
-In Kafka 4.3 exactly one API carries that flag: `InitProducerId` v6 (KIP-939
-two-phase commit), which is why it sits behind `unstable-protocol`.
-`ListOffsets` v11, `AddPartitionsToTxn` v5, `EndTxn` v5 and `DescribeQuorum` v2
-set it explicitly to `false` — they are stable, and krafka negotiates all of
-them.
+### KIP support
 
-### Version Constants
+Every KIP this documentation names, generated from `xtask/kips.toml`. Each
+status cites the evidence that holds it — an `api_versions!` row, a Cargo
+feature or a public item — and `just claims-check` fails if the evidence does
+not resolve, or if this table is edited by hand. Tracked against
+<!-- generated:kips:kafka-ref -->Apache Kafka 4.3<!-- /generated -->.
 
-Client-supported versions are defined in `krafka::protocol::versions`:
+<!-- generated:kips:kip-table -->
+| KIP | Title | Status | Evidence | Note |
+|-----|-------|--------|----------|------|
+| KIP-219 | Improve quota communication | implemented | `Produce` v6+, `Fetch` v8+ |  |
+| KIP-227 | Introduce incremental FetchRequests to increase partition scalability | implemented | `Fetch` v7+ |  |
+| KIP-255 | OAuth authentication via SASL/OAUTHBEARER | implemented | `auth::OAuthBearerToken`, `AuthConfig::sasl_oauthbearer_token` |  |
+| KIP-320 | Allow fetchers to detect and handle log truncation | implemented | `Fetch` v9+, `OffsetForLeaderEpoch` v2+, `ListOffsets` v4+, `OffsetCommit` v6+, `consumer::OffsetAndMetadata`, `admin::EpochEndOffset` |  |
+| KIP-345 | Introduce static membership protocol to reduce consumer rebalances | implemented | `JoinGroup` v4+, `Heartbeat` v3+, `LeaveGroup` v3+ |  |
+| KIP-360 | Improve reliability of idempotent/transactional producer | implemented | `InitProducerId` v3+, `producer::TransactionalProducer` |  |
+| KIP-368 | Allow SASL connections to periodically re-authenticate | partial | `auth::AuthConfig` | The broker-reported session lifetime is honoured by replacing a pooled connection before it expires; in-band re-authentication of a live connection is not implemented. |
+| KIP-373 | Allow users to create delegation tokens for other users | implemented | `CreateDelegationToken` v3+, `DescribeDelegationToken` v3+, `CreateDelegationTokenOptions::owner`, `admin::DelegationToken` |  |
+| KIP-392 | Allow consumers to fetch from closest replica | implemented | `Fetch` v11+, `OffsetForLeaderEpoch` v3+ |  |
+| KIP-405 | Kafka tiered storage | implemented | `ListOffsets` v8+, `OffsetSpec::EarliestLocal` | Tiered storage itself is broker-side; the client part is the local log-start offset spec and the OFFSET_MOVED_TO_TIERED_STORAGE error. |
+| KIP-429 | Kafka consumer incremental rebalance protocol | implemented | `PartitionAssignmentStrategy::CooperativeSticky`, `consumer::ConsumerRebalanceListener` |  |
+| KIP-447 | Producer scalability for exactly once semantics | implemented | `TxnOffsetCommit` v3+, `TransactionalProducer::send_offsets`, `consumer::ConsumerGroupMetadata` |  |
+| KIP-455 | Create an administrative API for replica reassignment | implemented | `AlterPartitionReassignments` v0+, `ListPartitionReassignments` v0+, `admin::AlterPartitionReassignmentsOptions`, `admin::PartitionReassignment` |  |
+| KIP-460 | Admin leader election RPC | implemented | `ElectLeaders` v1+, `admin::ElectionType` |  |
+| KIP-464 | Defaults for AdminClient#createTopic | implemented | `CreateTopics` v4+, `admin::NewTopic` |  |
+| KIP-511 | Collect and expose client's name and version in the brokers | implemented | `ApiVersions` v3+ |  |
+| KIP-512 | Make record headers available in onAcknowledgement | implemented | `interceptor::ProducerInterceptor` |  |
+| KIP-516 | Topic identifiers | implemented | `Metadata` v10+, `Fetch` v13+, `Produce` v13+, `DeleteTopics` v6+ |  |
+| KIP-518 | Allow listing consumer groups per state | implemented | `ListGroups` v4+, `ListConsumerGroupsOptions::states` |  |
+| KIP-525 | Return topic metadata and configs in CreateTopics response | partial | `CreateTopics` v5+ | CreateTopics v5+ is negotiated, but create_topics returns only per-topic success, so the partition count, replication factor and configs in the response are not surfaced. |
+| KIP-554 | Add broker-side SCRAM config API | implemented | `DescribeUserScramCredentials` v0+, `AlterUserScramCredentials` v0+, `admin::ScramCredentialInfo`, `admin::ScramCredentialUpsertion` |  |
+| KIP-559 | Make the Kafka protocol friendlier with L7 proxies | implemented | `JoinGroup` v7+, `SyncGroup` v5+ |  |
+| KIP-584 | Versioning scheme for features | implemented | `ApiVersions` v3+, `UpdateFeatures` v1+, `admin::FeatureMetadata`, `admin::UpdateFeaturesOptions` |  |
+| KIP-599 | Throttle create topic, create partition and delete topic operations | implemented | `CreateTopics` v6+, `CreatePartitions` v3+, `DeleteTopics` v5+ |  |
+| KIP-664 | Provide tooling to detect and abort hanging transactions | implemented | `DescribeProducers` v0+, `DescribeTransactions` v0+, `ListTransactions` v0+, `WriteTxnMarkers` v1+, `admin::ProducerState`, `admin::TransactionDescription`, `admin::TransactionListing`, `admin::AbortTransactionOptions` |  |
+| KIP-679 | Producer will enable the strongest delivery guarantee by default | implemented | `ProducerBuilder::idempotent` |  |
+| KIP-699 | Update FindCoordinator to resolve multiple coordinators at a time | implemented | `FindCoordinator` v4+ |  |
+| KIP-714 | Client metrics and observability | implemented | `GetTelemetrySubscriptions` v0+, `PushTelemetry` v0+, `ListConfigResources` v0+, `ProducerBuilder::metrics_push`, `Consumer::client_instance_id` |  |
+| KIP-734 | Improve AdminClient.listOffsets to return timestamp and offset for the record with the largest timestamp | implemented | `ListOffsets` v7+, `OffsetSpec::MaxTimestamp` |  |
+| KIP-768 | Extend SASL/OAUTHBEARER with support for OIDC | implemented | feature `oauth-oidc`, `auth::OidcTokenProvider`, `ClientCredentials::Secret` |  |
+| KIP-794 | Strictly uniform sticky partitioner | partial | `ProducerBuilder::batch_size` | Keyless records stick to a partition for batch_size bytes and then switch at random, but the next partition is not weighted by per-broker queue size (partitioner.adaptive.partitioning.enable) and slow brokers are not avoided (partitioner.availability.timeout.ms). |
+| KIP-800 | Add reason to JoinGroupRequest and LeaveGroupRequest | partial | `JoinGroup` v8+, `LeaveGroup` v5+ | JoinGroup v8 and LeaveGroup v5 are negotiated, but the reason field is always sent as null. |
+| KIP-836 | Expose replication information of the cluster metadata | implemented | `DescribeQuorum` v1+, `admin::QuorumReplica` |  |
+| KIP-848 | The next generation of the consumer rebalance protocol | implemented | `ConsumerGroupHeartbeat` v0+, `ConsumerGroupDescribe` v0+, `OffsetCommit` v9+, `GroupProtocol::Consumer`, `admin::ConsumerGroupDescription` |  |
+| KIP-853 | KRaft controller membership changes | partial | `DescribeQuorum` v2+, `Fetch` v17+, `admin::QuorumNode` | Quorum membership can be described, but the AddRaftVoter and RemoveRaftVoter admin RPCs are not implemented. |
+| KIP-890 | Transactions server-side defense | implemented | `Produce` v12+, `EndTxn` v5+, `InitProducerId` v5+, `AddOffsetsToTxn` v4+, `TxnOffsetCommit` v5+, `producer::TransactionVersion` |  |
+| KIP-899 | Allow producer and consumer clients to rebootstrap | implemented | `krafka::MetadataRecoveryStrategy`, `Kafka::rebootstrap`, `KafkaBuilder::metadata_recovery_strategy` |  |
+| KIP-903 | Replicas with stale broker epoch should not be allowed to join the ISR | implemented | `Fetch` v15+ | Broker-side change; the client only negotiates Fetch v15, which moves ReplicaId into ReplicaState. |
+| KIP-932 | Queues for Kafka | partial | `ShareGroupHeartbeat` v1+, `ShareFetch` v1+, `ShareAcknowledge` v1+, `FindCoordinator` v6+, `DescribeShareGroupOffsets` v0+, `AlterShareGroupOffsets` v0+, `DeleteShareGroupOffsets` v0+, `share_consumer::ShareConsumer`, `admin::SharePartitionOffset` | The share consumer and share-group offset administration are implemented, but ShareGroupDescribe is never sent, so no admin call describes or lists share groups' members. |
+| KIP-939 | Support participation in 2PC | implemented | `InitProducerId` v6+, feature `unstable-protocol`, `ProducerBuilder::two_phase_commit`, `TransactionalProducer::prepare`, `TransactionalProducer::complete`, `producer::PreparedTxnState` |  |
+| KIP-951 | Leader discovery optimisations for the client | implemented | `Fetch` v16+, `Produce` v10+ |  |
+| KIP-966 | Eligible leader replicas | implemented | `DescribeTopicPartitions` v0+, `admin::PartitionDescription` |  |
+| KIP-994 | Minor enhancements to ListTransactions and DescribeTransactions APIs | implemented | `ListTransactions` v1+, `ListTransactionsOptions::min_duration` |  |
+| KIP-1005 | Expose EarliestLocalOffset and TieredOffset | implemented | `ListOffsets` v9+, `OffsetSpec::LatestTiered` |  |
+| KIP-1023 | Follower fetch from tiered offset | implemented | `ListOffsets` v11+, `OffsetSpec::EarliestPendingUpload` |  |
+| KIP-1030 | Change constraints and default values for various configurations | implemented | `ProducerBuilder::linger` |  |
+| KIP-1043 | Administration of groups | implemented | `DescribeGroups` v6+, `ListGroups` v5+, `admin::GroupType`, `ListConsumerGroupsOptions::types` |  |
+| KIP-1066 | Mechanism to cordon brokers and log directories | implemented | `DescribeLogDirs` v5+, `admin::LogDirDescription` |  |
+| KIP-1071 | Streams rebalance protocol | partial | `StreamsGroupDescribe` v0+, `admin::DescribedStreamsGroup`, `admin::DescribeStreamsGroupsOptions` | Streams groups can be described, but StreamsGroupHeartbeat is not implemented because its request carries an application topology that only a Streams runtime can supply. |
+| KIP-1075 | Introduce delayed remote list offsets purgatory to make LIST_OFFSETS async | implemented | `ListOffsets` v10+ |  |
+| KIP-1082 | Require client-generated IDs over the ConsumerGroupHeartbeat RPC | implemented | `ConsumerGroupHeartbeat` v1+ |  |
+| KIP-1092 | Extend Consumer#close with an option to leave the group or not | implemented | `GroupMembershipOperation::RemainInGroup`, `CloseOptions::group_membership_operation` |  |
+| KIP-1102 | Enable clients to rebootstrap based on timeout or error code | implemented | `Metadata` v13+, `KafkaBuilder::metadata_recovery_rebootstrap_trigger` |  |
+| KIP-1106 | Add duration based offset reset option for consumer clients | implemented | `AutoOffsetReset::ByDuration` |  |
+| KIP-1123 | Rack-aware partitioning for Kafka producer | implemented | `ProducerBuilder::partitioner_rack_aware` |  |
+| KIP-1142 | Allow to list non-existent group which has dynamic config | implemented | `ListConfigResources` v1+, `admin::ListedConfigResource`, `admin::ListConfigResourcesOptions` |  |
+| KIP-1152 | Add transactional ID pattern filter to ListTransactions API | implemented | `ListTransactions` v2+, `ListTransactionsOptions::transactional_id_pattern` |  |
+| KIP-1160 | Enable returning supported features from a specific broker | implemented | `DescribeFeaturesOptions::node_id` |  |
+| KIP-1166 | Improve high-watermark replication | implemented | `Fetch` v18+ | The new field is populated only by follower fetches; the client negotiates Fetch v18. |
+| KIP-1206 | Strict max fetch records in share fetch | implemented | `ShareFetch` v2+, `AcquireMode::RecordLimit`, `ShareConsumerBuilder::acquire_mode` |  |
+| KIP-1222 | Acquisition lock timeout renewal in share consumer explicit mode | implemented | `ShareFetch` v2+, `ShareAcknowledge` v2+, `ShareConsumer::renew`, `ShareConsumer::acquisition_lock_timeout` |  |
+| KIP-1226 | Share partition lag persistence and retrieval | implemented | `DescribeShareGroupOffsets` v1+, `admin::SharePartitionOffset` |  |
+| KIP-1242 | Detection and handling of misrouted connections | partial | `ApiVersions` v5+, feature `unstable-protocol` | ApiVersions v5 is encoded behind unstable-protocol, but the ClusterId and NodeId fields are never populated and REBOOTSTRAP_REQUIRED from ApiVersions does not trigger a rebootstrap. |
+| KIP-1258 | Add support for OAuth client assertion to client_credentials grant type | implemented | feature `oauth-oidc`, `auth::AssertionSource`, `ClientCredentials::Assertion` |  |
+| KIP-1274 | Deprecate and remove support for the classic rebalance protocol in KafkaConsumer | implemented | `GroupProtocol::Classic`, `GroupProtocol::Consumer` | As of Kafka 4.3 the client part is a deprecation warning when the classic protocol is used, which krafka emits once per process. |
+| KIP-1288 | SSL certificate hot reload | implemented | `Kafka::refresh_tls`, `KafkaBuilder::tls_reload_interval` |  |
+<!-- /generated -->
 
-```rust,compile
-use krafka::protocol::versions;
+#### Not implemented
 
-// Each API has both MIN and MAX constants
-let min_fetch = versions::FETCH_MIN;        // 4  (Kafka 3.9+ baseline)
-let max_fetch = versions::FETCH_MAX;        // 18 (v18 KIP-1166 high-watermark)
-let min_produce = versions::PRODUCE_MIN;    // 3  (v3+ transactions)
-let max_produce = versions::PRODUCE_MAX;    // 13 (v13 topic UUIDs, KIP-516)
-let max_metadata = versions::METADATA_MAX;  // 13 (v13 top-level error_code)
-```
+<!-- generated:kips:not-implemented -->
+- **SASL/GSSAPI (Kerberos) authentication** (GSSAPI) — No mature pure-Rust GSSAPI implementation exists, and linking system Kerberos libraries would add a C dependency for every user.
+- **Schema registry client** (schema-registry) — A schema registry is a separate service with its own protocol; krafka provides the serdes::Serializer and Deserializer hooks instead.
+- **Async runtimes other than Tokio** (runtime-agnostic) — krafka is built on Tokio and does not abstract over the async runtime.
+- **Kafka Streams runtime** (streams-runtime) — krafka is a client library with no stream-processing runtime, which is also why StreamsGroupHeartbeat is not implemented.
+- **Broker-, controller- and KRaft-internal APIs** (broker-internal-apis) — APIs such as LeaderAndIsr, UpdateMetadata, Vote and the share-group state persister are spoken between brokers, not by clients.
+- **KIP-368 Allow SASL connections to periodically re-authenticate**, partly — The broker-reported session lifetime is honoured by replacing a pooled connection before it expires; in-band re-authentication of a live connection is not implemented.
+- **KIP-525 Return topic metadata and configs in CreateTopics response**, partly — CreateTopics v5+ is negotiated, but create_topics returns only per-topic success, so the partition count, replication factor and configs in the response are not surfaced.
+- **KIP-794 Strictly uniform sticky partitioner**, partly — Keyless records stick to a partition for batch_size bytes and then switch at random, but the next partition is not weighted by per-broker queue size (partitioner.adaptive.partitioning.enable) and slow brokers are not avoided (partitioner.availability.timeout.ms).
+- **KIP-800 Add reason to JoinGroupRequest and LeaveGroupRequest**, partly — JoinGroup v8 and LeaveGroup v5 are negotiated, but the reason field is always sent as null.
+- **KIP-853 KRaft controller membership changes**, partly — Quorum membership can be described, but the AddRaftVoter and RemoveRaftVoter admin RPCs are not implemented.
+- **KIP-932 Queues for Kafka**, partly — The share consumer and share-group offset administration are implemented, but ShareGroupDescribe is never sent, so no admin call describes or lists share groups' members.
+- **KIP-1071 Streams rebalance protocol**, partly — Streams groups can be described, but StreamsGroupHeartbeat is not implemented because its request carries an application topology that only a Streams runtime can supply.
+- **KIP-1242 Detection and handling of misrouted connections**, partly — ApiVersions v5 is encoded behind unstable-protocol, but the ClusterId and NodeId fields are never populated and REBOOTSTRAP_REQUIRED from ApiVersions does not trigger a rebootstrap.
+- `AlterConfigs` is implemented below Kafka's ceiling — superseded by IncrementalAlterConfigs, which krafka uses instead; the legacy whole-config replace is not exposed
+- `SaslHandshake` is implemented below Kafka's ceiling — pinned at v1 by the handshake path; v0 has no mechanism list
+- `SaslAuthenticate` is implemented below Kafka's ceiling — pinned at v1: v2 only adds flexible encoding, and the pre-auth reader is deliberately version-pinned so an unauthenticated peer cannot steer it
+- Not spoken by a client (broker-, controller- and KRaft-internal): `LeaderAndIsr`, `StopReplica`, `UpdateMetadata`, `ControlledShutdown`, `Vote`, `BeginQuorumEpoch`, `EndQuorumEpoch`, `AlterPartition`, `Envelope`, `FetchSnapshot`, `BrokerRegistration`, `BrokerHeartbeat`, `UnregisterBroker`, `AllocateProducerIds`, `ControllerRegistration`, `AssignReplicasToDirs`, `UpdateRaftVoter`, `InitializeShareGroupState`, `ReadShareGroupState`, `WriteShareGroupState`, `DeleteShareGroupState`, `ReadShareGroupStateSummary`
+<!-- /generated -->
 
 ## Record Batches
 
 krafka uses Kafka's v2 record batch format with:
 
-- Magic byte 2 (modern format)
-- CRC32C checksums (validated on decode)
-- Variable-length encoding for efficiency
+- Magic byte 2
+- CRC32C checksums, validated on decode
+- Varint-encoded record fields
 - Optional compression (gzip, snappy, lz4, zstd)
 
 ### Header Versioning
@@ -295,59 +335,35 @@ version (needed for protocol bootstrapping).
 
 ### Unified Version Dispatch
 
-Core request/response message types in `krafka::protocol` implement the `VersionedEncode` and `VersionedDecode` traits, which dispatch to the correct `encode_vN`/`decode_vN` method based on the protocol version number:
+Every request and response type encodes and decodes each supported version
+through one entry point that dispatches on the negotiated version number.
+Unsupported version numbers (including negative values) return a descriptive
+`KrafkaError::Protocol` error.
 
-```rust,compile
-use krafka::protocol::{VersionedEncode, VersionedDecode, MetadataRequest, MetadataResponse};
-
-let request = MetadataRequest::all_topics();
-let mut buf = bytes::BytesMut::new();
-
-// Encode for a specific protocol version — dispatches to the right encoder
-request.encode_versioned(1, &mut buf)?;
-
-// In real usage, `response_buf` would be filled with bytes read from the network.
-let mut response_buf = buf.freeze();
-
-// Decode response for a specific version
-let response = MetadataResponse::decode_versioned(1, &mut response_buf)?;
-```
-
-Unsupported version numbers (including negative values) return a descriptive `KrafkaError::protocol` error.
-
-### Creating Records
-
-```rust
-use krafka::protocol::{RecordBatchBuilder, Compression};
-
-let batch = RecordBatchBuilder::new()
-    .compression(Compression::Snappy)
-    .add_record(Some(b"key"), Some(b"value"), vec![])
-    .add_record(None, Some(b"value-only"), vec![])
-    .build()?;
-```
+The protocol layer is internal: it is not part of krafka's public API and is
+not covered by semver.
 
 ### Compression Support
 
 | Codec | Feature | Notes |
 |-------|---------|-------|
 | None | Default | No compression |
-| Gzip | `gzip` via default `compression` | Good compression, slower |
-| Snappy | `snappy` via default `compression` | Fast, moderate compression |
-| LZ4 | `lz4` via default `compression` | Very fast, good compression |
-| Zstd | `zstd` or `compression-all` | Best compression, fast; requires a C toolchain via `zstd-sys` |
+| Gzip | Always on | Good compression, slower |
+| Snappy | Always on | Fast, moderate compression. Encoded and decoded in snappy-java's stream format, as the Java client writes it; raw snappy also decodes |
+| LZ4 | Always on | Very fast, good compression |
+| Zstd | Decode always on; encode with `zstd` | High ratio, fast decode. Decoding is pure Rust (`ruzstd`); encoding compiles the C zstd library through `zstd-sys` |
 
-> **Note:** Decompression output is capped at 128 MiB by default to protect against compression bombs. This limit is configurable via `ConsumerConfig::max_decompressed_size()`. Compressed payloads that expand beyond the limit will return a `KrafkaError::compression` error.
+> **Note:** Decompression output is capped at 128 MiB by default to protect against compression bombs. This limit is configurable with the consumer builder's `max_decompressed_size`. Compressed payloads that expand beyond the limit will return a `KrafkaError::compression` error.
 
 ## Protocol Safety
 
-krafka protects against malicious or corrupted broker responses:
+Limits on what a malicious or corrupted broker response can make the client do:
 
-- **Decode array bounds**: Every array-length field decoded from the wire is validated against `MAX_DECODE_ARRAY_LEN` (100,000), typically via `check_decode_array_len()` and in some specialized decode paths (e.g., `KafkaArray::decode`, record batch counts) via equivalent local checks. These checks reject negative counts and oversized counts across all 63+ protocol-message decode sites, `KafkaArray` decode paths, and record batch/header counts. The validation runs *before* any `Vec::with_capacity()` allocation, preventing both OOM and runaway decode loops.
+- **Decode array bounds**: Every array length decoded from the wire is checked against `MAX_DECODE_ARRAY_LEN` (100,000) before anything is allocated for it.
+- **Record batch bounds**: A record batch has no record-count limit; it is bounded by its bytes. A declared count larger than the record bytes can hold (7 bytes per record at least) is rejected before anything is allocated for it, and decompressed output is bounded by the size limit below.
 - **Decompression limits**: Decompressed record data is limited to 128 MiB (configurable) via streaming `.take()` limits and post-decompression size checks
-- **Record headers**: Record headers are preserved during batch building — no silent data loss
-- **Encode validation**: The `TryEncode` trait provides fallible encoding for protocol primitives (`KafkaString`, `KafkaBytes`, `KafkaArray<T>` where `T: TryEncode`, `TaggedFields`), returning errors instead of panicking on oversized data. `ProducerRecord::validate()` checks wire-format limits at the API boundary before encoding
-- **Fuzz testing**: The `fuzz/` directory provides [cargo-fuzz](https://rust-fuzz.github.io/book/cargo-fuzz.html) targets for `KafkaArray` decode, `RecordBatch` decode, and response message decode across multiple API versions. See `fuzz/README.md` for usage.
+- **Encode validation**: The `TryEncode` trait provides fallible encoding for protocol primitives (`KafkaString`, `KafkaBytes`, `KafkaArray<T>` where `T: TryEncode`, `TaggedFields`), returning an error on oversized data. `Record::validate()` checks wire-format limits at the API boundary before encoding
+- **Fuzz testing**: The `fuzz/` directory provides [cargo-fuzz](https://rust-fuzz.github.io/book/cargo-fuzz.html) targets for the framing header and primitives, `KafkaArray` decode, `RecordBatch` decode, every response decoder at every version in the table above, request encode, the SCRAM exchange, the OIDC token client's HTTP response parser, and record-batch decompression under a small cap in every codec. `just fuzz-coverage` fails when a version in the table has no fuzz path. Every pull request runs each target for 60 seconds from committed seeds, and a nightly run fuzzes each for 30 minutes. See `fuzz/README.md` for usage.
 
 ## Wire Protocol
 
@@ -379,13 +395,19 @@ All messages are length-prefixed with a 4-byte big-endian size field.
 +---------------+
 ```
 
-## Zero-Copy Design
+## Buffers
 
-krafka uses `bytes::Bytes` throughout for zero-copy buffer management:
-
-- Incoming data is parsed without copying
-- Record payloads share underlying buffers
-- Memory is released when last reference drops
+- The reader reserves each response frame once, at the size its length prefix
+  declares, and reads socket data straight into it: a 16 MiB frame is one
+  allocation of 1.01× its size.
+- A record batch's header is parsed first; the consumer skips aborted
+  transactional batches from the header, without decompressing them.
+- Decoded record keys, values and header values are slices of the response
+  buffer (uncompressed) or of the decompressed buffer. Decoding 1000
+  uncompressed 100-byte records makes one allocation (the record list),
+  0.89× the wire size.
+- A record kept alive keeps the buffer it came from alive. Copy the bytes you
+  retain long-term if the rest of the response should be freed.
 
 ## Broker Compatibility
 
@@ -403,38 +425,52 @@ command:
 
 ```sh
 just integration-matrix                  # Kafka 3.9.0 → 4.3.0
+just integration-sasl-matrix             # SASL suite on Kafka 3.9.0 and 4.3.1
 just integration-matrix "4.2.0 4.3.0"    # a subset
 KAFKA_VERSION=4.3.0 just integration     # a single version
 ```
 
 ### Redpanda
 
-Redpanda works out of the box — no configuration, no feature flag:
+Redpanda needs no configuration and no feature flag:
 
 - **Version negotiation** lands inside Redpanda's advertised ranges for every
-  API krafka's clients need (krafka's floors — Produce v3, Fetch v4,
-  Metadata v1 — sit well below what current Redpanda advertises).
+  API krafka's clients need.
 - **Transactions fall back to TV1 automatically.** Redpanda does not
   implement server-side KIP-890 transaction version 2; krafka's
   `TransactionalProducer` probes the cluster's finalized
-  `transaction.version` feature at `init_transactions()` and uses the
-  classic explicit-`AddPartitionsToTxn` protocol when the feature is absent —
-  the same fallback the Java 4.x client performs.
-- **KIP-848 consumer groups** are implemented by current Redpanda, so the
-  next-generation group protocol works there too; the classic protocol is
-  the fallback either way.
-- **What does not apply:** APIs Redpanda does not implement — KIP-932 share
-  groups (`ShareConsumer`), log-dir administration, `DescribeQuorum` — fail
-  fast with a clear `UnknownApiVersion` error rather than degrading
-  silently, exactly as they do against an older Apache Kafka.
+  `transaction.version` feature in `build_transactional` and uses the
+  classic explicit-`AddPartitionsToTxn` protocol when the feature is absent,
+  as the Java 4.x client does.
+- **APIs Redpanda does not implement** (KIP-932 share groups, log-dir
+  administration, `DescribeQuorum`) fail with `UnknownApiVersion`; see
+  [A cluster without a feature](#a-cluster-without-a-feature).
 
-A dedicated smoke suite pins this against a real Redpanda container,
-including the TV1 fallback and `read_committed` visibility:
+The Redpanda suite covers a produce/consume round trip, the admin topic
+lifecycle, the TV1 transaction fallback with `read_committed` visibility, and
+closing a consumer without wedging a shared connection. CI gates every merge on
+the Redpanda release pinned in `tests/redpanda/Dockerfile`, and runs the same
+suite against `latest` weekly without gating:
 
 ```sh
-just integration-redpanda
-REDPANDA_VERSION=v25.1.1 just integration-redpanda   # pin a tag
+just integration-redpanda                           # the pinned release
+REDPANDA_VERSION=latest just integration-redpanda   # the current release
 ```
+
+### A cluster without a feature
+
+A broker that lacks an API, or refuses a feature, fails the call with an error
+whose message names the missing feature and, where one exists, the setting that
+avoids it. The error keeps its kind (`UnknownApiVersion` when the API cannot be
+negotiated) and the broker's error code.
+
+| The cluster lacks | Fails in | Error | Avoid it with |
+|---|---|---|---|
+| KIP-848 consumer groups (`ConsumerGroupHeartbeat`) | `poll` / `recv` | `Protocol(UnknownApiVersion)` | `.group_protocol(GroupProtocol::Classic)` |
+| Share groups (`ShareGroupHeartbeat`, `ShareFetch`, `ShareAcknowledge`) | share consumer `subscribe` / `poll` | `Protocol(UnknownApiVersion)` | none: share groups need Apache Kafka 4.2+ |
+| Idempotent producers (`InitProducerId` missing or refused) | `ProducerBuilder::build`, then every pending `send` | `Protocol(UnknownApiVersion)`, or `Broker` with the broker's code | `.idempotent(false)` |
+| The batch's compression codec (`UNSUPPORTED_COMPRESSION_TYPE`) | `send` | `Broker(UnsupportedCompressionType)`, naming the codec | `.compression(..)` / `.topic_compression(..)` |
+| Transactions (`InitProducerId`, `EndTxn`, `AddPartitionsToTxn`, `AddOffsetsToTxn`) | `build_transactional`, or the first transactional send | `Protocol(UnknownApiVersion)` | none: use a non-transactional producer |
 
 ## Next Steps
 

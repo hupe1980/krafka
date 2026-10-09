@@ -1,13 +1,9 @@
 //! Producer configuration.
 
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use crate::auth::AuthConfig;
-use crate::dlq::DeadLetterQueue;
 use crate::error::{KrafkaError, Result};
-use crate::metadata::MetadataRecoveryStrategy;
 use crate::protocol::Compression;
 
 /// Required acknowledgments for produce requests.
@@ -50,307 +46,141 @@ impl Acks {
     }
 }
 
-/// Producer configuration.
-///
-/// Produced by [`Producer::builder()`](crate::producer::Producer::builder), whose
-/// [`build_config`](crate::producer::ProducerBuilder::build_config) terminal
-/// returns it without connecting. [`Default::default()`] also works.
+/// Producer settings, as the builder collected them.
 #[derive(Debug, Clone)]
-pub struct ProducerConfig {
-    /// Bootstrap servers (comma-separated).
-    pub(crate) bootstrap_servers: String,
-    /// Client ID.
-    pub(crate) client_id: String,
+pub(crate) struct ProducerConfig {
     /// Required acknowledgments.
     pub(crate) acks: Acks,
     /// Compression type.
     pub(crate) compression: Compression,
-    /// Compression level, or `None` for the codec's own default.
-    ///
-    /// Applies to whichever codec is active, including per-topic overrides.
-    /// Kafka's own configuration splits this per codec
-    /// (`compression.gzip.level`, `compression.zstd.level`, KIP-390); a single
-    /// value is used here because krafka validates it against the *selected*
-    /// codec at build time, so the per-codec split would only add a way to set
-    /// a level for a codec you are not using.
+    /// Compression level, or `None` for the codec's own default. Applies to
+    /// whichever codec is active, including per-topic overrides, and is
+    /// validated against each of them.
     pub(crate) compression_level: Option<i32>,
-    /// Per-topic compression overrides.
-    ///
-    /// When a topic name is present in this map, its compression type takes
-    /// precedence over the global [`compression`](Self::compression) setting.
-    /// Use [`ProducerBuilder::topic_compression`](crate::producer::ProducerBuilder::topic_compression) to populate this map.
+    /// Per-topic compression overrides, taking precedence over `compression`.
     pub(crate) topic_compression: HashMap<String, Compression>,
-    /// Batch size in bytes.
+    /// Batch size in bytes; also how many bytes of keyless records stick to
+    /// one partition before the built-in partitioner switches (KIP-794).
     pub(crate) batch_size: usize,
-    /// Time to wait before sending a batch.
+    /// How long a batch may wait for more records before it is sent, when its
+    /// partition has nothing in flight. Default 5 ms (KIP-1030).
     pub(crate) linger: Duration,
-    /// Request timeout.
-    pub(crate) request_timeout: Duration,
-    /// Time allowed for TCP establishment to one broker.
-    pub(crate) connect_timeout: Duration,
-    /// Total delivery timeout for a record, including retries and time spent queued.
+    /// Bound from a batch's creation to its records' outcome, retries and
+    /// time spent queued included. The only bound on retries; at least
+    /// `linger + request_timeout`.
     pub(crate) delivery_timeout: Duration,
-    /// Number of retries.
-    ///
-    /// Defaults to `u32::MAX` (effectively unlimited). The retry loop is
-    /// always bounded by [`delivery_timeout`](ProducerConfig::delivery_timeout),
-    /// which is enforced to be greater than zero. Setting `retries = u32::MAX`
-    /// **without** a finite `delivery_timeout` would create an infinite loop;
-    /// use a finite retry count when disabling the delivery timeout.
-    pub(crate) retries: u32,
-    /// Time between retries.
+    /// First retry delay; doubles per retry, ±20 % jitter, capped at 1 s.
     pub(crate) retry_backoff: Duration,
     /// Maximum encoded Kafka request frame size in bytes.
     pub(crate) max_request_size: usize,
-    /// Enable idempotent producer.
-    ///
-    /// When `true` (the default, matching KIP-679 / Kafka 3.0+), the producer
-    /// obtains a Producer ID from the broker and tracks sequence numbers per
-    /// partition to guarantee exactly-once delivery within a session.
-    ///
-    /// Requires `acks = All`. Per-partition ordering is guaranteed
-    /// structurally — the record accumulator keeps exactly one batch per
-    /// partition on the wire — so there is no in-flight-request limit to
-    /// configure for it, unlike the Java client's `max.in.flight ≤ 5` rule.
+    /// Idempotent production (KIP-679 default). Requires `acks = All`.
     pub(crate) idempotent: bool,
     /// One budget for everything `send()` may block on: fetching metadata for
-    /// an unresolved topic, and waiting for buffer memory when the accumulator
-    /// is full. Mirrors `max.block.ms`.
+    /// an unresolved topic, and waiting for buffer memory (`max.block.ms`).
+    /// Also bounds each transaction coordinator call.
     pub(crate) max_block: Duration,
     /// Buffer memory size.
     pub(crate) buffer_memory: usize,
-    /// Metadata max age.
-    pub(crate) metadata_max_age: Duration,
-    /// Topic cache TTL for partial metadata refreshes.
-    pub(crate) metadata_topic_cache_ttl: Option<Duration>,
-    /// Whether a metadata request for a topic the cluster does not have may
-    /// ask the broker to create it, i.e. `allow.auto.create.topics`.
-    ///
-    /// Defaults to `false`. The broker must have
-    /// `auto.create.topics.enable=true` for this flag to do anything.
-    pub(crate) allow_auto_create_topics: bool,
-    /// Metadata recovery strategy (KIP-899).
-    ///
-    /// When set to [`MetadataRecoveryStrategy::Rebootstrap`], the producer
-    /// falls back to bootstrap servers if metadata refresh fails for longer
-    /// than [`metadata_recovery_rebootstrap_trigger`](Self::metadata_recovery_rebootstrap_trigger).
-    pub(crate) metadata_recovery_strategy: MetadataRecoveryStrategy,
-    /// Duration after which failing metadata refreshes trigger a rebootstrap
-    /// (KIP-899). Only effective with
-    /// [`MetadataRecoveryStrategy::Rebootstrap`]. Default: 300 s.
-    pub(crate) metadata_recovery_rebootstrap_trigger: Duration,
-    /// Authentication configuration (optional).
-    pub(crate) auth: Option<AuthConfig>,
-    /// Socket- and pool-level transport tuning.
-    ///
-    /// Defaults reproduce krafka's historical behaviour; see
-    /// [`TransportConfig`](crate::network::TransportConfig).
-    pub(crate) transport: crate::network::TransportConfig,
-    /// Optional dead-letter queue for permanently-failed records.
-    ///
-    /// When set, records that exhaust all retries (or encounter a
-    /// non-retriable error) are routed to this DLQ
-    /// before the error is returned to the caller.
-    pub(crate) dead_letter_queue: Option<Arc<dyn DeadLetterQueue>>,
+    /// The rack this producer runs in (Java `client.rack`).
+    pub(crate) client_rack: Option<String>,
+    /// Keyless records only go to partitions led in `client_rack` (KIP-1123).
+    pub(crate) partitioner_rack_aware: bool,
+    /// How long the coordinator lets a transaction stay open, when set
+    /// explicitly. Transactional producers only.
+    pub(crate) transaction_timeout: Option<Duration>,
+    /// Participate in an external two-phase commit (KIP-939). Transactional
+    /// producers only.
+    pub(crate) two_phase_commit: bool,
+    /// Push this client's metrics to brokers that subscribe to them (KIP-714,
+    /// Java `enable.metrics.push`).
+    pub(crate) metrics_push: bool,
 }
 
 impl Default for ProducerConfig {
     fn default() -> Self {
         Self {
-            bootstrap_servers: String::new(),
-            client_id: "krafka".to_string(),
             acks: Acks::All,
             compression: Compression::None,
             compression_level: None,
             topic_compression: HashMap::new(),
             batch_size: 16384,
-            linger: Duration::ZERO,
-            request_timeout: Duration::from_secs(30),
-            connect_timeout: crate::network::DEFAULT_CONNECT_TIMEOUT,
+            linger: DEFAULT_LINGER,
             delivery_timeout: Duration::from_secs(120),
-            retries: u32::MAX,
             retry_backoff: Duration::from_millis(100),
             max_request_size: crate::protocol::MAX_MESSAGE_SIZE,
             idempotent: true,
             max_block: Duration::from_secs(60),
-            buffer_memory: 32 * 1024 * 1024, // 32 MB
-            metadata_max_age: Duration::from_secs(300),
-            metadata_topic_cache_ttl: Some(Duration::from_secs(300)),
-            allow_auto_create_topics: false,
-            metadata_recovery_strategy: MetadataRecoveryStrategy::Rebootstrap,
-            metadata_recovery_rebootstrap_trigger: Duration::from_secs(300),
-            auth: None,
-            transport: crate::network::TransportConfig::default(),
-            dead_letter_queue: None,
+            buffer_memory: 32 * 1024 * 1024,
+            client_rack: None,
+            partitioner_rack_aware: false,
+            transaction_timeout: None,
+            two_phase_commit: false,
+            metrics_push: true,
         }
     }
 }
 
+/// The default `linger` (KIP-1030).
+pub(crate) const DEFAULT_LINGER: Duration = Duration::from_millis(5);
+
+/// The transaction timeout when none is set (Java `transaction.timeout.ms`).
+pub(crate) const DEFAULT_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(60);
+
 impl ProducerConfig {
-    /// Returns the bootstrap servers.
-    #[inline]
-    pub fn bootstrap_servers(&self) -> &str {
-        &self.bootstrap_servers
+    /// The transaction timeout sent with `InitProducerId`.
+    pub(crate) fn transaction_timeout(&self) -> Duration {
+        self.transaction_timeout
+            .unwrap_or(DEFAULT_TRANSACTION_TIMEOUT)
     }
+}
 
-    /// Returns the client ID.
-    #[inline]
-    pub fn client_id(&self) -> &str {
-        &self.client_id
+/// Reject `delivery_timeout < linger + request_timeout`, as Java's
+/// `configureDeliveryTimeout` does: a batch could not get even one full
+/// attempt in.
+pub(crate) fn validate_delivery_timeout(
+    delivery_timeout: Duration,
+    linger: Duration,
+    request_timeout: Duration,
+) -> Result<()> {
+    if delivery_timeout < linger + request_timeout {
+        return Err(KrafkaError::config(format!(
+            "delivery_timeout ({delivery_timeout:?}) must be at least linger ({linger:?}) + \
+             request_timeout ({request_timeout:?})"
+        )));
     }
+    Ok(())
+}
 
-    /// Returns the required acknowledgments.
-    #[inline]
-    pub fn acks(&self) -> Acks {
-        self.acks
+/// Rack-aware partitioning needs a client rack and the built-in partitioner.
+pub(crate) fn validate_partitioning(
+    rack_aware: bool,
+    client_rack: Option<&str>,
+    custom_partitioner: bool,
+) -> Result<()> {
+    if !rack_aware {
+        return Ok(());
     }
-
-    /// Returns the compression type.
-    #[inline]
-    pub fn compression(&self) -> Compression {
-        self.compression
+    if client_rack.is_none_or(str::is_empty) {
+        return Err(KrafkaError::config(
+            "partitioner_rack_aware requires client_rack: without the client's rack there is \
+             no rack to stay in",
+        ));
     }
-
-    /// Returns the configured compression level, or `None` for the codec
-    /// default.
-    #[inline]
-    pub fn compression_level(&self) -> Option<i32> {
-        self.compression_level
+    if custom_partitioner {
+        return Err(KrafkaError::config(
+            "partitioner_rack_aware has no effect with a custom partitioner; remove one of \
+             partitioner_rack_aware and partitioner",
+        ));
     }
-
-    /// Returns the effective compression for a given topic.
-    ///
-    /// If a per-topic override was configured via
-    /// [`ProducerBuilder::topic_compression`](crate::producer::ProducerBuilder::topic_compression), that value is returned;
-    /// otherwise the global [`compression()`](Self::compression) setting is used.
-    #[inline]
-    pub fn compression_for(&self, topic: &str) -> Compression {
-        self.topic_compression
-            .get(topic)
-            .copied()
-            .unwrap_or(self.compression)
-    }
-
-    /// Returns the batch size in bytes.
-    #[inline]
-    pub fn batch_size(&self) -> usize {
-        self.batch_size
-    }
-
-    /// Returns the linger time.
-    #[inline]
-    pub fn linger(&self) -> Duration {
-        self.linger
-    }
-
-    /// Returns the request timeout.
-    #[inline]
-    pub fn request_timeout(&self) -> Duration {
-        self.request_timeout
-    }
-
-    /// Returns the connect timeout.
-    #[inline]
-    pub fn connect_timeout(&self) -> Duration {
-        self.connect_timeout
-    }
-
-    /// Returns the total delivery timeout.
-    #[inline]
-    pub fn delivery_timeout(&self) -> Duration {
-        self.delivery_timeout
-    }
-
-    /// Returns the number of retries.
-    #[inline]
-    pub fn retries(&self) -> u32 {
-        self.retries
-    }
-
-    /// Returns the retry backoff duration.
-    #[inline]
-    pub fn retry_backoff(&self) -> Duration {
-        self.retry_backoff
-    }
-
-    /// Returns the maximum encoded request frame size in bytes.
-    #[inline]
-    pub fn max_request_size(&self) -> usize {
-        self.max_request_size
-    }
-
-    /// Returns whether idempotent production is enabled.
-    #[inline]
-    pub fn idempotent(&self) -> bool {
-        self.idempotent
-    }
-
-    /// Returns the total time `send()` may block on metadata and buffer
-    /// memory combined (`max.block.ms`).
-    #[inline]
-    pub fn max_block(&self) -> Duration {
-        self.max_block
-    }
-
-    /// Returns the buffer memory size.
-    #[inline]
-    pub fn buffer_memory(&self) -> usize {
-        self.buffer_memory
-    }
-
-    /// Returns the metadata max age.
-    #[inline]
-    pub fn metadata_max_age(&self) -> Duration {
-        self.metadata_max_age
-    }
-
-    /// Returns the topic cache TTL for partial metadata refreshes.
-    #[inline]
-    pub fn metadata_topic_cache_ttl(&self) -> Option<Duration> {
-        self.metadata_topic_cache_ttl
-    }
-
-    /// Returns whether the client may ask the broker to auto-create topics
-    /// (`allow.auto.create.topics`).
-    #[inline]
-    pub fn allow_auto_create_topics(&self) -> bool {
-        self.allow_auto_create_topics
-    }
-
-    /// Returns the metadata recovery strategy (KIP-899).
-    #[inline]
-    pub fn metadata_recovery_strategy(&self) -> MetadataRecoveryStrategy {
-        self.metadata_recovery_strategy
-    }
-
-    /// Returns the rebootstrap trigger duration (KIP-899).
-    #[inline]
-    pub fn metadata_recovery_rebootstrap_trigger(&self) -> Duration {
-        self.metadata_recovery_rebootstrap_trigger
-    }
-
-    /// Returns the authentication configuration, if set.
-    #[inline]
-    pub fn auth(&self) -> Option<&AuthConfig> {
-        self.auth.as_ref()
-    }
+    Ok(())
 }
 
 /// Validate a compression codec, its level and any per-topic overrides.
 ///
-/// # Why this is shared
+/// Three rules:
 ///
-/// Both producers compress, so both need these rules — and
-/// [`TransactionalProducer`](crate::producer::TransactionalProducer) is the one
-/// that always batches, which is where a mis-set level costs the most CPU. The
-/// rules living in `ProducerConfig::validate` alone is how the transactional
-/// producer ended up with no `compression_level` setter at all: there was
-/// nowhere to validate one.
-///
-/// Three separate rules, each of which was a real silent failure:
-///
-/// 1. A codec whose Cargo feature is not enabled fails at build time, not on
-///    the first `send()`.
+/// 1. Zstd without the `zstd` Cargo feature fails at build time, not on the
+///    first `send()`.
 /// 2. A level set alongside a codec that has none (Snappy, LZ4) is an error —
 ///    an operator who sets it believes they tuned something.
 /// 3. Per-topic overrides are checked against the level too, so a level valid
@@ -360,24 +190,16 @@ pub(crate) fn validate_compression(
     compression_level: Option<i32>,
     topic_compression: &HashMap<String, Compression>,
 ) -> Result<()> {
-    // Reject a compression codec that was not compiled in. This gives a clear
-    // build-time-equivalent error at producer construction rather than waiting
-    // until the first message is sent to discover the feature is missing.
-    if !compression.is_available() {
-        let feature = compression.required_feature().unwrap_or("unknown");
-        return Err(KrafkaError::config(format!(
-            "compression codec {compression:?} requires the `{feature}` Cargo feature; \
-             either enable the feature or choose a different compression codec"
-        )));
-    }
-
-    // Same check for per-topic compression overrides.
-    for (topic, codec) in topic_compression {
+    // Zstd encoding needs the `zstd` Cargo feature; reject it at build time
+    // rather than on the first `send()`.
+    let topics = topic_compression
+        .iter()
+        .map(|(t, c)| (Some(t.as_str()), *c));
+    for (topic, codec) in std::iter::once((None, compression)).chain(topics) {
         if !codec.is_available() {
-            let feature = codec.required_feature().unwrap_or("unknown");
+            let where_ = topic.map_or_else(String::new, |t| format!(" for topic {t:?}"));
             return Err(KrafkaError::config(format!(
-                "per-topic compression codec {codec:?} for topic {topic:?} requires the \
-                 `{feature}` Cargo feature"
+                "compression codec {codec:?}{where_} requires the `zstd` Cargo feature"
             )));
         }
     }
@@ -413,48 +235,14 @@ pub(crate) fn validate_compression(
     Ok(())
 }
 
-/// Validate and normalise a [`ProducerConfig`].
-///
-/// # Why this is a free function
-///
-/// There used to be two producer builders: a public [`ProducerBuilder`](crate::producer::ProducerBuilder) that
-/// every caller uses, and a `ProducerConfigBuilder` that nothing outside this
-/// crate's own tests ever touched. Each carried its own copy of these rules,
-/// and the copies had **diverged**: the public path — the only one anybody ran
-/// — silently skipped the client-id length limit, the infinite-retry-loop
-/// guard, the compression-codec availability checks (global and per topic), the
-/// retry-budget warning and the linger warning.
-///
-/// A `Producer::builder().compression(Zstd)` without the `zstd` feature
-/// therefore *built successfully* and failed on the first send.
-///
-/// The second builder is gone and this is the single place the rules live.
-/// Both the synchronous
-/// [`build_config`](crate::producer::ProducerBuilder::build_config) terminal and the async
-/// [`build`](crate::producer::ProducerBuilder::build) call it, so they cannot disagree again.
-///
-/// # Normalisation
-///
-/// Takes `&mut` because validation is not purely a predicate: it normalises a
-/// few fields (for example clamping compression levels into the selected
-/// codec's range) rather than only rejecting them.
-///
-/// `has_shared_pool` relaxes the `bootstrap_servers` requirement: a client
-/// built with [`with_client`](crate::producer::ProducerBuilder::with_client) inherits an
-/// already-connected pool and has no bootstrap list of its own.
-pub(crate) fn validate(config: &mut ProducerConfig, has_shared_pool: bool) -> Result<()> {
-    if !has_shared_pool && config.bootstrap_servers.is_empty() {
-        return Err(KrafkaError::config("bootstrap_servers is required"));
-    }
-
-    // Validate client_id against the Kafka wire limit for KafkaString (i16::MAX).
-    const MAX_KAFKA_STRING_LEN: usize = i16::MAX as usize;
-    if config.client_id.len() > MAX_KAFKA_STRING_LEN {
-        return Err(KrafkaError::config(format!(
-            "client_id is {} bytes, exceeding the Kafka wire limit of {MAX_KAFKA_STRING_LEN}",
-            config.client_id.len()
-        )));
-    }
+/// Validate a [`ProducerConfig`]. `request_timeout` is the handle's;
+/// `transactional` says whether the producer is built with
+/// `build_transactional`.
+pub(crate) fn validate(
+    config: &ProducerConfig,
+    request_timeout: Duration,
+    transactional: bool,
+) -> Result<()> {
     if config.batch_size == 0 {
         return Err(KrafkaError::config(format!(
             "batch_size must be >= 1 (got {})",
@@ -469,70 +257,60 @@ pub(crate) fn validate(config: &mut ProducerConfig, has_shared_pool: bool) -> Re
             "delivery_timeout must be greater than zero",
         ));
     }
-    // Reject the combination of delivery_timeout = Duration::MAX and retries = u32::MAX.
-    // Both individually have well-defined semantics (MAX delivery window / unlimited retries),
-    // but together they create an infinite retry loop: the delivery deadline never expires
-    // so the retry counter is the only termination condition — but that counter also never
-    // expires. This combination is almost certainly a misconfiguration. If you genuinely
-    // want unlimited retries, set a finite delivery_timeout.
-    if config.delivery_timeout == Duration::MAX && config.retries == u32::MAX {
-        return Err(KrafkaError::config(
-            "delivery_timeout = Duration::MAX combined with retries = u32::MAX creates \
-             an infinite retry loop; set a finite delivery_timeout or reduce retries",
-        ));
-    }
+    validate_delivery_timeout(config.delivery_timeout, config.linger, request_timeout)?;
     validate_compression(
         config.compression,
         config.compression_level,
         &config.topic_compression,
     )?;
-    // Warn when delivery_timeout is shorter than a single full retry cycle.
-    // In this case some retry attempts can never complete before the deadline,
-    // causing premature delivery failures without exhausting all retries.
-    if config.retries > 0 {
-        let min_budget = config
-            .request_timeout
-            .saturating_mul(config.retries.saturating_add(1));
-        if config.delivery_timeout < min_budget {
-            tracing::warn!(
-                delivery_timeout_secs = config.delivery_timeout.as_secs_f64(),
-                request_timeout_secs = config.request_timeout.as_secs_f64(),
-                retries = config.retries,
-                minimum_budget_secs = min_budget.as_secs_f64(),
-                "delivery_timeout is shorter than request_timeout × (retries + 1); \
-                 some retry attempts will be cut short by the delivery deadline"
-            );
-        }
-    }
-    if config.idempotent {
-        if config.retries == 0 {
+    if transactional {
+        // A transactional producer is idempotent with acks=all by definition;
+        // the coordinator only guarantees atomicity over replicated writes.
+        if !config.idempotent || config.acks != Acks::All {
             return Err(KrafkaError::config(
-                "idempotent producer requires retries > 0",
+                "a transactional producer requires idempotent(true) and acks = All",
             ));
         }
-        if config.acks != Acks::All {
-            return Err(KrafkaError::config(format!(
-                "idempotent producer requires acks = All (got {:?})",
-                config.acks
-            )));
+        if config.transaction_timeout == Some(Duration::ZERO) {
+            return Err(KrafkaError::config("transaction_timeout must be > 0"));
         }
-        // Warn when idempotency is enabled without a transactional_id:
-        // idempotent producers prevent duplicates within a session but do NOT
-        // fence zombie producers after a crash/restart. Only a TransactionalProducer
-        // with a stable transactional_id provides full zombie fencing (KIP-360).
-        // Emitted at warn! via a OnceLock so it fires once per process and is
-        // visible to operators without spamming logs.
-        static IDEMPOTENT_NO_TXN_WARNED: OnceLock<()> = OnceLock::new();
-        IDEMPOTENT_NO_TXN_WARNED.get_or_init(|| {
+        if config.two_phase_commit && config.transaction_timeout.is_some() {
+            return Err(KrafkaError::config(
+                "two_phase_commit and transaction_timeout contradict each other: under \
+                 KIP-939 the coordinator holds a prepared transaction until an external \
+                 coordinator decides, so no transaction timeout applies. Drop one of the two.",
+            ));
+        }
+        if config.delivery_timeout > config.transaction_timeout() {
             tracing::warn!(
-                "Idempotent producer enabled without a transactional_id. \
-                 This provides per-session duplicate detection (KIP-679) but not zombie \
-                 fencing. Use TransactionalProducer with a stable transactional_id for \
-                 exactly-once end-to-end guarantees across producer restarts (KIP-360)."
+                delivery_timeout_secs = config.delivery_timeout.as_secs_f64(),
+                transaction_timeout_secs = config.transaction_timeout().as_secs_f64(),
+                "delivery_timeout exceeds transaction_timeout; the coordinator aborts the \
+                 transaction first, so the extra delivery budget is unreachable"
             );
-        });
+        }
+    } else {
+        if config.transaction_timeout.is_some() {
+            return Err(KrafkaError::config(
+                "transaction_timeout applies only to build_transactional()",
+            ));
+        }
+        if config.two_phase_commit {
+            return Err(KrafkaError::config(
+                "two_phase_commit applies only to build_transactional()",
+            ));
+        }
     }
-    if config.buffer_memory > 0 && config.batch_size > config.buffer_memory {
+    if config.idempotent && config.acks != Acks::All {
+        return Err(KrafkaError::config(format!(
+            "idempotent producer requires acks = All (got {:?})",
+            config.acks
+        )));
+    }
+    if config.buffer_memory == 0 {
+        return Err(KrafkaError::config("buffer_memory must be >= 1"));
+    }
+    if config.batch_size > config.buffer_memory {
         return Err(KrafkaError::config(format!(
             "batch_size must not exceed buffer_memory (got batch_size={}, buffer_memory={})",
             config.batch_size, config.buffer_memory
@@ -544,42 +322,25 @@ pub(crate) fn validate(config: &mut ProducerConfig, has_shared_pool: bool) -> Re
             config.batch_size, config.max_request_size
         )));
     }
-    // Warn when linger >= delivery_timeout — records would time out before
-    // the linger period expires, making lingering counterproductive.
-    if config.linger >= config.delivery_timeout {
-        tracing::warn!(
-            linger_ms = config.linger.as_millis(),
-            delivery_timeout_ms = config.delivery_timeout.as_millis(),
-            "linger >= delivery_timeout: records may expire before they are sent"
-        );
-    }
-    // Warn when retries = u32::MAX — the retry loop is bounded by
-    // delivery_timeout (validated non-zero above), but a future caller
-    // that disables that guard would create an infinite loop.
-    if config.retries == u32::MAX {
-        tracing::debug!(
-            "retries = u32::MAX; retry loop is bounded by delivery_timeout ({:?})",
-            config.delivery_timeout
-        );
-    }
     Ok(())
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use crate::producer::Producer;
+    use super::*;
+    use crate::Kafka;
 
-    /// A level set alongside a codec that cannot use one must be rejected.
-    ///
-    /// Silently ignoring it is the failure mode worth guarding: an operator
-    /// who sets `compression_level(9)` with Snappy believes they tuned
-    /// something, and nothing would ever tell them otherwise.
-    #[cfg(feature = "snappy")]
-    #[test]
-    fn compression_level_on_a_levelless_codec_is_rejected() {
-        let err = Producer::builder()
-            .bootstrap_servers("localhost:9092")
+    fn producer() -> crate::producer::ProducerBuilder {
+        Kafka::detached().producer()
+    }
+
+    /// A level set alongside a codec that cannot use one must be rejected:
+    /// an operator who sets `compression_level(9)` with Snappy believes they
+    /// tuned something.
+    #[tokio::test]
+    async fn compression_level_on_a_levelless_codec_is_rejected() {
+        let err = producer()
             .compression(Compression::Snappy)
             .compression_level(Some(9))
             .build_config()
@@ -591,195 +352,61 @@ mod tests {
         );
     }
 
-    /// An out-of-range level must be rejected rather than clamped at build
-    /// time, so the operator learns the real range.
-    #[cfg(feature = "gzip")]
-    #[test]
-    fn out_of_range_compression_level_is_rejected() {
-        let err = Producer::builder()
-            .bootstrap_servers("localhost:9092")
+    /// An out-of-range level is rejected rather than clamped, so the operator
+    /// learns the real range.
+    #[tokio::test]
+    async fn out_of_range_compression_level_is_rejected() {
+        let err = producer()
             .compression(Compression::Gzip)
             .compression_level(Some(42))
             .build_config()
             .expect_err("gzip tops out at 9");
-        assert!(
-            err.to_string().contains("0..=9"),
-            "the error must name the valid range, got: {err}"
-        );
+        assert!(err.to_string().contains("0..=9"), "got: {err}");
     }
 
-    /// A valid level must survive validation and land on the config.
     #[cfg(feature = "zstd")]
-    #[test]
-    fn valid_compression_level_reaches_the_config() {
-        let config = Producer::builder()
-            .bootstrap_servers("localhost:9092")
+    #[tokio::test]
+    async fn valid_compression_level_reaches_the_config() {
+        let config = producer()
             .compression(Compression::Zstd)
             .compression_level(Some(1))
             .build_config()
             .expect("level 1 is valid for zstd");
-        assert_eq!(config.compression_level(), Some(1));
+        assert_eq!(config.compression_level, Some(1));
     }
 
-    /// A per-topic override must be validated too — otherwise a level valid
-    /// for the default codec silently applies to a topic using another.
-    #[cfg(all(feature = "zstd", feature = "snappy"))]
-    #[test]
-    fn per_topic_codec_is_validated_against_the_level() {
-        let err = Producer::builder()
-            .bootstrap_servers("localhost:9092")
+    /// A per-topic override is validated too — otherwise a level valid for
+    /// the default codec silently applies to a topic using another.
+    #[cfg(feature = "zstd")]
+    #[tokio::test]
+    async fn per_topic_codec_is_validated_against_the_level() {
+        let err = producer()
             .compression(Compression::Zstd)
             .compression_level(Some(1))
             .topic_compression("events", Compression::Snappy)
             .build_config()
             .expect_err("the per-topic Snappy override takes no level");
-        assert!(
-            err.to_string().contains("events"),
-            "the error must name the offending topic, got: {err}"
-        );
+        assert!(err.to_string().contains("events"), "got: {err}");
     }
-    use super::*;
 
-    // ── One validator, reachable from the only builder ───────────────────
-    //
-    // There used to be two producer builders, and their validation had
-    // diverged: the public `Producer::builder()` — the only one anybody used —
-    // skipped six checks the unused `ProducerConfigBuilder` performed. The
-    // second builder is gone; these assert the checks it uniquely had now run
-    // on the surviving path.
-
-    /// A codec whose Cargo feature is not enabled must be rejected at build
-    /// time. Before the builders were merged this passed validation and failed
-    /// on the first `send()`, with the error surfacing from deep in the
-    /// accumulator long after the misconfiguration was actionable.
-    #[test]
-    fn build_config_rejects_a_codec_that_is_not_compiled_in() {
-        let Some(missing) = [
-            Compression::Gzip,
-            Compression::Snappy,
-            Compression::Lz4,
-            Compression::Zstd,
-        ]
-        .into_iter()
-        .find(|c| !c.is_available()) else {
-            // Every codec is compiled in for this feature set; nothing to assert.
-            return;
-        };
-
-        let err = crate::producer::Producer::builder()
-            .bootstrap_servers("localhost:9092")
-            .compression(missing)
+    /// Zstd without its Cargo feature is rejected at build time, for the
+    /// default codec and for a per-topic override.
+    #[cfg(not(feature = "zstd"))]
+    #[tokio::test]
+    async fn build_rejects_zstd_without_its_feature() {
+        let err = producer()
+            .compression(Compression::Zstd)
             .build_config()
-            .expect_err("an unavailable codec must be rejected")
+            .expect_err("zstd without the feature must be rejected")
             .to_string();
-        assert!(
-            err.contains("Cargo feature"),
-            "the error must name the missing feature, got: {err}"
-        );
-    }
+        assert!(err.contains("`zstd` Cargo feature"), "got: {err}");
 
-    /// Same rule for a per-topic override, which is a separate code path and
-    /// was separately missing from the public builder.
-    #[test]
-    fn build_config_rejects_an_unavailable_per_topic_codec() {
-        let Some(missing) = [
-            Compression::Gzip,
-            Compression::Snappy,
-            Compression::Lz4,
-            Compression::Zstd,
-        ]
-        .into_iter()
-        .find(|c| !c.is_available()) else {
-            return;
-        };
-
-        let err = crate::producer::Producer::builder()
-            .bootstrap_servers("localhost:9092")
-            .topic_compression("high-volume", missing)
+        let err = producer()
+            .topic_compression("high-volume", Compression::Zstd)
             .build_config()
-            .expect_err("an unavailable per-topic codec must be rejected")
+            .expect_err("a per-topic zstd override must be rejected too")
             .to_string();
-        assert!(
-            err.contains("Cargo feature"),
-            "the error must name the missing feature, got: {err}"
-        );
-    }
-
-    /// `delivery_timeout = MAX` with `retries = MAX` is an infinite retry loop:
-    /// the deadline never expires, so the retry counter is the only termination
-    /// condition — and it never expires either.
-    #[test]
-    fn build_config_rejects_the_infinite_retry_loop() {
-        let err = crate::producer::Producer::builder()
-            .bootstrap_servers("localhost:9092")
-            .idempotent(false)
-            .delivery_timeout(Duration::MAX)
-            .retries(u32::MAX)
-            .build_config()
-            .expect_err("MAX/MAX must be rejected")
-            .to_string();
-        assert!(err.contains("infinite retry loop"), "got: {err}");
-    }
-
-    /// An oversize `client_id` cannot be encoded as a Kafka string. Rejecting
-    /// it at the builder keeps the wire encoder's panic path structurally
-    /// unreachable.
-    #[test]
-    fn build_config_rejects_an_oversize_client_id() {
-        let err = crate::producer::Producer::builder()
-            .bootstrap_servers("localhost:9092")
-            .client_id("x".repeat(i16::MAX as usize + 1))
-            .build_config()
-            .expect_err("an oversize client_id must be rejected")
-            .to_string();
-        assert!(err.contains("client_id"), "got: {err}");
-    }
-
-    /// Re-validating an already-validated config is idempotent, so `build`
-    /// running the validator after `build_config` did cannot change the answer.
-    #[test]
-    fn validation_is_idempotent() {
-        let mut config = crate::producer::Producer::builder()
-            .bootstrap_servers("localhost:9092")
-            .build_config()
-            .expect("a default config is valid");
-        validate(&mut config, false).expect("re-validation must succeed");
-    }
-
-    /// A shared `KrafkaClient` supplies the pool, so an empty bootstrap list is
-    /// legitimate on that path and must not be rejected.
-    #[test]
-    fn validate_allows_an_empty_bootstrap_list_with_a_shared_pool() {
-        let mut config = ProducerConfig {
-            bootstrap_servers: String::new(),
-            ..ProducerConfig::default()
-        };
-        assert!(validate(&mut config, true).is_ok());
-        assert!(validate(&mut config, false).is_err());
-    }
-
-    /// A setter that stores into a field nobody reads is exactly the defect
-    /// `TransportConfig` was introduced to fix, so the round-trip is asserted
-    /// rather than assumed.
-    #[test]
-    fn test_config_builder_transport_round_trips() {
-        let transport = crate::network::TransportConfig::builder()
-            .tcp_keepalive(Some(std::time::Duration::from_secs(11)))
-            .max_connections(Some(7))
-            .build()
-            .expect("valid transport config");
-
-        let config = crate::producer::Producer::builder()
-            .bootstrap_servers("localhost:9092")
-            .transport(transport)
-            .build_config()
-            .expect("config builds");
-
-        assert_eq!(
-            config.transport.tcp_keepalive(),
-            Some(std::time::Duration::from_secs(11))
-        );
-        assert_eq!(config.transport.max_connections(), Some(7));
+        assert!(err.contains("high-volume"), "got: {err}");
     }
 
     #[test]
@@ -794,6 +421,8 @@ mod tests {
         assert_eq!(Acks::from_i16(0), Some(Acks::None));
         assert_eq!(Acks::from_i16(1), Some(Acks::Leader));
         assert_eq!(Acks::from_i16(-1), Some(Acks::All));
+        assert_eq!(Acks::from_i16(2), None);
+        assert_eq!(Acks::from_i16(-2), None);
     }
 
     #[test]
@@ -805,256 +434,131 @@ mod tests {
         assert_eq!(config.batch_size, 16384);
         assert_eq!(config.max_request_size, crate::protocol::MAX_MESSAGE_SIZE);
         assert_eq!(config.delivery_timeout, Duration::from_secs(120));
-        assert_eq!(config.retries, u32::MAX);
-        assert_eq!(
-            config.metadata_topic_cache_ttl,
-            Some(Duration::from_secs(300))
-        );
+        assert_eq!(config.linger, Duration::from_millis(5), "KIP-1030");
     }
 
-    #[test]
-    // `Lz4` is only a valid setting when its codec is compiled in — validation
-    // now rejects an unavailable codec on this path, which it did not before
-    // the two producer builders were merged.
-    #[cfg(feature = "lz4")]
-    fn test_config_builder() {
-        let config = crate::producer::Producer::builder()
-            .bootstrap_servers("localhost:9092")
-            .client_id("test")
+    #[tokio::test]
+    async fn test_config_builder() {
+        let config = producer()
             .acks(Acks::All)
             .compression(Compression::Lz4)
             .batch_size(32768)
             .max_request_size(65536)
+            .delivery_timeout(Duration::from_secs(45))
             .build_config()
             .unwrap();
-
-        assert_eq!(config.bootstrap_servers, "localhost:9092");
-        assert_eq!(config.client_id, "test");
         assert_eq!(config.acks, Acks::All);
         assert_eq!(config.compression, Compression::Lz4);
         assert_eq!(config.batch_size, 32768);
         assert_eq!(config.max_request_size, 65536);
+        assert_eq!(config.delivery_timeout, Duration::from_secs(45));
     }
 
-    #[test]
-    fn test_config_builder_request_timeout() {
-        let config = crate::producer::Producer::builder()
-            .bootstrap_servers("localhost:9092")
-            .request_timeout(Duration::from_secs(60))
-            .build_config()
-            .unwrap();
-        assert_eq!(
-            config.request_timeout,
-            Duration::from_secs(60),
-            "request_timeout should be set by builder"
-        );
-    }
-
-    #[test]
-    fn test_config_builder_delivery_timeout() {
-        let config = crate::producer::Producer::builder()
-            .bootstrap_servers("localhost:9092")
-            .delivery_timeout(Duration::from_secs(45))
-            .build_config()
-            .unwrap();
-        assert_eq!(config.delivery_timeout(), Duration::from_secs(45));
-    }
-
-    #[test]
-    fn test_config_builder_infinite_retry_loop_is_err() {
-        // Duration::MAX + retries=u32::MAX = infinite retry loop — must be rejected
-        let err = crate::producer::Producer::builder()
-            .bootstrap_servers("localhost:9092")
-            .idempotent(false)
-            .delivery_timeout(Duration::MAX)
-            .retries(u32::MAX)
-            .build_config()
-            .unwrap_err();
-        let msg = err.to_string();
+    #[tokio::test]
+    async fn zero_sizes_and_budgets_are_rejected() {
+        assert!(producer().batch_size(0).build_config().is_err());
+        assert!(producer().max_request_size(0).build_config().is_err());
         assert!(
-            msg.contains("infinite retry loop"),
-            "expected 'infinite retry loop' in error, got: {msg}"
+            producer()
+                .delivery_timeout(Duration::ZERO)
+                .build_config()
+                .is_err()
         );
-    }
-
-    #[test]
-    fn test_config_builder_metadata_max_age() {
-        let config = crate::producer::Producer::builder()
-            .bootstrap_servers("localhost:9092")
-            .metadata_max_age(Duration::from_secs(120))
+        let err = producer()
+            .buffer_memory(0)
             .build_config()
-            .unwrap();
-        assert_eq!(
-            config.metadata_max_age,
-            Duration::from_secs(120),
-            "metadata_max_age should be set by builder"
-        );
+            .expect_err("a zero buffer budget must be rejected")
+            .to_string();
+        assert!(err.contains("buffer_memory must be >= 1"), "got: {err}");
     }
 
-    #[test]
-    fn test_config_builder_metadata_topic_cache_ttl() {
-        let config = crate::producer::Producer::builder()
-            .bootstrap_servers("localhost:9092")
-            .metadata_topic_cache_ttl(Duration::from_secs(600))
-            .build_config()
-            .unwrap();
-        assert_eq!(
-            config.metadata_topic_cache_ttl(),
-            Some(Duration::from_secs(600))
-        );
-    }
-
-    #[test]
-    fn test_config_builder_disable_metadata_topic_cache_ttl() {
-        let config = crate::producer::Producer::builder()
-            .bootstrap_servers("localhost:9092")
-            .disable_metadata_topic_cache_ttl()
-            .build_config()
-            .unwrap();
-        assert_eq!(config.metadata_topic_cache_ttl(), None);
-    }
-
-    // ── R14: Acks::from_i16 known values ──
-
-    #[test]
-    fn test_acks_from_i16_known_values() {
-        assert_eq!(Acks::from_i16(0), Some(Acks::None));
-        assert_eq!(Acks::from_i16(1), Some(Acks::Leader));
-        assert_eq!(Acks::from_i16(-1), Some(Acks::All));
-    }
-
-    #[test]
-    fn test_acks_from_i16_unknown_returns_none() {
-        // Unknown values return None — callers decide how to handle them
-        assert_eq!(Acks::from_i16(2), None);
-        assert_eq!(Acks::from_i16(99), None);
-        assert_eq!(Acks::from_i16(-2), None);
-    }
-
-    #[test]
-    fn test_acks_roundtrip() {
-        assert_eq!(Acks::from_i16(Acks::None.to_i16()), Some(Acks::None));
-        assert_eq!(Acks::from_i16(Acks::Leader.to_i16()), Some(Acks::Leader));
-        assert_eq!(Acks::from_i16(Acks::All.to_i16()), Some(Acks::All));
-    }
-
-    #[cfg(feature = "socks5")]
-    #[test]
-    fn test_config_builder_proxy_round_trip() {
-        let config = crate::producer::Producer::builder()
-            .bootstrap_servers("localhost:9092")
-            .proxy(crate::network::ProxyConfig::new("proxy:1080"))
-            .build_config()
-            .unwrap();
-        let proxy = config
-            .transport
-            .proxy()
-            .expect("proxy should reach the transport config");
-        assert_eq!(proxy.address(), "proxy:1080");
-    }
-
-    #[test]
-    fn test_config_default_recovery_strategy() {
-        let config = ProducerConfig::default();
-        assert_eq!(
-            config.metadata_recovery_strategy,
-            MetadataRecoveryStrategy::Rebootstrap,
-        );
-        assert_eq!(
-            config.metadata_recovery_rebootstrap_trigger,
-            Duration::from_secs(300),
-        );
-    }
-
-    #[test]
-    fn test_config_builder_recovery_strategy() {
-        let config = crate::producer::Producer::builder()
-            .bootstrap_servers("localhost:9092")
-            .metadata_recovery_strategy(MetadataRecoveryStrategy::Rebootstrap)
-            .metadata_recovery_rebootstrap_trigger(Duration::from_secs(120))
-            .build_config()
-            .unwrap();
-        assert_eq!(
-            config.metadata_recovery_strategy(),
-            MetadataRecoveryStrategy::Rebootstrap,
-        );
-        assert_eq!(
-            config.metadata_recovery_rebootstrap_trigger(),
-            Duration::from_secs(120),
-        );
-    }
-
-    #[test]
-    fn test_config_builder_rejects_zero_batch_size() {
-        let err = crate::producer::Producer::builder()
-            .batch_size(0)
-            .build_config();
-        assert!(err.is_err());
-    }
-
-    #[test]
-    fn test_config_builder_rejects_zero_max_request_size() {
-        let err = crate::producer::Producer::builder()
-            .max_request_size(0)
-            .build_config();
-        assert!(err.is_err());
-    }
-
-    #[test]
-    fn test_config_builder_rejects_zero_delivery_timeout() {
-        let err = crate::producer::Producer::builder()
-            .delivery_timeout(Duration::ZERO)
-            .build_config();
-        assert!(err.is_err());
-    }
-
-    #[test]
-    fn test_config_builder_rejects_idempotent_without_retries() {
-        let err = crate::producer::Producer::builder()
-            .retries(0)
-            .build_config();
-        assert!(err.is_err());
-    }
-
-    #[test]
-    fn test_config_builder_rejects_idempotent_with_acks_leader() {
-        let err = crate::producer::Producer::builder()
+    #[tokio::test]
+    async fn idempotent_with_acks_leader_is_rejected() {
+        let err = producer()
             .idempotent(true)
             .acks(Acks::Leader)
-            .build_config();
-        assert!(err.is_err());
+            .build_config()
+            .expect_err("idempotence needs acks=all");
+        assert!(err.to_string().contains("acks"), "got: {err}");
     }
 
-    #[test]
-    fn test_config_builder_rejects_batch_exceeding_buffer() {
-        let err = crate::producer::Producer::builder()
-            .batch_size(1024)
-            .buffer_memory(512)
-            .build_config();
-        assert!(err.is_err());
-    }
-
-    #[test]
-    fn test_config_builder_rejects_batch_exceeding_max_request_size() {
-        let err = crate::producer::Producer::builder()
-            .batch_size(1024)
-            .max_request_size(512)
-            .build_config();
-        assert!(err.is_err());
-    }
-
-    #[test]
-    fn test_config_builder_rejects_empty_bootstrap_servers() {
-        let err = crate::producer::Producer::builder()
-            .bootstrap_servers("")
-            .build_config();
+    #[tokio::test]
+    async fn batch_larger_than_its_bounds_is_rejected() {
         assert!(
-            err.is_err(),
-            "empty bootstrap_servers should be rejected at build time"
+            producer()
+                .batch_size(1024)
+                .buffer_memory(512)
+                .build_config()
+                .is_err()
         );
         assert!(
-            err.unwrap_err().to_string().contains("bootstrap_servers"),
-            "error message should mention bootstrap_servers"
+            producer()
+                .batch_size(1024)
+                .max_request_size(512)
+                .build_config()
+                .is_err()
         );
+    }
+
+    /// `delivery_timeout` must leave room for one full attempt: linger plus
+    /// the handle's request timeout.
+    #[tokio::test]
+    async fn delivery_timeout_below_linger_plus_request_timeout_is_rejected() {
+        let err = producer()
+            .delivery_timeout(Duration::from_secs(10))
+            .build_config()
+            .expect_err("30 s request timeout does not fit in 10 s")
+            .to_string();
+        assert!(err.contains("request_timeout"), "got: {err}");
+    }
+
+    /// Transaction settings on a plain producer are an error, not ignored.
+    #[tokio::test]
+    async fn transaction_settings_need_build_transactional() {
+        let err = producer()
+            .transaction_timeout(Duration::from_secs(30))
+            .build_config()
+            .expect_err("transaction_timeout on a plain producer")
+            .to_string();
+        assert!(err.contains("build_transactional"), "got: {err}");
+        let err = producer()
+            .two_phase_commit(true)
+            .build_config()
+            .expect_err("two_phase_commit on a plain producer")
+            .to_string();
+        assert!(err.contains("build_transactional"), "got: {err}");
+    }
+
+    #[test]
+    fn two_phase_commit_contradicts_an_explicit_transaction_timeout() {
+        let config = ProducerConfig {
+            two_phase_commit: true,
+            transaction_timeout: Some(Duration::from_secs(60)),
+            ..ProducerConfig::default()
+        };
+        let err = validate(&config, Duration::from_secs(30), true)
+            .expect_err("2PC with a timeout")
+            .to_string();
+        assert!(err.contains("contradict"), "got: {err}");
+
+        let config = ProducerConfig {
+            two_phase_commit: true,
+            ..ProducerConfig::default()
+        };
+        validate(&config, Duration::from_secs(30), true).expect("2PC alone is valid");
+    }
+
+    #[test]
+    fn a_transactional_producer_cannot_drop_idempotence() {
+        let config = ProducerConfig {
+            idempotent: false,
+            ..ProducerConfig::default()
+        };
+        assert!(validate(&config, Duration::from_secs(30), true).is_err());
+        let config = ProducerConfig {
+            transaction_timeout: Some(Duration::ZERO),
+            ..ProducerConfig::default()
+        };
+        assert!(validate(&config, Duration::from_secs(30), true).is_err());
     }
 }

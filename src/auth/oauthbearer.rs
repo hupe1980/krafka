@@ -32,7 +32,7 @@
 //!     .with_extension("identityPoolId", "pool-456");
 //! let config = AuthConfig::sasl_oauthbearer_token(token);
 //!
-//! // Automatic token refresh via provider (recommended for production)
+//! // Automatic token refresh via a `CredentialProvider` (recommended)
 //! let config = AuthConfig::sasl_oauthbearer_provider(|| async {
 //!     let jwt = my_oauth_client.get_access_token().await?;
 //!     Ok(OAuthBearerToken::new(jwt))
@@ -41,18 +41,18 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::time::Instant;
 
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
+use super::{CredentialProvider, ErasedCredentialProvider};
 use crate::error::{KrafkaError, Result};
-use crate::metrics::ConnectionMetrics;
+use crate::metrics::ConnectionRecorder;
 
 const OAUTHBEARER_EXPIRY_SKEW_MARGIN_MS: i64 = 30_000;
 
@@ -78,64 +78,12 @@ fn current_epoch_ms() -> Result<i64> {
     i64::try_from(d.as_millis()).map_err(|_| KrafkaError::auth("current epoch_ms overflows i64"))
 }
 
-/// Trait for providing fresh OAuth 2.0 bearer tokens on each broker connection.
-///
-/// Implement this to integrate with your OAuth/OIDC provider. The provider is
-/// called on every new broker connection (including automatic reconnections),
-/// ensuring tokens are always fresh.
-///
-/// # Examples
-///
-/// ```rust,ignore
-/// use krafka::auth::{OAuthBearerToken, OAuthBearerTokenProvider};
-/// use krafka::error::Result;
-/// use std::future::Future;
-/// use std::pin::Pin;
-///
-/// struct MyProvider { /* OAuth client */ }
-///
-/// impl OAuthBearerTokenProvider for MyProvider {
-///     fn provide_token(&self) -> Pin<Box<dyn Future<Output = Result<OAuthBearerToken>> + Send + '_>> {
-///         Box::pin(async move {
-///             // Fetch a fresh token from your OAuth server
-///             let jwt = my_oauth_client.get_access_token().await?;
-///             Ok(OAuthBearerToken::new(jwt))
-///         })
-///     }
-/// }
-/// ```
-pub trait OAuthBearerTokenProvider: Send + Sync {
-    /// Fetch a fresh OAuth 2.0 bearer token.
-    ///
-    /// Called on every new broker connection. Implementations should handle
-    /// token caching and refresh internally if desired.
-    fn provide_token(&self) -> Pin<Box<dyn Future<Output = Result<OAuthBearerToken>> + Send + '_>>;
-}
-
-/// Blanket impl: any `Fn() -> Future<Output = Result<OAuthBearerToken>>` is a provider.
-///
-/// The `'static` bound on `Fut` is required because the trait method signature
-/// uses an anonymous lifetime (`+ '_`), and the compiler cannot prove the
-/// future outlives `&self` without it. In practice this is not restrictive:
-/// closures that own their captured state (the common case) produce `'static`
-/// futures. For borrowing patterns, implement `OAuthBearerTokenProvider`
-/// directly.
-impl<F, Fut> OAuthBearerTokenProvider for F
-where
-    F: Fn() -> Fut + Send + Sync,
-    Fut: Future<Output = Result<OAuthBearerToken>> + Send + 'static,
-{
-    fn provide_token(&self) -> Pin<Box<dyn Future<Output = Result<OAuthBearerToken>> + Send + '_>> {
-        Box::pin(self())
-    }
-}
-
 /// Internal state shared across all clones of [`OAuthBearerTokenProviderHandle`].
 ///
 /// Wrapped in `Arc` so cloning the handle shares the cache and the coalescing
 /// mutex rather than creating independent instances.
 struct OAuthTokenStoreInner {
-    provider: Arc<dyn OAuthBearerTokenProvider>,
+    provider: Arc<dyn ErasedCredentialProvider<OAuthBearerToken>>,
     /// Most recently fetched token. `None` until the first call to `provide_token`.
     cached: RwLock<Option<CachedToken>>,
     /// At most one refresh in flight at a time. Concurrent callers that find
@@ -144,7 +92,7 @@ struct OAuthTokenStoreInner {
     refreshing: Mutex<()>,
     /// Connection metrics to report token fetches into, once a pool has bound
     /// itself. See [`OAuthBearerTokenProviderHandle::bind_metrics`].
-    metrics: OnceLock<Arc<ConnectionMetrics>>,
+    metrics: OnceLock<Arc<ConnectionRecorder>>,
 }
 
 impl OAuthTokenStoreInner {
@@ -154,13 +102,11 @@ impl OAuthTokenStoreInner {
     /// and the background proactive refresh both — so the counters cannot
     /// cover one path and miss the other.
     ///
-    /// The `warn!` on failure is the load-bearing part even without metrics: a
-    /// misconfigured `token_endpoint` used to surface only as connection
-    /// failures, with nothing anywhere naming the OAuth round trip as the
-    /// cause.
+    /// The `warn!` on failure names the OAuth round trip as the cause, which
+    /// connection failures alone would not.
     async fn fetch(&self) -> Result<OAuthBearerToken> {
         let started = Instant::now();
-        match self.provider.provide_token().await {
+        match self.provider.credentials_erased().await {
             Ok(token) => {
                 if let Some(metrics) = self.metrics.get() {
                     metrics.record_oauth_token_fetch(started.elapsed(), token.lifetime_ms());
@@ -227,7 +173,8 @@ impl CachedToken {
     }
 }
 
-/// Handle wrapping a cached, coalescing [`OAuthBearerTokenProvider`].
+/// Handle wrapping a cached, coalescing
+/// [`CredentialProvider`](super::CredentialProvider) of tokens.
 ///
 /// All clones of a handle share the same internal [`Arc`], so they all read
 /// from and write to the same token cache. A background proactive-refresh
@@ -245,11 +192,11 @@ impl CachedToken {
 /// 4. The proactive refresh task wakes at step (2) so that (3) rarely happens
 ///    on a connection path.
 #[derive(Clone)]
-pub struct OAuthBearerTokenProviderHandle(Arc<OAuthTokenStoreInner>);
+pub(crate) struct OAuthBearerTokenProviderHandle(Arc<OAuthTokenStoreInner>);
 
 impl OAuthBearerTokenProviderHandle {
     /// Create a new handle wrapping the given provider.
-    pub fn new(provider: impl OAuthBearerTokenProvider + 'static) -> Self {
+    pub(crate) fn new(provider: impl CredentialProvider<OAuthBearerToken> + 'static) -> Self {
         Self(Arc::new(OAuthTokenStoreInner {
             provider: Arc::new(provider),
             cached: RwLock::new(None),
@@ -264,14 +211,14 @@ impl OAuthBearerTokenProviderHandle {
     /// starts the proactive-refresh task, so `oauth_token_fetches`,
     /// `oauth_token_fetch_failures`, `oauth_token_fetch_latency` and
     /// `oauth_token_expiry_epoch_ms` show up on the same
-    /// [`ConnectionMetrics`] a client already exports.
+    /// [`ConnectionRecorder`] a client already exports.
     ///
     /// **First binding wins.** All clones of a handle share one store, so an
     /// [`AuthConfig`](super::AuthConfig) cloned across two pools reports into
     /// whichever bound first. Every fetch is still logged either way, and
     /// clients that share a pool — the recommended shape — share one
-    /// `ConnectionMetrics` anyway.
-    pub(crate) fn bind_metrics(&self, metrics: Arc<ConnectionMetrics>) {
+    /// `ConnectionRecorder` anyway.
+    pub(crate) fn bind_metrics(&self, metrics: Arc<ConnectionRecorder>) {
         // `set` fails only when already bound, which is exactly the
         // first-binding-wins rule; there is nothing to report.
         let _ = self.0.metrics.set(metrics);
@@ -288,7 +235,7 @@ impl OAuthBearerTokenProviderHandle {
     ///
     /// A token with no `lifetime_ms` is **never** cached indefinitely; see
     /// the cache staleness check.
-    pub async fn provide_token(&self) -> Result<OAuthBearerToken> {
+    pub(crate) async fn provide_token(&self) -> Result<OAuthBearerToken> {
         // Fast path: cached token is still fresh.
         {
             let guard = self.0.cached.read().await;
@@ -341,7 +288,7 @@ impl OAuthBearerTokenProviderHandle {
     ///
     /// Returns the [`JoinHandle`] so the caller can abort the task on shutdown.
     /// Must be called from within a Tokio runtime.
-    pub fn start_refresh_task(&self) -> JoinHandle<()> {
+    pub(crate) fn start_refresh_task(&self) -> JoinHandle<()> {
         let inner = self.0.clone();
         tokio::spawn(async move {
             loop {
@@ -791,7 +738,7 @@ mod tests {
     #[tokio::test]
     async fn test_token_provider_closure_impl() {
         let provider = || async { Ok(OAuthBearerToken::new("from-closure")) };
-        let token = provider.provide_token().await.unwrap();
+        let token = provider.credentials().await.unwrap();
         assert_eq!(
             token.to_gs2_initial_response(),
             OAuthBearerToken::new("from-closure").to_gs2_initial_response()
@@ -844,12 +791,9 @@ mod tests {
         struct StaticProvider {
             token: String,
         }
-        impl OAuthBearerTokenProvider for StaticProvider {
-            fn provide_token(
-                &self,
-            ) -> Pin<Box<dyn Future<Output = Result<OAuthBearerToken>> + Send + '_>> {
-                let token = self.token.clone();
-                Box::pin(async move { Ok(OAuthBearerToken::new(token)) })
+        impl CredentialProvider<OAuthBearerToken> for StaticProvider {
+            async fn credentials(&self) -> Result<OAuthBearerToken> {
+                Ok(OAuthBearerToken::new(self.token.clone()))
             }
         }
 
@@ -963,14 +907,12 @@ mod tests {
 
     // ── Token-fetch observability ───────────────────────────────────────────
     //
-    // An OAUTHBEARER provider is called per connection, so a misconfigured
-    // `token_endpoint` used to surface only as connection failures: nothing
-    // counted the OAuth round trip and nothing named it as the cause. These
-    // pin the counters to the two paths that fetch.
+    // An OAUTHBEARER provider is called per connection. These pin the
+    // counters to the two paths that fetch.
 
     #[tokio::test]
     async fn a_successful_fetch_is_counted_with_its_expiry() {
-        let metrics = Arc::new(ConnectionMetrics::new());
+        let metrics = Arc::new(ConnectionRecorder::default());
         let expiry = current_epoch_ms().unwrap() + 3_600_000;
         let handle = OAuthBearerTokenProviderHandle::new(move || async move {
             Ok(OAuthBearerToken::new("jwt").with_lifetime_ms(expiry))
@@ -998,7 +940,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_fetch_is_counted_separately() {
-        let metrics = Arc::new(ConnectionMetrics::new());
+        let metrics = Arc::new(ConnectionRecorder::default());
         let handle = OAuthBearerTokenProviderHandle::new(|| async {
             Err(KrafkaError::auth("token endpoint returned HTTP 401"))
         });
@@ -1024,7 +966,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_refresh_leaves_the_previous_expiry_alone() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let metrics = Arc::new(ConnectionMetrics::new());
+        let metrics = Arc::new(ConnectionRecorder::default());
         let expiry = current_epoch_ms().unwrap() + 3_600_000;
         let calls = Arc::new(AtomicUsize::new(0));
         let c = calls.clone();

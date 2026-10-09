@@ -1,66 +1,68 @@
-//! Admin client example.
+//! Cluster administration: describe the cluster, then create, describe and
+//! delete a topic.
 //!
-//! Demonstrates how to use the Krafka admin client for cluster management.
+//! Needs a broker at `KAFKA_BOOTSTRAP_SERVERS` (default `localhost:9092`) on
+//! which the client may create and delete topics.
 //!
 //! Run with:
-//! ```
+//! ```sh
 //! cargo run --example admin
 //! ```
 
-use krafka::admin::AdminClient;
+use krafka::Kafka;
+use krafka::admin::NewTopic;
+
+const TOPIC: &str = "krafka-admin-example";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing
-    tracing_subscriber::fmt()
-        .with_env_filter("krafka=debug")
-        .init();
-
-    // Create admin client
-    let admin = AdminClient::builder()
-        .bootstrap_servers("localhost:9092")
+    let bootstrap =
+        std::env::var("KAFKA_BOOTSTRAP_SERVERS").unwrap_or_else(|_| "localhost:9092".into());
+    let kafka = Kafka::builder(bootstrap)
         .client_id("krafka-admin-example")
-        .build()
+        .connect()
         .await?;
+    let admin = kafka.admin();
 
-    println!("Admin client connected to Kafka!");
-
-    // List all topics
-    println!("\n=== Topics ===");
-    let topics = admin.list_topics().await?;
-    for topic in &topics {
-        println!("  - {}", topic);
-    }
-
-    // Describe cluster
-    println!("\n=== Cluster ===");
-    let cluster = admin.describe_cluster().await?;
-    println!("Controller ID: {:?}", cluster.controller_id);
-    println!("Brokers:");
+    let cluster = admin.describe_cluster(Default::default()).await?;
+    println!(
+        "cluster {} (controller {})",
+        cluster.cluster_id, cluster.controller_id
+    );
     for broker in &cluster.brokers {
-        println!(
-            "  - ID: {}, Address: {}:{}",
-            broker.broker_id, broker.host, broker.port
-        );
+        println!("  broker {} at {}:{}", broker.id, broker.host, broker.port);
     }
 
-    // Describe specific topics
-    if !topics.is_empty() {
-        println!("\n=== Topic Details ===");
-        let topic_infos = admin
-            .describe_topics(&topics[..1.min(topics.len())])
-            .await?;
-        for (_, info) in topic_infos {
-            println!("Topic: {}", info.name);
-            println!("  Partitions: {}", info.partition_count());
-            for partition in info.partitions_iter() {
-                println!(
-                    "    Partition {}: leader={}, replicas={:?}, isr={:?}",
-                    partition.partition, partition.leader, partition.replicas, partition.isr
-                );
-            }
+    // Results are per topic: one topic failing does not fail the call.
+    let created = admin
+        .create_topics([NewTopic::new(TOPIC, 3, 1)?], Default::default())
+        .await?;
+    for (name, result) in created {
+        match result {
+            Ok(()) => println!("created {name}"),
+            Err(error) => println!("create {name}: {error}"),
         }
     }
 
+    let topics = admin.list_topics(Default::default()).await?;
+    println!("{} topics", topics.len());
+
+    for (name, description) in admin.describe_topics([TOPIC], Default::default()).await? {
+        let description = description?;
+        println!("{name}:");
+        for partition in &description.partitions {
+            println!(
+                "  partition {} leader={:?} replicas={:?} isr={:?}",
+                partition.partition, partition.leader, partition.replicas, partition.isr
+            );
+        }
+    }
+
+    for (name, result) in admin.delete_topics([TOPIC], Default::default()).await? {
+        result?;
+        println!("deleted {name}");
+    }
+
+    admin.close().await?;
     Ok(())
 }

@@ -1,45 +1,27 @@
 //! Network layer for Kafka connections.
 //!
-//! This module provides:
-//! - TCP connection handling with priority-based request scheduling
-//! - Connection pooling with coalesced, deadline-bounded reconnection
-//! - Automatic reconnection with exponential backoff
-//! - Request/response correlation
-//! - TLS/SSL encrypted connections
-//! - SASL authentication (PLAIN, SCRAM)
-//!
-//! # Request Priority
-//!
-//! Connections support automatic priority scheduling:
-//! - **High priority**: Heartbeats, metadata, coordinator discovery
-//! - **Normal priority**: Produce, fetch, and other data requests
-//!
-//! This prevents consumer group ejection during backpressure.
-//!
-//! # One connection per broker
-//!
-//! The pool holds exactly one multiplexed socket per broker, matching the
-//! Apache Kafka Java client. The former `connections_per_broker` knob and its
-//! `BrokerConnectionBundle` type were removed: nothing ever constructed a
-//! bundle, so the knob was silently a no-op, and round-robining a partition's
-//! produce requests across sockets would have broken the idempotent
-//! producer's ordering guarantee — which holds per *connection*.
+//! - [`BrokerConnection`](crate::network::BrokerConnection): one socket to one broker, FIFO, with KIP-219
+//!   muting, close on the first request timeout, TLS and SASL.
+//! - [`ConnectionPool`](crate::network::ConnectionPool): one data connection per broker plus a coordination
+//!   connection per group coordinator ([`ConnectionPurpose`](crate::network::ConnectionPurpose)), one dial per
+//!   call with per-address reconnect backoff, and an optional connection cap.
+//! - [`TransportConfig`](crate::network::TransportConfig): the socket- and pool-level settings of a
+//!   [`Kafka`](crate::Kafka) handle.
 
 mod connection;
+pub(crate) mod connector;
 mod happy_eyeballs;
 mod pool;
 mod secure;
 mod transport;
 
-pub use connection::{
-    BrokerConnection, BrokerFeatures, ConnectionConfig, ConnectionConfigBuilder, ConnectionStats,
-    DEFAULT_CONNECT_TIMEOUT, RequestPriority,
-};
-#[cfg(feature = "socks5")]
-#[cfg_attr(docsrs, doc(cfg(feature = "socks5")))]
-pub use connection::{ProxyConfig, ProxyCredentials};
-pub use pool::{ConnectionPool, ConnectionRetryConfig, DEFAULT_MAX_IDLE};
-pub use secure::{
-    ChallengeResponse, SaslAuthenticator, SecureConnectionConfig, SecureConnectionConfigBuilder,
-};
+pub use connection::{BrokerConnection, ConnectionConfig, DEFAULT_CONNECT_TIMEOUT, ProxyConfig};
+pub use pool::ConnectionPool;
 pub use transport::{TransportConfig, TransportConfigBuilder};
+// For `__private`, benches and tests.
+#[cfg_attr(not(feature = "internal"), allow(unused_imports))]
+pub use connection::{BrokerFeatures, ConnectionConfigBuilder, ProxyCredentials};
+#[cfg_attr(not(feature = "internal"), allow(unused_imports))]
+pub use pool::{ConnectionPurpose, DEFAULT_MAX_IDLE};
+#[cfg_attr(not(feature = "internal"), allow(unused_imports))]
+pub use secure::{ChallengeResponse, SaslAuthenticator};

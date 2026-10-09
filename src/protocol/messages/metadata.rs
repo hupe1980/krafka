@@ -62,7 +62,7 @@ impl MetadataRequest {
     ///
     /// Used only by pre-flexible encode paths. Returns an error if any
     /// entry has `name: None`; flexible encoders (v9+) handle topic IDs
-    /// directly via [`encode_topic_entries_flexible`].
+    /// directly via `encode_topic_entries_flexible`.
     fn topic_names(topics: &[MetadataRequestTopic]) -> Result<Vec<KafkaString>> {
         topics
             .iter()

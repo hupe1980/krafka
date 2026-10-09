@@ -19,7 +19,7 @@
 use bytes::{Buf, Bytes};
 use libfuzzer_sys::fuzz_target;
 
-use krafka::protocol::{Decode, KafkaArray, KafkaBytes, KafkaString, ResponseHeader, TaggedFields};
+use krafka::__private::protocol::{Decode, KafkaArray, KafkaBytes, KafkaString, ResponseHeader, TaggedFields};
 
 fuzz_target!(|data: &[u8]| {
     if data.is_empty() {

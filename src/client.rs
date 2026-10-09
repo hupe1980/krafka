@@ -1,69 +1,34 @@
-//! Shared transport for connection pooling and metadata across multiple clients.
+//! The shared [`Kafka`] handle: one place for every connection setting.
 //!
-//! By default every [`Producer`](crate::producer::Producer),
-//! [`TransactionalProducer`](crate::producer::TransactionalProducer),
-//! [`Consumer`](crate::consumer::Consumer), `ShareConsumer` and
-//! [`AdminClient`](crate::admin::AdminClient) creates its own TCP connection
-//! pool and metadata cache. An application that runs one producer and two
-//! consumers against a 5-broker cluster therefore opens **15** TCP
-//! connections.
+//! A `Kafka` owns a connection pool and a cluster-metadata cache. Every client
+//! is built from it — [`producer`](Kafka::producer),
+//! [`consumer`](Kafka::consumer), [`share_consumer`](Kafka::share_consumer),
+//! [`admin`](Kafka::admin) — and shares both, so one producer and two
+//! consumers against a 5-broker cluster open 5 connections, not 15. Role
+//! builders carry only role settings: a client cannot run with security,
+//! transport or a `client_id` other than the handle's.
 //!
-//! A [`KrafkaClient`] holds a single shared pool and a single shared metadata
-//! cache. Passing one to each builder via
-//! [`.with_client()`](crate::producer::ProducerBuilder::with_client) reduces
-//! the connection count to **5** regardless of how many client objects are
-//! created. Every client builder accepts it.
-//!
-//! # Who closes the pool
-//!
-//! The `KrafkaClient` does. A client built with `.with_client(..)` **borrows**
-//! the pool: its own `close()` shuts that client down and leaves the sockets
-//! alone, and its `owns_pool()` returns `false`. Closing the `KrafkaClient`
-//! releases them.
-//!
-//! This is load-bearing rather than cosmetic. A client that tore down a
-//! borrowed pool would kill every sibling's connections and fail their
-//! in-flight Produce and Fetch requests — undoing the whole point of sharing.
-//! Only [`AdminClient`](crate::admin::AdminClient) got this right initially;
-//! its four siblings called `close_all()` unconditionally until this release.
-//!
-//! # One transport for all of them
-//!
-//! A [`TransportConfig`](crate::network::TransportConfig) given to the
-//! `KrafkaClient` applies to every attached client, since there is one pool.
-//! That is the reliable way to guarantee a SOCKS5 route, a file-descriptor cap
-//! or a KIP-1288 TLS reload interval covers the whole process — with separate
-//! pools, one client left on the defaults quietly takes a different network
-//! path.
-//!
-//! # Example
+//! The handle is cheap to clone. Clients hold a clone, so dropping the handle
+//! while clients are alive is fine; the pool closes when its last owner is
+//! dropped. Separate pools — a different identity, different credentials, an
+//! isolated failure domain — are separate handles.
 //!
 //! ```rust,no_run
-//! use krafka::client::KrafkaClient;
-//! use krafka::producer::Producer;
-//! use krafka::consumer::Consumer;
+//! use krafka::Kafka;
 //!
-//! # async fn example() -> Result<(), krafka::error::KrafkaError> {
-//! let client = KrafkaClient::builder("localhost:9092")
-//!     .build()
+//! # async fn example() -> krafka::Result<()> {
+//! let kafka = Kafka::builder("localhost:9092")
+//!     .client_id("orders")
+//!     .connect()
 //!     .await?;
 //!
-//! // Both share the same five TCP connections.
-//! let producer = Producer::builder()
-//!     .with_client(&client)
-//!     .build()
-//!     .await?;
-//!
-//! let consumer = Consumer::builder()
-//!     .with_client(&client)
-//!     .group_id("my-group")
-//!     .build()
-//!     .await?;
+//! let producer = kafka.producer().build().await?;
+//! let consumer = kafka.consumer("my-group").build().await?;
 //! # Ok(())
 //! # }
 //! ```
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use tracing::info;
@@ -71,33 +36,47 @@ use tracing::info;
 use crate::auth::AuthConfig;
 use crate::error::{KrafkaError, Result};
 use crate::metadata::{ClusterMetadata, MetadataRecoveryStrategy};
-use crate::network::{ConnectionConfig, ConnectionConfigBuilder, ConnectionPool};
+use crate::metrics::{Metrics, MetricsSource};
+use crate::network::{
+    ConnectionConfig, ConnectionPool, ProxyConfig, TransportConfig, TransportConfigBuilder,
+};
 
-/// Shared connection pool and metadata cache.
+/// A connection to a Kafka cluster that every client is built from.
 ///
-/// Construct with [`KrafkaClient::builder`] and pass to each client builder via
-/// `.with_client(&client)`. The idle-connection evictor and (when configured)
-/// the OAUTHBEARER proactive-refresh task are started once here and shared by
-/// all attached clients.
-///
-/// The `KrafkaClient` is cheap to clone: all clones share the same `Arc`-wrapped
-/// pool and metadata.
+/// Construct with [`Kafka::builder`]. Cheap to clone: clones share the pool
+/// and the metadata cache.
 #[derive(Clone)]
-pub struct KrafkaClient {
-    pool: Arc<ConnectionPool>,
-    metadata: Arc<ClusterMetadata>,
+pub struct Kafka {
+    inner: Arc<KafkaInner>,
 }
 
-impl KrafkaClient {
-    /// Create a new builder for `bootstrap_servers`.
-    ///
-    /// `bootstrap_servers` must be a comma-separated list of `host:port` pairs,
-    /// e.g. `"broker1:9092,broker2:9092"`.
-    pub fn builder(bootstrap_servers: impl Into<String>) -> KrafkaClientBuilder {
-        KrafkaClientBuilder {
+struct KafkaInner {
+    pool: Arc<ConnectionPool>,
+    metadata: Arc<ClusterMetadata>,
+    client_id: String,
+    request_timeout: Duration,
+    /// The clients built from this handle, for [`Kafka::metrics`].
+    clients: parking_lot::Mutex<Vec<Weak<MetricsSource>>>,
+}
+
+impl std::fmt::Debug for Kafka {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Kafka")
+            .field("client_id", &self.inner.client_id)
+            .field("connections", &self.inner.pool.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Kafka {
+    /// Start configuring a connection to `bootstrap_servers`, a
+    /// comma-separated list of `host:port` pairs such as
+    /// `"broker1:9092,broker2:9092"`.
+    pub fn builder(bootstrap_servers: impl Into<String>) -> KafkaBuilder {
+        KafkaBuilder {
             bootstrap_servers: bootstrap_servers.into(),
             client_id: "krafka".to_string(),
-            auth: None,
+            security: None,
             request_timeout: Duration::from_secs(30),
             connect_timeout: crate::network::DEFAULT_CONNECT_TIMEOUT,
             metadata_max_age: Duration::from_secs(300),
@@ -105,55 +84,209 @@ impl KrafkaClient {
             metadata_recovery_rebootstrap_trigger: Duration::from_secs(300),
             metadata_topic_cache_ttl: Some(Duration::from_secs(300)),
             allow_auto_create_topics: false,
-            transport: crate::network::TransportConfig::default(),
-            #[cfg(feature = "socks5")]
-            proxy: None,
+            transport: TransportConfig::builder(),
+            #[cfg(feature = "test-broker")]
+            connector: None,
         }
     }
 
-    /// Returns a reference to the shared connection pool.
-    ///
-    /// Prefer [`ProducerBuilder::with_client`](crate::producer::ProducerBuilder::with_client)
-    /// over accessing the pool directly.
-    pub fn pool(&self) -> &Arc<ConnectionPool> {
-        &self.pool
+    /// Start a producer.
+    pub fn producer(&self) -> crate::producer::ProducerBuilder {
+        crate::producer::ProducerBuilder::new(self.clone())
     }
 
-    /// Re-read TLS certificate and key files from disk and atomically install
-    /// the new material for all **future** connections opened from this shared
-    /// pool (KIP-1288).
-    ///
-    /// Existing TLS sessions are unaffected. Because a `KrafkaClient` owns the
-    /// pool that its producers, consumers and admin clients share, one call
-    /// here rotates certificates for all of them.
-    ///
-    /// No-op when TLS is not configured.
+    /// Start a consumer in consumer group `group_id`.
+    pub fn consumer(&self, group_id: impl Into<String>) -> crate::consumer::ConsumerBuilder {
+        crate::consumer::ConsumerBuilder::new(self.clone(), Some(group_id.into()))
+    }
+
+    /// Start a consumer that belongs to no group: partitions are
+    /// [`assign`](crate::consumer::Consumer::assign)ed by hand (or every
+    /// partition of the subscribed topics is taken), and offsets are not
+    /// committed.
+    pub fn consumer_without_group(&self) -> crate::consumer::ConsumerBuilder {
+        crate::consumer::ConsumerBuilder::new(self.clone(), None)
+    }
+
+    /// Start a share consumer (KIP-932) in share group `group_id`.
+    pub fn share_consumer(
+        &self,
+        group_id: impl Into<String>,
+    ) -> crate::share_consumer::ShareConsumerBuilder {
+        crate::share_consumer::ShareConsumerBuilder::new(self.clone(), group_id.into())
+    }
+
+    /// An admin client. Contacts no broker until its first call.
+    pub fn admin(&self) -> crate::admin::AdminClient {
+        crate::admin::AdminClient::new(self.clone())
+    }
+
+    /// Re-read TLS certificate and key files from disk and use them for every
+    /// connection opened from now on, by every client of this handle
+    /// (KIP-1288). Existing TLS sessions are unaffected. No-op without TLS.
     ///
     /// # Errors
     ///
-    /// Returns an error if the certificate or key files cannot be read or
-    /// parsed; the previous material stays active.
+    /// Returns an error if the files cannot be read or parsed; the previous
+    /// material stays active.
     pub async fn refresh_tls(&self) -> Result<()> {
-        self.pool.refresh_tls().await
+        self.inner.pool.refresh_tls().await
     }
 
-    /// Returns a reference to the shared metadata cache.
+    /// Replace the bootstrap server list used when the client falls back to
+    /// bootstrapping (KIP-899). Existing connections stay open.
     ///
-    /// Prefer [`ProducerBuilder::with_client`](crate::producer::ProducerBuilder::with_client)
-    /// over accessing the metadata directly.
-    pub fn metadata(&self) -> &Arc<ClusterMetadata> {
-        &self.metadata
+    /// # Errors
+    ///
+    /// Returns an error if `servers` is empty.
+    pub fn update_seed_brokers(&self, servers: Vec<String>) -> Result<()> {
+        self.inner.metadata.update_seed_brokers(servers)
+    }
+
+    /// Close every connection, clear the metadata cache and rediscover the
+    /// cluster from the bootstrap servers (KIP-899).
+    pub async fn rebootstrap(&self) {
+        self.inner.metadata.rebootstrap().await;
+    }
+
+    /// The metrics of every live client built from this handle, summed, with
+    /// the shared pool's connection counters counted once. The snapshot
+    /// carries no `client_id`, so its
+    /// [`prometheus_text`](Metrics::prometheus_text) has no client label.
+    ///
+    /// A client's counters leave the sum when the client is dropped.
+    pub fn metrics(&self) -> Metrics {
+        let mut total = Metrics::default();
+        self.inner
+            .clients
+            .lock()
+            .retain(|client| match client.upgrade() {
+                Some(source) => {
+                    total.add_client(&source.client_counters());
+                    true
+                }
+                None => false,
+            });
+        total.connections = self.inner.pool.metrics();
+        total
+    }
+
+    /// Count `source` in [`Kafka::metrics`] while it lives.
+    pub(crate) fn register_metrics(&self, source: &Arc<MetricsSource>) {
+        let mut clients = self.inner.clients.lock();
+        clients.retain(|client| client.strong_count() > 0);
+        clients.push(Arc::downgrade(source));
+    }
+
+    pub(crate) fn pool(&self) -> &Arc<ConnectionPool> {
+        &self.inner.pool
+    }
+
+    pub(crate) fn metadata(&self) -> &Arc<ClusterMetadata> {
+        &self.inner.metadata
+    }
+
+    pub(crate) fn client_id(&self) -> &str {
+        &self.inner.client_id
+    }
+
+    pub(crate) fn request_timeout(&self) -> Duration {
+        self.inner.request_timeout
+    }
+
+    /// A handle over an unconnected pool, for unit tests that exercise a
+    /// builder's validation without a broker.
+    #[cfg(test)]
+    pub(crate) fn detached() -> Self {
+        let pool = Arc::new(ConnectionPool::new(ConnectionConfig::default()));
+        let metadata = Arc::new(ClusterMetadata::new(
+            vec!["localhost:9092".to_string()],
+            Arc::clone(&pool),
+            Duration::from_secs(300),
+        ));
+        Self {
+            inner: Arc::new(KafkaInner {
+                pool,
+                metadata,
+                client_id: "krafka".to_string(),
+                request_timeout: Duration::from_secs(30),
+                clients: parking_lot::Mutex::default(),
+            }),
+        }
     }
 }
 
-/// Builder for [`KrafkaClient`].
+/// How a client's `close_with` shuts down.
 ///
-/// Obtain via [`KrafkaClient::builder`].
-#[must_use = "builders do nothing until .build().await is called"]
-pub struct KrafkaClientBuilder {
+/// Every client has `close()`, which is `close_with(CloseOptions::new())`.
+/// Without a timeout each client uses its own default: a producer waits for
+/// every queued record, a consumer and a share consumer bound the close by
+/// 30 s.
+#[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
+pub struct CloseOptions {
+    pub(crate) timeout: Option<Duration>,
+    pub(crate) group_membership_operation: GroupMembershipOperation,
+}
+
+impl CloseOptions {
+    /// The client's default close.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Bound the whole close by `timeout`.
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// Whether a [`Consumer`](crate::consumer::Consumer) in a group leaves it
+    /// on close (KIP-1092). Other clients ignore it: a share consumer always
+    /// leaves its group.
+    pub fn group_membership_operation(mut self, operation: GroupMembershipOperation) -> Self {
+        self.group_membership_operation = operation;
+        self
+    }
+}
+
+/// What a closing [`Consumer`](crate::consumer::Consumer) does about its group
+/// membership (KIP-1092), set with
+/// [`CloseOptions::group_membership_operation`].
+///
+/// | | Classic protocol | Consumer protocol (KIP-848) |
+/// |---|---|---|
+/// | `Default`, dynamic member | `LeaveGroup` | heartbeat at epoch −1 |
+/// | `Default`, static member | nothing | heartbeat at epoch −2 |
+/// | `LeaveGroup` | `LeaveGroup` (with the instance id) | heartbeat at epoch −1 |
+/// | `RemainInGroup` | nothing | nothing |
+///
+/// A member that remains keeps its partitions until the session timeout
+/// expires, so a restart within it rejoins without a rebalance only if it is a
+/// static member; a dynamic member that remains is removed when its session
+/// times out.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum GroupMembershipOperation {
+    /// Dynamic members leave; static members keep their membership.
+    #[default]
+    Default,
+    /// Leave the group, static members included.
+    LeaveGroup,
+    /// Send nothing: the coordinator removes the member when its session
+    /// expires.
+    RemainInGroup,
+}
+
+/// Builder for [`Kafka`]: every connection setting.
+///
+/// Obtain with [`Kafka::builder`]. Nothing is validated until
+/// [`connect`](Self::connect).
+#[must_use = "builders do nothing until .connect().await is called"]
+pub struct KafkaBuilder {
     bootstrap_servers: String,
     client_id: String,
-    auth: Option<AuthConfig>,
+    security: Option<AuthConfig>,
     request_timeout: Duration,
     connect_timeout: Duration,
     metadata_max_age: Duration,
@@ -161,249 +294,311 @@ pub struct KrafkaClientBuilder {
     metadata_recovery_rebootstrap_trigger: Duration,
     metadata_topic_cache_ttl: Option<Duration>,
     allow_auto_create_topics: bool,
-    transport: crate::network::TransportConfig,
-    #[cfg(feature = "socks5")]
-    proxy: Option<crate::network::ProxyConfig>,
+    transport: TransportConfigBuilder,
+    #[cfg(feature = "test-broker")]
+    connector: Option<crate::network::connector::Connector>,
 }
 
-impl KrafkaClientBuilder {
-    /// Set the client ID sent in every Kafka request header.
+impl std::fmt::Debug for KafkaBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KafkaBuilder")
+            .field("bootstrap_servers", &self.bootstrap_servers)
+            .field("client_id", &self.client_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl KafkaBuilder {
+    /// The client id sent in every request header. Default: `"krafka"`.
     ///
-    /// Default: `"krafka"`.
-    pub fn client_id(mut self, id: impl Into<String>) -> Self {
-        self.client_id = id.into();
+    /// Shared by every client of the handle; build a second handle for a
+    /// second identity.
+    pub fn client_id(mut self, client_id: impl Into<String>) -> Self {
+        self.client_id = client_id.into();
         self
     }
 
-    /// Set authentication configuration (TLS, SASL/PLAIN, SCRAM, MSK IAM,
-    /// OAUTHBEARER …).
-    pub fn auth(mut self, auth: AuthConfig) -> Self {
-        self.auth = Some(auth);
+    /// TLS and SASL for every connection: see [`AuthConfig`]. Default:
+    /// plaintext.
+    pub fn security(mut self, security: AuthConfig) -> Self {
+        self.security = Some(security);
         self
     }
 
-    /// Configure SASL/OAUTHBEARER with an async token provider.
+    /// How long one request may wait for its response. Default: 30 s.
     ///
-    /// The provider is called on every new broker connection and is backed by
-    /// the built-in caching/coalescing layer. A proactive background refresh
-    /// task starts when `build()` completes.
-    pub fn sasl_oauthbearer_provider(
-        mut self,
-        provider: impl crate::auth::OAuthBearerTokenProvider + 'static,
-    ) -> Self {
-        self.auth = Some(AuthConfig::sasl_oauthbearer_provider(provider));
-        self
-    }
-
-    /// Set the per-request timeout for metadata and API-version checks.
-    ///
-    /// Default: 30 s. Must be at least
-    /// [`connect_timeout`](Self::connect_timeout), whose default is 10 s — a
-    /// request's clock covers establishing the connection it is sent over, so a
-    /// shorter value would expire every request before the handshake could
-    /// finish. To go below 10 s, lower `connect_timeout` as well; `build()`
-    /// returns a config error otherwise.
+    /// Must be at least [`connect_timeout`](Self::connect_timeout): a
+    /// request's clock covers establishing the connection it is sent over.
     pub fn request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
         self
     }
 
-    /// Set how long TCP establishment to one broker may take.
-    ///
-    /// Default: 10 s. This also acts as the floor on
-    /// [`request_timeout`](Self::request_timeout), so lowering it is what makes
-    /// a sub-10-second request timeout possible.
+    /// How long establishing a TCP connection to one broker may take.
+    /// Default: 10 s.
     pub fn connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = timeout;
         self
     }
 
-    /// Set how long cluster metadata may be cached before an automatic
-    /// background refresh.
-    ///
+    /// How long cluster metadata may be cached before a background refresh.
     /// Default: 5 min.
-    pub fn metadata_max_age(mut self, duration: Duration) -> Self {
-        self.metadata_max_age = duration;
+    pub fn metadata_max_age(mut self, age: Duration) -> Self {
+        self.metadata_max_age = age;
         self
     }
 
-    /// Set the metadata recovery strategy for lost-cluster detection.
-    ///
+    /// What to do when every known broker is unreachable (KIP-899).
     /// Default: [`MetadataRecoveryStrategy::Rebootstrap`].
     pub fn metadata_recovery_strategy(mut self, strategy: MetadataRecoveryStrategy) -> Self {
         self.metadata_recovery_strategy = strategy;
         self
     }
 
-    /// Set the idle duration after which, if no metadata refresh has succeeded,
-    /// the client triggers a rebootstrap (when the strategy is `Rebootstrap`).
-    ///
-    /// Default: 5 min.
+    /// How long metadata refreshes may keep failing before the client
+    /// rebootstraps (KIP-1102). Default: 5 min.
     pub fn metadata_recovery_rebootstrap_trigger(mut self, duration: Duration) -> Self {
         self.metadata_recovery_rebootstrap_trigger = duration;
         self
     }
 
-    /// Set the per-topic TTL for partial metadata refreshes.
-    ///
+    /// How long a topic's metadata stays cached without being used, or
+    /// `None` to keep it forever (Java `metadata.max.idle.ms`).
     /// Default: 5 min.
-    pub fn metadata_topic_cache_ttl(mut self, ttl: Duration) -> Self {
-        self.metadata_topic_cache_ttl = Some(ttl);
+    pub fn metadata_topic_cache_ttl(mut self, ttl: Option<Duration>) -> Self {
+        self.metadata_topic_cache_ttl = ttl;
         self
     }
 
-    /// Disable per-topic TTL eviction for partial metadata refreshes.
-    ///
-    /// Entries will then persist across partial refreshes indefinitely.
-    pub fn disable_metadata_topic_cache_ttl(mut self) -> Self {
-        self.metadata_topic_cache_ttl = None;
-        self
-    }
-
-    /// Let the broker create a topic this client asks about but the cluster
-    /// does not have, i.e. `allow.auto.create.topics`.
-    ///
-    /// **This setting is shared.** Every producer and consumer built with
-    /// [`ProducerBuilder::with_client`](crate::producer::ProducerBuilder::with_client)
-    /// and its siblings routes through this client's metadata, so it governs
-    /// them too and their own `allow_auto_create_topics` is not consulted.
-    ///
-    /// Default: `false` — see
-    /// [`ClusterMetadata::with_auto_create_topics`] for why.
+    /// Let the broker create a topic a client asks about but the cluster does
+    /// not have (`allow.auto.create.topics`; the broker must also have
+    /// `auto.create.topics.enable=true`). Default: `false` — a typo'd topic
+    /// name otherwise silently becomes a real topic.
     pub fn allow_auto_create_topics(mut self, allow: bool) -> Self {
         self.allow_auto_create_topics = allow;
         self
     }
 
-    /// Configure SASL/PLAIN authentication.
+    /// Route every connection through a SOCKS5 proxy. Default: direct.
+    pub fn proxy(mut self, proxy: ProxyConfig) -> Self {
+        self.transport = self.transport.proxy(proxy);
+        self
+    }
+
+    /// Disable Nagle's algorithm on every broker socket. Default: `true`.
+    pub fn tcp_nodelay(mut self, enabled: bool) -> Self {
+        self.transport = self.transport.tcp_nodelay(enabled);
+        self
+    }
+
+    /// TCP keepalive interval, or `None` to leave keepalive off.
+    /// Default: 60 s. Set it below the idle timeout of any firewall or load
+    /// balancer between the client and the brokers.
+    pub fn tcp_keepalive(mut self, interval: Option<Duration>) -> Self {
+        self.transport = self.transport.tcp_keepalive(interval);
+        self
+    }
+
+    /// Largest response frame accepted, in bytes. Default: 100 MiB; at least
+    /// 1 KiB. A frame declaring more closes the connection.
+    pub fn max_response_size(mut self, bytes: usize) -> Self {
+        self.transport = self.transport.max_response_size(bytes);
+        self
+    }
+
+    /// Requests that may be outstanding on one connection before senders
+    /// wait. Default: 10; at least 1.
+    pub fn max_in_flight_requests(mut self, max: usize) -> Self {
+        self.transport = self.transport.max_in_flight_requests(max);
+        self
+    }
+
+    /// `SO_SNDBUF` for every broker socket, or `None` for the OS default
+    /// (Java `send.buffer.bytes`). Default: `None`.
+    pub fn socket_send_buffer(mut self, bytes: Option<usize>) -> Self {
+        self.transport = self.transport.socket_send_buffer(bytes);
+        self
+    }
+
+    /// `SO_RCVBUF` for every broker socket, or `None` for the OS default
+    /// (Java `receive.buffer.bytes`). Default: `None`.
+    pub fn socket_receive_buffer(mut self, bytes: Option<usize>) -> Self {
+        self.transport = self.transport.socket_receive_buffer(bytes);
+        self
+    }
+
+    /// Stagger between parallel connection attempts to one broker's
+    /// addresses (Happy Eyeballs, RFC 8305). Default: 250 ms, clamped to
+    /// 100 ms – 2 s.
+    pub fn connection_attempt_delay(mut self, delay: Duration) -> Self {
+        self.transport = self.transport.connection_attempt_delay(delay);
+        self
+    }
+
+    /// How long a connection may sit unused before it is closed, or `None`
+    /// to keep it (Java `connections.max.idle.ms`). Default: 9 min.
+    pub fn connections_max_idle(mut self, max_idle: Option<Duration>) -> Self {
+        self.transport = self.transport.connections_max_idle(max_idle);
+        self
+    }
+
+    /// Cap on live connections across all brokers, or `None` for no cap.
+    /// Default: `None`.
+    pub fn max_connections(mut self, limit: Option<usize>) -> Self {
+        self.transport = self.transport.max_connections(limit);
+        self
+    }
+
+    /// Re-read TLS certificate and key files every `interval` (KIP-1288), or
+    /// `None` to reload only on [`Kafka::refresh_tls`]. Default: `None`.
+    pub fn tls_reload_interval(mut self, interval: Option<Duration>) -> Self {
+        self.transport = self.transport.tls_reload_interval(interval);
+        self
+    }
+
+    /// Dial every broker through `connector` instead of the network.
+    #[cfg(feature = "test-broker")]
+    pub(crate) fn connector(mut self, connector: crate::network::connector::Connector) -> Self {
+        self.connector = Some(connector);
+        self
+    }
+
+    /// Validate the settings, open the pool and bootstrap the cluster
+    /// metadata.
     ///
     /// # Errors
     ///
-    /// Returns an error if the credentials contain bytes the SASL framing
-    /// cannot carry.
-    pub fn sasl_plain(
-        mut self,
-        username: impl Into<String>,
-        password: impl Into<String>,
-    ) -> crate::Result<Self> {
-        self.auth = Some(AuthConfig::sasl_plain(username, password)?);
-        Ok(self)
-    }
-
-    /// Configure SASL/SCRAM-SHA-256 authentication.
-    pub fn sasl_scram_sha256(
-        mut self,
-        username: impl Into<String>,
-        password: impl Into<String>,
-    ) -> Self {
-        self.auth = Some(AuthConfig::sasl_scram_sha256(username, password));
-        self
-    }
-
-    /// Configure SASL/SCRAM-SHA-512 authentication.
-    pub fn sasl_scram_sha512(
-        mut self,
-        username: impl Into<String>,
-        password: impl Into<String>,
-    ) -> Self {
-        self.auth = Some(AuthConfig::sasl_scram_sha512(username, password));
-        self
-    }
-
-    /// Configure SASL/OAUTHBEARER with a static token.
-    ///
-    /// For a token that must be refreshed, use
-    /// [`auth`](Self::auth) with
-    /// [`AuthConfig::sasl_oauthbearer_provider`](crate::auth::AuthConfig::sasl_oauthbearer_provider),
-    /// or the built-in OIDC provider behind the `oauth-oidc` feature.
-    pub fn sasl_oauthbearer(mut self, token: impl Into<String>) -> Self {
-        self.auth = Some(AuthConfig::sasl_oauthbearer(token));
-        self
-    }
-
-    /// Configure a SOCKS5 proxy for all broker connections.
-    #[cfg(feature = "socks5")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "socks5")))]
-    pub fn proxy(mut self, proxy: crate::network::ProxyConfig) -> Self {
-        self.proxy = Some(proxy);
-        self
-    }
-
-    /// Set socket- and pool-level transport tuning.
-    ///
-    /// Covers TCP keepalive and nodelay, the per-connection response ceiling
-    /// and in-flight cap, the priority-channel depths, the Happy Eyeballs
-    /// stagger, idle-connection eviction, a total-connection cap, and the
-    /// KIP-1288 automatic TLS reload interval.
-    ///
-    /// Omitting this call keeps krafka's historical defaults, which
-    /// [`TransportConfig::default`](crate::network::TransportConfig) reproduces
-    /// exactly.
-    pub fn transport(mut self, transport: crate::network::TransportConfig) -> Self {
-        self.transport = transport;
-        self
-    }
-
-    /// Build the shared client, establish the initial metadata fetch, and
-    /// start background tasks (idle evictor, OAUTHBEARER token refresh).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - `bootstrap_servers` is empty
-    /// - TLS initialisation fails
-    /// - The initial metadata fetch fails
-    pub async fn build(self) -> Result<KrafkaClient> {
-        if self.bootstrap_servers.is_empty() {
+    /// [`KrafkaError::Config`] naming the setting for an invalid
+    /// configuration (an empty bootstrap list, empty SASL credentials, a
+    /// request timeout below the connect timeout, …); a network, timeout or
+    /// authentication error if no bootstrap server answers.
+    pub async fn connect(self) -> Result<Kafka> {
+        if self.bootstrap_servers.trim().is_empty() {
             return Err(KrafkaError::config("bootstrap_servers is required"));
         }
+        if self.client_id.len() > i16::MAX as usize {
+            return Err(KrafkaError::config(format!(
+                "client_id is {} bytes, exceeding the Kafka wire limit of {}",
+                self.client_id.len(),
+                i16::MAX
+            )));
+        }
+        if let Some(security) = &self.security {
+            security.validate()?;
+        }
+        let transport = self.transport.build()?;
+        let bootstrap_servers = crate::util::parse_bootstrap_servers(&self.bootstrap_servers)?;
 
-        let mut pool_config_builder: ConnectionConfigBuilder = self.transport.apply(
+        let mut pool_config = transport.apply(
             ConnectionConfig::builder()
                 .client_id(&self.client_id)
                 .request_timeout(self.request_timeout)
                 .connect_timeout(self.connect_timeout),
         );
-
-        if let Some(ref auth) = self.auth {
-            pool_config_builder = pool_config_builder.auth(auth.clone());
+        if let Some(security) = self.security {
+            pool_config = pool_config.auth(security);
         }
-
-        #[cfg(feature = "socks5")]
-        if let Some(ref proxy) = self.proxy {
-            pool_config_builder = pool_config_builder.proxy(proxy.clone());
+        let mut pool_config = pool_config.build()?;
+        #[cfg(feature = "test-broker")]
+        {
+            pool_config.connector = self.connector;
         }
-
-        let mut pool_config = pool_config_builder.build()?;
         pool_config.init_tls().await?;
+        let pool = transport.build_pool(pool_config);
 
-        // Every client builds its pool through `TransportConfig::build_pool`,
-        // which applies the pool-level settings and starts the background
-        // tasks (idle eviction, OAUTHBEARER refresh, KIP-1288 TLS reload).
-        // Routing all construction sites through one function is what stops
-        // them drifting apart again.
-        let pool = self.transport.build_pool(pool_config);
-
-        let bootstrap_servers = crate::util::parse_bootstrap_servers(&self.bootstrap_servers)?;
-
-        let mut meta = ClusterMetadata::new(bootstrap_servers, pool.clone(), self.metadata_max_age)
-            .with_recovery_strategy(self.metadata_recovery_strategy)
-            .with_rebootstrap_trigger(self.metadata_recovery_rebootstrap_trigger);
-        meta = match self.metadata_topic_cache_ttl {
-            Some(ttl) => meta.with_topic_cache_ttl(ttl),
-            None => meta.with_topic_cache_ttl_disabled(),
-        };
-        meta = meta.with_auto_create_topics(self.allow_auto_create_topics);
-        let metadata = Arc::new(meta);
-
+        let metadata =
+            ClusterMetadata::new(bootstrap_servers, Arc::clone(&pool), self.metadata_max_age)
+                .with_recovery_strategy(self.metadata_recovery_strategy)
+                .with_rebootstrap_trigger(self.metadata_recovery_rebootstrap_trigger)
+                .with_auto_create_topics(self.allow_auto_create_topics);
+        let metadata = Arc::new(match self.metadata_topic_cache_ttl {
+            Some(ttl) => metadata.with_topic_cache_ttl(ttl),
+            None => metadata.with_topic_cache_ttl_disabled(),
+        });
         metadata.refresh().await?;
 
         info!(
             bootstrap_servers = %self.bootstrap_servers,
             brokers = metadata.brokers().len(),
-            "KrafkaClient initialized"
+            "connected"
         );
 
-        Ok(KrafkaClient { pool, metadata })
+        Ok(Kafka {
+            inner: Arc::new(KafkaInner {
+                pool,
+                metadata,
+                client_id: self.client_id,
+                request_timeout: self.request_timeout,
+                clients: parking_lot::Mutex::default(),
+            }),
+        })
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn an_empty_bootstrap_list_is_a_config_error() {
+        let err = Kafka::builder("").connect().await.unwrap_err();
+        assert!(matches!(err, KrafkaError::Config { .. }), "{err:?}");
+        assert!(err.to_string().contains("bootstrap_servers"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn empty_sasl_credentials_are_a_config_error_naming_the_setting() {
+        let err = Kafka::builder("127.0.0.1:1")
+            .security(AuthConfig::sasl_plain("", "secret"))
+            .connect()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KrafkaError::Config { .. }), "{err:?}");
+        assert!(err.to_string().contains("username"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_invalid_transport_setting_is_a_config_error() {
+        let err = Kafka::builder("127.0.0.1:1")
+            .max_in_flight_requests(0)
+            .connect()
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("max_in_flight_requests"), "{err}");
+    }
+
+    /// A 2 s request timeout is reachable only by lowering `connect_timeout`
+    /// too; the connection layer rejects a request timeout below it.
+    #[tokio::test]
+    async fn a_request_timeout_below_connect_timeout_names_the_setting() {
+        let err = Kafka::builder("127.0.0.1:1")
+            .request_timeout(Duration::from_secs(2))
+            .connect()
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("connect_timeout"), "{err}");
+
+        let err = Kafka::builder("127.0.0.1:1")
+            .request_timeout(Duration::from_secs(2))
+            .connect_timeout(Duration::from_secs(2))
+            .connect()
+            .await
+            .unwrap_err();
+        assert!(!err.to_string().contains("connect_timeout"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_cluster_fails_with_network_or_timeout() {
+        let err = Kafka::builder("127.0.0.1:1")
+            .request_timeout(Duration::from_secs(2))
+            .connect_timeout(Duration::from_secs(1))
+            .connect()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, KrafkaError::Network(_) | KrafkaError::Timeout { .. }),
+            "{err:?}"
+        );
     }
 }

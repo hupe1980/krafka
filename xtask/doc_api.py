@@ -78,6 +78,8 @@ ALLOWLIST = {
     # coordinator is the point of KIP-939, so the guide has to show one; these
     # are `postgres`-shaped placeholders, not krafka API.
     "query_one", "execute",
+    # testcontainers (the testing guide's real-broker section)
+    "with_exposed_port", "with_wait_for", "with_mapped_port", "start",
 }
 
 
@@ -109,6 +111,11 @@ def crate_symbols() -> set[str]:
         r"pub use [^;]*?\b(\w+)\s*(?:,|\}|;|\s+as\b)",
     ):
         names.update(re.findall(pattern, src))
+    # Options structs declared with the admin's `admin_options!` macro: the
+    # struct name and one setter per field.
+    for block in re.findall(r"^admin_options! \{\n(.*?)^\}", src, re.M | re.S):
+        names.update(re.findall(r"^    (\w+) \{", block, re.M))
+        names.update(re.findall(r"^        (\w+):", block, re.M))
     # Enum variants: a bare `Name,` or `Name = 3,` at one indent level.
     names.update(re.findall(r"^\s{4}(\w+)\s*(?:=\s*-?\d+)?\s*,\s*$", src, re.M))
     return names

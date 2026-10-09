@@ -448,14 +448,11 @@ mod tests {
         assert_eq!(cursor.partition_index, 10);
     }
 
-    // ── Regression: nullable-struct presence byte ──────────────────────
+    // ── Nullable-struct presence byte ──────────────────────────────────
 
-    /// The presence byte must be consumed before the struct fields.
-    ///
-    /// Previously the non-null branch began decoding `topic_name` *at* the
-    /// marker, so `0x01` was read as a compact-string length (yielding an empty
-    /// name) and `partition_index` then consumed the first four bytes of the
-    /// real topic name. Pagination silently walked the wrong cursor.
+    /// The presence byte must be consumed before the struct fields;
+    /// otherwise `0x01` reads as a compact-string length and pagination
+    /// walks the wrong cursor.
     #[test]
     fn decode_v0_cursor_does_not_consume_presence_byte_as_string_len() {
         let mut buf = BytesMut::new();

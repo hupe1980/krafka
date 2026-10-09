@@ -1,17 +1,20 @@
 //! Minimal async HTTP/1.1 client used by the OIDC token provider.
 //!
-//! Avoids reqwest, and with it hyper, h2 and tower. The only additional crates
-//! used here are `tokio-rustls` and `webpki-roots`, both already required by
-//! the Kafka transport layer.
+//! Avoids reqwest, and with it hyper, h2 and tower. TLS is the Kafka transport's
+//! own: the caller passes a `rustls::ClientConfig` built by
+//! `auth::tls::build_tls_config_sync`.
 //!
 //! Design constraints:
 //! - One new TCP (+ TLS) connection per request — token fetches happen once per
 //!   token lifetime; the simplicity outweighs the minor overhead.
-//! - Supports HTTP and HTTPS, GET / POST / DELETE with JSON bodies.
+//! - Supports HTTP and HTTPS and one request shape: a form-encoded `POST`
+//!   (the OAuth 2.0 token request).
 //! - Handles both `Content-Length` and `Transfer-Encoding: chunked` response
 //!   bodies.
-//! - Response bodies are capped at `MAX_BODY_BYTES` to prevent runaway
-//!   memory consumption on malicious or buggy servers.
+//! - Response bodies are capped at the caller's limit while reading, so a
+//!   malicious or buggy server cannot make the client buffer more.
+//! - The request buffer and the response body are zeroized on drop: they hold
+//!   client credentials and access tokens.
 //! - Every status / header / chunk-size / trailer line is capped at
 //!   `MAX_LINE_BYTES` and the header block at `MAX_HEADERS` entries, so a
 //!   hostile server cannot exhaust memory by streaming an endless "header".
@@ -21,18 +24,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rustls::RootCertStore;
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::{KrafkaError, Result};
-
-/// Hard cap on response body size (16 MiB). Token responses are small; this is
-/// a bound against a hostile or broken peer, not a working limit.
-const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 /// Hard cap on a single status / header / chunk-size / trailer line (8 KiB).
 ///
@@ -40,13 +39,13 @@ const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// `large_client_header_buffers` default is 8 KiB). Without this cap a
 /// malicious server could stream an unbounded run of non-newline bytes into
 /// `read_line`, growing a `String` until the process is OOM-killed.
-const MAX_LINE_BYTES: u64 = 8 * 1024;
+pub const MAX_LINE_BYTES: u64 = 8 * 1024;
 
 /// Hard cap on the number of response header lines accepted.
 ///
 /// Prevents a server from streaming an unbounded number of short header lines
 /// (each individually under `MAX_LINE_BYTES`) to the same effect.
-const MAX_HEADERS: usize = 100;
+pub const MAX_HEADERS: usize = 100;
 
 /// Hard cap on the number of trailer lines accepted after a chunked body.
 const MAX_TRAILERS: usize = 32;
@@ -77,9 +76,9 @@ async fn read_line_bounded<R: AsyncRead + Unpin>(
     let n = limited
         .read_line(line)
         .await
-        .map_err(|e| KrafkaError::http(format!("reading {what} failed: {e}")))?;
+        .map_err(|e| KrafkaError::auth_with_source(format!("reading {what} failed: {e}"), e))?;
     if n as u64 > MAX_LINE_BYTES {
-        return Err(KrafkaError::http(format!(
+        return Err(KrafkaError::auth(format!(
             "{what} exceeds the {MAX_LINE_BYTES}-byte line limit"
         )));
     }
@@ -99,14 +98,10 @@ struct ParsedUrl {
 impl ParsedUrl {
     /// The value for the `Host` request header, per RFC 9110 §7.2.
     ///
-    /// Two rules the previous implementation broke by sending the bare host:
-    ///
-    /// * the port **must** be included whenever it is not the scheme default,
-    ///   and the Confluent Schema Registry's own default is 8081 — so the
-    ///   common deployment was the one that sent the wrong header. Name-based
-    ///   virtual hosting, most reverse proxies and any origin that validates
-    ///   `Host` against its configured authority reject or mis-route it;
-    /// * an IPv6 literal must stay bracketed, or the colons in the address are
+    /// * the port is included whenever it is not the scheme default, or
+    ///   name-based virtual hosting and reverse proxies that validate `Host`
+    ///   against their configured authority reject or mis-route the request;
+    /// * an IPv6 literal stays bracketed, or the colons in the address are
     ///   indistinguishable from a port separator.
     fn host_header(&self) -> String {
         let bracketed = self.host.contains(':');
@@ -238,47 +233,42 @@ impl AsyncWrite for HttpStream {
 pub(crate) struct HttpResponse {
     /// HTTP status code (e.g. `200`, `404`).
     pub status: u16,
-    /// Value of the `Content-Type` response header, if present.
-    ///
-    /// Callers should validate this before attempting to parse the body as JSON
-    /// to avoid confusing parse errors from HTML error pages or proxy responses.
-    ///
-    /// The OIDC token provider inspects the body rather than this field,
-    /// because RFC 6749 error responses are JSON regardless of what a proxy in
-    /// front of the identity provider labels them. Kept because a
-    /// `Content-Type` mismatch is the first thing to look at when an identity
-    /// provider returns an HTML error page.
-    #[allow(dead_code)]
-    pub content_type: Option<String>,
-    /// Raw response body bytes.
-    pub body: Vec<u8>,
+    /// Raw response body bytes, zeroized on drop.
+    pub body: Zeroizing<Vec<u8>>,
 }
 
 /// Minimal async HTTP/1.1 client.
 ///
-/// Opens one new connection per request (no pooling).  Supports HTTP and
-/// HTTPS, GET / POST / DELETE, and both `Content-Length` and chunked
-/// transfer-encoding response bodies.
+/// Opens one new connection per request (no pooling). Sends a form-encoded
+/// `POST` over HTTP or HTTPS and reads `Content-Length`, chunked or
+/// read-to-close response bodies.
 pub(crate) struct HttpClient {
     tls_config: Arc<rustls::ClientConfig>,
     /// Wall-clock budget for one request (connect + TLS + write + read).
     ///
     /// Always set: callers that pass `None` get `DEFAULT_HTTP_TIMEOUT`.
     timeout: Duration,
+    /// Largest response body accepted, enforced while reading.
+    max_body_bytes: usize,
 }
 
 impl HttpClient {
-    /// Build a client that validates server certificates against the Mozilla
-    /// WebPKI trust roots bundled in the `webpki-roots` crate.
+    /// Build a client that connects over `tls_config`.
     ///
     /// `timeout` bounds the whole request. `None` selects
-    /// `DEFAULT_HTTP_TIMEOUT` rather than disabling the bound.
-    pub fn with_webpki_roots(timeout: Option<Duration>) -> Result<Self> {
-        let tls_config = make_tls_config()?;
-        Ok(Self {
+    /// `DEFAULT_HTTP_TIMEOUT` rather than disabling the bound. A response
+    /// body larger than `max_body_bytes` fails the request after at most that
+    /// many body bytes (plus one read buffer) have been read.
+    pub fn new(
+        tls_config: Arc<rustls::ClientConfig>,
+        timeout: Option<Duration>,
+        max_body_bytes: usize,
+    ) -> Self {
+        Self {
             tls_config,
             timeout: timeout.unwrap_or(DEFAULT_HTTP_TIMEOUT),
-        })
+            max_body_bytes,
+        }
     }
 
     /// Reject header values that could smuggle additional headers.
@@ -302,31 +292,21 @@ impl HttpClient {
         Ok(())
     }
 
-    /// Send an HTTP request and return the parsed response.
+    /// `POST` an `application/x-www-form-urlencoded` body to `url` and return
+    /// the parsed response.
     ///
-    /// # Arguments
-    ///
-    /// * `method` — HTTP verb (`"GET"`, `"POST"`, `"DELETE"`, …).
-    /// * `url` — Absolute URL including scheme, authority, and path.
-    /// * `extra_headers` — Additional `(name, value)` header pairs appended
-    ///   after the mandatory `Host` and `Connection` headers.
-    /// * `body` — Optional request body.  A `Content-Length` header is added
-    ///   automatically when this is `Some`.
-    /// * `auth_header` — Pre-formatted `Authorization` header value, e.g.
-    ///   `"Basic dXNlcjpwYXNz"` or `"Bearer token123"`.  `None` omits the
-    ///   header.
+    /// `auth_header` is a pre-formatted `Authorization` header value, e.g.
+    /// `"Basic dXNlcjpwYXNz"`; `None` omits the header.
     ///
     /// # Errors
     ///
-    /// Returns [`KrafkaError::Config`] if `auth_header` or any `extra_headers`
-    /// value contains a byte outside printable ASCII (CRLF header injection),
-    /// and [`KrafkaError::Timeout`] if the request exceeds the client timeout.
-    pub async fn request(
+    /// Returns [`KrafkaError::Config`] if `auth_header` contains a byte outside
+    /// printable ASCII (CRLF header injection), and [`KrafkaError::Timeout`] if
+    /// the request exceeds the client timeout.
+    pub async fn post_form(
         &self,
-        method: &str,
         url: &str,
-        extra_headers: &[(&str, &str)],
-        body: Option<&[u8]>,
+        form: &[u8],
         auth_header: Option<&str>,
     ) -> Result<HttpResponse> {
         // Reject CRLF (and every other control byte) before it can reach the
@@ -334,18 +314,14 @@ impl HttpClient {
         if let Some(auth) = auth_header {
             Self::validate_header_value("Authorization", auth)?;
         }
-        for (name, value) in extra_headers {
-            Self::validate_header_value(name, value)?;
-        }
 
         let parsed = ParsedUrl::parse(url)?;
         let fut = do_request(
             &self.tls_config,
-            method,
             &parsed,
-            extra_headers,
-            body,
+            form,
             auth_header,
+            self.max_body_bytes,
         );
         tokio::time::timeout(self.timeout, fut)
             .await
@@ -357,16 +333,18 @@ impl HttpClient {
 
 async fn do_request(
     tls_config: &Arc<rustls::ClientConfig>,
-    method: &str,
     url: &ParsedUrl,
-    extra_headers: &[(&str, &str)],
-    body: Option<&[u8]>,
+    body: &[u8],
     auth_header: Option<&str>,
+    max_body_bytes: usize,
 ) -> Result<HttpResponse> {
-    let tcp = TcpStream::connect((url.host.as_str(), url.port))
+    let tcp = crate::network::connector::dial_http(url.host.as_str(), url.port)
         .await
         .map_err(|e| {
-            KrafkaError::http(format!("connect to {}:{} failed: {e}", url.host, url.port))
+            KrafkaError::auth_with_source(
+                format!("connect to {}:{} failed: {e}", url.host, url.port),
+                e,
+            )
         })?;
 
     let stream = if url.is_https {
@@ -375,57 +353,54 @@ async fn do_request(
             .to_owned();
         let connector = TlsConnector::from(Arc::clone(tls_config));
         let tls = connector.connect(server_name, tcp).await.map_err(|e| {
-            KrafkaError::http(format!("TLS handshake with {} failed: {e}", url.host))
+            KrafkaError::auth_with_source(format!("TLS handshake with {} failed: {e}", url.host), e)
         })?;
         HttpStream::Tls(Box::new(tls))
     } else {
         HttpStream::Plain(tcp)
     };
 
-    // Serialise the request into a single buffer to minimise write calls.
-    let mut req = String::with_capacity(256);
-    req.push_str(method);
-    req.push(' ');
-    req.push_str(&url.path_and_query);
-    req.push_str(" HTTP/1.1\r\nHost: ");
-    req.push_str(&url.host_header());
-    req.push_str("\r\nConnection: close\r\n");
+    // Serialise the request head into a single buffer to minimise write calls.
+    // The buffer carries the `Authorization` header, so it is sized exactly
+    // up front (no reallocation leaves a copy behind) and zeroized on drop.
+    let host = url.host_header();
+    let content_length = body.len().to_string();
+    let mut parts: Vec<&str> = vec![
+        "POST ",
+        &url.path_and_query,
+        " HTTP/1.1\r\nHost: ",
+        &host,
+        "\r\nConnection: close\r\n",
+    ];
     if let Some(auth) = auth_header {
-        req.push_str("Authorization: ");
-        req.push_str(auth);
-        req.push_str("\r\n");
+        parts.extend(["Authorization: ", auth, "\r\n"]);
     }
-    for (name, val) in extra_headers {
-        req.push_str(name);
-        req.push_str(": ");
-        req.push_str(val);
-        req.push_str("\r\n");
+    parts.extend([
+        "Content-Type: application/x-www-form-urlencoded\r\n",
+        "Accept: application/json\r\n",
+        "Content-Length: ",
+        &content_length,
+        "\r\n\r\n",
+    ]);
+    let mut req = Zeroizing::new(String::with_capacity(parts.iter().map(|p| p.len()).sum()));
+    for part in parts {
+        req.push_str(part);
     }
-    if let Some(b) = body {
-        req.push_str("Content-Length: ");
-        req.push_str(&b.len().to_string());
-        req.push_str("\r\n");
-    }
-    req.push_str("\r\n");
 
     let mut stream = stream;
-    stream
-        .write_all(req.as_bytes())
-        .await
-        .map_err(|e| KrafkaError::http(format!("writing request headers failed: {e}")))?;
-    if let Some(b) = body {
-        stream
-            .write_all(b)
-            .await
-            .map_err(|e| KrafkaError::http(format!("writing request body failed: {e}")))?;
-    }
+    stream.write_all(req.as_bytes()).await.map_err(|e| {
+        KrafkaError::auth_with_source(format!("writing request headers failed: {e}"), e)
+    })?;
+    stream.write_all(body).await.map_err(|e| {
+        KrafkaError::auth_with_source(format!("writing request body failed: {e}"), e)
+    })?;
     stream
         .flush()
         .await
-        .map_err(|e| KrafkaError::http(format!("flushing request failed: {e}")))?;
+        .map_err(|e| KrafkaError::auth_with_source(format!("flushing request failed: {e}"), e))?;
 
     let mut reader = BufReader::new(stream);
-    read_response(&mut reader).await
+    read_response(&mut reader, max_body_bytes).await
 }
 
 // ── Response parsing ──────────────────────────────────────────────────────
@@ -434,9 +409,12 @@ async fn do_request(
 ///
 /// Every read is bounded: the status line, each header line and each chunk
 /// header at `MAX_LINE_BYTES`; the header block at `MAX_HEADERS` lines;
-/// the body at `MAX_BODY_BYTES` — enforced *before* allocating in every
+/// the body at `max_body_bytes` — enforced *before* reading past it in every
 /// branch, including the `Connection: close` read-to-EOF path.
-async fn read_response<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) -> Result<HttpResponse> {
+async fn read_response<R: AsyncRead + Unpin>(
+    reader: &mut BufReader<R>,
+    max_body_bytes: usize,
+) -> Result<HttpResponse> {
     // Status line: `HTTP/1.1 200 OK\r\n`
     let mut line = String::new();
     read_line_bounded(reader, &mut line, "HTTP status line").await?;
@@ -445,7 +423,6 @@ async fn read_response<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) -> Resul
     // Headers
     let mut content_length: Option<usize> = None;
     let mut is_chunked = false;
-    let mut content_type: Option<String> = None;
     let mut header_count = 0usize;
     loop {
         let n = read_line_bounded(reader, &mut line, "HTTP header line").await?;
@@ -454,7 +431,7 @@ async fn read_response<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) -> Resul
         }
         header_count += 1;
         if header_count > MAX_HEADERS {
-            return Err(KrafkaError::http(format!(
+            return Err(KrafkaError::auth(format!(
                 "response contains more than {MAX_HEADERS} headers"
             )));
         }
@@ -463,60 +440,71 @@ async fn read_response<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) -> Resul
             content_length = rest.trim().parse().ok();
         } else if lower.starts_with("transfer-encoding:") && lower.contains("chunked") {
             is_chunked = true;
-        } else if let Some(rest) = lower.strip_prefix("content-type:") {
-            // Store the lowercased media-type only (strip parameters like `;charset=utf-8`).
-            let media_type = rest
-                .trim()
-                .split(';')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            content_type = Some(media_type);
         }
     }
 
     // Body
     let body = if is_chunked {
-        read_chunked_body(reader).await?
+        read_chunked_body(reader, max_body_bytes).await?
     } else if let Some(n) = content_length {
-        if n > MAX_BODY_BYTES {
-            return Err(KrafkaError::http(format!(
-                "response Content-Length {n} exceeds {MAX_BODY_BYTES}-byte limit"
+        if n > max_body_bytes {
+            return Err(KrafkaError::auth(format!(
+                "response Content-Length {n} exceeds {max_body_bytes}-byte limit"
             )));
         }
-        let mut buf = vec![0u8; n];
-        reader
-            .read_exact(&mut buf)
-            .await
-            .map_err(|e| KrafkaError::http(format!("reading response body failed: {e}")))?;
+        let mut buf = Zeroizing::new(vec![0u8; n]);
+        reader.read_exact(&mut buf).await.map_err(|e| {
+            KrafkaError::auth_with_source(format!("reading response body failed: {e}"), e)
+        })?;
         buf
     } else {
         // No Content-Length and not chunked — read to EOF (`Connection: close`).
         //
-        // The reader is capped at MAX_BODY_BYTES + 1 so the limit constrains
-        // the *allocation* rather than merely the value observed afterwards.
-        // Reading the extra byte is what distinguishes "exactly at the limit"
-        // from "over the limit".
-        let mut buf = Vec::new();
-        (&mut *reader)
-            .take(MAX_BODY_BYTES as u64 + 1)
-            .read_to_end(&mut buf)
-            .await
-            .map_err(|e| KrafkaError::http(format!("reading response body failed: {e}")))?;
-        if buf.len() > MAX_BODY_BYTES {
-            return Err(KrafkaError::http(format!(
-                "response body exceeds {MAX_BODY_BYTES}-byte limit"
-            )));
-        }
+        // Read in blocks so the limit bounds what is read, not merely the
+        // value observed afterwards.
+        let mut buf = Zeroizing::new(Vec::new());
+        let mut block = [0u8; 8 * 1024];
+        let result = loop {
+            let n = match reader.read(&mut block).await {
+                Ok(0) => break Ok(()),
+                Ok(n) => n,
+                Err(e) => {
+                    break Err(KrafkaError::auth_with_source(
+                        format!("reading response body failed: {e}"),
+                        e,
+                    ));
+                }
+            };
+            if buf.len() + n > max_body_bytes {
+                break Err(KrafkaError::auth(format!(
+                    "response body exceeds {max_body_bytes}-byte limit"
+                )));
+            }
+            let start = grow_zeroizing(&mut buf, n, max_body_bytes);
+            buf[start..].copy_from_slice(&block[..n]);
+        };
+        block.zeroize();
+        result?;
         buf
     };
 
-    Ok(HttpResponse {
-        status,
-        content_type,
-        body,
-    })
+    Ok(HttpResponse { status, body })
+}
+
+/// Parse a complete response held in memory: its status and body length.
+///
+/// The fuzz entry point for `read_response`; an in-memory reader never
+/// returns `Pending`, so one poll completes it.
+#[cfg(feature = "internal")]
+pub fn read_response_from_bytes(bytes: &[u8], max_body_bytes: usize) -> Result<(u16, usize)> {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+    let mut reader = BufReader::new(bytes);
+    let future = std::pin::pin!(read_response(&mut reader, max_body_bytes));
+    match future.poll(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(response) => response.map(|r| (r.status, r.body.len())),
+        Poll::Pending => Err(KrafkaError::auth("in-memory HTTP response read pending")),
+    }
 }
 
 fn parse_status_line(line: &str) -> Result<u16> {
@@ -525,12 +513,32 @@ fn parse_status_line(line: &str) -> Result<u16> {
     let _version = parts.next().unwrap_or("");
     let code = parts.next().unwrap_or("");
     code.parse::<u16>().map_err(|_| {
-        KrafkaError::http(format!("malformed HTTP status line: {:?}", line.trim_end()))
+        KrafkaError::auth(format!("malformed HTTP status line: {:?}", line.trim_end()))
     })
 }
 
-async fn read_chunked_body<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) -> Result<Vec<u8>> {
-    let mut body = Vec::new();
+/// Grow `buf` by `additional` zero bytes, returning where they start.
+///
+/// A plain `Vec` reallocation would free the old buffer with the body bytes
+/// still in it; here the old buffer is a `Zeroizing` that is dropped.
+fn grow_zeroizing(buf: &mut Zeroizing<Vec<u8>>, additional: usize, limit: usize) -> usize {
+    let start = buf.len();
+    let len = start + additional;
+    if len > buf.capacity() {
+        let capacity = len.max(buf.capacity().saturating_mul(2).min(limit));
+        let mut grown = Zeroizing::new(Vec::with_capacity(capacity));
+        grown.extend_from_slice(buf);
+        *buf = grown;
+    }
+    buf.resize(len, 0);
+    start
+}
+
+async fn read_chunked_body<R: AsyncRead + Unpin>(
+    reader: &mut BufReader<R>,
+    max_body_bytes: usize,
+) -> Result<Zeroizing<Vec<u8>>> {
+    let mut body = Zeroizing::new(Vec::new());
     let mut line = String::new();
     loop {
         // Each chunk begins with a hex size line, optionally followed by
@@ -538,27 +546,24 @@ async fn read_chunked_body<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) -> R
         read_line_bounded(reader, &mut line, "chunk size line").await?;
         let hex = line.split(';').next().unwrap_or("").trim();
         let chunk_size = usize::from_str_radix(hex, 16)
-            .map_err(|_| KrafkaError::http(format!("invalid chunk size: {hex:?}")))?;
+            .map_err(|_| KrafkaError::auth(format!("invalid chunk size: {hex:?}")))?;
         if chunk_size == 0 {
             break;
         }
-        if body.len() + chunk_size > MAX_BODY_BYTES {
-            return Err(KrafkaError::http(format!(
-                "chunked response body exceeds {MAX_BODY_BYTES}-byte limit"
+        if body.len().saturating_add(chunk_size) > max_body_bytes {
+            return Err(KrafkaError::auth(format!(
+                "chunked response body exceeds {max_body_bytes}-byte limit"
             )));
         }
-        let start = body.len();
-        body.resize(start + chunk_size, 0);
-        reader
-            .read_exact(&mut body[start..])
-            .await
-            .map_err(|e| KrafkaError::http(format!("reading chunk data failed: {e}")))?;
+        let start = grow_zeroizing(&mut body, chunk_size, max_body_bytes);
+        reader.read_exact(&mut body[start..]).await.map_err(|e| {
+            KrafkaError::auth_with_source(format!("reading chunk data failed: {e}"), e)
+        })?;
         // Consume the CRLF that trails each chunk data block.
         let mut crlf = [0u8; 2];
-        reader
-            .read_exact(&mut crlf)
-            .await
-            .map_err(|e| KrafkaError::http(format!("reading chunk CRLF failed: {e}")))?;
+        reader.read_exact(&mut crlf).await.map_err(|e| {
+            KrafkaError::auth_with_source(format!("reading chunk CRLF failed: {e}"), e)
+        })?;
     }
     // Consume the trailing CRLF (or any trailing headers we don't use).
     //
@@ -574,44 +579,6 @@ async fn read_chunked_body<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) -> R
         }
     }
     Ok(body)
-}
-
-// ── TLS configuration ─────────────────────────────────────────────────────
-
-/// Build a `ClientConfig` backed by the Mozilla WebPKI roots.
-///
-/// Uses the process-global crypto provider when available, falling back to
-/// the compiled-in default (`ring` or `aws-lc-rs`).
-fn make_tls_config() -> Result<Arc<rustls::ClientConfig>> {
-    let provider = rustls::crypto::CryptoProvider::get_default()
-        .cloned()
-        .unwrap_or_else(|| {
-            #[cfg(feature = "rustls-aws-lc-rs")]
-            {
-                Arc::new(rustls::crypto::aws_lc_rs::default_provider())
-            }
-            #[cfg(all(feature = "ring", not(feature = "rustls-aws-lc-rs")))]
-            {
-                Arc::new(rustls::crypto::ring::default_provider())
-            }
-            // See `auth::tls::resolve_crypto_provider` — unreachable, kept so
-            // the no-backend build fails with the `compile_error!` alone.
-            #[cfg(not(any(feature = "ring", feature = "rustls-aws-lc-rs")))]
-            {
-                unreachable!("lib.rs compile_error! guarantees a crypto backend")
-            }
-        });
-
-    let mut root_store = RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-    let config = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|e| KrafkaError::config(format!("TLS protocol versions: {e}")))?
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-
-    Ok(Arc::new(config))
 }
 
 // ── Base64 encoder ────────────────────────────────────────────────────────
@@ -648,22 +615,76 @@ pub(crate) fn base64_encode(input: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    const TEST_LIMIT: usize = 16 * 1024 * 1024;
+
+    fn test_client(timeout: Option<Duration>) -> HttpClient {
+        let tls = crate::auth::tls::build_tls_config_sync(&crate::auth::TlsConfig::new()).unwrap();
+        HttpClient::new(Arc::new(tls), timeout, TEST_LIMIT)
+    }
+
+    /// Bytes `read_response` consumed from a 2 MiB body capped at 1 MiB.
+    async fn consumed_from_oversized_body(head: &[u8], body: &[u8], limit: usize) -> usize {
+        let mut raw = head.to_vec();
+        raw.extend_from_slice(body);
+        let mut reader = BufReader::new(&raw[..]);
+        let err = read_response(&mut reader, limit).await.unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "got: {err}");
+        raw.len() - reader.get_ref().len()
+    }
+
+    /// The cap bounds what is read from the peer, not only what is kept: at
+    /// most the limit, the framing and one read buffer leave the socket.
+    #[tokio::test]
+    async fn the_body_cap_is_enforced_while_reading() {
+        const LIMIT: usize = 1024 * 1024;
+        const SLACK: usize = 2 * 8 * 1024 + 256;
+        let body = vec![b'x'; 2 * LIMIT];
+
+        let eof = consumed_from_oversized_body(b"HTTP/1.1 200 OK\r\n\r\n", &body, LIMIT).await;
+        assert!(eof <= LIMIT + SLACK, "read {eof} bytes");
+
+        let mut chunked = Vec::new();
+        for chunk in body.chunks(64 * 1024) {
+            chunked.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            chunked.extend_from_slice(chunk);
+            chunked.extend_from_slice(b"\r\n");
+        }
+        chunked.extend_from_slice(b"0\r\n\r\n");
+        let read = consumed_from_oversized_body(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+            &chunked,
+            LIMIT,
+        )
+        .await;
+        assert!(read <= LIMIT + SLACK, "read {read} bytes");
+    }
+
+    #[tokio::test]
+    async fn a_body_at_the_cap_is_accepted() {
+        let mut raw = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
+        raw.extend(std::iter::repeat_n(b'y', 100_000));
+        let mut reader = BufReader::new(&raw[..]);
+        let resp = read_response(&mut reader, 100_000).await.unwrap();
+        assert_eq!(resp.body.len(), 100_000);
+        assert!(resp.body.iter().all(|&b| b == b'y'));
+    }
+
     #[test]
     fn test_parse_url_http_default_port() {
-        let u = ParsedUrl::parse("http://localhost/subjects").unwrap();
+        let u = ParsedUrl::parse("http://localhost/token").unwrap();
         assert!(!u.is_https);
         assert_eq!(u.host, "localhost");
         assert_eq!(u.port, 80);
-        assert_eq!(u.path_and_query, "/subjects");
+        assert_eq!(u.path_and_query, "/token");
     }
 
     #[test]
     fn test_parse_url_https_explicit_port() {
-        let u = ParsedUrl::parse("https://registry.example.com:8081/schemas/ids/1").unwrap();
+        let u = ParsedUrl::parse("https://idp.example.com:8443/oauth2/token").unwrap();
         assert!(u.is_https);
-        assert_eq!(u.host, "registry.example.com");
-        assert_eq!(u.port, 8081);
-        assert_eq!(u.path_and_query, "/schemas/ids/1");
+        assert_eq!(u.host, "idp.example.com");
+        assert_eq!(u.port, 8443);
+        assert_eq!(u.path_and_query, "/oauth2/token");
     }
 
     #[test]
@@ -682,43 +703,42 @@ mod tests {
 
     #[test]
     fn test_host_header_includes_non_default_port() {
-        // The Confluent Schema Registry's default port is 8081, so this is the
-        // *common* case, not an edge case: omitting it broke name-based
-        // virtual hosting and every reverse proxy that routes on `Host`.
-        let u = ParsedUrl::parse("http://registry.example.com:8081/subjects").unwrap();
-        assert_eq!(u.host_header(), "registry.example.com:8081");
+        // Omitting a non-default port breaks name-based virtual hosting and
+        // every reverse proxy that routes on `Host`.
+        let u = ParsedUrl::parse("http://idp.example.com:8081/token").unwrap();
+        assert_eq!(u.host_header(), "idp.example.com:8081");
 
-        let u = ParsedUrl::parse("https://registry.example.com:9443/subjects").unwrap();
-        assert_eq!(u.host_header(), "registry.example.com:9443");
+        let u = ParsedUrl::parse("https://idp.example.com:9443/token").unwrap();
+        assert_eq!(u.host_header(), "idp.example.com:9443");
     }
 
     #[test]
     fn test_host_header_omits_default_port() {
         // RFC 9110 §7.2: the port is elided when it is the scheme default.
-        let u = ParsedUrl::parse("http://registry.example.com/subjects").unwrap();
-        assert_eq!(u.host_header(), "registry.example.com");
+        let u = ParsedUrl::parse("http://idp.example.com/token").unwrap();
+        assert_eq!(u.host_header(), "idp.example.com");
 
-        let u = ParsedUrl::parse("https://registry.example.com/subjects").unwrap();
-        assert_eq!(u.host_header(), "registry.example.com");
+        let u = ParsedUrl::parse("https://idp.example.com/token").unwrap();
+        assert_eq!(u.host_header(), "idp.example.com");
 
-        let u = ParsedUrl::parse("http://registry.example.com:80/subjects").unwrap();
-        assert_eq!(u.host_header(), "registry.example.com");
+        let u = ParsedUrl::parse("http://idp.example.com:80/token").unwrap();
+        assert_eq!(u.host_header(), "idp.example.com");
 
-        let u = ParsedUrl::parse("https://registry.example.com:443/subjects").unwrap();
-        assert_eq!(u.host_header(), "registry.example.com");
+        let u = ParsedUrl::parse("https://idp.example.com:443/token").unwrap();
+        assert_eq!(u.host_header(), "idp.example.com");
     }
 
     #[test]
     fn test_host_header_brackets_ipv6_literals() {
         // Without brackets the colons in the address are indistinguishable
         // from a port separator.
-        let u = ParsedUrl::parse("http://[::1]:8081/subjects").unwrap();
+        let u = ParsedUrl::parse("http://[::1]:8081/token").unwrap();
         assert_eq!(u.host_header(), "[::1]:8081");
 
-        let u = ParsedUrl::parse("http://[2001:db8::1]/subjects").unwrap();
+        let u = ParsedUrl::parse("http://[2001:db8::1]/token").unwrap();
         assert_eq!(u.host_header(), "[2001:db8::1]");
 
-        let u = ParsedUrl::parse("https://[2001:db8::1]:443/subjects").unwrap();
+        let u = ParsedUrl::parse("https://[2001:db8::1]:443/token").unwrap();
         assert_eq!(u.host_header(), "[2001:db8::1]");
     }
 
@@ -765,23 +785,18 @@ mod tests {
         // Build a minimal chunked HTTP/1.1 response in memory.
         let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/json\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
         let mut reader = BufReader::new(&raw[..]);
-        let resp = read_response(&mut reader).await.unwrap();
+        let resp = read_response(&mut reader, TEST_LIMIT).await.unwrap();
         assert_eq!(resp.status, 200);
-        assert_eq!(resp.content_type.as_deref(), Some("application/json"));
-        assert_eq!(resp.body, b"hello world");
+        assert_eq!(resp.body.as_slice(), b"hello world");
     }
 
     #[tokio::test]
     async fn test_read_response_content_length() {
-        let raw = b"HTTP/1.1 201 Created\r\nContent-Length: 7\r\nContent-Type: application/vnd.schemaregistry.v1+json\r\n\r\npayload";
+        let raw = b"HTTP/1.1 201 Created\r\nContent-Length: 7\r\nContent-Type: application/json\r\n\r\npayload";
         let mut reader = BufReader::new(&raw[..]);
-        let resp = read_response(&mut reader).await.unwrap();
+        let resp = read_response(&mut reader, TEST_LIMIT).await.unwrap();
         assert_eq!(resp.status, 201);
-        assert_eq!(
-            resp.content_type.as_deref(),
-            Some("application/vnd.schemaregistry.v1+json")
-        );
-        assert_eq!(resp.body, b"payload");
+        assert_eq!(resp.body.as_slice(), b"payload");
     }
 
     #[tokio::test]
@@ -789,9 +804,9 @@ mod tests {
         // No Content-Length, no chunked — read to EOF.
         let raw = b"HTTP/1.1 200 OK\r\n\r\nbody data";
         let mut reader = BufReader::new(&raw[..]);
-        let resp = read_response(&mut reader).await.unwrap();
+        let resp = read_response(&mut reader, TEST_LIMIT).await.unwrap();
         assert_eq!(resp.status, 200);
-        assert_eq!(resp.body, b"body data");
+        assert_eq!(resp.body.as_slice(), b"body data");
     }
 
     // ── Every read is bounded ──────────────────────────────────────────
@@ -803,7 +818,7 @@ mod tests {
         let mut raw = b"HTTP/1.1 200 ".to_vec();
         raw.extend(std::iter::repeat_n(b'A', (MAX_LINE_BYTES as usize) + 64));
         let mut reader = BufReader::new(&raw[..]);
-        let err = read_response(&mut reader).await.unwrap_err();
+        let err = read_response(&mut reader, TEST_LIMIT).await.unwrap_err();
         assert!(err.to_string().contains("line limit"), "got: {err}");
     }
 
@@ -812,7 +827,7 @@ mod tests {
         let mut raw = b"HTTP/1.1 200 OK\r\nX-Huge: ".to_vec();
         raw.extend(std::iter::repeat_n(b'A', (MAX_LINE_BYTES as usize) + 64));
         let mut reader = BufReader::new(&raw[..]);
-        let err = read_response(&mut reader).await.unwrap_err();
+        let err = read_response(&mut reader, TEST_LIMIT).await.unwrap_err();
         assert!(err.to_string().contains("line limit"), "got: {err}");
     }
 
@@ -824,7 +839,7 @@ mod tests {
         }
         raw.extend_from_slice(b"\r\n");
         let mut reader = BufReader::new(&raw[..]);
-        let err = read_response(&mut reader).await.unwrap_err();
+        let err = read_response(&mut reader, TEST_LIMIT).await.unwrap_err();
         assert!(err.to_string().contains("more than"), "got: {err}");
     }
 
@@ -836,9 +851,9 @@ mod tests {
         }
         raw.extend_from_slice(b"\r\nok");
         let mut reader = BufReader::new(&raw[..]);
-        let resp = read_response(&mut reader).await.unwrap();
+        let resp = read_response(&mut reader, TEST_LIMIT).await.unwrap();
         assert_eq!(resp.status, 200);
-        assert_eq!(resp.body, b"ok");
+        assert_eq!(resp.body.as_slice(), b"ok");
     }
 
     #[tokio::test]
@@ -850,18 +865,18 @@ mod tests {
             raw.extend_from_slice(format!("X-T{i}: v\r\n").as_bytes());
         }
         let mut reader = BufReader::new(&raw[..]);
-        let resp = read_response(&mut reader).await.unwrap();
-        assert_eq!(resp.body, b"hi");
+        let resp = read_response(&mut reader, TEST_LIMIT).await.unwrap();
+        assert_eq!(resp.body.as_slice(), b"hi");
     }
 
     #[tokio::test]
     async fn test_eof_body_over_limit_is_rejected_before_full_read() {
-        // The old code did `read_to_end` and *then* checked the length, so the
-        // check could never protect the allocation it guarded.
+        // The length must be checked while reading, not after `read_to_end`,
+        // or the check cannot protect the allocation it guards.
         let mut raw = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
-        raw.extend(std::iter::repeat_n(b'x', MAX_BODY_BYTES + 1024));
+        raw.extend(std::iter::repeat_n(b'x', TEST_LIMIT + 1024));
         let mut reader = BufReader::new(&raw[..]);
-        let err = read_response(&mut reader).await.unwrap_err();
+        let err = read_response(&mut reader, TEST_LIMIT).await.unwrap_err();
         assert!(err.to_string().contains("exceeds"), "got: {err}");
     }
 
@@ -869,10 +884,10 @@ mod tests {
     fn test_default_timeout_applied_when_none() {
         // `None` must select DEFAULT_HTTP_TIMEOUT, not "unbounded" — otherwise
         // a slowloris peer pins the task forever.
-        let client = HttpClient::with_webpki_roots(None).unwrap();
+        let client = test_client(None);
         assert_eq!(client.timeout, DEFAULT_HTTP_TIMEOUT);
 
-        let client = HttpClient::with_webpki_roots(Some(Duration::from_secs(3))).unwrap();
+        let client = test_client(Some(Duration::from_secs(3)));
         assert_eq!(client.timeout, Duration::from_secs(3));
     }
 
@@ -905,34 +920,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_request_rejects_injected_auth_header() {
-        let client = HttpClient::with_webpki_roots(Some(Duration::from_secs(1))).unwrap();
+    async fn test_post_form_rejects_injected_auth_header() {
+        let client = test_client(Some(Duration::from_secs(1)));
         let err = client
-            .request(
-                "GET",
-                "http://127.0.0.1:1/x",
-                &[],
-                None,
-                Some("Bearer t\r\nX-Evil: 1"),
-            )
+            .post_form("http://127.0.0.1:1/x", b"", Some("Bearer t\r\nX-Evil: 1"))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("invalid byte"), "got: {err}");
     }
 
+    /// The one request shape the token provider needs, as it goes on the wire.
     #[tokio::test]
-    async fn test_request_rejects_injected_extra_header() {
-        let client = HttpClient::with_webpki_roots(Some(Duration::from_secs(1))).unwrap();
-        let err = client
-            .request(
-                "GET",
-                "http://127.0.0.1:1/x",
-                &[("X-Bad", "v\r\nX-Evil: 1")],
-                None,
-                None,
+    async fn test_post_form_sends_a_form_post() {
+        use tokio::io::AsyncReadExt as _;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let mut seen = Vec::new();
+            while !seen.ends_with(b"grant_type=client_credentials") {
+                let n = socket.read(&mut buf).await.unwrap();
+                assert!(
+                    n > 0,
+                    "request ended early: {:?}",
+                    String::from_utf8_lossy(&seen)
+                );
+                seen.extend_from_slice(&buf[..n]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                .await
+                .unwrap();
+            String::from_utf8(seen).unwrap()
+        });
+        let client = test_client(Some(Duration::from_secs(5)));
+        let resp = client
+            .post_form(
+                &format!("http://{addr}/token"),
+                b"grant_type=client_credentials",
+                Some("Basic dXNlcjpwYXNz"),
             )
             .await
-            .unwrap_err();
-        assert!(err.to_string().contains("invalid byte"), "got: {err}");
+            .unwrap();
+        assert_eq!(resp.status, 200);
+        let request = server.await.unwrap();
+        assert!(request.starts_with("POST /token HTTP/1.1\r\n"), "{request}");
+        assert!(request.contains("Content-Type: application/x-www-form-urlencoded\r\n"));
+        assert!(request.contains("Authorization: Basic dXNlcjpwYXNz\r\n"));
+        assert!(request.contains("Content-Length: 29\r\n"));
     }
 }

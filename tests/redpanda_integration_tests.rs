@@ -12,7 +12,7 @@
 //!   `AddPartitionsToTxn` path must work end to end
 //! - admin: create/list/delete topics, describe cluster
 //! - consumer close: the fetch-session close must be answered, so closing a
-//!   consumer does not wedge a connection shared through a `KrafkaClient`
+//!   consumer does not wedge a connection shared through one `Kafka` handle
 //!
 //! These tests require Docker and are ignored by default:
 //!
@@ -22,20 +22,22 @@
 //! cargo test --test redpanda_integration_tests -- --ignored --test-threads=1
 //! ```
 //!
-//! Image is read from `REDPANDA_IMAGE` (default `redpandadata/redpanda`), tag
-//! from `REDPANDA_VERSION` (default `latest`).
+//! The image is the release pinned in `tests/redpanda/Dockerfile`;
+//! `REDPANDA_VERSION` overrides the tag (`REDPANDA_VERSION=latest`). One
+//! container serves every test in this binary.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use testcontainers::core::{ContainerPort, ContainerState, ExecCommand, WaitFor};
-use testcontainers::{ContainerAsync, Image, runners::AsyncRunner};
+use testcontainers::{Image, ImageExt, runners::AsyncRunner};
 
-/// Time to wait after container start for Redpanda to stabilize.
-const CONTAINER_SETTLE: Duration = Duration::from_secs(5);
+/// The pinned release: the `FROM` line of this file is the one record of it.
+const PINNED: &str = include_str!("redpanda/Dockerfile");
 
 const KAFKA_PORT: ContainerPort = ContainerPort::Tcp(9092);
 const START_SCRIPT: &str = "/tmp/testcontainers_start.sh";
@@ -128,59 +130,90 @@ impl Image for Redpanda {
     }
 }
 
-/// Start a Redpanda container and return it with its bootstrap address.
-async fn redpanda_container() -> (ContainerAsync<Redpanda>, String) {
-    let image =
-        std::env::var("REDPANDA_IMAGE").unwrap_or_else(|_| "redpandadata/redpanda".to_string());
-    let tag = std::env::var("REDPANDA_VERSION").unwrap_or_else(|_| "latest".to_string());
-
-    let max_attempts = 3;
-    let mut last_err = None;
-    for attempt in 1..=max_attempts {
-        match Redpanda::new(&image, &tag).start().await {
-            Ok(container) => {
-                tokio::time::sleep(CONTAINER_SETTLE).await;
-                let host_port = container
-                    .get_host_port_ipv4(KAFKA_PORT)
-                    .await
-                    .expect("Failed to get host port");
-                return (container, format!("127.0.0.1:{host_port}"));
-            }
-            Err(e) => {
-                eprintln!("Redpanda container start attempt {attempt}/{max_attempts} failed: {e}");
-                last_err = Some(e);
-                if attempt < max_attempts {
-                    tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
-                }
-            }
+/// The image the suite runs: `REDPANDA_IMAGE_REF` (set by
+/// `just integration-redpanda`), else the pin with `REDPANDA_VERSION` as tag.
+fn image_ref() -> (String, String) {
+    let reference = std::env::var("REDPANDA_IMAGE_REF").unwrap_or_else(|_| {
+        let pinned = PINNED
+            .lines()
+            .find_map(|l| l.strip_prefix("FROM "))
+            .expect("tests/redpanda/Dockerfile has a FROM line")
+            .trim()
+            .to_string();
+        match std::env::var("REDPANDA_VERSION") {
+            Ok(tag) => format!("{}:{tag}", pinned.rsplit_once(':').unwrap().0),
+            Err(_) => pinned,
         }
-    }
-    panic!(
-        "Failed to start Redpanda container after {max_attempts} attempts: {}",
-        last_err.unwrap()
-    );
+    });
+    let (image, tag) = reference.rsplit_once(':').expect("image:tag");
+    (image.to_string(), tag.to_string())
+}
+
+static REDPANDA: OnceLock<Result<String, String>> = OnceLock::new();
+
+/// The bootstrap address of the Redpanda broker shared by every test.
+///
+/// Started once, on a thread whose runtime keeps the container alive for the
+/// life of the process; `just integration-redpanda` removes it by its label.
+fn redpanda() -> String {
+    REDPANDA
+        .get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime for the shared broker");
+                rt.block_on(async move {
+                    let (image, tag) = image_ref();
+                    eprintln!("Redpanda image: {image}:{tag}");
+                    let started = Redpanda::new(image, tag)
+                        .with_labels([("krafka.test-suite", "redpanda_integration_tests")])
+                        .start()
+                        .await;
+                    match started {
+                        Ok(container) => {
+                            let port = container.get_host_port_ipv4(KAFKA_PORT).await;
+                            tx.send(
+                                port.map(|p| format!("127.0.0.1:{p}"))
+                                    .map_err(|e| e.to_string()),
+                            )
+                            .ok();
+                            std::future::pending::<()>().await;
+                            drop(container);
+                        }
+                        Err(e) => {
+                            tx.send(Err(e.to_string())).ok();
+                        }
+                    }
+                });
+            });
+            rx.recv()
+                .unwrap_or_else(|_| Err("the broker thread exited".into()))
+        })
+        .clone()
+        .unwrap_or_else(|e| panic!("Redpanda did not start: {e}"))
 }
 
 /// Create a topic and wait briefly for metadata propagation.
 async fn create_topic(bootstrap_servers: &str, topic: &str, partitions: i32) {
-    use krafka::admin::{AdminClient, NewTopic};
+    use krafka::admin::NewTopic;
 
-    let admin = AdminClient::builder()
-        .bootstrap_servers(bootstrap_servers)
+    let admin = krafka::Kafka::builder(bootstrap_servers)
         .client_id("redpanda-test-admin")
-        .build()
+        .connect()
         .await
-        .expect("Failed to create admin client");
+        .expect("Failed to create admin client")
+        .admin();
 
     admin
         .create_topics(
             vec![NewTopic::new(topic, partitions, 1).unwrap()],
-            Duration::from_secs(10),
-            false,
+            Default::default(),
         )
         .await
         .expect("Failed to create topic");
-    admin.close().await;
+    admin.close().await.unwrap();
     tokio::time::sleep(Duration::from_secs(1)).await;
 }
 
@@ -205,30 +238,34 @@ async fn poll_for_records(
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn redpanda_produce_consume_round_trip() {
-    use krafka::consumer::{AutoOffsetReset, Consumer};
-    use krafka::producer::Producer;
+    use krafka::consumer::AutoOffsetReset;
 
-    let (_container, bootstrap_servers) = redpanda_container().await;
+    let bootstrap_servers = redpanda();
     let topic = "rp-round-trip";
     create_topic(&bootstrap_servers, topic, 1).await;
 
-    let producer = Producer::builder()
-        .bootstrap_servers(&bootstrap_servers)
+    let producer = krafka::Kafka::builder(&bootstrap_servers)
         .client_id("rp-producer")
+        .connect()
+        .await
+        .expect("Failed to create producer")
+        .producer()
         .build()
         .await
         .expect("Failed to create producer");
 
     // Idempotence is on by default; Redpanda supports it.
     let metadata = producer
-        .send(topic, Some(b"rp-key"), Some(b"rp-value"))
+        .send(krafka::Record::new(topic, "rp-value").key("rp-key"))
         .await
         .expect("Failed to send message");
     assert!(metadata.offset >= 0);
 
-    let consumer = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .group_id("rp-group")
+    let consumer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create consumer")
+        .consumer("rp-group")
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .build()
         .await
@@ -245,48 +282,53 @@ async fn redpanda_produce_consume_round_trip() {
 
     consumer.commit().await.expect("commit failed");
     consumer.close().await.expect("consumer close");
-    producer.close().await;
+    producer.close().await.unwrap();
 }
 
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn redpanda_admin_topic_lifecycle() {
-    use krafka::admin::{AdminClient, NewTopic};
+    use krafka::admin::NewTopic;
 
-    let (_container, bootstrap_servers) = redpanda_container().await;
+    let bootstrap_servers = redpanda();
 
-    let admin = AdminClient::builder()
-        .bootstrap_servers(&bootstrap_servers)
+    let admin = krafka::Kafka::builder(&bootstrap_servers)
         .client_id("rp-admin")
-        .build()
+        .connect()
         .await
-        .expect("Failed to create admin client");
+        .expect("Failed to create admin client")
+        .admin();
 
     let topic = "rp-admin-topic";
     admin
         .create_topics(
             vec![NewTopic::new(topic, 3, 1).unwrap()],
-            Duration::from_secs(10),
-            false,
+            Default::default(),
         )
         .await
         .expect("Failed to create topic");
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    let topics = admin.list_topics().await.expect("Failed to list topics");
+    let topics = admin
+        .list_topics(Default::default())
+        .await
+        .expect("Failed to list topics");
     assert!(topics.iter().any(|t| t == topic), "Topic not in list");
 
     let cluster = admin
-        .describe_cluster()
+        .describe_cluster(Default::default())
         .await
         .expect("Failed to describe cluster");
     assert!(!cluster.brokers.is_empty(), "No brokers found");
 
     admin
-        .delete_topics(vec![topic.to_string()], Duration::from_secs(10))
+        .delete_topics(
+            vec![topic.to_string()],
+            krafka::admin::DeleteTopicsOptions::default(),
+        )
         .await
         .expect("Failed to delete topic");
-    admin.close().await;
+    admin.close().await.unwrap();
 }
 
 /// Redpanda does not implement KIP-890 transaction version 2 server-side, so
@@ -296,25 +338,22 @@ async fn redpanda_admin_topic_lifecycle() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn redpanda_transactions_fall_back_to_tv1() {
-    use krafka::consumer::{AutoOffsetReset, Consumer, IsolationLevel};
-    use krafka::producer::{TransactionVersion, TransactionalProducer};
+    use krafka::consumer::{AutoOffsetReset, IsolationLevel};
+    use krafka::producer::TransactionVersion;
 
-    let (_container, bootstrap_servers) = redpanda_container().await;
+    let bootstrap_servers = redpanda();
     let topic = "rp-txn-topic";
     create_topic(&bootstrap_servers, topic, 1).await;
 
-    let producer = TransactionalProducer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .transactional_id("rp-txn-1")
+    let producer = krafka::Kafka::builder(&bootstrap_servers)
         .client_id("rp-txn-producer")
-        .build()
+        .connect()
+        .await
+        .expect("Failed to create transactional producer")
+        .producer()
+        .build_transactional("rp-txn-1")
         .await
         .expect("Failed to create transactional producer");
-
-    producer
-        .init_transactions()
-        .await
-        .expect("init_transactions failed");
 
     assert_eq!(
         producer.transaction_version(),
@@ -323,19 +362,18 @@ async fn redpanda_transactions_fall_back_to_tv1() {
          fall back to TV1"
     );
 
-    producer.begin_transaction().expect("begin failed");
+    producer.begin().expect("begin failed");
     let _metadata = producer
-        .send(topic, Some(b"txn-key"), Some(b"txn-value"))
+        .send(krafka::Record::new(topic, "txn-value").key("txn-key"))
         .await
         .expect("transactional send failed");
-    producer
-        .commit_transaction()
-        .await
-        .expect("commit_transaction failed");
+    producer.commit().await.expect("commit failed");
 
-    let consumer = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .group_id("rp-txn-group")
+    let consumer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create consumer")
+        .consumer("rp-txn-group")
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .isolation_level(IsolationLevel::ReadCommitted)
         .build()
@@ -354,7 +392,7 @@ async fn redpanda_transactions_fall_back_to_tv1() {
     assert_eq!(records[0].value_str(), Some("txn-value"));
 
     consumer.close().await.expect("consumer close");
-    producer.close().await;
+    producer.close().await.unwrap();
 }
 
 /// Closing a consumer leaves the connection it shares usable: Redpanda must
@@ -362,36 +400,34 @@ async fn redpanda_transactions_fall_back_to_tv1() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn redpanda_consumer_close_does_not_wedge_shared_connection() {
-    use krafka::client::KrafkaClient;
-    use krafka::consumer::{AutoOffsetReset, Consumer};
-    use krafka::producer::Producer;
+    use krafka::consumer::AutoOffsetReset;
+
     use std::time::Instant;
 
-    let (_container, bootstrap_servers) = redpanda_container().await;
+    let bootstrap_servers = redpanda();
     let topic = "rp-close-shared";
     create_topic(&bootstrap_servers, topic, 1).await;
 
     // A short request timeout keeps a regression from hiding behind a slow
     // but eventually successful close.
     let request_timeout = Duration::from_secs(10);
-    let client = KrafkaClient::builder(&bootstrap_servers)
+    let client = krafka::Kafka::builder(&bootstrap_servers)
         .request_timeout(request_timeout)
-        .build()
+        .connect()
         .await
         .expect("Failed to create client");
-    let producer = Producer::builder()
-        .with_client(&client)
+    let producer = client
+        .producer()
         .build()
         .await
         .expect("Failed to create producer");
     let _ = producer
-        .send(topic, Some(b"k"), Some(b"before-close"))
+        .send(krafka::Record::new(topic, "before-close").key("k"))
         .await
         .expect("Failed to send message");
 
-    let consumer = Consumer::builder()
-        .with_client(&client)
-        .group_id("rp-close-shared-group")
+    let consumer = client
+        .consumer("rp-close-shared-group")
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .build()
         .await
@@ -420,7 +456,7 @@ async fn redpanda_consumer_close_does_not_wedge_shared_connection() {
     let started = Instant::now();
     let metadata = tokio::time::timeout(
         request_timeout,
-        producer.send(topic, Some(b"k"), Some(b"after-close")),
+        producer.send(krafka::Record::new(topic, "after-close").key("k")),
     )
     .await
     .expect("produce after consumer close hung on the shared connection")
@@ -432,6 +468,6 @@ async fn redpanda_consumer_close_does_not_wedge_shared_connection() {
         started.elapsed()
     );
 
-    producer.close().await;
+    producer.close().await.unwrap();
     drop(client);
 }

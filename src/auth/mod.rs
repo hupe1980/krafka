@@ -13,7 +13,7 @@
 //! All credential types in this module use memory zeroization on drop to prevent
 //! sensitive data from remaining in memory after use.
 
-pub mod msk_iam;
+pub(crate) mod msk_iam;
 pub mod oauthbearer;
 /// Built-in OIDC token provider for SASL/OAUTHBEARER: the OAuth 2.0
 /// `client_credentials` grant (KIP-768) and the RFC 7523 client-assertion
@@ -23,101 +23,37 @@ pub mod oauthbearer;
 #[cfg(feature = "oauth-oidc")]
 #[cfg_attr(docsrs, doc(cfg(feature = "oauth-oidc")))]
 pub mod oidc;
-pub mod scram;
-pub mod tls;
+mod provider;
+pub(crate) mod scram;
+pub(crate) mod tls;
 
-pub use msk_iam::MskIamAuthenticator;
-pub use oauthbearer::{OAuthBearerToken, OAuthBearerTokenProvider, OAuthBearerTokenProviderHandle};
+pub use oauthbearer::OAuthBearerToken;
+pub(crate) use oauthbearer::OAuthBearerTokenProviderHandle;
 #[cfg(feature = "oauth-oidc")]
 #[cfg_attr(docsrs, doc(cfg(feature = "oauth-oidc")))]
 pub use oidc::{AssertionSource, ClientCredentials, OidcTokenProvider, OidcTokenProviderBuilder};
-pub use scram::{
-    ChannelBinding, MAX_PBKDF2_ITERATIONS, MIN_PBKDF2_ITERATIONS, ScramClient, ScramMechanism,
-    ScramState,
-};
-pub use tls::{
-    MaybeSecureStream, build_tls_config, build_tls_connector, connect_tls,
-    extract_tls_server_end_point,
-};
+pub use provider::CredentialProvider;
+pub(crate) use provider::ErasedCredentialProvider;
+pub use scram::ScramMechanism;
 
 use std::fmt;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-/// Provider for dynamically fetching AWS MSK IAM credentials.
-///
-/// Implement this trait to enable automatic credential refresh for MSK IAM
-/// authentication. The provider is called on every new broker connection
-/// (including automatic reconnections), ensuring credentials are always fresh.
-///
-/// This is essential when using temporary credentials (STS, IRSA, ECS task
-/// role, EC2 instance profile) that expire and need periodic renewal.
-///
-/// # Examples
-///
-/// ```rust,ignore
-/// use krafka::auth::{AwsMskIamCredentialProvider, AwsMskIamCredentials};
-/// use krafka::error::Result;
-/// use std::future::Future;
-/// use std::pin::Pin;
-///
-/// struct MyCredentialProvider {
-///     region: String,
-/// }
-///
-/// impl AwsMskIamCredentialProvider for MyCredentialProvider {
-///     fn provide_credentials(
-///         &self,
-///     ) -> Pin<Box<dyn Future<Output = Result<AwsMskIamCredentials>> + Send + '_>> {
-///         let region = self.region.clone();
-///         Box::pin(async move {
-///             AwsMskIamCredentials::from_default_chain(region).await
-///         })
-///     }
-/// }
-/// ```
-pub trait AwsMskIamCredentialProvider: Send + Sync {
-    /// Fetch fresh AWS credentials for MSK IAM authentication.
-    ///
-    /// Called on every new broker connection. Implementations should handle
-    /// caching and refresh internally if desired.
-    fn provide_credentials(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = crate::error::Result<AwsMskIamCredentials>> + Send + '_>>;
-}
-
-/// Blanket impl: any `Fn() -> Future<Output = Result<AwsMskIamCredentials>>` is a provider.
-impl<F, Fut> AwsMskIamCredentialProvider for F
-where
-    F: Fn() -> Fut + Send + Sync,
-    Fut: Future<Output = crate::error::Result<AwsMskIamCredentials>> + Send + 'static,
-{
-    fn provide_credentials(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = crate::error::Result<AwsMskIamCredentials>> + Send + '_>> {
-        Box::pin(self())
-    }
-}
-
-/// Handle wrapping an [`Arc<dyn AwsMskIamCredentialProvider>`].
-///
-/// Provides `Clone` and `Debug` so it can be stored in
-/// [`AuthConfig`] without requiring implementors to derive those traits.
+/// A shared [`CredentialProvider`] of AWS MSK IAM credentials.
 #[derive(Clone)]
-pub struct AwsMskIamCredentialProviderHandle(Arc<dyn AwsMskIamCredentialProvider>);
+pub(crate) struct AwsMskIamCredentialProviderHandle(
+    Arc<dyn ErasedCredentialProvider<AwsMskIamCredentials>>,
+);
 
 impl AwsMskIamCredentialProviderHandle {
-    /// Create a new handle wrapping the given provider.
-    pub fn new(provider: impl AwsMskIamCredentialProvider + 'static) -> Self {
+    pub(crate) fn new(provider: impl CredentialProvider<AwsMskIamCredentials> + 'static) -> Self {
         Self(Arc::new(provider))
     }
 
-    /// Fetch fresh credentials from the wrapped provider.
-    pub async fn provide_credentials(&self) -> crate::error::Result<AwsMskIamCredentials> {
-        self.0.provide_credentials().await
+    pub(crate) async fn provide_credentials(&self) -> crate::error::Result<AwsMskIamCredentials> {
+        self.0.credentials_erased().await
     }
 }
 
@@ -187,6 +123,21 @@ impl fmt::Display for SaslMechanism {
     }
 }
 
+impl SaslMechanism {
+    /// Whether the mechanism puts a credential on the wire that an
+    /// eavesdropper can replay: PLAIN's password and OAUTHBEARER's token.
+    ///
+    /// SCRAM sends a proof bound to the exchange's nonces and AWS_MSK_IAM a
+    /// signature that expires within minutes. The match is exhaustive so a
+    /// new mechanism must be classified here.
+    pub(crate) fn sends_reusable_credential(&self) -> bool {
+        match self {
+            Self::Plain | Self::OAuthBearer => true,
+            Self::ScramSha256 | Self::ScramSha512 | Self::AwsMskIam | Self::Gssapi => false,
+        }
+    }
+}
+
 /// SASL PLAIN credentials.
 ///
 /// Password is automatically zeroized on drop for security.
@@ -199,29 +150,29 @@ pub struct PlainCredentials {
 }
 
 impl PlainCredentials {
-    /// Create new PLAIN credentials.
-    ///
-    /// Returns an error if username or password contains a null byte (`\0`),
-    /// which is used as the delimiter in the SASL PLAIN wire format.
-    pub fn new(username: impl Into<String>, password: impl Into<String>) -> crate::Result<Self> {
-        let username = username.into();
-        let password = password.into();
-        if username.is_empty() {
+    /// Create new PLAIN credentials. Checked when the [`AuthConfig`] holding
+    /// them is used: see [`AuthConfig::sasl_plain`].
+    pub fn new(username: impl Into<String>, password: impl Into<String>) -> Self {
+        Self {
+            username: username.into(),
+            password: password.into(),
+        }
+    }
+
+    /// A NUL byte is the field delimiter of the PLAIN message, and an empty
+    /// username cannot authenticate.
+    fn validate(&self) -> crate::Result<()> {
+        if self.username.is_empty() {
             return Err(crate::error::KrafkaError::config(
-                "PLAIN username must not be empty",
+                "security: SASL/PLAIN username must not be empty",
             ));
         }
-        if username.contains('\0') {
+        if self.username.contains('\0') || self.password.contains('\0') {
             return Err(crate::error::KrafkaError::config(
-                "PLAIN username must not contain null bytes",
+                "security: SASL/PLAIN username and password must not contain NUL bytes",
             ));
         }
-        if password.contains('\0') {
-            return Err(crate::error::KrafkaError::config(
-                "PLAIN password must not contain null bytes",
-            ));
-        }
-        Ok(Self { username, password })
+        Ok(())
     }
 
     /// Build the SASL PLAIN authentication message.
@@ -759,7 +710,7 @@ impl TlsConfig {
 ///
 /// Use factory methods like [`AuthConfig::plaintext()`], [`AuthConfig::ssl()`],
 /// [`AuthConfig::sasl_plain()`], etc. to construct.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AuthConfig {
     /// Security protocol.
     pub(crate) security_protocol: SecurityProtocol,
@@ -779,33 +730,6 @@ pub struct AuthConfig {
     pub(crate) oauthbearer_provider: Option<OAuthBearerTokenProviderHandle>,
     /// TLS configuration.
     pub(crate) tls_config: Option<TlsConfig>,
-    /// Whether SCRAM-over-TLS may use `tls-server-end-point` channel binding.
-    ///
-    /// `true` (the default) preserves the strongest behaviour: when the broker
-    /// presents a certificate, the SCRAM exchange is bound to that TLS session
-    /// per RFC 5929 §4.1, so a stolen password is useless against a
-    /// man-in-the-middle. See [`AuthConfig::with_scram_channel_binding`] for
-    /// when to turn it off.
-    pub(crate) scram_channel_binding: bool,
-}
-
-impl Default for AuthConfig {
-    fn default() -> Self {
-        Self {
-            security_protocol: SecurityProtocol::default(),
-            sasl_mechanism: None,
-            plain_credentials: None,
-            scram_credentials: None,
-            aws_msk_iam_credentials: None,
-            aws_msk_iam_credential_provider: None,
-            oauthbearer_token: None,
-            oauthbearer_provider: None,
-            tls_config: None,
-            // Secure by default: bind SCRAM to the TLS session whenever the
-            // peer presents a certificate.
-            scram_channel_binding: true,
-        }
-    }
 }
 
 impl AuthConfig {
@@ -834,25 +758,7 @@ impl AuthConfig {
     /// | `SASL_PLAINTEXT` | `SASL_SSL` |
     /// | `SSL` / `SASL_SSL` | unchanged, `tls_config` replaced |
     ///
-    /// # Why this is the general form
-    ///
-    /// Every SASL mechanism composes with TLS, but the per-mechanism `_ssl`
-    /// constructors only cover the combinations someone remembered to write.
-    /// `SASL_SSL` + SCRAM — the default secured listener on Redpanda Cloud,
-    /// Aiven, Instaclustr and most Strimzi installs — was unreachable from
-    /// outside the crate for exactly that reason: `sasl_scram_sha256` hard-coded
-    /// `SASL_PLAINTEXT`, there was no `sasl_scram_sha256_ssl`, and
-    /// `security_protocol` / `tls_config` are private.
-    ///
-    /// The failure mode was quiet and bad: the returned config *looked* right,
-    /// and the client then attempted a cleartext SASL handshake against a TLS
-    /// listener — at best an opaque protocol error, at worst a SCRAM exchange
-    /// running unencrypted against a permissive broker.
-    ///
-    /// This method makes the combination structural rather than enumerated, so
-    /// a mechanism added later cannot miss it. `tests/builder_surface.rs`
-    /// asserts every `SaslMechanism` is constructible under both
-    /// `SASL_PLAINTEXT` and `SASL_SSL` from the public API alone.
+    /// Every SASL mechanism composes with TLS this way:
     ///
     /// ```rust
     /// use krafka::auth::{AuthConfig, SecurityProtocol, TlsConfig};
@@ -876,38 +782,21 @@ impl AuthConfig {
     }
 
     /// Create a SASL/PLAIN configuration.
-    pub fn sasl_plain(
-        username: impl Into<String>,
-        password: impl Into<String>,
-    ) -> crate::Result<Self> {
-        Ok(Self {
+    ///
+    /// The credentials are checked by
+    /// [`KafkaBuilder::connect`](crate::KafkaBuilder::connect): an empty
+    /// username or a NUL byte is a [`Config`](crate::KrafkaError::Config) error.
+    pub fn sasl_plain(username: impl Into<String>, password: impl Into<String>) -> Self {
+        Self {
             security_protocol: SecurityProtocol::SaslPlaintext,
             sasl_mechanism: Some(SaslMechanism::Plain),
-            plain_credentials: Some(PlainCredentials::new(username, password)?),
+            plain_credentials: Some(PlainCredentials::new(username, password)),
             ..Default::default()
-        })
+        }
     }
 
-    /// Create a SASL/PLAIN over TLS configuration.
-    pub fn sasl_plain_ssl(
-        username: impl Into<String>,
-        password: impl Into<String>,
-        tls_config: TlsConfig,
-    ) -> crate::Result<Self> {
-        Ok(Self {
-            security_protocol: SecurityProtocol::SaslSsl,
-            sasl_mechanism: Some(SaslMechanism::Plain),
-            plain_credentials: Some(PlainCredentials::new(username, password)?),
-            tls_config: Some(tls_config),
-            ..Default::default()
-        })
-    }
-
-    /// Create a SASL/SCRAM-SHA-256 configuration over cleartext.
-    ///
-    /// For `SASL_SSL` — the default secured listener on most managed Kafka
-    /// offerings — use [`sasl_scram_sha256_ssl`](Self::sasl_scram_sha256_ssl),
-    /// or chain [`with_tls`](Self::with_tls).
+    /// Create a SASL/SCRAM-SHA-256 configuration over cleartext. Chain
+    /// [`with_tls`](Self::with_tls) for `SASL_SSL`.
     pub fn sasl_scram_sha256(username: impl Into<String>, password: impl Into<String>) -> Self {
         Self {
             security_protocol: SecurityProtocol::SaslPlaintext,
@@ -917,20 +806,8 @@ impl AuthConfig {
         }
     }
 
-    /// Create a SASL/SCRAM-SHA-256 over TLS configuration.
-    pub fn sasl_scram_sha256_ssl(
-        username: impl Into<String>,
-        password: impl Into<String>,
-        tls_config: TlsConfig,
-    ) -> Self {
-        Self::sasl_scram_sha256(username, password).with_tls(tls_config)
-    }
-
-    /// Create a SASL/SCRAM-SHA-512 configuration over cleartext.
-    ///
-    /// For `SASL_SSL` — the default secured listener on most managed Kafka
-    /// offerings — use [`sasl_scram_sha512_ssl`](Self::sasl_scram_sha512_ssl),
-    /// or chain [`with_tls`](Self::with_tls).
+    /// Create a SASL/SCRAM-SHA-512 configuration over cleartext. Chain
+    /// [`with_tls`](Self::with_tls) for `SASL_SSL`.
     pub fn sasl_scram_sha512(username: impl Into<String>, password: impl Into<String>) -> Self {
         Self {
             security_protocol: SecurityProtocol::SaslPlaintext,
@@ -938,15 +815,6 @@ impl AuthConfig {
             scram_credentials: Some(ScramCredentials::new(username, password)),
             ..Default::default()
         }
-    }
-
-    /// Create a SASL/SCRAM-SHA-512 over TLS configuration.
-    pub fn sasl_scram_sha512_ssl(
-        username: impl Into<String>,
-        password: impl Into<String>,
-        tls_config: TlsConfig,
-    ) -> Self {
-        Self::sasl_scram_sha512(username, password).with_tls(tls_config)
     }
 
     /// Create an AWS MSK IAM configuration.
@@ -991,14 +859,19 @@ impl AuthConfig {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// With the `aws-msk` feature, `AwsMskIamCredentials::from_default_chain`
+    /// resolves credentials through the AWS SDK default chain.
+    ///
+    /// ```rust,no_run
     /// use krafka::auth::{AuthConfig, AwsMskIamCredentials};
     ///
     /// let config = AuthConfig::aws_msk_iam_provider(|| async {
-    ///     AwsMskIamCredentials::from_default_chain("us-east-1").await
+    ///     AwsMskIamCredentials::from_env_with_region("us-east-1")
     /// });
     /// ```
-    pub fn aws_msk_iam_provider(provider: impl AwsMskIamCredentialProvider + 'static) -> Self {
+    pub fn aws_msk_iam_provider(
+        provider: impl CredentialProvider<AwsMskIamCredentials> + 'static,
+    ) -> Self {
         Self {
             security_protocol: SecurityProtocol::SaslSsl,
             sasl_mechanism: Some(SaslMechanism::AwsMskIam),
@@ -1010,7 +883,7 @@ impl AuthConfig {
 
     /// Create a SASL/OAUTHBEARER configuration with a static token.
     ///
-    /// Uses SASL_PLAINTEXT. For TLS, use [`sasl_oauthbearer_ssl()`](Self::sasl_oauthbearer_ssl).
+    /// Uses SASL_PLAINTEXT; chain [`with_tls`](Self::with_tls) for TLS.
     /// For automatic token refresh on reconnection, use
     /// [`sasl_oauthbearer_provider()`](Self::sasl_oauthbearer_provider) instead.
     ///
@@ -1025,17 +898,6 @@ impl AuthConfig {
             security_protocol: SecurityProtocol::SaslPlaintext,
             sasl_mechanism: Some(SaslMechanism::OAuthBearer),
             oauthbearer_token: Some(OAuthBearerToken::new(token)),
-            ..Default::default()
-        }
-    }
-
-    /// Create a SASL/OAUTHBEARER over TLS configuration.
-    pub fn sasl_oauthbearer_ssl(token: impl Into<String>, tls_config: TlsConfig) -> Self {
-        Self {
-            security_protocol: SecurityProtocol::SaslSsl,
-            sasl_mechanism: Some(SaslMechanism::OAuthBearer),
-            oauthbearer_token: Some(OAuthBearerToken::new(token)),
-            tls_config: Some(tls_config),
             ..Default::default()
         }
     }
@@ -1061,17 +923,6 @@ impl AuthConfig {
         }
     }
 
-    /// Create a SASL/OAUTHBEARER over TLS configuration with a pre-built token.
-    pub fn sasl_oauthbearer_token_ssl(token: OAuthBearerToken, tls_config: TlsConfig) -> Self {
-        Self {
-            security_protocol: SecurityProtocol::SaslSsl,
-            sasl_mechanism: Some(SaslMechanism::OAuthBearer),
-            oauthbearer_token: Some(token),
-            tls_config: Some(tls_config),
-            ..Default::default()
-        }
-    }
-
     /// Create a SASL/OAUTHBEARER configuration with an async token provider.
     ///
     /// The provider is called on every new broker connection (including
@@ -1087,25 +938,13 @@ impl AuthConfig {
     ///     Ok(OAuthBearerToken::new("fresh-jwt-token"))
     /// });
     /// ```
-    pub fn sasl_oauthbearer_provider(provider: impl OAuthBearerTokenProvider + 'static) -> Self {
+    pub fn sasl_oauthbearer_provider(
+        provider: impl CredentialProvider<OAuthBearerToken> + 'static,
+    ) -> Self {
         Self {
             security_protocol: SecurityProtocol::SaslPlaintext,
             sasl_mechanism: Some(SaslMechanism::OAuthBearer),
             oauthbearer_provider: Some(OAuthBearerTokenProviderHandle::new(provider)),
-            ..Default::default()
-        }
-    }
-
-    /// Create a SASL/OAUTHBEARER over TLS configuration with an async token provider.
-    pub fn sasl_oauthbearer_provider_ssl(
-        provider: impl OAuthBearerTokenProvider + 'static,
-        tls_config: TlsConfig,
-    ) -> Self {
-        Self {
-            security_protocol: SecurityProtocol::SaslSsl,
-            sasl_mechanism: Some(SaslMechanism::OAuthBearer),
-            oauthbearer_provider: Some(OAuthBearerTokenProviderHandle::new(provider)),
-            tls_config: Some(tls_config),
             ..Default::default()
         }
     }
@@ -1122,7 +961,9 @@ impl AuthConfig {
     /// # Errors
     ///
     /// Returns an error if the provider fails to fetch a token.
-    pub async fn resolve_provider_to_token(&self) -> crate::error::Result<Option<AuthConfig>> {
+    pub(crate) async fn resolve_provider_to_token(
+        &self,
+    ) -> crate::error::Result<Option<AuthConfig>> {
         if self.sasl_mechanism == Some(SaslMechanism::OAuthBearer)
             && let Some(ref provider) = self.oauthbearer_provider
         {
@@ -1149,7 +990,9 @@ impl AuthConfig {
     /// # Errors
     ///
     /// Returns an error if the provider fails to fetch credentials.
-    pub async fn resolve_msk_iam_provider(&self) -> crate::error::Result<Option<AuthConfig>> {
+    pub(crate) async fn resolve_msk_iam_provider(
+        &self,
+    ) -> crate::error::Result<Option<AuthConfig>> {
         if self.sasl_mechanism == Some(SaslMechanism::AwsMskIam)
             && let Some(ref provider) = self.aws_msk_iam_credential_provider
         {
@@ -1161,6 +1004,43 @@ impl AuthConfig {
             }))
         } else {
             Ok(None)
+        }
+    }
+
+    /// Reject credentials that cannot authenticate, naming the setting.
+    pub(crate) fn validate(&self) -> crate::Result<()> {
+        if let Some(plain) = &self.plain_credentials {
+            plain.validate()?;
+        }
+        if let Some(scram) = &self.scram_credentials
+            && scram.username.is_empty()
+        {
+            return Err(crate::error::KrafkaError::config(
+                "security: SASL/SCRAM username must not be empty",
+            ));
+        }
+        if let Some(token) = &self.oauthbearer_token {
+            token.validate()?;
+        }
+        Ok(())
+    }
+
+    /// Warn that this configuration sends a reusable credential to `address`
+    /// without TLS.
+    ///
+    /// Called on every SASL connect, so the misconfiguration shows in the
+    /// logs whatever the reconnect history.
+    pub(crate) fn warn_if_cleartext_credential(&self, address: &str) {
+        if self.security_protocol != SecurityProtocol::SaslPlaintext {
+            return;
+        }
+        if let Some(mechanism) = &self.sasl_mechanism
+            && mechanism.sends_reusable_credential()
+        {
+            tracing::warn!(
+                "SASL {mechanism} credentials will be sent in cleartext to {address}; \
+                 anyone on the network path can reuse them. Use SASL_SSL."
+            );
         }
     }
 
@@ -1204,61 +1084,19 @@ impl AuthConfig {
     pub fn aws_msk_iam_credentials(&self) -> Option<&AwsMskIamCredentials> {
         self.aws_msk_iam_credentials.as_ref()
     }
-
-    /// Returns the AWS MSK IAM credential provider handle, if set.
-    pub fn aws_msk_iam_credential_provider(&self) -> Option<&AwsMskIamCredentialProviderHandle> {
-        self.aws_msk_iam_credential_provider.as_ref()
-    }
-
     /// Returns the OAUTHBEARER token, if set.
     pub fn oauthbearer_token(&self) -> Option<&OAuthBearerToken> {
         self.oauthbearer_token.as_ref()
     }
 
     /// Returns the OAUTHBEARER token provider handle, if set.
-    pub fn oauthbearer_provider(&self) -> Option<&OAuthBearerTokenProviderHandle> {
+    pub(crate) fn oauthbearer_provider(&self) -> Option<&OAuthBearerTokenProviderHandle> {
         self.oauthbearer_provider.as_ref()
     }
 
     /// Returns the TLS configuration, if set.
     pub fn tls_config(&self) -> Option<&TlsConfig> {
         self.tls_config.as_ref()
-    }
-
-    /// Enable or disable `tls-server-end-point` channel binding for SCRAM.
-    ///
-    /// Default: **enabled**. When SCRAM runs over TLS and the broker presents
-    /// a certificate, the client sends a `p=tls-server-end-point` GS2 header
-    /// and binds the exchange to that TLS session (RFC 5802 §6, RFC 5929
-    /// §4.1). This is strictly stronger — it stops an attacker who has the
-    /// password from relaying the exchange through a MITM proxy.
-    ///
-    /// Pass `false` only when the broker does not implement RFC 5929. Such a
-    /// broker rejects the bound exchange with an opaque SASL failure and there
-    /// is no in-band way to detect it, so the escape hatch has to be explicit.
-    /// Turning this off downgrades SCRAM-over-TLS to unbound `n,,` framing.
-    ///
-    /// No effect on SASL_PLAINTEXT, where channel binding is never used.
-    ///
-    /// ```rust
-    /// use krafka::auth::AuthConfig;
-    /// // Broker predates RFC 5929 support:
-    /// let config = AuthConfig::sasl_scram_sha256("user", "pass")
-    ///     .with_scram_channel_binding(false);
-    /// assert!(!config.scram_channel_binding());
-    /// ```
-    #[must_use]
-    pub fn with_scram_channel_binding(mut self, enabled: bool) -> Self {
-        self.scram_channel_binding = enabled;
-        self
-    }
-
-    /// Whether `tls-server-end-point` channel binding is enabled for SCRAM.
-    ///
-    /// See [`Self::with_scram_channel_binding`]. Default: `true`.
-    #[inline]
-    pub fn scram_channel_binding(&self) -> bool {
-        self.scram_channel_binding
     }
 
     /// Construct an `AuthConfig` from standard Kafka environment variables.
@@ -1326,10 +1164,7 @@ impl AuthConfig {
                 let use_tls = protocol.to_uppercase() == "SASL_SSL";
 
                 // One TLS config, applied through `with_tls` for every
-                // mechanism. The SCRAM arms used to assign `security_protocol`
-                // and `tls_config` directly — reachable only from inside the
-                // crate, which is what made `SASL_SSL` + SCRAM impossible to
-                // build from outside it.
+                // mechanism, so every mechanism composes with `SASL_SSL`.
                 let config = Self::sasl_config_from_env(&mechanism)?;
                 Ok(if use_tls {
                     config.with_tls(Self::tls_config_from_env()?)
@@ -1358,7 +1193,7 @@ impl AuthConfig {
         match mechanism.to_uppercase().as_str() {
             "PLAIN" => {
                 let (username, password) = user_password()?;
-                Self::sasl_plain(username, password)
+                Ok(Self::sasl_plain(username, password))
             }
             "SCRAM-SHA-256" => {
                 let (username, password) = user_password()?;
@@ -1474,6 +1309,110 @@ impl AuthConfig {
 mod tests {
     use super::*;
 
+    /// Run `f` and return what it logged at WARN or above.
+    fn warnings_from(f: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8(capture.0.lock().unwrap().clone()).unwrap()
+    }
+
+    struct FixedToken;
+    impl CredentialProvider<OAuthBearerToken> for FixedToken {
+        async fn credentials(&self) -> crate::Result<OAuthBearerToken> {
+            Ok(OAuthBearerToken::new("t"))
+        }
+    }
+
+    /// Every configuration that sends a replayable credential, as
+    /// `(mechanism, over SASL_PLAINTEXT, over SASL_SSL)`.
+    fn bearer_configs() -> Vec<(&'static str, AuthConfig, AuthConfig)> {
+        let tls = TlsConfig::new;
+        #[cfg_attr(not(feature = "oauth-oidc"), allow(unused_mut))]
+        let mut configs = vec![
+            (
+                "PLAIN",
+                AuthConfig::sasl_plain("u", "p"),
+                AuthConfig::sasl_plain("u", "p").with_tls(tls()),
+            ),
+            (
+                "OAUTHBEARER",
+                AuthConfig::sasl_oauthbearer("t"),
+                AuthConfig::sasl_oauthbearer("t").with_tls(tls()),
+            ),
+            (
+                "OAUTHBEARER",
+                AuthConfig::sasl_oauthbearer_token(OAuthBearerToken::new("t")),
+                AuthConfig::sasl_oauthbearer_token(OAuthBearerToken::new("t")).with_tls(tls()),
+            ),
+            (
+                "OAUTHBEARER",
+                AuthConfig::sasl_oauthbearer_provider(FixedToken),
+                AuthConfig::sasl_oauthbearer_provider(FixedToken).with_tls(tls()),
+            ),
+        ];
+        #[cfg(feature = "oauth-oidc")]
+        {
+            let oidc = || {
+                OidcTokenProvider::builder("https://idp.example.com/token")
+                    .credentials(ClientCredentials::secret("id", "secret"))
+                    .build()
+                    .unwrap()
+            };
+            configs.push((
+                "OAUTHBEARER",
+                AuthConfig::sasl_oauthbearer_provider(oidc()),
+                AuthConfig::sasl_oauthbearer_provider(oidc()).with_tls(tls()),
+            ));
+        }
+        configs
+    }
+
+    #[test]
+    fn every_bearer_credential_over_sasl_plaintext_is_warned_about() {
+        for (mechanism, plaintext, _) in bearer_configs() {
+            let logged = warnings_from(|| plaintext.warn_if_cleartext_credential("b1:9092"));
+            assert!(
+                logged.contains(&format!(
+                    "SASL {mechanism} credentials will be sent in cleartext to b1:9092"
+                )),
+                "{mechanism}: got {logged:?}"
+            );
+        }
+    }
+
+    /// Negative control: the same credentials over TLS, and SCRAM's
+    /// challenge-response over plaintext, log nothing.
+    #[test]
+    fn tls_and_scram_are_not_warned_about() {
+        let mut quiet: Vec<AuthConfig> = bearer_configs()
+            .into_iter()
+            .map(|(_, _, ssl)| ssl)
+            .collect();
+        quiet.push(AuthConfig::sasl_scram_sha256("u", "p"));
+        quiet.push(AuthConfig::sasl_scram_sha512("u", "p"));
+        for config in quiet {
+            let logged = warnings_from(|| config.warn_if_cleartext_credential("b1:9092"));
+            assert!(logged.is_empty(), "{config:?}: got {logged:?}");
+        }
+    }
+
     #[test]
     fn test_security_protocol_display() {
         assert_eq!(SecurityProtocol::Plaintext.to_string(), "PLAINTEXT");
@@ -1494,7 +1433,7 @@ mod tests {
 
     #[test]
     fn test_plain_credentials() {
-        let creds = PlainCredentials::new("user", "pass").unwrap();
+        let creds = PlainCredentials::new("user", "pass");
         let auth_bytes = creds.to_auth_bytes();
         assert_eq!(&*auth_bytes, b"\0user\0pass");
     }
@@ -1509,7 +1448,7 @@ mod tests {
 
     #[test]
     fn test_auth_config_sasl_plain() {
-        let config = AuthConfig::sasl_plain("user", "pass").unwrap();
+        let config = AuthConfig::sasl_plain("user", "pass");
         assert_eq!(config.security_protocol, SecurityProtocol::SaslPlaintext);
         assert_eq!(config.sasl_mechanism, Some(SaslMechanism::Plain));
         assert!(config.plain_credentials.is_some());
@@ -1546,7 +1485,7 @@ mod tests {
 
     #[test]
     fn test_credentials_debug_redacts_password() {
-        let creds = PlainCredentials::new("user", "secret").unwrap();
+        let creds = PlainCredentials::new("user", "secret");
         let debug_str = format!("{creds:?}");
         assert!(debug_str.contains("user"));
         assert!(debug_str.contains("[REDACTED]"));
@@ -1571,10 +1510,9 @@ mod tests {
 
     /// Re-regioning must not lose the session token.
     ///
-    /// This is the whole reason [`AwsMskIamCredentials::with_region`] exists:
-    /// the only way to change the region used to be to rebuild the credential
-    /// through `new`, which drops the token, and MSK then rejects the SigV4
-    /// signature at connect time with an error that never mentions it.
+    /// Rebuilding the credential through `new` drops the token, and MSK then
+    /// rejects the SigV4 signature at connect time with an error that never
+    /// mentions it.
     ///
     /// Negative control: deleting the `session_token` copy from `with_region`
     /// (i.e. rebuilding via `new`) fails this assertion.
@@ -1615,7 +1553,7 @@ mod tests {
         // SASL_PLAINTEXT → SASL_SSL, for every mechanism that can be built
         // over cleartext.
         for config in [
-            AuthConfig::sasl_plain("u", "p").expect("valid PLAIN credentials"),
+            AuthConfig::sasl_plain("u", "p"),
             AuthConfig::sasl_scram_sha256("u", "p"),
             AuthConfig::sasl_scram_sha512("u", "p"),
             AuthConfig::sasl_oauthbearer("jwt"),
@@ -1653,13 +1591,13 @@ mod tests {
 
     #[test]
     fn scram_ssl_constructors_produce_sasl_ssl() {
-        let sha256 = AuthConfig::sasl_scram_sha256_ssl("u", "p", TlsConfig::new());
+        let sha256 = AuthConfig::sasl_scram_sha256("u", "p").with_tls(TlsConfig::new());
         assert_eq!(sha256.security_protocol(), &SecurityProtocol::SaslSsl);
         assert_eq!(sha256.sasl_mechanism(), Some(&SaslMechanism::ScramSha256));
         assert!(sha256.scram_credentials().is_some());
         assert!(sha256.requires_tls() && sha256.requires_sasl());
 
-        let sha512 = AuthConfig::sasl_scram_sha512_ssl("u", "p", TlsConfig::new());
+        let sha512 = AuthConfig::sasl_scram_sha512("u", "p").with_tls(TlsConfig::new());
         assert_eq!(sha512.security_protocol(), &SecurityProtocol::SaslSsl);
         assert_eq!(sha512.sasl_mechanism(), Some(&SaslMechanism::ScramSha512));
         assert!(sha512.scram_credentials().is_some());
@@ -1703,9 +1641,7 @@ mod tests {
         );
     }
 
-    /// Every `KAFKA_SSL_*` variable must reach the `TlsConfig`. A setter that
-    /// parses its input and stores it nowhere is the defect class this whole
-    /// review keeps finding.
+    /// Every `KAFKA_SSL_*` variable must reach the `TlsConfig`.
     #[test]
     fn tls_environment_material_reaches_the_config() {
         let tls = AuthConfig::tls_config_from_parts(
@@ -1778,9 +1714,8 @@ mod tests {
 
     /// Every mechanism `KAFKA_SASL_MECHANISM` accepts must compose with TLS.
     ///
-    /// The SCRAM arms are the reason this exists: they used to assign the
-    /// private `security_protocol` field directly, so `SASL_SSL` + SCRAM
-    /// worked from inside the crate and was unreachable from outside it.
+    /// Guards against a mechanism arm setting `security_protocol` directly,
+    /// which would bypass `with_tls`.
     #[test]
     fn every_env_mechanism_reaches_sasl_ssl() {
         // AWS_MSK_IAM is excluded: its credentials come from the AWS
@@ -1790,7 +1725,7 @@ mod tests {
             // The password-based arms need credentials; supply them directly
             // rather than through the environment.
             let cleartext = match mechanism {
-                "PLAIN" => AuthConfig::sasl_plain("u", "p").expect("valid"),
+                "PLAIN" => AuthConfig::sasl_plain("u", "p"),
                 "SCRAM-SHA-256" => AuthConfig::sasl_scram_sha256("u", "p"),
                 _ => AuthConfig::sasl_scram_sha512("u", "p"),
             };
@@ -1837,7 +1772,7 @@ mod tests {
 
     #[test]
     fn test_auth_config_sasl_oauthbearer_ssl() {
-        let config = AuthConfig::sasl_oauthbearer_ssl("my-token", TlsConfig::new());
+        let config = AuthConfig::sasl_oauthbearer("my-token").with_tls(TlsConfig::new());
         assert_eq!(config.security_protocol, SecurityProtocol::SaslSsl);
         assert_eq!(config.sasl_mechanism, Some(SaslMechanism::OAuthBearer));
         assert!(config.oauthbearer_token.is_some());
@@ -1857,7 +1792,7 @@ mod tests {
     #[test]
     fn test_auth_config_sasl_oauthbearer_token_ssl() {
         let token = OAuthBearerToken::new("jwt");
-        let config = AuthConfig::sasl_oauthbearer_token_ssl(token, TlsConfig::new());
+        let config = AuthConfig::sasl_oauthbearer_token(token).with_tls(TlsConfig::new());
         assert_eq!(config.security_protocol, SecurityProtocol::SaslSsl);
         assert_eq!(config.sasl_mechanism, Some(SaslMechanism::OAuthBearer));
         assert!(config.oauthbearer_token.is_some());
@@ -1882,10 +1817,9 @@ mod tests {
 
     #[test]
     fn test_auth_config_sasl_oauthbearer_provider_ssl() {
-        let config = AuthConfig::sasl_oauthbearer_provider_ssl(
-            || async { Ok(OAuthBearerToken::new("tok")) },
-            TlsConfig::new(),
-        );
+        let config =
+            AuthConfig::sasl_oauthbearer_provider(|| async { Ok(OAuthBearerToken::new("tok")) })
+                .with_tls(TlsConfig::new());
         assert_eq!(config.security_protocol, SecurityProtocol::SaslSsl);
         assert_eq!(config.sasl_mechanism, Some(SaslMechanism::OAuthBearer));
         assert!(config.oauthbearer_provider.is_some());
@@ -1927,10 +1861,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_provider_to_token_preserves_tls() {
-        let config = AuthConfig::sasl_oauthbearer_provider_ssl(
-            || async { Ok(OAuthBearerToken::new("tok")) },
-            TlsConfig::new(),
-        );
+        let config =
+            AuthConfig::sasl_oauthbearer_provider(|| async { Ok(OAuthBearerToken::new("tok")) })
+                .with_tls(TlsConfig::new());
         let resolved = config.resolve_provider_to_token().await.unwrap().unwrap();
 
         assert!(resolved.tls_config.is_some());
@@ -1945,7 +1878,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_provider_to_token_returns_none_for_non_oauth() {
-        let config = AuthConfig::sasl_plain("user", "pass").unwrap();
+        let config = AuthConfig::sasl_plain("user", "pass");
         assert!(config.resolve_provider_to_token().await.unwrap().is_none());
     }
 
@@ -2007,7 +1940,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_msk_iam_provider_returns_none_for_non_msk() {
-        let config = AuthConfig::sasl_plain("user", "pass").unwrap();
+        let config = AuthConfig::sasl_plain("user", "pass");
         assert!(config.resolve_msk_iam_provider().await.unwrap().is_none());
     }
 

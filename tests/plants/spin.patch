@@ -1,0 +1,21 @@
+diff -ruN a/src/producer/engine.rs b/src/producer/engine.rs
+--- a/src/producer/engine.rs
++++ b/src/producer/engine.rs
+@@ -557,15 +557,8 @@
+             };
+             if let Some(open) = &queue.open {
+                 wake = wake.min(open.deadline);
+-                // A batch whose linger has passed and that `drain` still left
+-                // waits for a response, a bump or a command, not for a timer.
+-                let lingered = open.created + linger;
+-                if queue.in_flight.is_none()
+-                    && queue.sealed.is_empty()
+-                    && !linger.is_zero()
+-                    && lingered > now
+-                {
+-                    wake = wake.min(lingered);
++                if queue.in_flight.is_none() && queue.sealed.is_empty() && !linger.is_zero() {
++                    wake = wake.min(open.created + linger);
+                 }
+             }
+             if let Some(front) = queue.sealed.front() {

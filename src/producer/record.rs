@@ -5,14 +5,25 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use crate::error::{KrafkaError, ProtocolErrorKind, Result};
-use crate::protocol::{MAX_RECORD_HEADERS, RecordBatchBuilder, validate_topic_name};
+use crate::protocol::{MAX_RECORD_HEADERS, validate_topic_name};
 use crate::{PartitionId, Timestamp};
 
 /// A record to be sent to Kafka.
+///
+/// ```rust
+/// use krafka::Record;
+///
+/// let record = Record::new("orders", "hello")
+///     .key("order-7")
+///     .header("trace-id", "abc")
+///     .partition(0)
+///     .timestamp(1_700_000_000_000);
+/// assert_eq!(record.headers.len(), 1);
+/// ```
 #[non_exhaustive]
 #[must_use]
 #[derive(Debug, Clone)]
-pub struct ProducerRecord {
+pub struct Record {
     /// Target topic.
     pub topic: String,
     /// Target partition (optional, will be computed if not set).
@@ -36,19 +47,12 @@ pub struct ProducerRecord {
     ///
     /// Duplicate keys are permitted and preserved in order, matching the Kafka
     /// record format. A `None` value is a *null* header value, which the wire
-    /// format distinguishes from a zero-length one.
-    pub headers: Vec<(String, Option<Bytes>)>,
-    /// Optional type name forwarded to the
-    /// [`Serializer`](crate::serdes::Serializer).
-    ///
-    /// krafka never interprets it. It exists because a serializer often needs
-    /// to name the record's *type* as well as its topic — a schema-registry
-    /// serializer deriving a subject from a record name, for instance. Leave it
-    /// `None` unless your serializer documents that it reads it.
-    pub record_name: Option<String>,
+    /// format distinguishes from a zero-length one. The same type a
+    /// [`ConsumerRecord`](crate::consumer::ConsumerRecord) carries.
+    pub headers: crate::Headers,
 }
 
-impl ProducerRecord {
+impl Record {
     /// Create a new producer record carrying `value`.
     ///
     /// For a record with a *null* value — a tombstone — use
@@ -62,7 +66,6 @@ impl ProducerRecord {
             value: Some(value.into()),
             timestamp: None,
             headers: Vec::new(),
-            record_name: None,
         }
     }
 
@@ -77,20 +80,16 @@ impl ProducerRecord {
     /// a null value on a keyless record deletes nothing. Build that with
     /// [`without_value`](Self::without_value) if you need it.
     ///
-    /// A configured
-    /// [`value_serializer`](crate::producer::ProducerBuilder::value_serializer)
-    /// is **not** applied here; see its documentation.
-    ///
     /// # Example
     ///
     /// ```rust,no_run
-    /// use krafka::producer::ProducerRecord;
+    /// use krafka::producer::Record;
     ///
     /// # async fn example(producer: &krafka::producer::Producer) -> krafka::Result<()> {
-    /// let record = ProducerRecord::tombstone("users", "user-42")
-    ///     .with_header("X-Reason", &b"gdpr-erasure"[..]);
+    /// let record = Record::tombstone("users", "user-42")
+    ///     .header("X-Reason", &b"gdpr-erasure"[..]);
     /// assert!(record.is_tombstone());
-    /// producer.send_record(record).await?;
+    /// producer.send(record).await?;
     /// # Ok(())
     /// # }
     /// ```
@@ -102,18 +101,17 @@ impl ProducerRecord {
             value: None,
             timestamp: None,
             headers: Vec::new(),
-            record_name: None,
         }
     }
 
     /// Set the partition.
-    pub fn with_partition(mut self, partition: PartitionId) -> Self {
+    pub fn partition(mut self, partition: PartitionId) -> Self {
         self.partition = Some(partition);
         self
     }
 
     /// Set the key.
-    pub fn with_key(mut self, key: impl Into<Bytes>) -> Self {
+    pub fn key(mut self, key: impl Into<Bytes>) -> Self {
         self.key = Some(key.into());
         self
     }
@@ -125,7 +123,7 @@ impl ProducerRecord {
     }
 
     /// Set the value.
-    pub fn with_value(mut self, value: impl Into<Bytes>) -> Self {
+    pub fn value(mut self, value: impl Into<Bytes>) -> Self {
         self.value = Some(value.into());
         self
     }
@@ -140,7 +138,7 @@ impl ProducerRecord {
     }
 
     /// Set the timestamp.
-    pub fn with_timestamp(mut self, timestamp: Timestamp) -> Self {
+    pub fn timestamp(mut self, timestamp: Timestamp) -> Self {
         self.timestamp = Some(timestamp);
         self
     }
@@ -148,9 +146,9 @@ impl ProducerRecord {
     /// Add a header.
     ///
     /// Duplicate keys are allowed and preserved in insertion order. Use
-    /// [`with_null_header`](Self::with_null_header) for a header whose value is
+    /// [`null_header`](Self::null_header) for a header whose value is
     /// *null* rather than zero-length.
-    pub fn with_header(mut self, key: impl Into<String>, value: impl Into<Bytes>) -> Self {
+    pub fn header(mut self, key: impl Into<String>, value: impl Into<Bytes>) -> Self {
         self.headers.push((key.into(), Some(value.into())));
         self
     }
@@ -159,21 +157,10 @@ impl ProducerRecord {
     ///
     /// The Kafka record format distinguishes a null header value from a
     /// zero-length one, and some ecosystems use a null-valued header as a bare
-    /// flag. `with_header(k, Bytes::new())` produces the zero-length form
+    /// flag. `header(k, Bytes::new())` produces the zero-length form
     /// instead.
-    pub fn with_null_header(mut self, key: impl Into<String>) -> Self {
+    pub fn null_header(mut self, key: impl Into<String>) -> Self {
         self.headers.push((key.into(), None));
-        self
-    }
-
-    /// Set the type name passed to the
-    /// [`Serializer`](crate::serdes::Serializer).
-    ///
-    /// Only needed when the configured serializer reads it — for example a
-    /// schema-registry serializer whose subject-name strategy is derived from
-    /// the record name rather than the topic.
-    pub fn with_record_name(mut self, name: impl Into<String>) -> Self {
-        self.record_name = Some(name.into());
         self
     }
 
@@ -371,13 +358,14 @@ impl ProducerRecord {
     }
 
     /// Split the public record into an interned topic handle and routed payload.
+    #[cfg(test)]
     pub(crate) fn into_routed_parts(self) -> RoutedRecordParts {
         let topic = Arc::<str>::from(self.topic.as_str());
         self.into_routed_parts_with_topic(topic)
     }
 
-    /// As [`into_routed_parts`](Self::into_routed_parts), reusing a topic
-    /// handle the caller already holds.
+    /// Split the public record into the topic handle the caller already
+    /// holds and the routed payload.
     ///
     /// The send path interns the topic once, when the interceptor chain has
     /// finished with the record, and both the routing and the failure-reporting
@@ -390,7 +378,6 @@ impl ProducerRecord {
             value,
             timestamp,
             headers,
-            record_name: _,
         } = self;
 
         RoutedRecordParts {
@@ -406,20 +393,6 @@ impl ProducerRecord {
     }
 }
 
-/// The record headers handed to
-/// [`ProducerInterceptor::on_acknowledgement`](crate::interceptor::ProducerInterceptor::on_acknowledgement).
-///
-/// Named rather than spelled out for the same reason as
-/// [`CommitOffsets`](crate::interceptor::CommitOffsets): a trait signature that
-/// wrote `&[(String, Option<Bytes>)]` inline would make every implementor
-/// repeat it, and would pin the representation in place the first time someone
-/// did.
-///
-/// `Vec<(String, Option<Bytes>)>` — the type of
-/// [`ProducerRecord::headers`] — derefs to this, so `&record.headers` is
-/// already a `&RecordHeaders`.
-pub type RecordHeaders = [(String, Option<Bytes>)];
-
 /// Interned topic handle reused across the producer routing path.
 pub(crate) type TopicHandle = Arc<str>;
 
@@ -430,7 +403,7 @@ pub(crate) struct RoutedRecord {
     /// `None` is the Kafka null value — a tombstone.
     pub value: Option<Bytes>,
     pub timestamp: Option<Timestamp>,
-    pub headers: Vec<(String, Option<Bytes>)>,
+    pub headers: crate::Headers,
 }
 
 impl RoutedRecord {
@@ -451,21 +424,6 @@ impl RoutedRecord {
     #[inline]
     pub(crate) fn key_bytes(&self) -> Option<&[u8]> {
         self.key.as_deref()
-    }
-
-    pub(crate) fn append_to_batch_builder(
-        &self,
-        batch_builder: RecordBatchBuilder,
-    ) -> RecordBatchBuilder {
-        if self.headers.is_empty() {
-            batch_builder.add_record(self.key.clone(), self.value.clone())
-        } else {
-            batch_builder.add_record_with_headers(
-                self.key.clone(),
-                self.value.clone(),
-                self.headers.clone(),
-            )
-        }
     }
 }
 
@@ -500,28 +458,16 @@ pub enum DeliveryConfirmation {
     /// no response. There is **no** durability guarantee whatsoever; the record
     /// may never have been stored.
     Unacknowledged,
-    /// The send failed permanently. Present only on the metadata handed to
-    /// [`ProducerInterceptor::on_acknowledgement`](crate::interceptor::ProducerInterceptor::on_acknowledgement)
-    /// alongside the error; it is never returned as `Ok`.
-    Failed,
 }
 
 /// Partition value reported when a record failed before it was routed.
 ///
-/// A record rejected by serialization, validation or topic lookup never
-/// reaches the partitioner, so the
-/// [`RecordMetadata`] handed to
+/// A record rejected by validation or topic lookup never reaches the
+/// partitioner, so
 /// [`ProducerInterceptor::on_acknowledgement`](crate::interceptor::ProducerInterceptor::on_acknowledgement)
-/// carries this instead of a real partition. Mirrors the Java client's
+/// receives this instead of a real partition. Mirrors the Java client's
 /// `RecordMetadata.UNKNOWN_PARTITION`.
 pub const UNKNOWN_PARTITION: PartitionId = -1;
-
-/// Timestamp reported when the broker never assigned one.
-///
-/// Mirrors the Java client's `RecordBatch.NO_TIMESTAMP`. Only meaningful
-/// alongside [`DeliveryConfirmation::Failed`] or an `acks = 0` send — a
-/// successful append always carries a real timestamp.
-pub const NO_TIMESTAMP: Timestamp = -1;
 
 /// Metadata returned after successfully sending a record.
 ///
@@ -550,24 +496,6 @@ pub struct RecordMetadata {
 }
 
 impl RecordMetadata {
-    /// Terminal metadata for a record that failed and therefore has no offset.
-    ///
-    /// The single constructor for the failure case, so every path that reports
-    /// a terminal failure to
-    /// [`ProducerInterceptor::on_acknowledgement`](crate::interceptor::ProducerInterceptor::on_acknowledgement)
-    /// — pre-enqueue rejection, batch failure, dead-letter hand-off — describes
-    /// it identically. Pass [`UNKNOWN_PARTITION`] when the record failed before
-    /// it was routed.
-    pub(crate) fn failed(topic: String, partition: PartitionId) -> Self {
-        Self {
-            topic,
-            partition,
-            offset: -1,
-            timestamp: NO_TIMESTAMP,
-            delivery: DeliveryConfirmation::Failed,
-        }
-    }
-
     /// Returns `true` if the record was committed with a known log offset.
     ///
     /// Deduplicated records return `false` even though their data *is* in
@@ -622,7 +550,7 @@ mod tests {
 
     #[test]
     fn test_producer_record_new() {
-        let record = ProducerRecord::new("test-topic", b"hello".to_vec());
+        let record = Record::new("test-topic", b"hello".to_vec());
         assert_eq!(record.topic, "test-topic");
         assert_eq!(record.value.as_deref(), Some(&b"hello"[..]));
         assert!(record.key.is_none());
@@ -631,8 +559,7 @@ mod tests {
 
     #[test]
     fn test_producer_record_with_key() {
-        let record =
-            ProducerRecord::new("test-topic", b"hello".to_vec()).with_key(b"my-key".to_vec());
+        let record = Record::new("test-topic", b"hello".to_vec()).key(b"my-key".to_vec());
 
         assert_eq!(record.key, Some(Bytes::from_static(b"my-key")));
         assert_eq!(record.key_str(), Some("my-key"));
@@ -640,16 +567,16 @@ mod tests {
 
     #[test]
     fn test_producer_record_with_partition() {
-        let record = ProducerRecord::new("test-topic", b"hello".to_vec()).with_partition(5);
+        let record = Record::new("test-topic", b"hello".to_vec()).partition(5);
 
         assert_eq!(record.partition, Some(5));
     }
 
     #[test]
     fn test_producer_record_with_headers() {
-        let record = ProducerRecord::new("test-topic", b"hello".to_vec())
-            .with_header("h1", b"v1".to_vec())
-            .with_header("h2", b"v2".to_vec());
+        let record = Record::new("test-topic", b"hello".to_vec())
+            .header("h1", b"v1".to_vec())
+            .header("h2", b"v2".to_vec());
 
         assert_eq!(record.headers.len(), 2);
         assert_eq!(record.headers[0].0, "h1");
@@ -658,8 +585,7 @@ mod tests {
 
     #[test]
     fn test_producer_record_estimated_size() {
-        let record =
-            ProducerRecord::new("test-topic", b"hello world".to_vec()).with_key(b"key".to_vec());
+        let record = Record::new("test-topic", b"hello world".to_vec()).key(b"key".to_vec());
 
         let size = record.estimated_size();
         // Must include at least key + value bytes, the varint framing overhead,
@@ -670,15 +596,15 @@ mod tests {
         assert!(size < 512, "estimated_size={size} unexpectedly large");
 
         // A record with no key should still estimate correctly.
-        let no_key = ProducerRecord::new("test-topic", b"hello world".to_vec());
+        let no_key = Record::new("test-topic", b"hello world".to_vec());
         let no_key_size = no_key.estimated_size();
         // No key → slightly smaller than with key (only null sentinel varint, no key bytes).
         assert!(no_key_size < size, "no-key estimate should be smaller");
 
         // A record with headers should be larger than one without.
-        let with_headers = ProducerRecord::new("test-topic", b"hello world".to_vec())
-            .with_header("h1", b"v1".to_vec())
-            .with_header("h2", b"v2".to_vec());
+        let with_headers = Record::new("test-topic", b"hello world".to_vec())
+            .header("h1", b"v1".to_vec())
+            .header("h2", b"v2".to_vec());
         assert!(
             with_headers.estimated_size() > no_key_size,
             "headers should increase estimate"
@@ -687,11 +613,11 @@ mod tests {
 
     #[test]
     fn test_producer_record_into_routed_parts() {
-        let record = ProducerRecord::new("test-topic", b"hello".to_vec())
-            .with_partition(2)
-            .with_key(b"key".to_vec())
-            .with_timestamp(1234)
-            .with_header("h1", b"v1".to_vec());
+        let record = Record::new("test-topic", b"hello".to_vec())
+            .partition(2)
+            .key(b"key".to_vec())
+            .timestamp(1234)
+            .header("h1", b"v1".to_vec());
 
         let routed = record.into_routed_parts();
 
@@ -710,7 +636,7 @@ mod tests {
     /// log compaction reads as "delete this key".
     #[test]
     fn tombstone_has_key_and_null_value() {
-        let record = ProducerRecord::tombstone("users", "user-42");
+        let record = Record::tombstone("users", "user-42");
 
         assert_eq!(record.topic, "users");
         assert_eq!(record.key, Some(Bytes::from_static(b"user-42")));
@@ -723,14 +649,11 @@ mod tests {
     /// only a null value deletes. Collapsing the two loses the difference.
     #[test]
     fn empty_value_is_not_a_tombstone() {
-        let empty = ProducerRecord::new("users", Bytes::new()).with_key("user-42");
+        let empty = Record::new("users", Bytes::new()).key("user-42");
 
         assert_eq!(empty.value, Some(Bytes::new()));
         assert!(!empty.is_tombstone());
-        assert_ne!(
-            empty.value,
-            ProducerRecord::tombstone("users", "user-42").value
-        );
+        assert_ne!(empty.value, Record::tombstone("users", "user-42").value);
     }
 
     /// A null value without a key deletes nothing, so it is not a tombstone —
@@ -738,7 +661,7 @@ mod tests {
     /// on both sides of the wire.
     #[test]
     fn keyless_null_value_is_not_a_tombstone() {
-        let record = ProducerRecord::new("t", b"v".to_vec()).without_value();
+        let record = Record::new("t", b"v".to_vec()).without_value();
 
         assert_eq!(record.value, None);
         assert!(!record.is_tombstone(), "no key means nothing to delete");
@@ -746,7 +669,7 @@ mod tests {
 
     #[test]
     fn with_value_and_without_value_round_trip() {
-        let record = ProducerRecord::tombstone("t", "k").with_value(b"back".to_vec());
+        let record = Record::tombstone("t", "k").value(b"back".to_vec());
         assert_eq!(record.value, Some(Bytes::from_static(b"back")));
         assert!(!record.is_tombstone());
 
@@ -762,8 +685,8 @@ mod tests {
     /// under the batch budget.
     #[test]
     fn tombstone_estimated_size_accounts_for_the_null_sentinel() {
-        let tombstone = ProducerRecord::tombstone("test-topic", "key");
-        let valued = ProducerRecord::new("test-topic", b"hello world".to_vec()).with_key("key");
+        let tombstone = Record::tombstone("test-topic", "key");
+        let valued = Record::new("test-topic", b"hello world".to_vec()).key("key");
 
         assert!(
             tombstone.estimated_size() < valued.estimated_size(),
@@ -776,9 +699,9 @@ mod tests {
     /// A null header value is also a `-1` sentinel, not a zero-length payload.
     #[test]
     fn null_header_value_is_distinct_from_empty() {
-        let record = ProducerRecord::new("t", b"v".to_vec())
-            .with_null_header("flag")
-            .with_header("empty", Bytes::new());
+        let record = Record::new("t", b"v".to_vec())
+            .null_header("flag")
+            .header("empty", Bytes::new());
 
         assert_eq!(record.headers[0], ("flag".to_string(), None));
         assert_eq!(record.headers[1], ("empty".to_string(), Some(Bytes::new())));
@@ -789,8 +712,8 @@ mod tests {
     /// over-eager length check on an absent value would reject it.
     #[test]
     fn tombstone_validates() {
-        ProducerRecord::tombstone("t", "k")
-            .with_null_header("h")
+        Record::tombstone("t", "k")
+            .null_header("h")
             .validate()
             .expect("a tombstone is a legal record");
     }
@@ -799,8 +722,8 @@ mod tests {
     /// builder is still `None`.
     #[test]
     fn tombstone_survives_routing() {
-        let routed = ProducerRecord::tombstone("t", "k")
-            .with_null_header("h")
+        let routed = Record::tombstone("t", "k")
+            .null_header("h")
             .into_routed_parts();
 
         assert_eq!(routed.record.value, None);
@@ -812,16 +735,22 @@ mod tests {
     /// value length and decode back to `None`, not to an empty buffer.
     #[test]
     fn tombstone_encodes_as_null_on_the_wire() {
-        use crate::protocol::{RecordBatch, RecordBatchBuilder};
+        use crate::protocol::RecordBatch;
 
-        let routed = ProducerRecord::tombstone("t", "k")
-            .with_null_header("flag")
-            .with_header("kept", b"1".to_vec())
+        let routed = Record::tombstone("t", "k")
+            .null_header("flag")
+            .header("kept", b"1".to_vec())
             .into_routed_parts();
 
-        let builder = RecordBatchBuilder::new();
-        let batch = routed.record.append_to_batch_builder(builder).build();
-        let mut encoded = batch.encode().expect("batch should encode");
+        let data = [crate::producer::batch::RecordData::new(routed.record, 0)];
+        let mut encoded = crate::producer::batch::encode(
+            &data,
+            None,
+            false,
+            crate::protocol::Compression::None,
+            None,
+        )
+        .expect("batch should encode");
 
         let decoded = RecordBatch::decode(&mut encoded).expect("batch should decode");
         let record = &decoded.records[0];
@@ -837,15 +766,19 @@ mod tests {
     /// compaction would delete keys their producer meant to keep.
     #[test]
     fn empty_value_encodes_as_zero_length_not_null() {
-        use crate::protocol::{RecordBatch, RecordBatchBuilder};
+        use crate::protocol::RecordBatch;
 
-        let routed = ProducerRecord::new("t", Bytes::new())
-            .with_key("k")
-            .into_routed_parts();
+        let routed = Record::new("t", Bytes::new()).key("k").into_routed_parts();
 
-        let builder = RecordBatchBuilder::new();
-        let batch = routed.record.append_to_batch_builder(builder).build();
-        let mut encoded = batch.encode().expect("batch should encode");
+        let data = [crate::producer::batch::RecordData::new(routed.record, 0)];
+        let mut encoded = crate::producer::batch::encode(
+            &data,
+            None,
+            false,
+            crate::protocol::Compression::None,
+            None,
+        )
+        .expect("batch should encode");
 
         let decoded = RecordBatch::decode(&mut encoded).expect("batch should decode");
         assert_eq!(decoded.records[0].value, Some(Bytes::new()));
@@ -891,8 +824,7 @@ mod tests {
     }
 
     /// The `acks = 0` path also returns `offset == -1`, but has **no**
-    /// durability guarantee. Under the old `offset == -1` definition it was
-    /// reported as deduplicated — the exact opposite of the truth.
+    /// durability guarantee, so it must not be reported as deduplicated.
     #[test]
     fn test_acks_none_metadata_is_not_reported_as_deduplicated() {
         let m = meta_with(DeliveryConfirmation::Unacknowledged, -1);
@@ -919,25 +851,16 @@ mod tests {
     }
 
     #[test]
-    fn test_failed_metadata_is_neither_persisted_nor_successful() {
-        let m = meta_with(DeliveryConfirmation::Failed, -1);
-        assert!(!m.is_success());
-        assert!(!m.is_persisted());
-        assert!(!m.is_deduplicated());
-        assert!(!m.is_unacknowledged());
-    }
-
-    #[test]
     fn test_validate_valid_record() {
-        let record = ProducerRecord::new("topic", b"value".to_vec())
-            .with_key(b"key".to_vec())
-            .with_header("h1", b"v1".to_vec());
+        let record = Record::new("topic", b"value".to_vec())
+            .key(b"key".to_vec())
+            .header("h1", b"v1".to_vec());
         assert!(record.validate().is_ok());
     }
 
     #[test]
     fn test_validate_rejects_oversized_topic() {
-        let record = ProducerRecord::new("x".repeat(i16::MAX as usize + 1), b"v".to_vec());
+        let record = Record::new("x".repeat(i16::MAX as usize + 1), b"v".to_vec());
         let err = record.validate().unwrap_err().to_string();
         assert!(err.contains("topic name length"), "unexpected: {err}");
     }
@@ -945,30 +868,30 @@ mod tests {
     #[test]
     fn test_validate_accepts_header_key_within_i32_limit() {
         // Header keys use varint i32 length prefix in record batch v2,
-        // so i16::MAX + 1 must be accepted (previously rejected).
-        let record = ProducerRecord::new("topic", b"v".to_vec())
-            .with_header("x".repeat(i16::MAX as usize + 1), b"v".to_vec());
+        // so i16::MAX + 1 must be accepted.
+        let record = Record::new("topic", b"v".to_vec())
+            .header("x".repeat(i16::MAX as usize + 1), b"v".to_vec());
         assert!(record.validate().is_ok());
     }
 
     #[test]
     fn test_validate_accepts_max_valid_sizes() {
         // Topic name max is 249 bytes (Kafka protocol limit).
-        let record = ProducerRecord::new("a".repeat(249), b"v".to_vec());
+        let record = Record::new("a".repeat(249), b"v".to_vec());
         assert!(record.validate().is_ok());
     }
 
     #[test]
     fn test_without_key_clears_key() {
-        let record = ProducerRecord::new("topic", b"value".to_vec())
-            .with_key("my-key")
+        let record = Record::new("topic", b"value".to_vec())
+            .key("my-key")
             .without_key();
         assert!(record.key.is_none());
     }
 
     #[test]
     fn test_validate_rejects_empty_topic() {
-        let record = ProducerRecord::new("", b"value".to_vec());
+        let record = Record::new("", b"value".to_vec());
         let err = record.validate().unwrap_err().to_string();
         assert!(err.contains("empty"), "unexpected: {err}");
     }

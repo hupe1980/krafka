@@ -1,111 +1,16 @@
-//! Transport tuning shared by every client.
+//! Socket- and pool-level settings of a [`Kafka`](crate::Kafka) handle.
 //!
-//! # Why this type exists
-//!
-//! [`ConnectionConfig`] and [`ConnectionPool`] between them expose a dozen
-//! socket- and pool-level knobs — TCP keepalive, the per-connection response
-//! ceiling, the in-flight cap, the idle-eviction window, a total-connection
-//! cap. All of them are documented in detail, several with sizing tables.
-//!
-//! None of them were reachable. Every client — [`Producer`], [`Consumer`],
-//! [`AdminClient`], [`TransactionalProducer`], `ShareConsumer`, [`KrafkaClient`]
-//! — built its `ConnectionConfig` from exactly four settings (`client_id`,
-//! `request_timeout`, `connect_timeout`, `auth`, plus `proxy` under the
-//! `socks5` feature) and then called `ConnectionPool::new`, which takes the
-//! pool defaults and offers no way to override them afterwards
-//! (`with_max_idle` and `with_max_total_connections` consume `self`, and the
-//! pool is immediately wrapped in an `Arc`).
-//!
-//! [`TransportConfig`] is the single place those settings now live, and
-//! `.transport(..)` on every client builder is the single way to reach them.
-//!
-//! # Defaults are unchanged
-//!
-//! `TransportConfig::default()` reproduces exactly what the clients used
-//! before, so adopting the type changes nothing until a field is set.
-//!
-//! ```rust,no_run
-//! use krafka::network::TransportConfig;
-//! use krafka::consumer::Consumer;
-//! use std::time::Duration;
-//!
-//! # async fn example() -> Result<(), krafka::error::KrafkaError> {
-//! let transport = TransportConfig::builder()
-//!     // Keep NAT/firewall state alive on a long-idle consumer.
-//!     .tcp_keepalive(Some(Duration::from_secs(30)))
-//!     // A 200 MiB ceiling for a topic with very large messages.
-//!     .max_response_size(200 * 1024 * 1024)
-//!     // Bound file descriptors on a cluster that scales brokers up and down.
-//!     .max_connections(Some(64))
-//!     .build()?;
-//!
-//! let consumer = Consumer::builder()
-//!     .bootstrap_servers("localhost:9092")
-//!     .group_id("my-group")
-//!     .transport(transport)
-//!     .build()
-//!     .await?;
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! # Pass the same instance to every client that shares a network path
-//!
-//! A `TransportConfig` describes *how this process reaches the cluster*: the
-//! SOCKS5 route, the file-descriptor budget, the response ceiling, the
-//! certificate-reload interval. Those are properties of the path, not of the
-//! client, so every client that travels the path needs the same one.
-//!
-//! This is easy to get wrong in one specific way. A service that builds a
-//! long-lived [`Producer`] with a tuned transport and a short-lived
-//! [`AdminClient`] for a preflight topic check — with the transport left at
-//! its default on the admin client — has quietly given the admin client a
-//! *different network path*: no proxy, no FD cap, no TLS reload. The preflight
-//! then fails in an environment where the producer works, or worse, succeeds by
-//! bypassing the proxy the deployment requires.
-//!
-//! Build it once and clone it:
-//!
-//! ```rust,no_run
-//! use krafka::admin::AdminClient;
-//! use krafka::network::TransportConfig;
-//! use krafka::producer::Producer;
-//!
-//! # async fn example() -> Result<(), krafka::error::KrafkaError> {
-//! let transport = TransportConfig::builder()
-//!     .max_connections(Some(64))
-//!     .tls_reload_interval(Some(std::time::Duration::from_secs(300)))
-//!     .build()?;
-//!
-//! let admin = AdminClient::builder()
-//!     .bootstrap_servers("localhost:9092")
-//!     .transport(transport.clone())
-//!     .build()
-//!     .await?;
-//!
-//! let producer = Producer::builder()
-//!     .bootstrap_servers("localhost:9092")
-//!     .transport(transport)
-//!     .build()
-//!     .await?;
-//! # let _ = (admin, producer);
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! Cloning shares the settings, not the sockets: each client still opens its
-//! own pool. To share the *connections* too, build one
-//! [`KrafkaClient`] with the transport and pass it to each builder's
-//! `with_client(..)` — then there is exactly one pool and the question cannot
-//! arise.
+//! [`ConnectionConfig`] and [`ConnectionPool`] carry the socket- and
+//! pool-level settings — TCP keepalive, the per-connection response ceiling,
+//! the in-flight cap, the idle-eviction window, a total-connection cap, the
+//! SOCKS5 route and the TLS reload interval. [`TransportConfig`] collects
+//! them from the [`KafkaBuilder`](crate::KafkaBuilder) setters of the same
+//! names; `TransportConfig::default()` matches `ConnectionConfig::default()`
+//! and the pool defaults. Every client built from one handle shares the pool,
+//! so they share one network path by construction.
 //!
 //! [`ConnectionConfig`]: super::ConnectionConfig
 //! [`ConnectionPool`]: super::ConnectionPool
-//! [`Producer`]: crate::producer::Producer
-//! [`Consumer`]: crate::consumer::Consumer
-//! [`AdminClient`]: crate::admin::AdminClient
-//! [`TransactionalProducer`]: crate::producer::TransactionalProducer
-//! [`KrafkaClient`]: crate::client::KrafkaClient
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -115,17 +20,9 @@ use crate::error::{KrafkaError, Result};
 use super::connection::{ConnectionConfig, ConnectionConfigBuilder};
 use super::pool::{ConnectionPool, DEFAULT_MAX_IDLE};
 
-/// Socket- and pool-level tuning applied to every broker connection a client
-/// opens.
-///
-/// Construct with [`TransportConfig::builder`] and hand it to a client builder
-/// via `.transport(..)`. [`Default`] reproduces krafka's historical behaviour
-/// exactly, so an unset field is never a behaviour change.
-///
-/// **Pass the same instance — cloned — to every client that must share the
-/// network path.** A client left on the defaults gets a different path: no
-/// proxy, no descriptor cap, no TLS reload. See the module documentation for
-/// the worked example and for why this type exists.
+/// Socket- and pool-level tuning applied to every broker connection of a
+/// [`Kafka`](crate::Kafka) handle, collected by its builder. [`Default`]
+/// leaves every field at krafka's default.
 #[derive(Debug, Clone)]
 pub struct TransportConfig {
     /// Disable Nagle's algorithm on every broker socket. Default: `true`.
@@ -177,21 +74,6 @@ pub struct TransportConfig {
     /// Minimum 1.
     pub(crate) max_in_flight_requests: usize,
 
-    /// Depth of the high-priority command channel (heartbeats, metadata,
-    /// coordinator discovery). Default: 64. Minimum 16.
-    pub(crate) high_priority_channel_capacity: usize,
-
-    /// Depth of the normal-priority command channel (produce, fetch,
-    /// everything else). Default: 256. Minimum 64.
-    pub(crate) normal_priority_channel_capacity: usize,
-
-    /// Consecutive high-priority commands the event loop may process before it
-    /// forces one normal-priority drain. Default: 4. Minimum 1.
-    ///
-    /// Higher values let heartbeats cut through produce/fetch backpressure more
-    /// aggressively, at the cost of data-path latency under load.
-    pub(crate) max_high_priority_bypasses_per_round: usize,
-
     /// Happy Eyeballs (RFC 8305 §5) stagger between parallel connection
     /// attempts. Default: 250 ms, clamped to 100 ms – 2 s at connect time.
     pub(crate) connection_attempt_delay: Duration,
@@ -214,19 +96,8 @@ pub struct TransportConfig {
     /// SOCKS5 route every broker connection is tunnelled through, or `None`
     /// for a direct connection. Default: `None`.
     ///
-    /// This belongs here rather than only on the client builders because it is
-    /// the most path-shaped setting there is: a broker reachable only through a
-    /// bastion is reachable only through a bastion for *every* client in the
-    /// process. Leaving it off `TransportConfig` meant a caller who mapped
-    /// their own transport settings onto this type — which is what the type
-    /// invites — silently produced a direct connection, while this module's own
-    /// documentation described `TransportConfig` as carrying "the SOCKS5 route".
-    ///
-    /// `ProducerBuilder::proxy` and its siblings remain as a shorthand for the
-    /// single-client case; setting both is an error at build time rather than a
-    /// silent precedence rule.
-    #[cfg(feature = "socks5")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "socks5")))]
+    /// A broker reachable only through a bastion is reachable only through
+    /// it for every client of the handle.
     pub(crate) proxy: Option<crate::network::ProxyConfig>,
 
     /// `SO_SNDBUF` for every broker socket, or `None` to leave the OS default.
@@ -264,26 +135,26 @@ pub struct TransportConfig {
     /// logged and the previous connector stays active, so an atomic-rename
     /// rotation and a non-atomic one both converge.
     ///
-    /// For an event-driven rotation, call `refresh_tls()` on the client
-    /// instead of — or in addition to — setting an interval.
+    /// For an event-driven rotation, call
+    /// [`Kafka::refresh_tls`](crate::Kafka::refresh_tls) instead of — or in
+    /// addition to — setting an interval.
     pub(crate) tls_reload_interval: Option<Duration>,
 }
 
 impl Default for TransportConfig {
-    /// The exact values krafka used before `TransportConfig` existed.
+    /// `TCP_NODELAY` on, 60 s keepalive, `MAX_MESSAGE_SIZE` responses, 10
+    /// in-flight requests per connection, 250 ms connection-attempt delay,
+    /// `DEFAULT_MAX_IDLE` idle timeout; no connection cap, proxy, socket
+    /// buffer sizes or TLS reload.
     fn default() -> Self {
         Self {
             tcp_nodelay: true,
             tcp_keepalive: Some(Duration::from_secs(60)),
             max_response_size: crate::protocol::MAX_MESSAGE_SIZE,
             max_in_flight_requests: 10,
-            high_priority_channel_capacity: 64,
-            normal_priority_channel_capacity: 256,
-            max_high_priority_bypasses_per_round: 4,
             connection_attempt_delay: Duration::from_millis(250),
             connections_max_idle: Some(DEFAULT_MAX_IDLE),
             max_connections: None,
-            #[cfg(feature = "socks5")]
             proxy: None,
             socket_send_buffer: None,
             socket_receive_buffer: None,
@@ -327,8 +198,6 @@ impl TransportConfig {
     }
 
     /// The SOCKS5 route, or `None` for a direct connection.
-    #[cfg(feature = "socks5")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "socks5")))]
     #[inline]
     #[must_use]
     pub fn proxy(&self) -> Option<&crate::network::ProxyConfig> {
@@ -347,27 +216,6 @@ impl TransportConfig {
     #[must_use]
     pub fn socket_receive_buffer(&self) -> Option<usize> {
         self.socket_receive_buffer
-    }
-
-    /// The high-priority channel depth.
-    #[inline]
-    #[must_use]
-    pub fn high_priority_channel_capacity(&self) -> usize {
-        self.high_priority_channel_capacity
-    }
-
-    /// The normal-priority channel depth.
-    #[inline]
-    #[must_use]
-    pub fn normal_priority_channel_capacity(&self) -> usize {
-        self.normal_priority_channel_capacity
-    }
-
-    /// The high-priority bypass budget per round.
-    #[inline]
-    #[must_use]
-    pub fn max_high_priority_bypasses_per_round(&self) -> usize {
-        self.max_high_priority_bypasses_per_round
     }
 
     /// The Happy Eyeballs connection-attempt stagger.
@@ -410,18 +258,13 @@ impl TransportConfig {
             .tcp_keepalive(self.tcp_keepalive)
             .max_response_size(self.max_response_size)
             .max_in_flight_requests(self.max_in_flight_requests)
-            .high_priority_channel_capacity(self.high_priority_channel_capacity)
-            .normal_priority_channel_capacity(self.normal_priority_channel_capacity)
-            .max_high_priority_bypasses_per_round(self.max_high_priority_bypasses_per_round)
             .connection_attempt_delay(self.connection_attempt_delay)
             .socket_send_buffer(self.socket_send_buffer)
             .socket_receive_buffer(self.socket_receive_buffer);
-        #[cfg(feature = "socks5")]
-        let builder = match self.proxy.clone() {
+        match self.proxy.clone() {
             Some(proxy) => builder.proxy(proxy),
             None => builder,
-        };
-        builder
+        }
     }
 
     /// Build a fully configured, running [`ConnectionPool`] from `config`.
@@ -490,8 +333,6 @@ impl TransportConfigBuilder {
     }
 
     /// See [`TransportConfig::proxy`].
-    #[cfg(feature = "socks5")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "socks5")))]
     pub fn proxy(mut self, proxy: crate::network::ProxyConfig) -> Self {
         self.0.proxy = Some(proxy);
         self
@@ -506,24 +347,6 @@ impl TransportConfigBuilder {
     /// See [`TransportConfig::socket_receive_buffer`].
     pub fn socket_receive_buffer(mut self, bytes: Option<usize>) -> Self {
         self.0.socket_receive_buffer = bytes;
-        self
-    }
-
-    /// Set the high-priority channel depth.
-    pub fn high_priority_channel_capacity(mut self, capacity: usize) -> Self {
-        self.0.high_priority_channel_capacity = capacity;
-        self
-    }
-
-    /// Set the normal-priority channel depth.
-    pub fn normal_priority_channel_capacity(mut self, capacity: usize) -> Self {
-        self.0.normal_priority_channel_capacity = capacity;
-        self
-    }
-
-    /// Set the high-priority bypass budget per round.
-    pub fn max_high_priority_bypasses_per_round(mut self, n: usize) -> Self {
-        self.0.max_high_priority_bypasses_per_round = n;
         self
     }
 
@@ -606,8 +429,7 @@ impl TransportConfigBuilder {
 mod tests {
     use super::*;
 
-    /// The defaults must reproduce the pre-`TransportConfig` behaviour exactly,
-    /// or adopting the type would silently retune every existing deployment.
+    /// The defaults must equal `ConnectionConfig`'s own defaults.
     #[test]
     fn defaults_match_historical_connection_config() {
         let transport = TransportConfig::default();
@@ -618,14 +440,6 @@ mod tests {
         assert_eq!(
             transport.max_in_flight_requests,
             legacy.max_in_flight_requests()
-        );
-        assert_eq!(
-            transport.high_priority_channel_capacity,
-            legacy.high_priority_channel_capacity()
-        );
-        assert_eq!(
-            transport.normal_priority_channel_capacity,
-            legacy.normal_priority_channel_capacity()
         );
         assert_eq!(
             transport.connection_attempt_delay,
@@ -686,7 +500,6 @@ mod tests {
     /// documentation described a `TransportConfig` as carrying "the SOCKS5
     /// route", and warned that a client left on the default transport gets
     /// "no proxy" — describing a capability the type did not have.
-    #[cfg(feature = "socks5")]
     #[test]
     fn a_proxy_on_the_transport_config_reaches_the_connection() {
         use crate::network::ProxyConfig;
@@ -721,8 +534,7 @@ mod tests {
         assert_eq!(applied.recv_buffer_size(), None);
     }
 
-    /// `.transport(TransportConfig::default())` and omitting it entirely
-    /// produce the same connection config.
+    /// Default transport settings produce the default connection config.
     #[test]
     fn applying_defaults_changes_nothing() {
         let applied = TransportConfig::default()
@@ -738,22 +550,13 @@ mod tests {
             plain.max_in_flight_requests()
         );
         assert_eq!(
-            applied.high_priority_channel_capacity(),
-            plain.high_priority_channel_capacity()
-        );
-        assert_eq!(
-            applied.normal_priority_channel_capacity(),
-            plain.normal_priority_channel_capacity()
-        );
-        assert_eq!(
             applied.connection_attempt_delay(),
             plain.connection_attempt_delay()
         );
     }
 
-    /// Every field must survive the builder → `ConnectionConfig` hop. A field
-    /// that is settable but not applied is exactly the defect this type was
-    /// introduced to fix, so it gets its own assertion.
+    /// Every field must survive the builder → `ConnectionConfig` hop; a field
+    /// that is settable but not applied gets caught here.
     #[test]
     fn every_connection_field_reaches_the_connection_config() {
         let transport = TransportConfig::builder()
@@ -761,9 +564,6 @@ mod tests {
             .tcp_keepalive(Some(Duration::from_secs(17)))
             .max_response_size(7 * 1024 * 1024)
             .max_in_flight_requests(3)
-            .high_priority_channel_capacity(128)
-            .normal_priority_channel_capacity(512)
-            .max_high_priority_bypasses_per_round(9)
             .connection_attempt_delay(Duration::from_millis(400))
             .socket_send_buffer(Some(1024 * 1024))
             .socket_receive_buffer(Some(512 * 1024))
@@ -778,8 +578,6 @@ mod tests {
         assert!(!config.nodelay());
         assert_eq!(config.max_response_size(), 7 * 1024 * 1024);
         assert_eq!(config.max_in_flight_requests(), 3);
-        assert_eq!(config.high_priority_channel_capacity(), 128);
-        assert_eq!(config.normal_priority_channel_capacity(), 512);
         assert_eq!(
             config.connection_attempt_delay(),
             Duration::from_millis(400)

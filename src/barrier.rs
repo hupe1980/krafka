@@ -1,25 +1,40 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use parking_lot::Mutex;
 use tokio::sync::Notify;
 
 use crate::error::{KrafkaError, Result};
 
-/// Shared barrier for producer operations that must complete before shutdown.
+/// Counts operations by the generation they started in, so a flush or a close
+/// waits for exactly the operations that started before it.
+///
+/// Each [`start`](Self::start) registers in the current generation.
+/// [`snapshot`](Self::snapshot) and [`begin_close`](Self::begin_close) end
+/// the current generation and return it; [`wait_for`](Self::wait_for) then
+/// waits until no operation of that generation or an earlier one is still
+/// running. An operation started afterwards belongs to a later generation, so
+/// it can neither hold the wait up nor, by completing, release it early.
 pub(crate) struct InFlightBarrier {
     closing: AtomicBool,
-    started: AtomicU64,
-    completed: AtomicU64,
+    state: Mutex<Generations>,
     notify: Notify,
+}
+
+#[derive(Debug, Default)]
+struct Generations {
+    current: u64,
+    /// Running operations per generation; a generation with none is absent.
+    running: BTreeMap<u64, u64>,
 }
 
 impl InFlightBarrier {
     pub(crate) fn new() -> Self {
         Self {
             closing: AtomicBool::new(false),
-            started: AtomicU64::new(0),
-            completed: AtomicU64::new(0),
+            state: Mutex::new(Generations::default()),
             notify: Notify::new(),
         }
     }
@@ -31,72 +46,73 @@ impl InFlightBarrier {
 
     /// Register a new operation unless shutdown has already started.
     pub(crate) fn start(self: &Arc<Self>, owner: &str) -> Result<InFlightOpGuard> {
+        let mut state = self.state.lock();
+        // Checked under the lock `begin_close` takes, so an operation is
+        // either counted in a generation the close waits for or refused.
         if self.closing.load(Ordering::Acquire) {
-            return Err(KrafkaError::invalid_state(format!("{owner} is closed")));
+            return Err(KrafkaError::closed(format!("{owner} is closed")));
         }
-
-        self.started.fetch_add(1, Ordering::SeqCst);
-
-        // Why SeqCst and not AcqRel:
-        //
-        // This is the store-buffering (SB) litmus test.  Thread A writes
-        // `started` then reads `closing`; thread B (begin_close) writes
-        // `closing` then reads `started`.  Under AcqRel both reads may
-        // return the pre-write values (each thread's store is only
-        // visible when the *other* thread performs an acquire load of
-        // the *same* variable).  Only SeqCst establishes a total order
-        // that guarantees at least one thread sees the other's write.
-        //
-        // This cannot be safely weakened to AcqRel without adding a
-        // separate fence or restructuring the algorithm.
-
-        if self.closing.load(Ordering::SeqCst) {
-            self.complete_one();
-            return Err(KrafkaError::invalid_state(format!("{owner} is closed")));
-        }
-
+        let generation = state.current;
+        *state.running.entry(generation).or_default() += 1;
         Ok(InFlightOpGuard {
             barrier: Some(self.clone()),
+            generation,
         })
     }
 
-    /// Capture a flush snapshot without blocking new operations.
-    #[inline]
+    /// End the current generation and return it, for [`wait_for`](Self::wait_for).
     pub(crate) fn snapshot(&self) -> u64 {
-        self.started.load(Ordering::Relaxed)
+        let mut state = self.state.lock();
+        let generation = state.current;
+        state.current += 1;
+        generation
     }
 
-    /// Begin shutdown and capture the final target count.
+    /// Begin shutdown and return the last generation to wait for, or `None`
+    /// if shutdown had already begun.
     pub(crate) fn begin_close(&self) -> Option<u64> {
-        if self.closing.swap(true, Ordering::SeqCst) {
+        let mut state = self.state.lock();
+        if self.closing.swap(true, Ordering::AcqRel) {
             return None;
         }
-
-        // SeqCst pairs with `start()` — see the SB litmus-test comment
-        // there.  Cannot be weakened without breaking the invariant that
-        // at least one side observes the other's write.
-        Some(self.started.load(Ordering::SeqCst))
+        let generation = state.current;
+        state.current += 1;
+        Some(generation)
     }
 
-    pub(crate) async fn wait_for(&self, target: u64) {
+    /// Wait until no operation of `generation` or an earlier one is running.
+    pub(crate) async fn wait_for(&self, generation: u64) {
         loop {
-            if self.completed.load(Ordering::Acquire) >= target {
-                return;
-            }
-
             let notified = self.notify.notified();
-            if self.completed.load(Ordering::Acquire) >= target {
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_drained(generation) {
                 return;
             }
             notified.await;
         }
     }
 
-    fn complete_one(&self) {
-        self.completed.fetch_add(1, Ordering::Release);
-        // `notify_waiters` (broadcast) is intentional: concurrent `flush()`
-        // and `close_inner()` can wait on different targets simultaneously,
-        // so `notify_one()` could leave the other waiter stuck.
+    fn is_drained(&self, generation: u64) -> bool {
+        self.state
+            .lock()
+            .running
+            .range(..=generation)
+            .next()
+            .is_none()
+    }
+
+    fn complete(&self, generation: u64) {
+        {
+            let mut state = self.state.lock();
+            if let Some(count) = state.running.get_mut(&generation) {
+                *count -= 1;
+                if *count == 0 {
+                    state.running.remove(&generation);
+                }
+            }
+        }
+        // Broadcast: a flush and a close can wait on different generations.
         self.notify.notify_waiters();
     }
 }
@@ -109,10 +125,11 @@ impl Default for InFlightBarrier {
 
 impl fmt::Debug for InFlightBarrier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = self.state.lock();
         f.debug_struct("InFlightBarrier")
             .field("closing", &self.closing.load(Ordering::Relaxed))
-            .field("started", &self.started.load(Ordering::Relaxed))
-            .field("completed", &self.completed.load(Ordering::Relaxed))
+            .field("generation", &state.current)
+            .field("running", &state.running.values().sum::<u64>())
             .finish()
     }
 }
@@ -120,12 +137,21 @@ impl fmt::Debug for InFlightBarrier {
 #[derive(Debug)]
 pub(crate) struct InFlightOpGuard {
     barrier: Option<Arc<InFlightBarrier>>,
+    generation: u64,
+}
+
+impl InFlightOpGuard {
+    /// The generation this operation started in.
+    #[inline]
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
 }
 
 impl Drop for InFlightOpGuard {
     fn drop(&mut self) {
         if let Some(barrier) = self.barrier.take() {
-            barrier.complete_one();
+            barrier.complete(self.generation);
         }
     }
 }
@@ -135,10 +161,8 @@ impl Drop for InFlightOpGuard {
 mod tests {
     use super::*;
 
-    // Both tests below exist because `cargo mutants` showed the suite could not
-    // tell the real implementations from stubs: `is_closing` could return a
-    // constant `true` and the `Debug` impl could render nothing, and every
-    // assertion still held.
+    // The tests below tell the real implementations from stubs (a constant
+    // `is_closing`, an empty `Debug`).
 
     /// `is_closing` must track the flag, not answer a constant.
     ///
@@ -179,13 +203,12 @@ mod tests {
         let rendered = format!("{barrier:?}");
         assert!(rendered.contains("InFlightBarrier"), "got: {rendered}");
         assert!(rendered.contains("closing: false"), "got: {rendered}");
-        assert!(rendered.contains("started: 1"), "got: {rendered}");
-        assert!(rendered.contains("completed: 0"), "got: {rendered}");
+        assert!(rendered.contains("running: 1"), "got: {rendered}");
 
         drop(guard);
         let rendered = format!("{barrier:?}");
         assert!(
-            rendered.contains("completed: 1"),
+            rendered.contains("running: 0"),
             "the counters must move, not just be present: {rendered}"
         );
     }
@@ -231,16 +254,15 @@ mod tests {
             .expect("shutdown wait should complete once all work finishes");
     }
 
-    /// Simulates `close_with_timeout` behavior: timeout elapses before
-    /// in-flight work completes → returns timeout error, but cleanup
-    /// (pool teardown) still runs unconditionally.
+    /// Simulates a `close_with` whose timeout elapses before in-flight work
+    /// completes: a timeout error, while the cleanup still runs.
     #[tokio::test]
     async fn test_close_with_timeout_returns_timeout_on_incomplete_work() {
         let barrier = Arc::new(InFlightBarrier::new());
         let _in_flight = barrier.start("producer").unwrap();
         let target = barrier.begin_close().unwrap();
 
-        // Mimic close_inner: wrap the graceful wait in a timeout.
+        // Mimic the close: wrap the graceful wait in a timeout.
         let close_result = tokio::time::timeout(
             std::time::Duration::from_millis(25),
             barrier.wait_for(target),
@@ -295,10 +317,9 @@ mod tests {
 
     /// Concurrent `flush()` + `close()` can wait on distinct targets simultaneously.
     ///
-    /// `flush()` captures `snapshot()` (current `started` count) as its target.
-    /// `close()` captures `begin_close()` as its target (same count or higher).
-    /// After all in-flight ops complete, `notify_waiters()` is broadcast and
-    /// both waiters must wake, not just one.
+    /// `flush()` waits on the generation `snapshot()` closed, `close()` on the
+    /// one `begin_close()` closed. When the last operation completes both
+    /// waiters must wake, not just one.
     #[tokio::test]
     async fn test_concurrent_flush_and_close_both_wake() {
         let barrier = Arc::new(InFlightBarrier::new());
@@ -307,14 +328,12 @@ mod tests {
         let op1 = barrier.start("producer").unwrap();
         let op2 = barrier.start("producer").unwrap();
 
-        // `flush()` snapshot — targets the current started count (2).
         let flush_target = barrier.snapshot();
 
-        // `close()` — also targets the current started count.
         let close_target = barrier.begin_close().unwrap();
 
-        // Both targets should be the same (2) since nothing extra was started.
-        assert_eq!(flush_target, close_target);
+        // The close covers a later generation than the flush.
+        assert!(close_target > flush_target);
 
         let b_flush = Arc::clone(&barrier);
         let b_close = Arc::clone(&barrier);
@@ -378,5 +397,30 @@ mod tests {
         .unwrap();
 
         assert!(barrier.start("producer").is_err());
+    }
+
+    /// An operation that starts after a snapshot can neither hold up nor
+    /// release the wait for that snapshot. With one shared completion counter
+    /// a later, faster operation released `flush()` while an earlier one was
+    /// still running.
+    #[tokio::test]
+    async fn a_later_completion_does_not_release_an_earlier_wait() {
+        let barrier = Arc::new(InFlightBarrier::new());
+        let slow = barrier.start("producer").unwrap();
+        let target = barrier.snapshot();
+        let fast = barrier.start("producer").unwrap();
+        drop(fast);
+
+        let early = tokio::time::timeout(
+            std::time::Duration::from_millis(25),
+            barrier.wait_for(target),
+        )
+        .await;
+        assert!(early.is_err(), "the slow operation is still running");
+
+        drop(slow);
+        tokio::time::timeout(std::time::Duration::from_secs(1), barrier.wait_for(target))
+            .await
+            .expect("drained once the slow operation completes");
     }
 }

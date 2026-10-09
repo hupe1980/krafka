@@ -1,133 +1,136 @@
 #![no_main]
 
+//! Every response decoder at every version krafka negotiates.
+//!
+//! The (API, version) pair comes from `SUPPORTED_API_VERSIONS`, the runtime
+//! form of the `api_versions!` table, so a raised MAX or a new row is fuzzed
+//! without editing this file. Only the API → response-type mapping is written
+//! here, and `just fuzz-coverage` fails when an API in the table has no arm.
+//!
+//! The SASL responses are outside the table: the pre-authentication path
+//! pins them (`SaslHandshake` v0 decode, `SaslAuthenticate` v1), and they are
+//! fuzzed at exactly those versions.
+//!
+//! Input: byte 0 picks a table row (or an off-table decoder), byte 1 a version
+//! inside the row's range, the rest is the response body.
+
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
 
-use krafka::protocol::{
-    AddOffsetsToTxnResponse, AddPartitionsToTxnResponse, AlterClientQuotasResponse,
-    ConsumerGroupDescribeResponse, ConsumerGroupHeartbeatResponse, CreateAclsResponse,
-    CreateDelegationTokenResponse, CreatePartitionsResponse, CreateTopicsResponse,
-    DeleteAclsResponse, DeleteGroupsResponse, DeleteRecordsResponse, DeleteTopicsResponse,
-    DescribeAclsResponse, DescribeClientQuotasResponse, DescribeClusterResponse,
-    DescribeConfigsResponse, DescribeDelegationTokenResponse, DescribeGroupsResponse,
-    DescribeTopicPartitionsResponse, EndTxnResponse, ExpireDelegationTokenResponse, FetchResponse,
-    FindCoordinatorResponse, GetTelemetrySubscriptionsResponse, HeartbeatResponse,
-    IncrementalAlterConfigsResponse, InitProducerIdResponse, JoinGroupResponse, LeaveGroupResponse,
-    ListConfigResourcesResponse, ListGroupsResponse, ListOffsetsResponse, MetadataResponse,
-    OffsetCommitResponse, OffsetFetchResponse, OffsetForLeaderEpochResponse, ProduceResponse,
-    PushTelemetryResponse, RenewDelegationTokenResponse, SaslAuthenticateResponse,
-    SaslHandshakeResponse, ShareAcknowledgeResponse, ShareFetchResponse,
-    ShareGroupDescribeResponse, ShareGroupHeartbeatResponse, SyncGroupResponse,
-    TxnOffsetCommitResponse, VersionedDecode,
-};
-// Previously unreachable from any fuzz target.
-use krafka::protocol::{
-    AlterPartitionReassignmentsResponse, AlterReplicaLogDirsResponse,
-    AlterUserScramCredentialsResponse, DescribeLogDirsResponse, DescribeProducersResponse,
-    DescribeQuorumResponse, DescribeTransactionsResponse, DescribeUserScramCredentialsResponse,
-    ElectLeadersResponse, ListPartitionReassignmentsResponse, ListTransactionsResponse,
-    OffsetDeleteResponse, UpdateFeaturesResponse, WriteTxnMarkersResponse,
-};
+use krafka::__private::protocol::versions::SUPPORTED_API_VERSIONS;
+use krafka::__private::protocol::*;
+
+/// Decode `buf` as the response of `api` at `version`.
+fn decode(api: ApiKey, version: i16, buf: &mut Bytes) {
+    macro_rules! dispatch {
+        ($($key:ident => $ty:ty),* $(,)?) => {
+            match api {
+                $(ApiKey::$key => { let _ = <$ty>::decode_versioned(version, buf); })*
+                ApiKey::ApiVersions => {
+                    let _ = match version {
+                        0 => ApiVersionsResponse::decode_v0(buf),
+                        1..=2 => ApiVersionsResponse::decode_v1(buf),
+                        _ => ApiVersionsResponse::decode_v3(buf),
+                    };
+                }
+                other => panic!("no fuzz path for {other:?}: add an arm to fuzz_response_decode"),
+            }
+        };
+    }
+    dispatch! {
+        Produce => ProduceResponse,
+        Fetch => FetchResponse,
+        ListOffsets => ListOffsetsResponse,
+        Metadata => MetadataResponse,
+        OffsetCommit => OffsetCommitResponse,
+        OffsetFetch => OffsetFetchResponse,
+        FindCoordinator => FindCoordinatorResponse,
+        JoinGroup => JoinGroupResponse,
+        Heartbeat => HeartbeatResponse,
+        LeaveGroup => LeaveGroupResponse,
+        SyncGroup => SyncGroupResponse,
+        DescribeGroups => DescribeGroupsResponse,
+        ListGroups => ListGroupsResponse,
+        CreateTopics => CreateTopicsResponse,
+        DeleteTopics => DeleteTopicsResponse,
+        DeleteRecords => DeleteRecordsResponse,
+        InitProducerId => InitProducerIdResponse,
+        OffsetForLeaderEpoch => OffsetForLeaderEpochResponse,
+        AddPartitionsToTxn => AddPartitionsToTxnResponse,
+        AddOffsetsToTxn => AddOffsetsToTxnResponse,
+        EndTxn => EndTxnResponse,
+        WriteTxnMarkers => WriteTxnMarkersResponse,
+        TxnOffsetCommit => TxnOffsetCommitResponse,
+        DescribeAcls => DescribeAclsResponse,
+        CreateAcls => CreateAclsResponse,
+        DeleteAcls => DeleteAclsResponse,
+        DescribeConfigs => DescribeConfigsResponse,
+        AlterReplicaLogDirs => AlterReplicaLogDirsResponse,
+        DescribeLogDirs => DescribeLogDirsResponse,
+        CreatePartitions => CreatePartitionsResponse,
+        CreateDelegationToken => CreateDelegationTokenResponse,
+        RenewDelegationToken => RenewDelegationTokenResponse,
+        ExpireDelegationToken => ExpireDelegationTokenResponse,
+        DescribeDelegationToken => DescribeDelegationTokenResponse,
+        DeleteGroups => DeleteGroupsResponse,
+        ElectLeaders => ElectLeadersResponse,
+        IncrementalAlterConfigs => IncrementalAlterConfigsResponse,
+        AlterPartitionReassignments => AlterPartitionReassignmentsResponse,
+        ListPartitionReassignments => ListPartitionReassignmentsResponse,
+        OffsetDelete => OffsetDeleteResponse,
+        DescribeClientQuotas => DescribeClientQuotasResponse,
+        AlterClientQuotas => AlterClientQuotasResponse,
+        DescribeUserScramCredentials => DescribeUserScramCredentialsResponse,
+        AlterUserScramCredentials => AlterUserScramCredentialsResponse,
+        DescribeQuorum => DescribeQuorumResponse,
+        UpdateFeatures => UpdateFeaturesResponse,
+        DescribeCluster => DescribeClusterResponse,
+        DescribeProducers => DescribeProducersResponse,
+        DescribeTransactions => DescribeTransactionsResponse,
+        ListTransactions => ListTransactionsResponse,
+        ConsumerGroupHeartbeat => ConsumerGroupHeartbeatResponse,
+        ConsumerGroupDescribe => ConsumerGroupDescribeResponse,
+        GetTelemetrySubscriptions => GetTelemetrySubscriptionsResponse,
+        PushTelemetry => PushTelemetryResponse,
+        ListConfigResources => ListConfigResourcesResponse,
+        DescribeTopicPartitions => DescribeTopicPartitionsResponse,
+        ShareGroupHeartbeat => ShareGroupHeartbeatResponse,
+        ShareGroupDescribe => ShareGroupDescribeResponse,
+        ShareFetch => ShareFetchResponse,
+        ShareAcknowledge => ShareAcknowledgeResponse,
+        StreamsGroupDescribe => StreamsGroupDescribeResponse,
+        DescribeShareGroupOffsets => DescribeShareGroupOffsetsResponse,
+        AlterShareGroupOffsets => AlterShareGroupOffsetsResponse,
+        DeleteShareGroupOffsets => DeleteShareGroupOffsetsResponse,
+    }
+}
 
 fuzz_target!(|data: &[u8]| {
-    // Use first two bytes to select one API and version per iteration,
-    // dramatically improving fuzzing throughput over decoding all 200+
-    // API/version pairs for every input.
-
-    if data.len() < 2 {
+    let [selector, ver_byte, body @ ..] = data else {
         return;
-    }
-
-    let api = data[0];
-    let ver_byte = data[1];
-    let mut buf = Bytes::copy_from_slice(&data[2..]);
-
-    // Version ranges below must match each type's `VersionedDecode::decode_versioned`
-    // match arms exactly. Out-of-range versions hit `unsupported_decode!` and
-    // return an error immediately, wasting the fuzz input.
-    macro_rules! fuzz_decode {
-        // Decode `$ty` at version `$min + (ver_byte % $count)`.
-        ($ty:ty, $min:expr, $count:expr) => {{
-            let version = $min + (ver_byte % $count) as i16;
-            let _ = <$ty>::decode_versioned(version, &mut buf);
-        }};
-    }
-
-    match api % 64 {
-        0 => fuzz_decode!(ProduceResponse, 3, 11),
-        1 => fuzz_decode!(FetchResponse, 4, 15),
-        2 => fuzz_decode!(MetadataResponse, 1, 13),
-        3 => fuzz_decode!(ListOffsetsResponse, 1, 11),
-        4 => fuzz_decode!(OffsetCommitResponse, 2, 9),
-        5 => fuzz_decode!(OffsetFetchResponse, 1, 10),
-        6 => fuzz_decode!(FindCoordinatorResponse, 1, 6),
-        7 => fuzz_decode!(JoinGroupResponse, 4, 6),
-        8 => fuzz_decode!(SyncGroupResponse, 3, 3),
-        9 => fuzz_decode!(HeartbeatResponse, 3, 2),
-        10 => fuzz_decode!(LeaveGroupResponse, 3, 3),
-        11 => fuzz_decode!(CreateTopicsResponse, 2, 6),
-        12 => fuzz_decode!(DeleteTopicsResponse, 1, 6),
-        13 => fuzz_decode!(DescribeAclsResponse, 1, 3),
-        14 => fuzz_decode!(CreateAclsResponse, 1, 3),
-        15 => fuzz_decode!(DeleteAclsResponse, 1, 3),
-        16 => fuzz_decode!(DescribeGroupsResponse, 1, 6),
-        17 => fuzz_decode!(ListGroupsResponse, 1, 5),
-        18 => fuzz_decode!(OffsetForLeaderEpochResponse, 2, 3),
-        19 => fuzz_decode!(ConsumerGroupHeartbeatResponse, 0, 2),
-        20 => fuzz_decode!(InitProducerIdResponse, 0, 7),
-        21 => fuzz_decode!(AddPartitionsToTxnResponse, 0, 6),
-        22 => fuzz_decode!(AddOffsetsToTxnResponse, 0, 5),
-        23 => fuzz_decode!(EndTxnResponse, 0, 6),
-        24 => fuzz_decode!(TxnOffsetCommitResponse, 0, 6),
-        25 => fuzz_decode!(SaslHandshakeResponse, 0, 2),
-        26 => fuzz_decode!(SaslAuthenticateResponse, 0, 2),
-        27 => fuzz_decode!(DescribeConfigsResponse, 0, 5),
-        28 => fuzz_decode!(IncrementalAlterConfigsResponse, 0, 2),
-        29 => fuzz_decode!(CreatePartitionsResponse, 0, 4),
-        30 => fuzz_decode!(DeleteRecordsResponse, 0, 3),
-        31 => fuzz_decode!(DeleteGroupsResponse, 0, 3),
-        32 => fuzz_decode!(DescribeClusterResponse, 0, 3),
-        33 => fuzz_decode!(ConsumerGroupDescribeResponse, 0, 2),
-        34 => fuzz_decode!(ListConfigResourcesResponse, 0, 2),
-        35 => fuzz_decode!(DescribeTopicPartitionsResponse, 0, 1),
-        36 => fuzz_decode!(DescribeClientQuotasResponse, 0, 2),
-        37 => fuzz_decode!(AlterClientQuotasResponse, 0, 2),
-        38 => fuzz_decode!(CreateDelegationTokenResponse, 1, 3),
-        39 => fuzz_decode!(RenewDelegationTokenResponse, 1, 2),
-        40 => fuzz_decode!(ExpireDelegationTokenResponse, 1, 2),
-        41 => fuzz_decode!(DescribeDelegationTokenResponse, 1, 3),
-        42 => fuzz_decode!(GetTelemetrySubscriptionsResponse, 0, 1),
-        43 => fuzz_decode!(PushTelemetryResponse, 0, 1),
-        44 => fuzz_decode!(ShareGroupHeartbeatResponse, 1, 1),
-        45 => fuzz_decode!(ShareGroupDescribeResponse, 1, 1),
-        46 => fuzz_decode!(ShareFetchResponse, 1, 2),
-        47 => fuzz_decode!(ShareAcknowledgeResponse, 1, 2),
-        // ── Previously uncovered decoders ──────────────────────────────────
-        48 => fuzz_decode!(DescribeLogDirsResponse, 1, 4),
-        49 => fuzz_decode!(DescribeProducersResponse, 0, 1),
-        50 => fuzz_decode!(DescribeTransactionsResponse, 0, 1),
-        51 => fuzz_decode!(ListTransactionsResponse, 0, 3),
-        52 => fuzz_decode!(DescribeQuorumResponse, 0, 1),
-        53 => fuzz_decode!(ElectLeadersResponse, 0, 3),
-        54 => fuzz_decode!(AlterPartitionReassignmentsResponse, 0, 1),
-        55 => fuzz_decode!(ListPartitionReassignmentsResponse, 0, 1),
-        56 => fuzz_decode!(AlterReplicaLogDirsResponse, 1, 2),
-        57 => fuzz_decode!(OffsetDeleteResponse, 0, 1),
-        58 => fuzz_decode!(DescribeUserScramCredentialsResponse, 0, 1),
-        59 => fuzz_decode!(AlterUserScramCredentialsResponse, 0, 1),
-        60 => fuzz_decode!(WriteTxnMarkersResponse, 1, 2),
-        61 => fuzz_decode!(UpdateFeaturesResponse, 0, 2),
-        // ── Embedded consumer protocol ─────────────────────────────────────
-        //
-        // Not responses, and not versioned by the caller: these blobs carry
-        // their own version and are written by another *client*, so they are
-        // the least trustworthy bytes the client parses.
-        62 => {
-            let _ = krafka::protocol::decode_consumer_protocol_subscription(&buf);
+    };
+    let mut buf = Bytes::copy_from_slice(body);
+    let rows = SUPPORTED_API_VERSIONS.len();
+    match *selector as usize % (rows + 4) {
+        // Not responses: these blobs carry their own version and are written
+        // by another client, so they are the least trusted bytes parsed.
+        i if i == rows => {
+            let _ = decode_consumer_protocol_subscription(&buf);
         }
-        63 => {
-            let _ = krafka::protocol::decode_consumer_protocol_assignment(&buf);
+        i if i == rows + 1 => {
+            let _ = decode_consumer_protocol_assignment(&buf);
         }
-        _ => unreachable!(),
+        i if i == rows + 2 => {
+            let _ = SaslHandshakeResponse::decode_v0(&mut buf);
+        }
+        i if i == rows + 3 => {
+            let _ = SaslAuthenticateResponse::decode_v1(&mut buf);
+        }
+        i => {
+            let row = &SUPPORTED_API_VERSIONS[i];
+            let span = (row.max_version - row.min_version + 1) as u16;
+            let version = row.min_version + (u16::from(*ver_byte) % span) as i16;
+            decode(ApiKey::from_i16(row.api_key), version, &mut buf);
+        }
     }
 });

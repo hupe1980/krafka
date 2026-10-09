@@ -9,114 +9,104 @@ slug_id = "errors"
 
 ## Error Types
 
-krafka uses a single error enum for all error conditions:
+krafka uses a single error enum for all error conditions. It is
+`#[non_exhaustive]`, so a `match` needs a wildcard arm.
 
 ```rust
 pub enum KrafkaError {
-    /// Network-related errors (connection, I/O)
+    /// Connecting, I/O, or a broker that is not reachable. Retriable.
     Network(Arc<io::Error>),
-
-    /// Protocol encoding/decoding errors
-    /// Display: "protocol error ({kind:?}): {message}"
+    /// Encoding/decoding; see `ProtocolErrorKind`.
     Protocol { kind: ProtocolErrorKind, message: String },
-
-    /// Authentication failures
-    Auth { message: String },
-
-    /// Operation timeouts
+    /// SASL, TLS certificate or OIDC token-endpoint failure. Fatal.
+    Auth { message: String, source: Option<ArcError> },
+    /// An operation exceeded its time bound. Retriable.
     Timeout { operation: String },
-
-    /// Kafka broker errors (with error code)
+    /// A record was not acknowledged within `delivery_timeout`.
+    DeliveryTimeout { possibly_written: bool, message: String },
+    /// An error code returned by a broker.
     Broker { code: ErrorCode, message: String },
-
-    /// Configuration errors
     Config { message: String },
-
-    /// Compression/decompression errors
     Compression { message: String },
-
-    /// Invalid state errors
-    InvalidState { message: String },
-
-    /// Serialization errors
     Serialization { message: String },
+    /// A consumed record could not be deserialized.
+    RecordDeserialization { topic: String, partition: i32, offset: i64, part: &'static str, message: String },
+    /// The client was closed. Fatal.
+    Closed { message: String },
+    /// A blocking consumer call was interrupted by `wakeup()`.
+    Wakeup,
+    /// Another producer took over this identity. Fatal.
+    Fenced { message: String },
+    /// The open transaction must be aborted.
+    TransactionAbortable { message: String },
+    /// No committed offset and no reset policy.
+    NoOffset { partitions: Vec<(String, i32)> },
+    UnknownTopic { topic: String },
+    /// The broker rejected a batch's sequence number.
+    OutOfOrderSequence { topic: String, partition: i32, message: String },
+    /// A call that is not valid in the client's current state.
+    IllegalState { message: String },
 }
 ```
+
+Errors keep their cause: `std::error::Error::source()` walks from a
+`KrafkaError` to the I/O or TLS error underneath it.
+
+### Where each kind comes from
+
+| Kind | Raised when | Predicate |
+|------|-------------|-----------|
+| `Network` | Connecting, I/O, a reset during a TLS handshake, the connection cap reached | retriable |
+| `Timeout` | A request or other operation exceeded its bound | retriable |
+| `Auth` | SASL failed, a certificate was rejected, the OIDC endpoint failed | fatal |
+| `Closed` | A call on a client (or a part it needs) that has been closed; records still unresolved when `close_with` times out | fatal |
+| `Fenced` | Another producer with the same transactional id, or the same idempotent identity, took over | fatal |
+| `TransactionAbortable` | A send or `send_offsets` of the open transaction failed; `commit()` and later sends refuse with it, and `abort()` fails the records it drops with it | requires abort |
+| `DeliveryTimeout { possibly_written }` | A record was not acknowledged within `delivery_timeout`; `possibly_written` says whether the broker may hold it | — |
+| `OutOfOrderSequence` | The broker lost an earlier batch of an idempotent producer's partition; the batch fails and the producer continues on a new epoch | — |
+| `NoOffset` | `auto_offset_reset(AutoOffsetReset::None)` and a partition has no committed offset; `seek_to_timestamp` past the newest record | — |
+| `Wakeup` | `Consumer::wakeup()` interrupted a blocking consumer call | — |
+| `UnknownTopic` | The consumer has no metadata for the topic after a refresh (`offsets_for_times_for_topic`) | — |
+| `IllegalState` | A call that is not valid now: `send` before `begin`, `seek` on an unassigned partition, `committed` without a group | — |
+| `Broker { code }` | The broker answered with an error code; `is_retriable()` and `is_fatal()` follow the code | by code |
+| `Protocol { kind }` | Encoding or decoding failed; see [ProtocolErrorKind](#protocolerrorkind) | by kind |
+| `Config` | An invalid builder setting, named in the message | — |
+| `Serialization` / `RecordDeserialization` | A serializer or deserializer failed | — |
+
+### What to do next
+
+Three predicates decide what to do without matching on variants:
+
+| Predicate | Meaning |
+|-----------|---------|
+| `is_retriable()` | The same operation may succeed if tried again. |
+| `requires_abort()` | The open transaction must be aborted; the producer stays usable. |
+| `is_fatal()` | The client cannot continue; build a new one. |
+
+`requires_abort()` and `is_fatal()` are never both true. A connection reset
+during a TLS handshake is `Network` (retriable); a certificate the client or
+broker rejects is `Auth` (fatal).
 
 ## Kafka Error Codes
 
-krafka defines all Kafka error codes in the `ErrorCode` enum:
+`ErrorCode` names every Kafka error code (`ErrorCode::NotLeaderForPartition`,
+`ErrorCode::TopicAlreadyExists`, …); a code krafka does not know is
+`ErrorCode::Unknown(i16)`. `OffsetOutOfRange` during a fetch never reaches the
+application: the consumer applies `auto_offset_reset`.
 
-```rust
+```rust,compile
 use krafka::error::ErrorCode;
-
-// Common error codes
-ErrorCode::None                      // 0: No error
-ErrorCode::UnknownServerError        // -1: Unknown error
-ErrorCode::OffsetOutOfRange          // 1: Offset out of range
-ErrorCode::NotLeaderForPartition     // 6: Not leader for partition
-ErrorCode::RequestTimedOut           // 7: Request timed out
-ErrorCode::MessageTooLarge           // 10: Message too large
-ErrorCode::UnknownTopicOrPartition   // 3: Unknown topic
-ErrorCode::LeaderNotAvailable        // 5: Leader not available
-ErrorCode::TopicAlreadyExists        // 36: Topic already exists
-ErrorCode::InvalidTopic              // 17: Invalid topic
-ErrorCode::GroupAuthorizationFailed  // 30: Group auth failed
-ErrorCode::SaslAuthenticationFailed  // 58: SASL auth failed
-ErrorCode::UnknownProducerId         // 59: Unknown producer ID
-ErrorCode::FencedInstanceId          // 82: Fenced instance ID
-ErrorCode::UnstableOffsetCommit      // 88: Unstable offset commit
-ErrorCode::ProducerFenced            // 90: Producer fenced (zombie)
-ErrorCode::UnknownTopicId            // 100: Unknown topic ID (KIP-516)
-ErrorCode::InconsistentTopicId       // 103: Topic ID mismatch
-ErrorCode::FetchSessionTopicIdError  // 106: Fetch session topic ID error
-ErrorCode::OffsetMovedToTieredStorage // 109: Offset in tiered storage (KIP-405)
-ErrorCode::FencedMemberEpoch         // 110: Fenced member epoch (KIP-848)
-ErrorCode::StaleMemberEpoch          // 113: Stale member epoch (KIP-848)
-ErrorCode::TransactionAbortable      // 120: Transaction abortable (KIP-890)
-```
-
-> **Note:** `OffsetOutOfRange` errors during fetch are automatically handled by the consumer — it applies the configured `auto_offset_reset` policy to recover the affected partition without returning an error to the application.
-
-### Checking Error Codes
-
-```rust
-use krafka::error::ErrorCode;
-
-// Check if error code indicates success
-if error_code.is_ok() {
-    println!("Success!");
-}
 
 // Convert from raw i16
 let code = ErrorCode::from_i16(6);
 assert_eq!(code, ErrorCode::NotLeaderForPartition);
+assert!(code.is_retriable());
+
+// Check if an error code indicates success
+assert!(ErrorCode::from_i16(0).is_ok());
 ```
 
-## Error Handling Patterns
-
-### Basic Error Handling
-
-```rust,compile
-use krafka::error::{KrafkaError, Result};
-use krafka::producer::Producer;
-
-async fn send_message(producer: &Producer) -> Result<()> {
-    match producer.send("topic", Some(b"key"), Some(b"value")).await {
-        Ok(metadata) => {
-            println!("Sent to partition {} offset {}", 
-                     metadata.partition, metadata.offset);
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("Send failed: {}", e);
-            Err(e)
-        }
-    }
-}
-```
-
-### Pattern Matching on Errors
+## Matching on errors
 
 ```rust,compile
 use krafka::error::KrafkaError;
@@ -125,19 +115,18 @@ fn handle_error(error: KrafkaError) {
     match error {
         KrafkaError::Timeout { operation } => {
             eprintln!("Operation timed out: {}", operation);
-            // Consider retrying
         }
         KrafkaError::Broker { code, message } => {
             eprintln!("Broker error {:?}: {}", code, message);
-            // Check if retriable
         }
-        KrafkaError::Auth { message } => {
-            eprintln!("Authentication failed: {}", message);
-            // Likely not retriable - check credentials
+        KrafkaError::Auth { message, .. } => {
+            eprintln!("Authentication failed: {}", message); // fatal: check credentials
+        }
+        KrafkaError::DeliveryTimeout { possibly_written, .. } => {
+            eprintln!("Not acknowledged in time (possibly written: {possibly_written})");
         }
         KrafkaError::Config { message } => {
             eprintln!("Configuration error: {}", message);
-            // Fix configuration and restart
         }
         _ => {
             eprintln!("Other error: {}", error);
@@ -146,50 +135,14 @@ fn handle_error(error: KrafkaError) {
 }
 ```
 
-### Retry Logic
-
-`KrafkaError` exposes a built-in `.is_retriable()` method so callers don't need
-to duplicate retry-classification logic. Protocol errors are further classified
-by `ProtocolErrorKind` (see [below](#protocolerrorkind)) so you can distinguish
-a transient truncated frame from a permanent API-version mismatch.
-
-```rust,compile
-use krafka::error::KrafkaError;
-use std::time::Duration;
-
-async fn send_with_retry<F, T>(
-    mut operation: F,
-    max_retries: u32,
-    backoff: Duration,
-) -> Result<T, KrafkaError>
-where
-    F: FnMut() -> futures::future::BoxFuture<'static, Result<T, KrafkaError>>,
-{
-    let mut attempts = 0;
-
-    loop {
-        match operation().await {
-            Ok(result) => return Ok(result),
-            Err(e) if e.is_retriable() && attempts < max_retries => {
-                attempts += 1;
-                let delay = backoff * attempts;
-                eprintln!(
-                    "Retriable error (attempt {}/{}): {}. Retrying in {:?}",
-                    attempts, max_retries, e, delay
-                );
-                tokio::time::sleep(delay).await;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-}
-```
+The producer, the consumer and `commit()` already retry retriable failures;
+use `is_retriable()` to retry your own calls around them, such as admin
+operations.
 
 ## ProtocolErrorKind
 
-`KrafkaError::Protocol` carries a structured [`ProtocolErrorKind`] classification
-alongside the human-readable message. This lets callers make retry decisions
-without substring-matching the message text.
+`KrafkaError::Protocol` carries a `ProtocolErrorKind` next to the message, so
+callers can decide without matching on text.
 
 ```rust,compile
 use krafka::{KrafkaError, ProtocolErrorKind};
@@ -219,7 +172,7 @@ fn handle_protocol_error(err: &KrafkaError) {
 
 The display format for `KrafkaError::Protocol` is:
 
-```
+```text
 protocol error (CrcMismatch): record batch CRC check failed
 ```
 
@@ -229,108 +182,77 @@ protocol error (CrcMismatch): record batch CRC check failed
 |---|---|---|
 | `TruncatedFrame` | ✓ | Buffer exhausted before a complete frame could be read |
 | `CrcMismatch` | ✗ | Record batch CRC32C mismatch — corruption; re-fetching the same offset yields the same bytes |
+| `FrameTooLarge` | ✗ | A request frame larger than `max_request_size`, rejected before sending |
 | `Malformed` | ✓ | Structurally malformed response (often transient) |
-| `UnknownApiVersion` | ✗ | No mutually supported API version — permanent mismatch |
+| `UnknownApiVersion` | ✗ | No mutually supported API version — permanent mismatch. When the cluster lacks a feature, the message names it and the setting that avoids it ([table](@/docs/protocol.md#a-cluster-without-a-feature)) |
 | `InvalidLength` | ✗ | Encoded length exceeds protocol maximum or safety cap |
 | `InvalidUtf8` | ✗ | Bytes decoded as UTF-8 string were not valid UTF-8 |
 | `UnsupportedMagic` | ✗ | Record batch magic byte is not version 2 |
 | `InvalidValue` | ✗ | Field value outside allowed range or malformed varint |
 | `Other` | ✗ | Catch-all; inspect the message for details |
 
-### Error Context
-
-Add context to errors for better debugging:
-
-```rust,compile
-use krafka::error::{KrafkaError, Result};
-
-async fn process_topic(producer: &Producer, topic: &str) -> Result<()> {
-    producer
-        .send(topic, None, Some(b"message"))
-        .await
-        .map_err(|e| {
-            eprintln!("Failed to send to topic {}: {}", topic, e);
-            e
-        })?;
-    
-    Ok(())
-}
-```
-
 ## Consumer Error Handling
 
 ### `AutoOffsetReset::None` Error
 
-When `auto_offset_reset` is set to `None` and a partition has no committed offset, `poll()` will return an error:
+With `AutoOffsetReset::None`, a partition without a committed offset makes `poll()` return `KrafkaError::NoOffset` naming the partitions:
 
 ```rust,compile
 use krafka::consumer::{Consumer, AutoOffsetReset};
 
-let consumer = Consumer::builder()
-    .bootstrap_servers("localhost:9092")
-    .group_id("strict-group")
+let consumer = krafka::Kafka::builder("localhost:9092")
+    .connect()
+    .await?
+    .consumer("strict-group")
     .auto_offset_reset(AutoOffsetReset::None)
     .build()
     .await?;
 
 // This will error if any assigned partition has no committed offset
 match consumer.poll(Duration::from_secs(1)).await {
-    Err(e) => eprintln!("No committed offset: {}", e),
+    Err(KrafkaError::NoOffset { partitions }) => {
+        for (topic, partition) in partitions {
+            // Choose a position explicitly, e.g. with seek_to_beginning.
+            eprintln!("no committed offset for {topic}-{partition}");
+        }
+    }
+    Err(e) => return Err(e),
     Ok(records) => { /* process */ }
 }
 ```
 
 ### Handling Poll Errors
 
-```rust
-use krafka::consumer::Consumer;
+`poll()` returns an empty batch when its timeout passes, not an error:
+
+```rust,compile
+use krafka::consumer::{Consumer, ConsumerRecord};
 use krafka::error::KrafkaError;
 use std::time::Duration;
 
-async fn consume_safely(consumer: &Consumer) {
+async fn process_record(record: &ConsumerRecord) -> krafka::Result<()> {
+    Ok(())
+}
+
+async fn consume_safely(consumer: &Consumer) -> krafka::Result<()> {
     loop {
         match consumer.poll(Duration::from_secs(1)).await {
             Ok(records) => {
                 for record in records {
                     if let Err(e) = process_record(&record).await {
                         eprintln!("Failed to process record: {}", e);
-                        // Decide: skip, retry, or stop
+                        // Decide: skip, retry, or dead-letter
                     }
                 }
             }
-            Err(KrafkaError::Timeout { .. }) => {
-                // Normal - no messages available
-                continue;
+            // wakeup() from another task: stop cleanly.
+            Err(KrafkaError::Wakeup) => return Ok(()),
+            // A record that cannot be deserialized: skip past it.
+            Err(KrafkaError::RecordDeserialization { topic, partition, offset, .. }) => {
+                consumer.seek(&topic, partition, offset + 1).await?;
             }
-            Err(KrafkaError::Broker { code, message }) => {
-                eprintln!("Broker error {:?}: {}", code, message);
-                // May need to refresh metadata or reconnect
+            Err(e) if e.is_retriable() => {
                 tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-            Err(e) => {
-                eprintln!("Fatal error: {}", e);
-                break;
-            }
-        }
-    }
-}
-```
-
-### Commit Error Handling
-
-```rust,compile
-use krafka::error::KrafkaError;
-
-async fn commit_with_retry(consumer: &Consumer, retries: u32) -> Result<(), KrafkaError> {
-    let mut attempts = 0;
-    
-    loop {
-        match consumer.commit().await {
-            Ok(()) => return Ok(()),
-            Err(e) if attempts < retries => {
-                attempts += 1;
-                eprintln!("Commit failed (attempt {}): {}", attempts, e);
-                tokio::time::sleep(Duration::from_millis(100)).await;
             }
             Err(e) => return Err(e),
         }
@@ -340,41 +262,37 @@ async fn commit_with_retry(consumer: &Consumer, retries: u32) -> Result<(), Kraf
 
 ## Producer Error Handling
 
-### Send Error Handling
+A send error is final for that record: the producer has already retried
+until `delivery_timeout`. Decide by kind:
 
-```rust
+```rust,compile
+use krafka::Record;
 use krafka::producer::Producer;
-use krafka::error::{KrafkaError, ErrorCode};
+use krafka::error::{ErrorCode, KrafkaError};
 
-async fn send_critical_message(
-    producer: &Producer,
-    topic: &str,
-    key: &[u8],
-    value: &[u8],
-) -> Result<(), KrafkaError> {
-    const MAX_RETRIES: u32 = 3;
-    
-    for attempt in 1..=MAX_RETRIES {
-        match producer.send(topic, Some(key), Some(value)).await {
-            Ok(metadata) => {
-                println!("Message sent to {}:{}", metadata.partition, metadata.offset);
-                return Ok(());
-            }
-            Err(KrafkaError::Broker { code: ErrorCode::MessageTooLarge, .. }) => {
-                // Not retriable - message is too large
-                return Err(KrafkaError::config("Message exceeds max size"));
-            }
-            Err(e) if e.is_retriable() && attempt < MAX_RETRIES => {
-                eprintln!("Send failed (attempt {}): {}. Retrying...", attempt, e);
-                tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
-            }
-            Err(e) => {
-                return Err(e);
-            }
+async fn send_critical_message(producer: &Producer, record: Record) -> krafka::Result<()> {
+    match producer.send(record).await {
+        Ok(metadata) => {
+            println!("Message sent to {}:{}", metadata.partition, metadata.offset);
+            Ok(())
         }
+        Err(KrafkaError::Broker { code: ErrorCode::MessageTooLarge, .. }) => {
+            // The record is larger than the topic accepts; resending cannot help.
+            Err(KrafkaError::config("record exceeds the topic's max.message.bytes"))
+        }
+        Err(KrafkaError::DeliveryTimeout { possibly_written, .. }) => {
+            // possibly_written == false: never reached the broker, safe to resend.
+            // possibly_written == true: a resend may duplicate it.
+            Err(KrafkaError::timeout(format!(
+                "send not acknowledged (possibly written: {possibly_written})"
+            )))
+        }
+        Err(e) if e.is_fatal() => {
+            // Closed, fenced or not authorized: build a new producer.
+            Err(e)
+        }
+        Err(e) => Err(e),
     }
-    
-    Err(KrafkaError::timeout("send after retries"))
 }
 ```
 
@@ -382,237 +300,41 @@ async fn send_critical_message(
 
 ### Create Topic Errors
 
-```rust
-use krafka::admin::{AdminClient, NewTopic};
-use krafka::error::KrafkaError;
+`create_topics` returns a result per topic:
+
+```rust,compile
+use krafka::admin::{AdminClient, CreateTopicsOptions, NewTopic};
+use krafka::error::{ErrorCode, KrafkaError};
 
 async fn ensure_topic_exists(
     admin: &AdminClient,
     name: &str,
     partitions: i32,
     replication_factor: i16,
-) -> Result<(), KrafkaError> {
-    let topic = NewTopic::new(name, partitions, replication_factor);
-    
-    match admin.create_topics(vec![topic], Duration::from_secs(30), false).await {
-        Ok(results) => {
-            for result in results {
-                match &result.error {
-                    None => println!("Created topic: {}", result.name),
-                    Some(e) if e.contains("TOPIC_ALREADY_EXISTS") => {
-                        println!("Topic {} already exists", result.name);
-                    }
-                    Some(e) => {
-                        return Err(KrafkaError::broker(
-                            ErrorCode::UnknownServerError,
-                            e.clone(),
-                        ));
-                    }
-                }
+) -> krafka::Result<()> {
+    let topic = NewTopic::new(name, partitions, replication_factor)?;
+    let results = admin
+        .create_topics([topic], CreateTopicsOptions::default())
+        .await?;
+    for (name, result) in results {
+        match result {
+            Ok(()) => println!("Created topic: {name}"),
+            Err(KrafkaError::Broker { code: ErrorCode::TopicAlreadyExists, .. }) => {
+                println!("Topic {name} already exists");
             }
-            Ok(())
-        }
-        Err(e) => Err(e),
-    }
-}
-```
-
-## Best Practices
-
-### 1. Always Handle Errors
-
-```rust
-// ❌ Bad: ignoring errors
-let _ = producer.send("topic", None, Some(b"value")).await;
-
-// ✅ Good: handling errors
-if let Err(e) = producer.send("topic", None, Some(b"value")).await {
-    log::error!("Send failed: {}", e);
-}
-```
-
-### 2. Use Appropriate Retry Strategies
-
-```rust
-// ❌ Bad: infinite retries
-loop {
-    if producer.send(...).await.is_ok() {
-        break;
-    }
-}
-
-// ✅ Good: bounded retries with backoff
-let mut attempts = 0;
-while attempts < 3 {
-    match producer.send(...).await {
-        Ok(_) => break,
-        Err(e) if e.is_retriable() => {
-            attempts += 1;
-            tokio::time::sleep(Duration::from_millis(100 << attempts)).await;
-        }
-        Err(e) => return Err(e),
-    }
-}
-```
-
-### 3. Log Errors with Context
-
-```rust
-// ❌ Bad: minimal logging
-log::error!("Error: {}", e);
-
-// ✅ Good: contextual logging
-log::error!(
-    topic = %topic,
-    partition = %partition,
-    offset = %offset,
-    "Failed to process message: {}",
-    e
-);
-```
-
-### 4. Graceful Degradation
-
-```rust
-async fn process_with_fallback(record: &ConsumerRecord) -> Result<()> {
-    match primary_processing(record).await {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            log::warn!("Primary processing failed: {}. Using fallback.", e);
-            fallback_processing(record).await
+            Err(e) => return Err(e),
         }
     }
+    Ok(())
 }
 ```
-
-### 5. Circuit Breaker Pattern
-
-```rust,compile
-use std::sync::atomic::{AtomicU32, AtomicBool, Ordering};
-use std::time::{Duration, Instant};
-
-struct CircuitBreaker {
-    failures: AtomicU32,
-    threshold: u32,
-    open: AtomicBool,
-    opened_at: std::sync::Mutex<Option<Instant>>,
-    reset_timeout: Duration,
-}
-
-impl CircuitBreaker {
-    fn record_failure(&self) {
-        let failures = self.failures.fetch_add(1, Ordering::SeqCst) + 1;
-        if failures >= self.threshold {
-            self.open.store(true, Ordering::SeqCst);
-            *self.opened_at.lock().unwrap() = Some(Instant::now());
-        }
-    }
-
-    fn record_success(&self) {
-        self.failures.store(0, Ordering::SeqCst);
-        self.open.store(false, Ordering::SeqCst);
-    }
-
-    fn is_open(&self) -> bool {
-        if !self.open.load(Ordering::SeqCst) {
-            return false;
-        }
-        // Check if we should try again
-        if let Some(opened_at) = *self.opened_at.lock().unwrap() {
-            if opened_at.elapsed() > self.reset_timeout {
-                return false;  // Allow retry
-            }
-        }
-        true
-    }
-}
-```
-
-## Next Steps
-
-- [Configuration Reference](@/docs/configuration.md) - Timeout and retry settings
-- [Architecture Overview](@/docs/architecture.md) - How errors flow through the system
-
----
 
 ## Dead Letter Queue
 
-A _dead-letter queue_ (DLQ) receives records that cannot be processed or delivered. krafka provides the `DeadLetterQueue` trait in the `krafka::dlq` module to plug in custom routing logic.
-
-### Producer-side DLQ
-
-Configure a DLQ on the producer to automatically route records to an error topic when all retry attempts are exhausted:
-
-> This example is kept compiling by a doctest on the
-> [`DeadLetterQueue`](https://docs.rs/krafka/latest/krafka/dlq/trait.DeadLetterQueue.html)
-> trait itself, so it cannot silently drift from the API.
-
-```rust,compile
-use std::pin::Pin;
-use std::future::Future;
-use std::sync::Arc;
-use krafka::dlq::DeadLetterQueue;
-use krafka::producer::{Producer, ProducerRecord};
-
-// `Debug` is a supertrait of `DeadLetterQueue`; `Producer` implements it, so
-// an implementation can own one.
-#[derive(Debug)]
-struct KafkaDlq {
-    producer: Producer,
-    dlq_topic: String,
-}
-
-impl DeadLetterQueue for KafkaDlq {
-    fn send(
-        &self,
-        mut record: ProducerRecord,
-        error: String,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        record.topic = self.dlq_topic.clone();
-        record.headers.push((
-            "__krafka.dlq.exception.message".to_string(),
-            Some(bytes::Bytes::from(error)),
-        ));
-        Box::pin(async move {
-            if let Err(e) = self.producer.send_record(record).await {
-                tracing::error!(error = %e, "Failed to route record to DLQ");
-            }
-        })
-    }
-}
-
-// A separate producer: sharing the one whose sends are failing would queue the
-// dead-letter write behind the same stalled broker.
-let dlq_producer = Producer::builder()
-    .bootstrap_servers("localhost:9092")
-    .build()
-    .await?;
-
-let producer = Producer::builder()
-    .bootstrap_servers("localhost:9092")
-    .dead_letter_queue(Arc::new(KafkaDlq {
-        producer: dlq_producer,
-        dlq_topic: "my-topic.DLQ".to_string(),
-    }))
-    .build()
-    .await?;
-```
-
-> **Scope:** the producer DLQ is invoked on the plain producer and on the
-> `TransactionalProducer` alike, at every `linger` setting. Each record is
-> handed to the DLQ once, after its retry budget is exhausted or on a
-> non-retriable error, immediately before the failure is returned. `send()`
-> still returns the error: the DLQ preserves the payload, it does not swallow
-> the failure.
-
-On a `TransactionalProducer` the DLQ write happens **outside** the transaction —
-it is a separate producer, so it is not covered by the commit marker and
-survives the abort that a permanently failed send forces. That is the point: a
-record lost to an aborted transaction is otherwise unrecoverable.
-
-### Consumer-side DLQ (poison pills)
-
-Use `build_dlq_record` to convert a failed consumer record into a producer record ready for DLQ routing. The helper attaches standard provenance headers:
+A _dead-letter queue_ (DLQ) receives consumed records that cannot be
+processed, so one poison pill does not block the partition. Send the record
+to a dead-letter topic with an ordinary `Producer`; `krafka::dlq::record_for`
+builds the record and attaches provenance headers:
 
 | Header | Value |
 |--------|-------|
@@ -621,38 +343,41 @@ Use `build_dlq_record` to convert a failed consumer record into a producer recor
 | `__krafka.dlq.original.offset` | record offset |
 | `__krafka.dlq.exception.message` | error description |
 
-```rust
-use krafka::dlq::{DeadLetterQueue, build_dlq_record};
+```rust,compile
 use krafka::consumer::ConsumerRecord;
-use krafka::error::KrafkaError;
+use krafka::producer::Producer;
 
-async fn process_record(
-    record: ConsumerRecord,
-    dlq: &dyn DeadLetterQueue,
-) -> Result<(), KrafkaError> {
-    match decode_record(&record) {
-        Ok(decoded) => {
-            // normal processing
-            Ok(())
-        }
-        Err(e) => {
-            // Route to DLQ instead of blocking the consumer.
-            let dlq_record = build_dlq_record("my-topic.DLQ", &record, &e);
-            dlq.send(dlq_record, e.to_string()).await;
-            Ok(())  // continue consuming
-        }
-    }
+async fn dead_letter(
+    dlq: &Producer,
+    record: &ConsumerRecord,
+    error: &str,
+) -> krafka::Result<()> {
+    dlq.send(krafka::dlq::record_for("my-topic.DLQ", record, &error))
+        .await?;
+    Ok(())
 }
 ```
 
-`build_dlq_record` preserves nulls: a tombstone stays a tombstone and a null
+The record keeps the original key, value and headers, with the provenance
+headers appended after them, and no partition: the dead-letter topic chooses
+its own. `record_for` preserves nulls: a tombstone stays a tombstone and a null
 header value stays null, which matters when the dead-letter topic is itself
-compacted — the alternative would append a zero-length record instead of
-deleting the key. The one translation that is not verbatim is the header
-**key**: Kafka header keys are raw bytes while `ProducerRecord` uses `String`,
-so a non-UTF-8 key is hex-encoded behind a `hex:` prefix. See
+compacted. See
 [Tombstones and Compacted Topics](@/docs/producer.md#tombstones-and-compacted-topics).
 
-### Header Convention
+A failed *send* returns its error to the caller; `send` takes the record by
+value, so clone it first to route it elsewhere on failure.
 
-krafka follows the [Kafka Streams DLQ header convention](https://kafka.apache.org/documentation/streams/) for provenance headers, using the `__krafka.dlq.*` prefix. The `build_dlq_record` helper populates these automatically.
+## Guidelines
+
+- **Do not wrap sends in a retry loop.** The producer retries until
+  `delivery_timeout`; an error from `send()` is what is left after that.
+  Resend only a `DeliveryTimeout { possibly_written: false }`, or accept
+  duplicates. Raise `delivery_timeout` rather than adding a loop.
+- **Stop on fatal errors.** `is_fatal()` means the client cannot continue:
+  close it and build a new one, or exit.
+- **Log with context**: topic, partition and offset alongside the error.
+
+## Next Steps
+
+- [Configuration Reference](@/docs/configuration.md) - Timeout and retry settings

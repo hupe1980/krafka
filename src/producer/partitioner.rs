@@ -1,11 +1,24 @@
-//! Partitioning strategies for producers.
+//! How a record chooses its partition.
+//!
+//! Without a custom [`Partitioner`] the producer partitions as Java's
+//! built-in partitioner does (KIP-794): a keyed record goes to
+//! `murmur2(key) mod partitions`; keyless records stick to one partition
+//! until at least `batch_size` bytes were routed to it, then switch to a
+//! different partition chosen at random. With `partitioner_rack_aware` and a
+//! `client_rack`, a switch only chooses partitions whose leader is in that
+//! rack (KIP-1123), falling back to all partitions when none is.
+//!
+//! A custom partitioner gets neither the byte accounting nor the racks, as in
+//! Java; its answer is range-checked before the record is queued.
 
-use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use ahash::AHashMap;
 use parking_lot::Mutex;
 
 use crate::PartitionId;
+use crate::metadata::ClusterMetadata;
 
 /// Compute murmur2 hash (Kafka's default hash function).
 ///
@@ -68,114 +81,27 @@ fn partition_for_key(key: &[u8], partition_count: usize) -> PartitionId {
     (((murmur2(key) & 0x7fff_ffff) as usize) % partition_count) as PartitionId
 }
 
-/// Draw a random partition in `[0, partition_count)`.
-#[inline]
-fn random_partition(partition_count: usize) -> i32 {
-    debug_assert!(partition_count > 0);
-    rand::random_range(0..partition_count as u32) as i32
-}
-
-/// Trait for partitioning records across topic partitions.
+/// A custom partitioning strategy.
+///
+/// Set with `partitioner` on either producer builder; without one the
+/// producer uses the built-in partitioner described in the module docs.
 ///
 /// # Determinism contract
 ///
 /// Implementations **must** be deterministic for keyed records: the same
 /// `(topic, key)` pair must always map to the same partition (given a
 /// fixed `partition_count`). This is required for per-key ordering
-/// guarantees. Unkeyed records (`key = None`) may use any strategy
-/// (round-robin, random, sticky, etc.).
+/// guarantees. Unkeyed records (`key = None`) may use any strategy.
 ///
-/// # Batch notification
-///
-/// For partitioners that advance on batch boundaries (like
-/// [`UniformStickyPartitioner`]), the accumulator calls [`on_new_batch`]
-/// when a batch for `(topic, prev_partition)` has been filled and a new
-/// batch is about to be opened. The default implementation is a no-op.
-///
-/// [`on_new_batch`]: Partitioner::on_new_batch
+/// The answer must lie in `[0, partition_count)`; anything else fails the
+/// send with a configuration error.
 pub trait Partitioner: Send + Sync {
     /// Determine the partition for a record.
     ///
-    /// # Arguments
-    ///
     /// * `topic` - The topic name
-    /// * `key` - The record key (optional). When `Some`, the same key must
-    ///   always map to the same partition for a given `partition_count`.
+    /// * `key` - The record key, if any
     /// * `partition_count` - Number of partitions for the topic
-    ///
-    /// # Returns
-    ///
-    /// The partition ID to send the record to.
     fn partition(&self, topic: &str, key: Option<&[u8]>, partition_count: usize) -> PartitionId;
-
-    /// Called by the producer accumulator when a batch for `(topic, prev_partition)`
-    /// was filled and a new batch is about to be opened.
-    ///
-    /// Batch-boundary partitioners (e.g. [`UniformStickyPartitioner`]) use
-    /// this signal to pick a new sticky partition for the next batch. The
-    /// default implementation is a no-op; all existing partitioners except
-    /// `UniformStickyPartitioner` ignore batch events.
-    #[inline]
-    fn on_new_batch(&self, _topic: &str, _prev_partition: PartitionId, _partition_count: usize) {}
-}
-
-/// Default partitioner using murmur2 hash for keys, per-topic round-robin for null keys.
-///
-/// This matches the behavior of the Java Kafka client's default partitioner.
-/// The round-robin counter is maintained per-topic so that null-keyed records
-/// for different topics do not interfere with each other's distribution.
-#[derive(Debug)]
-pub struct DefaultPartitioner {
-    /// Per-topic round-robin counter for keyless records.
-    ///
-    /// Using a `Mutex<HashMap>` rather than a single global `AtomicUsize` so
-    /// that each topic distributes keyless records independently.  The lock is
-    /// only acquired for keyless records; keyed records use a lock-free
-    /// murmur2 hash path.
-    per_topic_counter: Mutex<HashMap<String, usize>>,
-}
-
-impl DefaultPartitioner {
-    /// Create a new default partitioner.
-    pub fn new() -> Self {
-        Self {
-            per_topic_counter: Mutex::new(HashMap::new()),
-        }
-    }
-}
-
-impl Default for DefaultPartitioner {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Partitioner for DefaultPartitioner {
-    #[inline]
-    fn partition(&self, topic: &str, key: Option<&[u8]>, partition_count: usize) -> PartitionId {
-        if partition_count == 0 {
-            return 0;
-        }
-
-        match key {
-            // Java branches on `keyBytes == null` only: a zero-length key is
-            // hashed like any other. Treating it as unkeyed would route the
-            // same records to different partitions than a Java producer,
-            // breaking co-partitioning for joins.
-            Some(k) => {
-                // Java-compatible keyed routing: toPositive(murmur2(key)) % partition_count.
-                partition_for_key(k, partition_count)
-            }
-            _ => {
-                // Per-topic round-robin for records without keys.
-                let mut counters = self.per_topic_counter.lock();
-                let counter = counters.entry(topic.to_owned()).or_insert(0);
-                let idx = *counter;
-                *counter = counter.wrapping_add(1);
-                (idx % partition_count) as PartitionId
-            }
-        }
-    }
 }
 
 /// Round-robin partitioner.
@@ -212,291 +138,185 @@ impl Partitioner for RoundRobinPartitioner {
     }
 }
 
-/// Sticky partitioner for improved batching.
-///
-/// Sticks to a partition until `batch_threshold` records have been sent
-/// (default: 100), then advances to the next partition. This improves
-/// batching efficiency by grouping unkeyed records together.
+/// How one producer partitions: the built-in partitioner or a custom one.
+pub(crate) enum Partitioning {
+    BuiltIn(BuiltInPartitioner),
+    Custom(Arc<dyn Partitioner>),
+}
+
+impl Partitioning {
+    pub(crate) fn new(
+        custom: Option<Arc<dyn Partitioner>>,
+        batch_size: usize,
+        rack: Option<String>,
+    ) -> Self {
+        match custom {
+            Some(custom) => Self::Custom(custom),
+            None => Self::BuiltIn(BuiltInPartitioner::new(batch_size, rack)),
+        }
+    }
+
+    /// The partition for a record of `record_size` bytes. Unchecked: the
+    /// caller range-checks the answer.
+    pub(crate) fn partition(
+        &self,
+        metadata: &ClusterMetadata,
+        topic: &Arc<str>,
+        key: Option<&[u8]>,
+        record_size: usize,
+        partition_count: usize,
+    ) -> PartitionId {
+        match self {
+            Self::BuiltIn(built_in) => {
+                built_in.partition(metadata, topic, key, record_size, partition_count)
+            }
+            Self::Custom(custom) => custom.partition(topic, key, partition_count),
+        }
+    }
+}
+
+/// One topic's sticky choice for keyless records.
+#[derive(Debug, Clone, Copy)]
+struct Sticky {
+    partition: PartitionId,
+    /// Bytes routed to `partition` since it was chosen.
+    bytes: usize,
+}
+
+/// The default partitioner: murmur2 for keys, byte-accounted stickiness for
+/// keyless records (KIP-794), optionally rack-aware (KIP-1123).
 #[derive(Debug)]
-pub struct StickyPartitioner {
-    current: AtomicUsize,
-    counter: AtomicUsize,
-    /// Number of records per sticky partition before advancing.
-    batch_threshold: usize,
+pub(crate) struct BuiltInPartitioner {
+    batch_size: usize,
+    /// `Some` when rack-aware partitioning is on.
+    rack: Option<String>,
+    sticky: Mutex<AHashMap<Arc<str>, Sticky>>,
 }
 
-impl StickyPartitioner {
-    /// Create a new sticky partitioner with default batch threshold (100).
-    pub fn new() -> Self {
+impl BuiltInPartitioner {
+    /// Topics whose sticky state is kept; beyond it one entry is evicted.
+    pub(crate) const MAX_TRACKED_TOPICS: usize = 10_000;
+
+    pub(crate) fn new(batch_size: usize, rack: Option<String>) -> Self {
         Self {
-            current: AtomicUsize::new(0),
-            counter: AtomicUsize::new(0),
-            batch_threshold: 100,
+            batch_size: batch_size.max(1),
+            rack,
+            sticky: Mutex::new(AHashMap::new()),
         }
     }
 
-    /// Create a sticky partitioner with a custom batch threshold.
-    pub fn with_batch_threshold(threshold: usize) -> Self {
-        Self {
-            current: AtomicUsize::new(0),
-            counter: AtomicUsize::new(0),
-            batch_threshold: threshold.max(1),
-        }
-    }
-
-    /// Manually switch to the next partition.
-    ///
-    /// Uses `fetch_add` for atomic read-modify-write to avoid the
-    /// race condition of separate load + store.
-    pub fn next_partition(&self, partition_count: usize) {
-        if partition_count > 0 {
-            // Atomic increment; the modulo is applied at read time in partition()
-            self.current.fetch_add(1, Ordering::AcqRel);
-        }
-    }
-}
-
-impl Default for StickyPartitioner {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Partitioner for StickyPartitioner {
-    /// Assign a partition for the given key.
-    ///
-    /// # Concurrent-advance semantics (null/empty keys only)
-    ///
-    /// When two threads call `partition()` simultaneously and both observe
-    /// the same `count` value satisfying `is_multiple_of(batch_threshold)`,
-    /// both will compute the **same** `next` value and store it. The second
-    /// `store` is idempotent — the partition advances exactly once. This is
-    /// correct, though the counter overshoots by at most one record relative
-    /// to the threshold boundary.
-    ///
-    /// `next_partition()` (manual advance) and the threshold-based auto-advance
-    /// are independent operations. A rare concurrent firing of both will advance
-    /// the partition by two instead of one. This is within the documented
-    /// "best-effort sticky" contract: partition distribution remains fair over
-    /// time, and per-key ordering is unaffected.
-    #[inline]
-    fn partition(&self, _topic: &str, key: Option<&[u8]>, partition_count: usize) -> PartitionId {
+    fn partition(
+        &self,
+        metadata: &ClusterMetadata,
+        topic: &Arc<str>,
+        key: Option<&[u8]>,
+        record_size: usize,
+        partition_count: usize,
+    ) -> PartitionId {
         if partition_count == 0 {
             return 0;
         }
+        if let Some(key) = key {
+            return partition_for_key(key, partition_count);
+        }
 
-        match key {
-            // Java branches on `keyBytes == null` only: a zero-length key is
-            // hashed like any other. Treating it as unkeyed would route the
-            // same records to different partitions than a Java producer,
-            // breaking co-partitioning for joins.
-            Some(k) => {
-                // Java-compatible keyed routing: toPositive(murmur2(key)) % partition_count.
-                partition_for_key(k, partition_count)
+        let mut sticky = self.sticky.lock();
+        if !sticky.contains_key(topic) && sticky.len() >= Self::MAX_TRACKED_TOPICS {
+            let evict = sticky.keys().next().cloned();
+            if let Some(evict) = evict {
+                sticky.remove(&evict);
             }
-            _ => {
-                // Auto-advance after batch_threshold records
-                let count = self.counter.fetch_add(1, Ordering::Relaxed);
-                if count > 0 && count.is_multiple_of(self.batch_threshold) {
-                    let next = count / self.batch_threshold;
-                    self.current
-                        .store(next % partition_count, Ordering::Release);
-                }
-                self.current.load(Ordering::Acquire) as PartitionId
+        }
+        let entry = sticky.entry(Arc::clone(topic)).or_insert_with(|| Sticky {
+            partition: self.choose(metadata, topic, partition_count, None),
+            bytes: 0,
+        });
+        // The topic shrank (or the state is stale): choose again.
+        if entry.partition as usize >= partition_count {
+            *entry = Sticky {
+                partition: self.choose(metadata, topic, partition_count, None),
+                bytes: 0,
+            };
+        }
+        let chosen = entry.partition;
+        entry.bytes += record_size;
+        if entry.bytes >= self.batch_size {
+            *entry = Sticky {
+                partition: self.choose(metadata, topic, partition_count, Some(chosen)),
+                bytes: 0,
+            };
+        }
+        chosen
+    }
+
+    /// A partition chosen uniformly at random, other than `avoid` when there
+    /// is another, among the partitions led in the client's rack if any are.
+    fn choose(
+        &self,
+        metadata: &ClusterMetadata,
+        topic: &str,
+        partition_count: usize,
+        avoid: Option<PartitionId>,
+    ) -> PartitionId {
+        let in_rack = self
+            .rack
+            .as_deref()
+            .map(|rack| partitions_led_in_rack(metadata, topic, rack, partition_count))
+            .filter(|candidates| !candidates.is_empty());
+        match in_rack {
+            Some(candidates) => pick_other(&candidates, avoid),
+            None => {
+                let all: Vec<PartitionId> = (0..partition_count)
+                    .map(|p| PartitionId::try_from(p).unwrap_or(PartitionId::MAX))
+                    .collect();
+                pick_other(&all, avoid)
             }
         }
     }
 }
 
-/// Hash-based partitioner using the same murmur2 algorithm as the Java Kafka client.
-///
-/// Unlike `DefaultPartitioner` (which uses round-robin for null keys), this
-/// partitioner hashes only keyed records. Null/empty keys are routed to
-/// partition 0.
-///
-/// # Determinism
-///
-/// `murmur2` produces identical output across all Rust compiler versions and
-/// across Java/Rust client pairs given the same key bytes and partition count.
-/// This satisfies the [`Partitioner`] trait's determinism contract.
-#[derive(Debug, Default)]
-pub struct HashPartitioner;
-
-impl HashPartitioner {
-    /// Create a new hash partitioner.
-    pub fn new() -> Self {
-        Self
-    }
+/// Partitions of `topic` whose current leader advertises `rack`. A leader
+/// that advertises no rack, or no known leader, does not count.
+fn partitions_led_in_rack(
+    metadata: &ClusterMetadata,
+    topic: &str,
+    rack: &str,
+    partition_count: usize,
+) -> Vec<PartitionId> {
+    let Some(info) = metadata.topic_arc(topic) else {
+        return Vec::new();
+    };
+    let mut candidates: Vec<PartitionId> = info
+        .partitions_iter()
+        .filter(|p| p.leader >= 0 && (p.partition as usize) < partition_count)
+        .filter(|p| {
+            metadata
+                .broker(p.leader)
+                .is_some_and(|broker| broker.rack() == Some(rack))
+        })
+        .map(|p| p.partition)
+        .collect();
+    candidates.sort_unstable();
+    candidates
 }
 
-impl Partitioner for HashPartitioner {
-    #[inline]
-    fn partition(&self, _topic: &str, key: Option<&[u8]>, partition_count: usize) -> PartitionId {
-        if partition_count == 0 {
-            return 0;
-        }
-
-        match key {
-            // Java branches on `keyBytes == null` only: a zero-length key is
-            // hashed like any other. Treating it as unkeyed would route the
-            // same records to different partitions than a Java producer,
-            // breaking co-partitioning for joins.
-            Some(k) => {
-                // Use murmur2 — same as Java DefaultPartitioner.
-                // Previously used DefaultHasher here which is NOT stable across
-                // Rust versions (stdlib explicitly reserves the right to change it),
-                // violating the Partitioner determinism contract.
-                partition_for_key(k, partition_count)
-            }
-            _ => 0,
-        }
-    }
-}
-
-/// Uniform sticky partitioner (KIP-794, Java client default since Kafka 3.3).
-///
-/// Assigns unkeyed records to a single *sticky* partition for the duration of
-/// one batch, then switches to a new partition when the batch is filled and
-/// flushed. This produces larger, more efficient batches than round-robin (which
-/// spreads records across all partitions, keeping each batch small) while still
-/// distributing load evenly over time.
-///
-/// # Keyed records
-///
-/// Uses the same `murmur2` algorithm as the Java `DefaultPartitioner` for
-/// consistent cross-language determinism.
-///
-/// # Unkeyed records
-///
-/// The sticky partition for a topic is chosen randomly on first use, then held
-/// until the batch for that partition is full. On batch fill,
-/// [`on_new_batch`](Partitioner::on_new_batch) is called by the accumulator with
-/// the filled partition. The partitioner then picks a **different** partition
-/// uniformly at random (using the same logic as Java's `nextPartition`).
-///
-/// # Comparison to `StickyPartitioner`
-///
-/// [`StickyPartitioner`] advances after a fixed record count (`batch_threshold`).
-/// `UniformStickyPartitioner` advances on **actual batch boundaries** regardless
-/// of record count, which yields truly batch-sized sticky windows and matches
-/// the Java 3.3+ behaviour exactly.
-///
-/// # Memory footprint
-///
-/// The per-topic sticky map is capped at [`UniformStickyPartitioner::MAX_TRACKED_TOPICS`]
-/// entries (default: 10 000). When the cap is reached, an existing entry is
-/// evicted pseudo-randomly (first key in iteration order, which is randomised by
-/// `HashMap`'s hash seed) before inserting the new topic.  This bounds memory
-/// usage in multi-tenant and CDC pipelines that produce to many short-lived
-/// topics while keeping eviction cost O(1).
-///
-/// # Thread safety
-///
-/// All methods are safe to call concurrently. A single `Mutex` guards the
-/// per-topic `HashMap<String, i32>`. Critical sections are nanosecond-scale
-/// (one HashMap lookup + one integer read or write).
-#[derive(Debug, Default)]
-pub struct UniformStickyPartitioner {
-    /// Per-topic sticky partition index, initialised on first use.
-    sticky: Mutex<HashMap<String, i32>>,
-}
-
-impl UniformStickyPartitioner {
-    /// Maximum number of per-topic sticky entries retained in memory.
-    ///
-    /// When the map reaches this size a single entry is evicted (pseudo-random
-    /// via HashMap iteration order) before the new topic is inserted.  This
-    /// prevents unbounded memory growth in multi-tenant or CDC workloads.
-    pub const MAX_TRACKED_TOPICS: usize = 10_000;
-
-    /// Create a new `UniformStickyPartitioner`.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Pick a new partition for `topic`, excluding `avoid` if possible.
-    ///
-    /// Mirrors Java's `StickyPartitionCache.nextPartition`:
-    /// draws a random partition in `[0, partition_count)` that differs
-    /// from `avoid`. Falls back to `avoid` when `partition_count == 1`.
-    fn pick_new_partition(partition_count: usize, avoid: i32) -> i32 {
-        if partition_count <= 1 {
-            return 0;
-        }
-        let candidate = random_partition(partition_count);
-        // Shift by 1 if we randomly drew the same partition we just flushed,
-        // so every advance always changes the sticky target.
-        if candidate == avoid {
-            (candidate + 1) % partition_count as i32
-        } else {
-            candidate
-        }
-    }
-}
-
-impl Partitioner for UniformStickyPartitioner {
-    #[inline]
-    fn partition(&self, topic: &str, key: Option<&[u8]>, partition_count: usize) -> PartitionId {
-        if partition_count == 0 {
-            return 0;
-        }
-
-        // Keyed records: deterministic murmur2 hash, same as Java.
-        // A zero-length key is hashed, matching Java (see above).
-        if let Some(k) = key {
-            return partition_for_key(k, partition_count);
-        }
-
-        // Unkeyed: return (or initialise) the sticky partition under the lock.
-        let mut map = self.sticky.lock();
-        let mut partition = if let Some(existing) = map.get_mut(topic) {
-            *existing
-        } else {
-            // Enforce the per-partitioner memory cap before inserting.
-            if map.len() >= Self::MAX_TRACKED_TOPICS {
-                // Evict one entry pseudo-randomly (first key in iteration order,
-                // which is randomised by HashMap's hash seed). O(1) cost.
-                if let Some(evict_key) = map.keys().next().map(|k| k.to_owned()) {
-                    map.remove(&evict_key);
-                }
-            }
-            let fresh = random_partition(partition_count);
-            map.insert(topic.to_string(), fresh);
-            fresh
-        };
-
-        // Guard against partition_count shrinking after the sticky was set.
-        if (partition as usize) >= partition_count {
-            partition = random_partition(partition_count);
-            map.insert(topic.to_string(), partition);
-        }
-        partition
-    }
-
-    /// Advance to a new sticky partition for `topic`.
-    ///
-    /// Called by the accumulator when the batch for `(topic, prev_partition)`
-    /// was filled and flushed. Picks a new partition uniformly at random,
-    /// different from `prev_partition`, and stores it as the new sticky value.
-    ///
-    /// Uses a compare-and-set pattern: the advance only applies when the
-    /// currently stored sticky value still equals `prev_partition`.  A
-    /// concurrent `on_new_batch` for a *different* batch that already advanced
-    /// past `prev_partition` leaves the new value intact.
-    fn on_new_batch(&self, topic: &str, prev_partition: PartitionId, partition_count: usize) {
-        if partition_count == 0 {
-            return;
-        }
-        let next = Self::pick_new_partition(partition_count, prev_partition);
-        let mut map = self.sticky.lock();
-        if let Some(current) = map.get_mut(topic) {
-            // Only advance if no other concurrent `on_new_batch` already moved on.
-            if *current == prev_partition {
-                *current = next;
-            }
-        }
-        // If the topic is not in the map yet, `partition()` will initialise it
-        // to a fresh random value on the next call.
+/// A uniformly random element of `candidates`, other than `avoid` when
+/// `candidates` has another.
+fn pick_other(candidates: &[PartitionId], avoid: Option<PartitionId>) -> PartitionId {
+    let others: Vec<PartitionId> = candidates
+        .iter()
+        .copied()
+        .filter(|p| Some(*p) != avoid)
+        .collect();
+    let pool = if others.is_empty() {
+        candidates
+    } else {
+        &others
+    };
+    match pool.len() {
+        0 => 0,
+        1 => pool[0],
+        n => pool[crate::util::with_rng(|rng| rand::Rng::random_range(rng, 0..n))],
     }
 }
 
@@ -506,34 +326,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_default_partitioner_with_key() {
-        let partitioner = DefaultPartitioner::new();
-
-        // Same key should always go to the same partition
-        let p1 = partitioner.partition("topic", Some(b"key1"), 10);
-        let p2 = partitioner.partition("topic", Some(b"key1"), 10);
-        assert_eq!(p1, p2);
-
-        // Different keys might go to different partitions
-        let p3 = partitioner.partition("topic", Some(b"key2"), 10);
-        let _ = p3; // Just verify it doesn't panic
-    }
-
-    #[test]
-    fn test_default_partitioner_without_key() {
-        let partitioner = DefaultPartitioner::new();
-
-        // Should round-robin without a key
-        let p1 = partitioner.partition("topic", None, 3);
-        let _p2 = partitioner.partition("topic", None, 3);
-        let _p3 = partitioner.partition("topic", None, 3);
-        let p4 = partitioner.partition("topic", None, 3);
-
-        assert_eq!(p4, p1); // Should wrap around
-    }
-
-    #[test]
-    fn test_default_partitioner_murmur2() {
+    fn test_murmur2_is_deterministic() {
         // Test known values
         let hash1 = murmur2(b"test");
         let hash2 = murmur2(b"test");
@@ -599,214 +392,107 @@ mod tests {
         assert_eq!(partitions, vec![0, 1, 2, 0, 1, 2]);
     }
 
-    #[test]
-    fn test_sticky_partitioner() {
-        let partitioner = StickyPartitioner::new();
-
-        // Should stick to partition 0 initially
-        let p1 = partitioner.partition("topic", None, 3);
-        let p2 = partitioner.partition("topic", None, 3);
-        assert_eq!(p1, p2);
-
-        // After switching, should use next partition
-        partitioner.next_partition(3);
-        let p3 = partitioner.partition("topic", None, 3);
-        assert_ne!(p1, p3);
+    fn metadata() -> ClusterMetadata {
+        let pool = Arc::new(crate::network::ConnectionPool::new(
+            crate::network::ConnectionConfig::default(),
+        ));
+        ClusterMetadata::new(
+            vec!["localhost:9092".to_string()],
+            pool,
+            std::time::Duration::from_secs(300),
+        )
     }
 
+    /// Keyless records stay on one partition until `batch_size` bytes were
+    /// routed to it, then move to a different one — whatever happens to the
+    /// batches.
     #[test]
-    fn test_sticky_partitioner_auto_advance() {
-        // Custom threshold of 5
-        let partitioner = StickyPartitioner::with_batch_threshold(5);
-        assert_eq!(
-            partitioner.batch_threshold, 5,
-            "with_batch_threshold should set custom threshold"
-        );
-
-        // Threshold of 0 should be clamped to 1
-        let partitioner_min = StickyPartitioner::with_batch_threshold(0);
-        assert_eq!(
-            partitioner_min.batch_threshold, 1,
-            "with_batch_threshold(0) should clamp to 1"
-        );
-
-        let partition_count = 3;
-
-        // First 5 calls (indices 0..4) should all return the same partition
-        let initial = partitioner.partition("topic", None, partition_count);
-        for i in 1..5 {
-            let p = partitioner.partition("topic", None, partition_count);
-            assert_eq!(p, initial, "call {i} should still be on initial partition");
+    fn keyless_records_switch_after_batch_size_bytes() {
+        let metadata = metadata();
+        let topic: Arc<str> = Arc::from("t");
+        let p = BuiltInPartitioner::new(1000, None);
+        let mut runs = vec![(p.partition(&metadata, &topic, None, 100, 4), 1usize)];
+        for _ in 1..100 {
+            let partition = p.partition(&metadata, &topic, None, 100, 4);
+            match runs.last_mut() {
+                Some((current, n)) if *current == partition => *n += 1,
+                _ => runs.push((partition, 1)),
+            }
         }
-
-        // The 6th call (index 5) triggers auto-advance (count=5, 5 % 5 == 0)
-        let after_advance = partitioner.partition("topic", None, partition_count);
-        assert_ne!(
-            after_advance, initial,
-            "after batch_threshold calls, partition should auto-advance to a different partition"
+        assert_eq!(runs.len(), 10, "{runs:?}");
+        assert!(runs.iter().all(|(_, n)| *n == 10), "{runs:?}");
+        assert!(
+            runs.windows(2).all(|w| w[0].0 != w[1].0),
+            "every switch moves to a different partition: {runs:?}"
         );
+    }
 
-        // Next 4 calls should stay on the new partition
-        for i in 0..4 {
-            let p = partitioner.partition("topic", None, partition_count);
+    /// Keyed records hash, and do not count toward the keyless budget.
+    #[test]
+    fn keyed_records_hash_and_are_not_charged() {
+        let metadata = metadata();
+        let topic: Arc<str> = Arc::from("t");
+        let p = BuiltInPartitioner::new(1000, None);
+        let first = p.partition(&metadata, &topic, None, 100, 4);
+        for _ in 0..50 {
             assert_eq!(
-                p, after_advance,
-                "call {i} after advance should stay on new partition"
+                p.partition(&metadata, &topic, Some(b"kafka"), 500, 10),
+                partition_for_key(b"kafka", 10)
             );
         }
-
-        // Another advance at count=10
-        let after_second_advance = partitioner.partition("topic", None, partition_count);
-        assert_ne!(
-            after_second_advance, after_advance,
-            "should auto-advance again after another batch_threshold calls"
-        );
+        assert_eq!(p.partition(&metadata, &topic, None, 100, 4), first);
     }
 
     #[test]
-    fn test_sticky_partitioner_with_key() {
-        let partitioner = StickyPartitioner::new();
-
-        // With a key, should use murmur2 hash
-        let p1 = partitioner.partition("topic", Some(b"key1"), 10);
-        let p2 = partitioner.partition("topic", Some(b"key1"), 10);
-        assert_eq!(p1, p2);
-    }
-
-    #[test]
-    fn test_hash_partitioner() {
-        let partitioner = HashPartitioner::new();
-
-        // Same key should always go to the same partition
-        let p1 = partitioner.partition("topic", Some(b"key"), 10);
-        let p2 = partitioner.partition("topic", Some(b"key"), 10);
-        assert_eq!(p1, p2);
-
-        // Null key goes to partition 0
-        let p3 = partitioner.partition("topic", None, 10);
-        assert_eq!(p3, 0);
-    }
-
-    #[test]
-    fn test_partitioners_with_zero_partitions() {
-        let default = DefaultPartitioner::new();
-        let round_robin = RoundRobinPartitioner::new();
-        let sticky = StickyPartitioner::new();
-        let hash = HashPartitioner::new();
-        let uniform = UniformStickyPartitioner::new();
-
-        // All should return 0 for 0 partitions
-        assert_eq!(default.partition("topic", Some(b"key"), 0), 0);
-        assert_eq!(round_robin.partition("topic", Some(b"key"), 0), 0);
-        assert_eq!(sticky.partition("topic", Some(b"key"), 0), 0);
-        assert_eq!(hash.partition("topic", Some(b"key"), 0), 0);
-        assert_eq!(uniform.partition("topic", Some(b"key"), 0), 0);
-        assert_eq!(uniform.partition("topic", None, 0), 0);
-    }
-
-    #[test]
-    fn test_uniform_sticky_partitioner_basic() {
-        let p = UniformStickyPartitioner::new();
-
-        // Sticky: all calls for the same topic without on_new_batch return the same partition.
-        let first = p.partition("topic", None, 8);
-        assert!(first < 8);
+    fn a_shrunken_topic_gets_a_valid_partition() {
+        let metadata = metadata();
+        let topic: Arc<str> = Arc::from("t");
+        let p = BuiltInPartitioner::new(1_000_000, None);
         for _ in 0..20 {
-            assert_eq!(p.partition("topic", None, 8), first);
+            let _ = p.partition(&metadata, &topic, None, 1, 64);
         }
-
-        // Different topics get independent sticky values (may coincidentally be equal).
-        let other = p.partition("other-topic", None, 8);
-        assert!(other < 8);
+        assert_eq!(p.partition(&metadata, &topic, None, 1, 1), 0);
+        assert_eq!(p.partition(&metadata, &topic, None, 1, 0), 0);
     }
 
     #[test]
-    fn test_uniform_sticky_partitioner_keyed() {
-        let p = UniformStickyPartitioner::new();
-
-        // Keyed records: deterministic murmur2 hash — same result every call.
-        let k1a = p.partition("topic", Some(b"key1"), 8);
-        let k1b = p.partition("topic", Some(b"key1"), 8);
-        assert_eq!(k1a, k1b);
-
-        // Different keys should map to any of the partitions (not necessarily different).
-        let k2 = p.partition("topic", Some(b"key2"), 8);
-        assert!(k2 < 8);
+    fn a_single_partition_takes_every_switch() {
+        let metadata = metadata();
+        let topic: Arc<str> = Arc::from("t");
+        let p = BuiltInPartitioner::new(10, None);
+        for _ in 0..100 {
+            assert_eq!(p.partition(&metadata, &topic, None, 7, 1), 0);
+        }
     }
 
     #[test]
-    fn test_uniform_sticky_on_new_batch() {
-        let p = UniformStickyPartitioner::new();
-
-        // Establish a sticky partition.
-        let prev = p.partition("topic", None, 8);
-
-        // Simulate batch flush: partitioner should advance to a new (different) partition.
-        p.on_new_batch("topic", prev, 8);
-        let next = p.partition("topic", None, 8);
-        assert_ne!(next, prev, "sticky should advance after on_new_batch");
-        assert!(next < 8);
-
-        // Calling on_new_batch again with the stale prev value must NOT regress the sticky.
-        p.on_new_batch("topic", prev, 8);
-        // The value should still be `next` (not reverted to prev).
-        assert_eq!(p.partition("topic", None, 8), next);
-    }
-
-    #[test]
-    fn test_uniform_sticky_partition_count_shrink() {
-        let p = UniformStickyPartitioner::new();
-
-        // Initialise with a large partition count so the sticky is likely > 1.
-        let _ = p.partition("topic", None, 64);
-
-        // Shrink partition_count to 1; partition() must return a valid index.
-        let result = p.partition("topic", None, 1);
-        assert_eq!(result, 0);
-    }
-
-    #[test]
-    fn test_uniform_sticky_single_partition() {
-        let p = UniformStickyPartitioner::new();
-
-        // With one partition, pick_new_partition must return 0, not panic.
-        let result = p.partition("topic", None, 1);
-        assert_eq!(result, 0);
-        p.on_new_batch("topic", 0, 1);
-        assert_eq!(p.partition("topic", None, 1), 0);
-    }
-
-    #[test]
-    fn test_uniform_sticky_on_new_batch_unknown_topic() {
-        // on_new_batch for a topic that has never been seen must not panic.
-        let p = UniformStickyPartitioner::new();
-        p.on_new_batch("unknown", 0, 4);
-        // partition() for that topic should still return a valid value.
-        let result = p.partition("unknown", None, 4);
-        assert!(result < 4);
-    }
-
-    #[test]
-    fn test_uniform_sticky_concurrent_safety() {
-        use std::sync::Arc;
+    fn concurrent_keyless_routing_stays_in_range() {
         use std::thread;
-
-        let p = Arc::new(UniformStickyPartitioner::new());
+        let metadata = Arc::new(metadata());
+        let p = Arc::new(BuiltInPartitioner::new(100, None));
         let mut handles = Vec::new();
-
         for _ in 0..8 {
             let p = Arc::clone(&p);
+            let metadata = Arc::clone(&metadata);
             handles.push(thread::spawn(move || {
+                let topic: Arc<str> = Arc::from("t");
                 for _ in 0..1000 {
-                    let part = p.partition("topic", None, 16);
-                    assert!(part < 16, "got out-of-range partition {part}");
-                    p.on_new_batch("topic", part, 16);
+                    let part = p.partition(&metadata, &topic, None, 10, 16);
+                    assert!((0..16).contains(&part), "got out-of-range partition {part}");
                 }
             }));
         }
         for h in handles {
             h.join().expect("thread panicked");
         }
+    }
+
+    #[test]
+    fn pick_other_avoids_the_partition_just_left() {
+        for _ in 0..100 {
+            assert_eq!(pick_other(&[3, 5], Some(3)), 5);
+        }
+        assert_eq!(pick_other(&[3], Some(3)), 3);
     }
 
     /// Cross-validate murmur2 against the Java Kafka client's `Utils.murmur2` test vectors.

@@ -1,0 +1,35 @@
+name: Simulation (nightly)
+
+# Non-blocking check (declared in xtask/ci_job_parity.py): 5000 seeds per
+# simulation workload, disjoint from the per-PR budget, then every planted
+# defect in tests/plants/ must be caught again. A failing seed turns this
+# workflow red; its log names the seed and the `just sim-replay` command. It
+# does not block merges.
+on:
+  schedule:
+    - cron: '43 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  sim:
+    name: Simulation (nightly budget)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: "1.58.0"
+      - run: just sim-nightly

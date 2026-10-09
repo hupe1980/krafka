@@ -79,7 +79,7 @@ pub(crate) async fn connect_happy_eyeballs(
     let addrs = resolve(address, config.connect_timeout).await?;
 
     if addrs.is_empty() {
-        return Err(KrafkaError::invalid_state(format!(
+        return Err(KrafkaError::unavailable(format!(
             "no addresses resolved for '{address}'"
         )));
     }
@@ -333,15 +333,50 @@ fn spawn_attempt(
     });
 }
 
-/// Build a combined error message from individual per-address failures.
-fn build_combined_error(errors: &[(SocketAddr, KrafkaError)]) -> KrafkaError {
-    if errors.is_empty() {
-        return KrafkaError::invalid_state("all connection attempts failed");
+/// One failed connection attempt, kept as the cause of the combined error.
+#[derive(Debug, thiserror::Error)]
+#[error("connection to {addr} failed: {source}")]
+struct AttemptError {
+    addr: SocketAddr,
+    #[source]
+    source: KrafkaError,
+}
+
+/// Every attempt failed; the last one is the cause.
+#[derive(Debug, thiserror::Error)]
+#[error("all {count} connection attempts failed:\n{details}")]
+struct AllAttemptsError {
+    count: usize,
+    details: String,
+    #[source]
+    last: KrafkaError,
+}
+
+/// The I/O kind of a failed attempt, so the combined error still reads as
+/// refused, timed out, and so on.
+fn attempt_kind(error: &KrafkaError) -> std::io::ErrorKind {
+    match error {
+        KrafkaError::Network(io) => io.kind(),
+        _ => std::io::ErrorKind::Other,
     }
+}
+
+/// Build a combined network error from individual per-address failures,
+/// keeping the failures as its cause chain.
+fn build_combined_error(errors: &[(SocketAddr, KrafkaError)]) -> KrafkaError {
+    let Some((last_addr, last)) = errors.last() else {
+        return KrafkaError::unavailable("all connection attempts failed");
+    };
 
     if errors.len() == 1 {
-        let (addr, e) = &errors[0];
-        return KrafkaError::invalid_state(format!("connection to {addr} failed: {e}"));
+        let kind = attempt_kind(last);
+        return KrafkaError::network(std::io::Error::new(
+            kind,
+            AttemptError {
+                addr: *last_addr,
+                source: last.clone(),
+            },
+        ));
     }
 
     let details: Vec<String> = errors
@@ -349,10 +384,13 @@ fn build_combined_error(errors: &[(SocketAddr, KrafkaError)]) -> KrafkaError {
         .map(|(addr, e)| format!("  {addr}: {e}"))
         .collect();
 
-    KrafkaError::invalid_state(format!(
-        "all {} connection attempts failed:\n{}",
-        errors.len(),
-        details.join("\n")
+    KrafkaError::network(std::io::Error::new(
+        attempt_kind(last),
+        AllAttemptsError {
+            count: errors.len(),
+            details: details.join("\n"),
+            last: last.clone(),
+        },
     ))
 }
 

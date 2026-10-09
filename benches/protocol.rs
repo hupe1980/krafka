@@ -10,7 +10,7 @@
 use bytes::BytesMut;
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 
-use krafka::util::varint::{
+use krafka::__private::util::varint::{
     decode_signed_varint, decode_unsigned_varint, encode_signed_varint, encode_unsigned_varint,
 };
 
@@ -161,7 +161,7 @@ fn bench_varint_detailed(c: &mut Criterion) {
 
 /// Benchmark CRC32C checksum (used in record batch validation).
 fn bench_crc32c(c: &mut Criterion) {
-    use krafka::util::crc32c;
+    use krafka::__private::util::crc32c;
 
     let mut group = c.benchmark_group("crc32c");
 
@@ -182,7 +182,7 @@ fn bench_crc32c(c: &mut Criterion) {
 
 /// Benchmark request header encoding (called for every request).
 fn bench_request_header(c: &mut Criterion) {
-    use krafka::protocol::{ApiKey, RequestHeader};
+    use krafka::__private::protocol::{ApiKey, RequestHeader};
 
     let mut group = c.benchmark_group("request_header");
 
@@ -252,7 +252,7 @@ fn bench_error_code(c: &mut Criterion) {
 
 /// Benchmark API key conversions.
 fn bench_api_key(c: &mut Criterion) {
-    use krafka::protocol::ApiKey;
+    use krafka::testing::ApiKey;
 
     let mut group = c.benchmark_group("api_key");
 

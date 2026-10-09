@@ -6,7 +6,7 @@
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 
-use krafka::protocol::{Compression, LazyRecordBatch, RecordBatch};
+use krafka::__private::protocol::{Compression, RecordBatch, RecordBatchHeader};
 
 fn ok<T, E: std::fmt::Display>(result: Result<T, E>) -> T {
     match result {
@@ -15,16 +15,9 @@ fn ok<T, E: std::fmt::Display>(result: Result<T, E>) -> T {
     }
 }
 
-fn some<T>(value: Option<T>) -> T {
-    match value {
-        Some(value) => value,
-        None => unreachable!("benchmark should contain at least one record"),
-    }
-}
-
 /// Benchmark record batch decoding with different batch sizes.
 fn bench_record_batch_decoding(c: &mut Criterion) {
-    use krafka::protocol::RecordBatchBuilder;
+    use krafka::__private::protocol::RecordBatchBuilder;
 
     let mut group = c.benchmark_group("record_batch_decoding");
 
@@ -61,7 +54,7 @@ fn bench_record_batch_decoding(c: &mut Criterion) {
 
 /// Benchmark decompression performance.
 fn bench_decompression(c: &mut Criterion) {
-    use krafka::protocol::RecordBatchBuilder;
+    use krafka::__private::protocol::RecordBatchBuilder;
 
     let mut group = c.benchmark_group("decompression");
 
@@ -76,11 +69,8 @@ fn bench_decompression(c: &mut Criterion) {
         .collect();
 
     for compression in [
-        #[cfg(feature = "gzip")]
         Compression::Gzip,
-        #[cfg(feature = "snappy")]
         Compression::Snappy,
-        #[cfg(feature = "lz4")]
         Compression::Lz4,
         #[cfg(feature = "zstd")]
         Compression::Zstd,
@@ -114,7 +104,7 @@ fn bench_decompression(c: &mut Criterion) {
 
 /// Benchmark record iteration (simulates consumer record processing).
 fn bench_record_iteration(c: &mut Criterion) {
-    use krafka::protocol::RecordBatchBuilder;
+    use krafka::__private::protocol::RecordBatchBuilder;
 
     let mut group = c.benchmark_group("record_iteration");
 
@@ -156,15 +146,12 @@ fn bench_record_iteration(c: &mut Criterion) {
 
 /// Benchmark lazy vs eager record batch decoding.
 fn bench_lazy_vs_eager_decoding(c: &mut Criterion) {
-    use krafka::protocol::RecordBatchBuilder;
+    use krafka::__private::protocol::RecordBatchBuilder;
 
     let mut group = c.benchmark_group("lazy_vs_eager");
 
     for batch_size in [10, 100, 500] {
-        #[cfg(feature = "lz4")]
         let compression = Compression::Lz4;
-        #[cfg(not(feature = "lz4"))]
-        let compression = Compression::None;
 
         let mut builder = RecordBatchBuilder::new().compression(compression);
         for i in 0..batch_size {
@@ -191,29 +178,14 @@ fn bench_lazy_vs_eager_decoding(c: &mut Criterion) {
             },
         );
 
-        // Lazy: decode only header (records parsed on demand)
+        // Header only: what a skipped (aborted or control) batch costs
         group.bench_with_input(
-            BenchmarkId::new("lazy_header_only", batch_size),
+            BenchmarkId::new("header_only", batch_size),
             &encoded,
             |b, encoded| {
                 b.iter(|| {
-                    let mut buf = encoded.clone();
-                    let lazy = ok(LazyRecordBatch::decode(&mut buf));
-                    black_box(lazy.len())
-                });
-            },
-        );
-
-        // Lazy with first record access
-        group.bench_with_input(
-            BenchmarkId::new("lazy_first_record", batch_size),
-            &encoded,
-            |b, encoded| {
-                b.iter(|| {
-                    let mut buf = encoded.clone();
-                    let lazy = ok(LazyRecordBatch::decode(&mut buf));
-                    let first = ok(some(lazy.records().next()));
-                    black_box(first.key)
+                    let header = ok(RecordBatchHeader::peek(encoded));
+                    black_box(header.records_count)
                 });
             },
         );

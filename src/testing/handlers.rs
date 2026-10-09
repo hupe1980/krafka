@@ -13,87 +13,111 @@
 //! silently absorbed.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::error::{ErrorCode, Result};
 use crate::protocol::ApiKey;
-use crate::protocol::{Encode, KafkaString, TaggedField, TryEncode};
+use crate::protocol::{Decode, Encode, KafkaString, TaggedField, TryEncode};
 
 use super::state::{
-    ClassicGroupState, ClusterState, CommittedOffset, GroupMember, ShareSessionClose,
-    TransactionState,
+    BrokerTransaction, ClassicGroupState, ClusterState, CommittedOffset,
+    ConsumerGroupHeartbeatSeen, GroupMember, LeaveGroupMemberSeen, ListOffsetsLookup,
+    SequenceCheck, ShareSession, ShareSessionClose, TxnStatus,
 };
 use super::wire::*;
 
-/// The single API version the fake broker speaks for each supported API.
+/// The API versions the fake broker serves, as `(api, min, max)`.
 ///
-/// Pinning `min == max` forces the client's negotiation onto exactly the
-/// version each codec in [`super::wire`] was written against. Non-flexible
-/// versions are chosen wherever the client still accepts them, so there are no
-/// compact lengths or tagged fields to mis-handle.
-pub(crate) fn supported_versions() -> Vec<(ApiKey, i16)> {
+/// Most APIs are pinned to one version (`min == max`), forcing the client's
+/// negotiation onto exactly the version each codec in [`super::wire`] was
+/// written against. Ranges are served where the version itself carries
+/// semantics a test needs to reach: the `Produce`, `InitProducerId` and
+/// `EndTxn` versions select between the TV1 and TV2 transaction protocols and
+/// KIP-360 recovery, and the share APIs' v2 adds KIP-1206 and KIP-1222.
+pub(crate) fn supported_versions() -> Vec<(ApiKey, i16, i16)> {
     vec![
-        // The value here is ignored for ApiVersions: it is advertised as the
-        // range in `API_VERSIONS_RANGE` instead. See that constant.
-        (ApiKey::ApiVersions, 0),
+        // The range here is ignored for ApiVersions: it is advertised as
+        // `API_VERSIONS_RANGE` instead. See that constant.
+        (ApiKey::ApiVersions, 0, 0),
         // v12 is the lowest version carrying topic UUIDs in a form KIP-848
         // can use (v10 forces an all-zero UUID in the *request*, v12 is where
-        // the client may look topics up by ID). Serving it also means the
-        // flexible Metadata codec is exercised by every test here, which v8
-        // never reached.
-        (ApiKey::Metadata, 12),
-        // v10 is the lowest Produce version carrying the KIP-951 leader hint,
-        // which a client test needs to observe a failover without a metadata
-        // refresh. It is flexible, hence the tagged-field handling in `wire`.
-        // v12 is the lowest Produce version KIP-890 (TV2) accepts, and its
-        // request and response layouts are identical to v10's — the client
-        // uses one codec for v9–v12 in both directions — so serving it costs
-        // nothing and is what lets the fake broker negotiate TV2.
-        (ApiKey::Produce, 12),
-        (ApiKey::Fetch, 11),
-        (ApiKey::ListOffsets, 5),
-        (ApiKey::FindCoordinator, 2),
-        (ApiKey::JoinGroup, 5),
-        (ApiKey::SyncGroup, 3),
-        (ApiKey::Heartbeat, 3),
-        (ApiKey::LeaveGroup, 3),
-        (ApiKey::OffsetCommit, 7),
-        (ApiKey::OffsetFetch, 5),
+        // the client may look topics up by ID).
+        (ApiKey::Metadata, 12, 12),
+        // v10 is the lowest Produce version carrying the KIP-951 leader hint.
+        // v10–v12 share one layout in both directions. A transactional write
+        // at v12 joins its partition to the transaction (KIP-890 TV2); at v11
+        // and below the partition must have been added with
+        // `AddPartitionsToTxn` first (TV1).
+        (ApiKey::Produce, 10, 12),
+        (ApiKey::Fetch, 11, 11),
+        // v11 understands every offset sentinel down to -6 (KIP-1023); the
+        // per-sentinel minimum versions are reached by overriding the range.
+        (ApiKey::ListOffsets, 5, 11),
+        (ApiKey::FindCoordinator, 2, 2),
+        (ApiKey::JoinGroup, 5, 5),
+        (ApiKey::SyncGroup, 3, 3),
+        (ApiKey::Heartbeat, 3, 3),
+        (ApiKey::LeaveGroup, 3, 3),
+        // v8 is flexible; from v9 a KIP-848 member commits with its member
+        // epoch in the generation field.
+        (ApiKey::OffsetCommit, 7, 9),
+        (ApiKey::OffsetFetch, 5, 5),
         // KIP-848. v1 is the only version krafka negotiates, and the only one
         // carrying the client-generated member ID (KIP-1082).
-        (ApiKey::ConsumerGroupHeartbeat, 1),
-        (ApiKey::InitProducerId, 1),
+        (ApiKey::ConsumerGroupHeartbeat, 1, 1),
+        // v3 adds the KIP-360 producer ID and epoch, v4 PRODUCER_FENCED. v6
+        // (KIP-939) is served when a test advertises it.
+        (ApiKey::InitProducerId, 0, 5),
         // Transactions. v0 for the two TV1-only APIs, because the client still
-        // speaks the non-flexible format there and there is less to get wrong.
-        // `EndTxn` and `TxnOffsetCommit` are served at v5: their request
-        // layouts are unchanged from v3, and v5 is the floor KIP-890 requires,
-        // so one codec covers both transaction versions.
-        (ApiKey::AddPartitionsToTxn, 0),
-        (ApiKey::AddOffsetsToTxn, 0),
-        (ApiKey::TxnOffsetCommit, 5),
-        (ApiKey::EndTxn, 5),
-        (ApiKey::CreateTopics, 4),
-        (ApiKey::DeleteTopics, 3),
-        // KIP-932 share groups. v1 is the stable version; v2 (KIP-1206
-        // ShareAcquireMode, KIP-1222 renew-ack) is deliberately not advertised
-        // because neither an acquire mode nor a lock timer is modelled here,
-        // and advertising a version whose semantics the fake broker does not
-        // implement would make tests pass for the wrong reason.
-        (ApiKey::ShareGroupHeartbeat, 1),
-        (ApiKey::ShareFetch, 1),
-        (ApiKey::ShareAcknowledge, 1),
+        // speaks the non-flexible format there.
+        (ApiKey::AddPartitionsToTxn, 0, 0),
+        (ApiKey::AddOffsetsToTxn, 0, 0),
+        (ApiKey::TxnOffsetCommit, 5, 5),
+        // v3–v5 share a request layout. The coordinator reads the protocol
+        // from the version, as Kafka does: v5 is TV2 and bumps the epoch at
+        // every completion, v4 and below is TV1 and does not.
+        (ApiKey::EndTxn, 3, 5),
+        (ApiKey::CreateTopics, 4, 4),
+        (ApiKey::DeleteTopics, 3, 3),
+        // KIP-932 share groups. ShareFetch and ShareAcknowledge v2 add
+        // ShareAcquireMode (KIP-1206) and IsRenewAck (KIP-1222).
+        (ApiKey::ShareGroupHeartbeat, 1, 1),
+        (ApiKey::ShareFetch, 1, 2),
+        (ApiKey::ShareAcknowledge, 1, 2),
         // KIP-584. v2 is the Kafka 4.0 version that dropped the per-feature
         // `Results` array; overriding this down to v0 is how a test reaches
         // the client's "validate_only needs v1+" refusal.
-        (ApiKey::UpdateFeatures, 2),
+        (ApiKey::UpdateFeatures, 2, 2),
         // KIP-1071, describe half only — see `streams_group_describe`.
-        (ApiKey::StreamsGroupDescribe, 0),
+        (ApiKey::StreamsGroupDescribe, 0, 0),
         // v4 is the newest non-flexible DescribeGroups, and the newest one
-        // carrying `group_instance_id`. v5+ only adds compact encodings and
-        // (v6) a per-group error message.
-        (ApiKey::DescribeGroups, 4),
+        // carrying `group_instance_id`.
+        (ApiKey::DescribeGroups, 4, 4),
     ]
+}
+
+/// Long-poll state carried across the attempts of one `Fetch` or
+/// `ShareFetch`.
+#[derive(Debug, Default)]
+pub(crate) struct LongPoll {
+    /// The wait is over: answer with whatever is there.
+    pub expired: bool,
+    /// Acknowledgement results of a `ShareFetch` whose session check and
+    /// acknowledgements ran on an earlier attempt, keyed by
+    /// `(topic_id, partition)`.
+    pub share_acks: Option<HashMap<([u8; 16], i32), ErrorCode>>,
+}
+
+/// What [`dispatch`] did with a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Served {
+    /// The response is in `out`.
+    Done,
+    /// Nothing to return yet: run the request again when data arrives, or
+    /// with [`LongPoll::expired`] set once this long has passed.
+    Wait(Duration),
 }
 
 /// Serve one request, writing the response body (no header) into `out`.
@@ -101,6 +125,7 @@ pub(crate) fn supported_versions() -> Vec<(ApiKey, i16)> {
 /// `node_id` is the broker the request arrived at, which is what lets the
 /// handlers detect misrouted requests. `client_id` is the one from the request
 /// header, which the group APIs record and report back.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch(
     api_key: ApiKey,
     api_version: i16,
@@ -108,40 +133,84 @@ pub(crate) fn dispatch(
     node_id: i32,
     client_id: Option<&str>,
     state: &mut ClusterState,
+    poll: &mut LongPoll,
     out: &mut BytesMut,
-) -> Result<()> {
+) -> Result<Served> {
+    match api_key {
+        ApiKey::Fetch => return fetch_inner(body, node_id, state, poll, out, false),
+        ApiKey::ShareFetch => return share_fetch(body, api_version, node_id, state, poll, out),
+        _ => {}
+    }
     match api_key {
         ApiKey::ApiVersions => api_versions(api_version, state, out),
         ApiKey::Metadata => metadata(body, state, out),
-        ApiKey::Produce => produce(body, node_id, state, out),
-        ApiKey::Fetch => fetch(body, node_id, state, out),
-        ApiKey::ListOffsets => list_offsets(body, node_id, state, out),
+        ApiKey::Produce => produce(body, api_version, node_id, state, out),
+        ApiKey::ListOffsets => list_offsets(body, api_version, node_id, state, out),
         ApiKey::FindCoordinator => find_coordinator(body, state, out),
         ApiKey::JoinGroup => join_group(body, node_id, client_id, state, out),
         ApiKey::SyncGroup => sync_group(body, node_id, state, out),
         ApiKey::Heartbeat => heartbeat(body, node_id, state, out),
         ApiKey::LeaveGroup => leave_group(body, node_id, state, out),
-        ApiKey::OffsetCommit => offset_commit(body, node_id, state, out),
+        ApiKey::OffsetCommit => offset_commit(body, api_version, node_id, state, out),
         ApiKey::OffsetFetch => offset_fetch(body, node_id, state, out),
         ApiKey::ConsumerGroupHeartbeat => consumer_group_heartbeat(body, node_id, state, out),
-        ApiKey::InitProducerId => init_producer_id(body, state, out),
-        ApiKey::AddPartitionsToTxn => add_partitions_to_txn(body, node_id, state, out),
-        ApiKey::AddOffsetsToTxn => add_offsets_to_txn(body, node_id, state, out),
+        ApiKey::InitProducerId => init_producer_id(body, api_version, node_id, state, out),
+        ApiKey::AddPartitionsToTxn => add_partitions_to_txn(body, api_version, node_id, state, out),
+        ApiKey::AddOffsetsToTxn => add_offsets_to_txn(body, api_version, node_id, state, out),
         ApiKey::TxnOffsetCommit => txn_offset_commit(body, node_id, state, out),
         ApiKey::EndTxn => end_txn(body, api_version, node_id, state, out),
         ApiKey::CreateTopics => create_topics(body, node_id, state, out),
         ApiKey::DeleteTopics => delete_topics(body, node_id, state, out),
         ApiKey::ShareGroupHeartbeat => share_group_heartbeat(body, node_id, state, out),
-        ApiKey::ShareFetch => share_fetch(body, api_version, node_id, state, out),
         ApiKey::ShareAcknowledge => share_acknowledge(body, api_version, node_id, state, out),
         ApiKey::UpdateFeatures => update_features(body, api_version, node_id, state, out),
         ApiKey::StreamsGroupDescribe => streams_group_describe(body, node_id, state, out),
         ApiKey::DescribeGroups => describe_groups(body, node_id, state, out),
+        ApiKey::GetTelemetrySubscriptions => get_telemetry_subscriptions(body, state, out),
+        ApiKey::PushTelemetry => push_telemetry(body, state, out),
         other => Err(crate::error::KrafkaError::protocol_kind(
             crate::error::ProtocolErrorKind::UnknownApiVersion,
             format!("fake broker has no handler for {other:?}"),
         )),
+    }?;
+    Ok(Served::Done)
+}
+
+/// `SaslHandshake` v1: accept PLAIN.
+pub(crate) fn sasl_handshake(body: &mut Bytes, out: &mut BytesMut) -> Result<()> {
+    let mechanism = KafkaString::decode(body)?.0.unwrap_or_default();
+    if mechanism == "PLAIN" {
+        write_error(out, ErrorCode::None);
+    } else {
+        write_error(out, ErrorCode::UnsupportedSaslMechanism);
     }
+    write_array_len(out, 1)?;
+    write_string(out, "PLAIN")?;
+    Ok(())
+}
+
+/// `SaslAuthenticate` v1 for PLAIN: `\0username\0password` against
+/// `credentials`. Returns whether the connection is now authenticated.
+pub(crate) fn sasl_authenticate(
+    body: &mut Bytes,
+    credentials: &(String, String),
+    out: &mut BytesMut,
+) -> Result<bool> {
+    let auth = crate::protocol::KafkaBytes::decode(body)?
+        .0
+        .unwrap_or_default();
+    let expected = format!("\0{}\0{}", credentials.0, credentials.1);
+    let ok = auth.as_ref() == expected.as_bytes();
+    if ok {
+        write_error(out, ErrorCode::None);
+        (-1i16).encode(out); // null error message
+    } else {
+        write_error(out, ErrorCode::SaslAuthenticationFailed);
+        write_string(out, "Authentication failed: invalid credentials")?;
+    }
+    0i32.encode(out); // empty auth bytes
+    0i64.encode(out); // session_lifetime_ms
+    Ok(ok)
 }
 
 /// Serve one request as a forced failure with `code`.
@@ -263,21 +332,20 @@ pub(crate) fn dispatch_error(
             Ok(())
         }
         ApiKey::ListOffsets => {
-            let req = ListOffsetsReq::read(body)?;
-            out.put_i32(0);
-            write_array_len(out, req.topics.len())?;
-            for topic in &req.topics {
-                write_string(out, &topic.name)?;
-                write_array_len(out, topic.partitions.len())?;
-                for partition in &topic.partitions {
-                    out.put_i32(partition.partition_index);
-                    write_error(out, code);
-                    out.put_i64(-1);
-                    out.put_i64(-1);
-                    out.put_i32(-1);
-                }
-            }
-            Ok(())
+            let req = ListOffsetsReq::read(body, api_version)?;
+            let topics: Vec<(String, Vec<ListOffsetsAnswer>)> = req
+                .topics
+                .iter()
+                .map(|t| {
+                    let answers = t
+                        .partitions
+                        .iter()
+                        .map(|p| ListOffsetsAnswer::error(p.partition_index, code))
+                        .collect();
+                    (t.name.clone(), answers)
+                })
+                .collect();
+            write_list_offsets_response(out, api_version, &topics)
         }
         ApiKey::FindCoordinator => {
             let _ = FindCoordinatorReq::read(body)?;
@@ -312,18 +380,8 @@ pub(crate) fn dispatch_error(
             write_array_len(out, 0)
         }
         ApiKey::OffsetCommit => {
-            let req = OffsetCommitReq::read(body)?;
-            out.put_i32(0);
-            write_array_len(out, req.topics.len())?;
-            for topic in &req.topics {
-                write_string(out, &topic.name)?;
-                write_array_len(out, topic.partitions.len())?;
-                for partition in &topic.partitions {
-                    out.put_i32(partition.partition_index);
-                    write_error(out, code);
-                }
-            }
-            Ok(())
+            let req = OffsetCommitReq::read(body, api_version)?;
+            write_offset_commit_response(out, api_version, &req, code)
         }
         ApiKey::OffsetFetch => {
             let _ = OffsetFetchReq::read(body)?;
@@ -333,12 +391,152 @@ pub(crate) fn dispatch_error(
             Ok(())
         }
         ApiKey::InitProducerId => {
-            let _ = InitProducerIdReq::read(body)?;
+            let _ = InitProducerIdReq::read(body, api_version)?;
+            write_init_producer_id(out, api_version, 0, code, -1, -1, (-1, -1))
+        }
+        ApiKey::AddPartitionsToTxn => {
+            let req = AddPartitionsToTxnReq::read(body)?;
+            let mut by_topic: Vec<(String, Vec<i32>)> = Vec::new();
+            for (topic, partition) in req.partitions {
+                match by_topic.iter_mut().find(|(name, _)| *name == topic) {
+                    Some((_, partitions)) => partitions.push(partition),
+                    None => by_topic.push((topic, vec![partition])),
+                }
+            }
+            out.put_i32(0);
+            write_array_len(out, by_topic.len())?;
+            for (topic, partitions) in &by_topic {
+                write_string(out, topic)?;
+                write_array_len(out, partitions.len())?;
+                for partition in partitions {
+                    out.put_i32(*partition);
+                    write_error(out, code);
+                }
+            }
+            Ok(())
+        }
+        ApiKey::AddOffsetsToTxn => {
+            let _ = AddOffsetsToTxnReq::read(body)?;
             out.put_i32(0);
             write_error(out, code);
-            out.put_i64(-1);
-            out.put_i16(-1);
             Ok(())
+        }
+        ApiKey::TxnOffsetCommit => {
+            let req = TxnOffsetCommitReq::read(body)?;
+            let mut by_topic: Vec<(String, Vec<i32>)> = Vec::new();
+            for offset in req.offsets {
+                match by_topic.iter_mut().find(|(name, _)| *name == offset.topic) {
+                    Some((_, partitions)) => partitions.push(offset.partition),
+                    None => by_topic.push((offset.topic, vec![offset.partition])),
+                }
+            }
+            out.put_i32(0);
+            write_compact_array_len(out, by_topic.len())?;
+            for (topic, partitions) in &by_topic {
+                write_compact_string(out, topic)?;
+                write_compact_array_len(out, partitions.len())?;
+                for partition in partitions {
+                    out.put_i32(*partition);
+                    write_error(out, code);
+                    write_empty_tagged_fields(out)?;
+                }
+                write_empty_tagged_fields(out)?;
+            }
+            write_empty_tagged_fields(out)
+        }
+        ApiKey::EndTxn => {
+            let _ = EndTxnReq::read(body)?;
+            out.put_i32(0);
+            write_error(out, code);
+            if api_version >= 5 {
+                out.put_i64(-1);
+                out.put_i16(-1);
+            }
+            write_empty_tagged_fields(out)
+        }
+        // Session and request errors are top-level; partition and
+        // acknowledgement errors go on every requested partition.
+        ApiKey::ShareFetch => {
+            let req = ShareFetchReq::read(body, api_version)?;
+            if !share_partition_scoped(code) {
+                return write_share_fetch_error(out, code, "injected by the fake broker");
+            }
+            let (error, ack_error) = if code == ErrorCode::InvalidRecordState {
+                (ErrorCode::None, code)
+            } else {
+                (code, ErrorCode::None)
+            };
+            out.put_i32(0);
+            write_error(out, ErrorCode::None);
+            write_compact_nullable_string(out, None)?;
+            out.put_i32(ACQUISITION_LOCK_TIMEOUT_MS);
+            write_share_partitions(out, &req.topics, |out, partition| {
+                write_share_fetch_partition(out, partition, error, ack_error, -1, -1, None, &[])
+            })?;
+            write_compact_array_len(out, 0)?;
+            write_empty_tagged_fields(out)
+        }
+        ApiKey::ShareAcknowledge => {
+            let req = ShareAcknowledgeReq::read(body, api_version)?;
+            if !share_partition_scoped(code) {
+                return write_share_acknowledge_error(
+                    out,
+                    api_version,
+                    code,
+                    "injected by the fake broker",
+                );
+            }
+            out.put_i32(0);
+            write_error(out, ErrorCode::None);
+            write_compact_nullable_string(out, None)?;
+            if api_version >= 2 {
+                out.put_i32(ACQUISITION_LOCK_TIMEOUT_MS);
+            }
+            write_share_partitions(out, &req.topics, |out, partition| {
+                out.put_i32(partition);
+                write_error(out, code);
+                write_compact_nullable_string(out, None)?;
+                out.put_i32(-1);
+                out.put_i32(-1);
+                write_empty_tagged_fields(out)?;
+                write_empty_tagged_fields(out)
+            })?;
+            write_compact_array_len(out, 0)?;
+            write_empty_tagged_fields(out)
+        }
+        ApiKey::UpdateFeatures => {
+            let req = UpdateFeaturesReq::read(body, api_version)?;
+            out.put_i32(0);
+            write_error(out, code);
+            write_compact_nullable_string(out, Some("injected by the fake broker"))?;
+            if api_version < 2 {
+                write_compact_array_len(out, req.feature_updates.len())?;
+                for update in &req.feature_updates {
+                    write_compact_string(out, &update.feature)?;
+                    write_error(out, code);
+                    write_compact_nullable_string(out, None)?;
+                    write_empty_tagged_fields(out)?;
+                }
+            }
+            write_empty_tagged_fields(out)
+        }
+        ApiKey::StreamsGroupDescribe => {
+            let req = StreamsGroupDescribeReq::read(body)?;
+            out.put_i32(0);
+            write_compact_array_len(out, req.group_ids.len())?;
+            for group_id in &req.group_ids {
+                write_error(out, code);
+                write_compact_nullable_string(out, None)?;
+                write_compact_string(out, group_id)?;
+                write_compact_string(out, "")?;
+                out.put_i32(0);
+                out.put_i32(0);
+                write_presence(out, false);
+                write_compact_array_len(out, 0)?;
+                out.put_i32(i32::MIN);
+                write_empty_tagged_fields(out)?;
+            }
+            write_empty_tagged_fields(out)
         }
         ApiKey::CreateTopics => {
             let req = CreateTopicsReq::read(body)?;
@@ -376,6 +574,23 @@ pub(crate) fn dispatch_error(
             }
             Ok(())
         }
+        ApiKey::GetTelemetrySubscriptions => {
+            out.put_i32(0); // throttle_time_ms
+            write_error(out, code);
+            out.put_slice(&[0; 16]); // client_instance_id
+            out.put_i32(0); // subscription_id
+            write_compact_array_len(out, 0)?; // accepted_compression_types
+            out.put_i32(0); // push_interval_ms
+            out.put_i32(0); // telemetry_max_bytes
+            out.put_u8(0); // delta_temporality
+            write_compact_array_len(out, 0)?; // requested_metrics
+            write_empty_tagged_fields(out)
+        }
+        ApiKey::PushTelemetry => {
+            out.put_i32(0); // throttle_time_ms
+            write_error(out, code);
+            write_empty_tagged_fields(out)
+        }
         other => Err(crate::error::KrafkaError::protocol_kind(
             crate::error::ProtocolErrorKind::UnknownApiVersion,
             format!("fake broker cannot synthesize an error for {other:?}"),
@@ -384,14 +599,97 @@ pub(crate) fn dispatch_error(
 }
 
 // ---------------------------------------------------------------------------
+// KIP-714 client telemetry
+// ---------------------------------------------------------------------------
+
+fn read_uuid(body: &mut Bytes) -> Result<[u8; 16]> {
+    if body.len() < 16 {
+        return Err(crate::error::KrafkaError::protocol_kind(
+            crate::error::ProtocolErrorKind::TruncatedFrame,
+            "uuid",
+        ));
+    }
+    let mut id = [0; 16];
+    id.copy_from_slice(&body.split_to(16));
+    Ok(id)
+}
+
+/// `GetTelemetrySubscriptions` v0: hand out the cluster's subscription,
+/// assigning the configured instance id to a client that asks with zero.
+fn get_telemetry_subscriptions(
+    body: &mut Bytes,
+    state: &ClusterState,
+    out: &mut BytesMut,
+) -> Result<()> {
+    let requested_id = read_uuid(body)?;
+    skip_tagged_fields(body)?;
+    let Some(subscription) = &state.telemetry else {
+        return dispatch_error(
+            ApiKey::GetTelemetrySubscriptions,
+            0,
+            body,
+            ErrorCode::UnsupportedVersion,
+            out,
+        );
+    };
+    out.put_i32(0); // throttle_time_ms
+    write_error(out, ErrorCode::None);
+    if requested_id == [0; 16] {
+        out.put_slice(&subscription.client_instance_id);
+    } else {
+        out.put_slice(&requested_id);
+    }
+    out.put_i32(subscription.subscription_id);
+    write_compact_array_len(out, subscription.accepted_compression_types.len())?;
+    for codec in &subscription.accepted_compression_types {
+        codec.encode(out);
+    }
+    out.put_i32(i32::try_from(subscription.push_interval.as_millis()).unwrap_or(i32::MAX));
+    out.put_i32(1024 * 1024); // telemetry_max_bytes
+    out.put_u8(u8::from(subscription.delta_temporality));
+    write_compact_array_len(out, subscription.requested_metrics.len())?;
+    for name in &subscription.requested_metrics {
+        write_compact_string(out, name)?;
+    }
+    write_empty_tagged_fields(out)
+}
+
+/// `PushTelemetry` v0: record the push; refuse one naming another
+/// subscription.
+fn push_telemetry(body: &mut Bytes, state: &mut ClusterState, out: &mut BytesMut) -> Result<()> {
+    let client_instance_id = read_uuid(body)?;
+    let subscription_id = i32::decode(body)?;
+    let terminating = bool::decode(body)?;
+    let compression_type = i8::decode(body)?;
+    let metrics = read_compact_nullable_bytes(body)?.unwrap_or_default();
+    skip_tagged_fields(body)?;
+    let code = match &state.telemetry {
+        Some(subscription) if subscription.subscription_id == subscription_id => {
+            state.telemetry_pushes.push(super::TelemetryPush {
+                client_instance_id,
+                subscription_id,
+                terminating,
+                compression_type,
+                metrics,
+            });
+            ErrorCode::None
+        }
+        _ => ErrorCode::UnknownSubscriptionId,
+    };
+    out.put_i32(0); // throttle_time_ms
+    write_error(out, code);
+    write_empty_tagged_fields(out)
+}
+
+// ---------------------------------------------------------------------------
 // ApiVersions
 // ---------------------------------------------------------------------------
 
 /// Range of `ApiVersions` versions the fake broker itself speaks.
 ///
-/// Every other entry in [`supported_versions`] pins `min == max`, because the
-/// client negotiates those against this response. `ApiVersions` cannot work
-/// that way — it *is* the negotiation — so the client probes with its ceiling
+/// Every other entry in [`supported_versions`] is negotiated against this
+/// response. `ApiVersions` cannot work that way — it *is* the negotiation —
+/// so the client probes with its ceiling
 /// and falls back on `UNSUPPORTED_VERSION`. Advertising a genuine range here is
 /// what lets the fake broker exercise both outcomes.
 ///
@@ -416,7 +714,22 @@ fn api_versions(request_version: i16, state: &ClusterState, out: &mut BytesMut) 
     }
 
     let flexible = request_version >= 3;
-    let versions = supported_versions();
+    let mut versions = supported_versions();
+    if state.telemetry.is_some() {
+        versions.push((ApiKey::GetTelemetrySubscriptions, 0, 0));
+        versions.push((ApiKey::PushTelemetry, 0, 0));
+    }
+    if state.sasl_plain.is_some() {
+        versions.push((ApiKey::SaslHandshake, 1, 1));
+        versions.push((ApiKey::SaslAuthenticate, 1, 1));
+    }
+    // An override for an API with no handler is still advertised, so a test
+    // can observe where the client routes a request this broker cannot serve.
+    for (&api_key, &(lo, hi)) in &state.api_version_overrides {
+        if !versions.iter().any(|(k, _, _)| *k == api_key) {
+            versions.push((api_key, lo, hi));
+        }
+    }
 
     write_error(out, ErrorCode::None);
     if flexible {
@@ -424,13 +737,13 @@ fn api_versions(request_version: i16, state: &ClusterState, out: &mut BytesMut) 
     } else {
         write_array_len(out, versions.len())?;
     }
-    for (api_key, version) in versions {
+    for (api_key, min, max) in versions {
         let (lo, hi) = if let Some(&range) = state.api_version_overrides.get(&api_key) {
             range
         } else if api_key == ApiKey::ApiVersions {
             (min_version, max_version)
         } else {
-            (version, version)
+            (min, max)
         };
         api_key.to_i16().encode(out);
         lo.encode(out);
@@ -451,12 +764,10 @@ fn api_versions(request_version: i16, state: &ClusterState, out: &mut BytesMut) 
 
 /// Write the KIP-584 feature tagged fields of an `ApiVersions` v3+ response.
 ///
-/// A cluster with no finalized features writes an empty section, which is the
-/// case a client must tolerate and the one this broker used to model
-/// unconditionally. Once `UpdateFeatures` has finalized something, the fields
-/// are emitted — which is what lets `AdminClient::describe_features()` be
-/// tested against what `update_features()` actually applied, rather than each
-/// being asserted in isolation.
+/// A cluster with no finalized features writes an empty section. Once
+/// `UpdateFeatures` has finalized something, the fields are emitted, so
+/// `AdminClient::describe_features()` can be tested against what
+/// `update_features()` applied.
 fn write_feature_tagged_fields(state: &ClusterState, out: &mut BytesMut) -> Result<()> {
     if state.finalized_features.is_empty() {
         return write_empty_tagged_fields(out);
@@ -615,6 +926,7 @@ fn write_compact_i32_array(out: &mut BytesMut, values: &[i32]) -> Result<()> {
 
 fn produce(
     body: &mut Bytes,
+    api_version: i16,
     node_id: i32,
     state: &mut ClusterState,
     out: &mut BytesMut,
@@ -661,44 +973,18 @@ fn produce(
                     )?;
                 }
                 Some(_) => {
-                    // A transactional write pins the partition's last stable
-                    // offset at the transaction's first record, so a
-                    // `read_committed` consumer cannot see it before the
-                    // commit marker lands. Under TV2 (KIP-890) this is also
-                    // how the partition joins the transaction at all — there
-                    // is no `AddPartitionsToTxn`.
-                    let txn_producer = req.transactional_id.as_ref().and_then(|id| {
-                        state
-                            .transactions
-                            .get(id)
-                            .map(|t| (id.clone(), t.producer_id))
-                    });
-                    let (base_offset, log_start_offset) = match (
-                        &partition.records,
-                        state.partition_mut(&topic.name, partition.index),
-                    ) {
-                        (Some(records), Some(p)) => {
-                            if txn_producer.is_some() && p.pending_txn_first_offset.is_none() {
-                                p.pending_txn_first_offset = Some(p.next_offset);
-                            }
-                            (p.append(records), p.log_start_offset)
-                        }
-                        (None, Some(p)) => (p.next_offset, p.log_start_offset),
-                        _ => (-1, -1),
-                    };
-                    if let Some((transactional_id, _)) = txn_producer
-                        && let Some(txn) = state.transactions.get_mut(&transactional_id)
-                    {
-                        txn.open = true;
-                        let entry = (topic.name.clone(), partition.index);
-                        if !txn.partitions.contains(&entry) {
-                            txn.partitions.push(entry);
-                        }
-                    }
+                    let (code, base_offset, log_start_offset) = append_produce_partition(
+                        state,
+                        api_version,
+                        req.transactional_id.as_deref(),
+                        &topic.name,
+                        partition.index,
+                        partition.records.as_ref(),
+                    );
                     write_produce_partition(
                         out,
                         partition.index,
-                        ErrorCode::None,
+                        code,
                         base_offset,
                         log_start_offset,
                         None,
@@ -708,8 +994,169 @@ fn produce(
         }
         write_empty_tagged_fields(out)?; // topic tagged fields
     }
-    out.put_i32(0); // throttle_time_ms
+    out.put_i32(state.throttle(ApiKey::Produce));
     write_produce_node_endpoints(out, &hinted_leaders, state)
+}
+
+/// Append one partition's batch on its leader, returning
+/// `(error, base_offset, log_start_offset)`.
+///
+/// A batch from a producer with an ID runs the checks a Kafka leader runs
+/// before it writes (`ProducerAppendInfo` and the transaction verification of
+/// KIP-890):
+///
+/// 1. A transactional batch must come from the producer ID and epoch the
+///    transaction coordinator holds (`INVALID_PRODUCER_ID_MAPPING`,
+///    `INVALID_PRODUCER_EPOCH`), and its partition must be in the
+///    transaction: at `Produce` v12 (TV2) the write adds it, below v12 (TV1)
+///    `AddPartitionsToTxn` must have (`INVALID_TXN_STATE`).
+/// 2. A non-transactional batch from a producer with an open transaction on
+///    this partition is `INVALID_TXN_STATE`.
+/// 3. The sequence and epoch checks of [`PartitionState::check_sequence`]: a
+///    duplicate is acknowledged at the offset it was first written at,
+///    without writing it again.
+///
+/// [`PartitionState::check_sequence`]: super::state::PartitionState
+fn append_produce_partition(
+    state: &mut ClusterState,
+    api_version: i16,
+    transactional_id: Option<&str>,
+    topic: &str,
+    partition: i32,
+    records: Option<&Bytes>,
+) -> (ErrorCode, i64, i64) {
+    let Some(records) = records else {
+        let (next, start) = state
+            .partition(topic, partition)
+            .map_or((-1, -1), |p| (p.next_offset, p.log_start_offset));
+        return (ErrorCode::None, next, start);
+    };
+    let producer = batch_producer(records).filter(|b| b.producer_id >= 0);
+
+    // Without producer state checks, a transactional write still joins its
+    // transaction by transactional ID.
+    let Some(producer) = producer.filter(|_| state.idempotence) else {
+        let txn_id = transactional_id
+            .filter(|id| state.transactions.contains_key(*id))
+            .map(str::to_string);
+        let Some(p) = state.partition_mut(topic, partition) else {
+            return (ErrorCode::UnknownTopicOrPartition, -1, -1);
+        };
+        let base_offset = p.append(records);
+        if txn_id.is_some() {
+            let producer_id = producer.map_or(-1, |b| b.producer_id);
+            p.open_transactions
+                .entry(producer_id)
+                .or_insert(base_offset);
+        }
+        let log_start_offset = p.log_start_offset;
+        if let Some(id) = txn_id
+            && let Some(txn) = state.transactions.get_mut(&id)
+        {
+            txn.begin();
+            let entry = (topic.to_string(), partition);
+            if !txn.partitions.contains(&entry) {
+                txn.partitions.push(entry);
+            }
+        }
+        return (ErrorCode::None, base_offset, log_start_offset);
+    };
+
+    // A rejection still reports the log start, as a Kafka leader does: it is
+    // how a producer tells retention from loss on UNKNOWN_PRODUCER_ID.
+    let log_start_offset = state
+        .partition(topic, partition)
+        .map_or(-1, |p| p.log_start_offset);
+    let reject = |code: ErrorCode| (code, -1, log_start_offset);
+
+    // 1. The coordinator's view of a transactional write.
+    let mut joins_transaction: Option<String> = None;
+    if producer.transactional {
+        let txn_id = transactional_id
+            .map(str::to_string)
+            .or_else(|| state.transaction_for_producer(producer.producer_id));
+        let Some((txn_id, txn)) = txn_id.and_then(|id| {
+            let txn = state.transactions.get(&id)?.clone();
+            Some((id, txn))
+        }) else {
+            return reject(ErrorCode::InvalidProducerIdMapping);
+        };
+        if txn.producer_id != producer.producer_id {
+            return reject(ErrorCode::InvalidProducerIdMapping);
+        }
+        if txn.producer_epoch != producer.producer_epoch {
+            return reject(ErrorCode::InvalidProducerEpoch);
+        }
+        if matches!(
+            txn.status,
+            TxnStatus::PrepareCommit | TxnStatus::PrepareAbort
+        ) {
+            return reject(ErrorCode::ConcurrentTransactions);
+        }
+        let registered = txn.is_open()
+            && txn
+                .partitions
+                .iter()
+                .any(|(t, p)| t == topic && *p == partition);
+        if !registered {
+            if api_version < 12 {
+                return reject(ErrorCode::InvalidTxnState);
+            }
+            joins_transaction = Some(txn_id);
+        }
+    }
+
+    let pre_kip360 = state.pre_kip360();
+    let Some(p) = state.partition_mut(topic, partition) else {
+        return reject(ErrorCode::UnknownTopicOrPartition);
+    };
+
+    // 2. An idempotent write cannot interleave with the same producer's open
+    // transaction.
+    if !producer.transactional && p.open_transactions.contains_key(&producer.producer_id) {
+        return reject(ErrorCode::InvalidTxnState);
+    }
+
+    // 3. Producer state.
+    match p.check_sequence(
+        producer.producer_id,
+        producer.producer_epoch,
+        producer.base_sequence,
+        producer.record_count,
+        pre_kip360,
+    ) {
+        SequenceCheck::Reject(code) => return reject(code),
+        SequenceCheck::Duplicate(base_offset) => {
+            return (ErrorCode::None, base_offset, p.log_start_offset);
+        }
+        SequenceCheck::Append => {}
+    }
+
+    let base_offset = p.append(records);
+    p.record_batch(
+        producer.producer_id,
+        producer.producer_epoch,
+        producer.base_sequence,
+        producer.record_count,
+        base_offset,
+    );
+    if producer.transactional {
+        p.open_transactions
+            .entry(producer.producer_id)
+            .or_insert(base_offset);
+    }
+    let log_start_offset = p.log_start_offset;
+
+    if let Some(txn_id) = joins_transaction
+        && let Some(txn) = state.transactions.get_mut(&txn_id)
+    {
+        txn.begin();
+        let entry = (topic.to_string(), partition);
+        if !txn.partitions.contains(&entry) {
+            txn.partitions.push(entry);
+        }
+    }
+    (ErrorCode::None, base_offset, log_start_offset)
 }
 
 /// Write the top-level `NodeEndpoints` tagged field for every leader this
@@ -782,7 +1229,13 @@ pub(crate) fn dispatch_corrupt(
     out: &mut BytesMut,
 ) -> Result<()> {
     match api_key {
-        ApiKey::Fetch => fetch_inner(body, node_id, state, out, true),
+        ApiKey::Fetch => {
+            let mut poll = LongPoll {
+                expired: true,
+                ..LongPoll::default()
+            };
+            fetch_inner(body, node_id, state, &mut poll, out, true).map(|_| ())
+        }
         other => Err(crate::error::KrafkaError::protocol_kind(
             crate::error::ProtocolErrorKind::UnknownApiVersion,
             format!(
@@ -813,116 +1266,110 @@ fn corrupt_record_bytes(records: &Bytes) -> Bytes {
     Bytes::from(bytes)
 }
 
-fn fetch(
-    body: &mut Bytes,
-    node_id: i32,
-    state: &mut ClusterState,
-    out: &mut BytesMut,
-) -> Result<()> {
-    fetch_inner(body, node_id, state, out, false)
-}
-
+/// Serve a `Fetch` v11.
+///
+/// Long-polls as a broker does: with no partition in error and fewer than
+/// `min_bytes` (at least one byte) of records to return, the request is held
+/// for up to `max_wait_ms` and answered as soon as an append brings enough
+/// data, or empty when the wait runs out.
 fn fetch_inner(
     body: &mut Bytes,
     node_id: i32,
     state: &mut ClusterState,
+    poll: &mut LongPoll,
     out: &mut BytesMut,
     corrupt: bool,
-) -> Result<()> {
+) -> Result<Served> {
     let req = FetchReq::read(body)?;
 
-    out.put_i32(0); // throttle_time_ms
+    out.put_i32(state.throttle(ApiKey::Fetch));
     write_error(out, ErrorCode::None);
     out.put_i32(req.session_id);
 
+    let mut record_bytes = 0usize;
+    let mut any_error = false;
     write_array_len(out, req.topics.len())?;
     for topic in &req.topics {
         write_string(out, &topic.topic)?;
         write_array_len(out, topic.partitions.len())?;
         for partition in &topic.partitions {
-            match state.partition(&topic.topic, partition.partition) {
-                None => write_fetch_partition(
-                    out,
-                    partition.partition,
-                    ErrorCode::UnknownTopicOrPartition,
-                    0,
-                    0,
-                    None,
-                )?,
-                Some(p) if p.leader != node_id => write_fetch_partition(
-                    out,
-                    partition.partition,
-                    ErrorCode::NotLeaderForPartition,
-                    p.next_offset,
-                    p.log_start_offset,
-                    None,
-                )?,
-                // A client whose leader epoch is behind the broker's has missed a
-                // leadership change; a client ahead of the broker is talking to a
-                // stale replica. Both are reported so the truncation-detection
-                // path in the consumer is reachable without a real cluster.
+            let p = state.partition(&topic.topic, partition.partition);
+            let error = match p {
+                None => Some(ErrorCode::UnknownTopicOrPartition),
+                Some(p) if p.leader != node_id => Some(ErrorCode::NotLeaderForPartition),
+                // A client whose leader epoch is behind the broker's has
+                // missed a leadership change; a client ahead of the broker is
+                // talking to a stale replica. Both are reported so the
+                // truncation-detection path in the consumer is reachable
+                // without a real cluster.
                 Some(p)
                     if partition.current_leader_epoch >= 0
                         && partition.current_leader_epoch != p.leader_epoch =>
                 {
-                    let code = if partition.current_leader_epoch < p.leader_epoch {
+                    Some(if partition.current_leader_epoch < p.leader_epoch {
                         ErrorCode::FencedLeaderEpoch
                     } else {
                         ErrorCode::UnknownLeaderEpoch
-                    };
-                    write_fetch_partition(
-                        out,
-                        partition.partition,
-                        code,
-                        p.next_offset,
-                        p.log_start_offset,
-                        None,
-                    )?;
+                    })
                 }
-                Some(p) if partition.fetch_offset > p.next_offset => write_fetch_partition(
+                Some(p) if partition.fetch_offset > p.next_offset => {
+                    Some(ErrorCode::OffsetOutOfRange)
+                }
+                Some(_) => None,
+            };
+            let Some(p) = p.filter(|_| error.is_none()) else {
+                any_error = true;
+                let (high_watermark, log_start_offset) =
+                    p.map_or((0, 0), |p| (p.next_offset, p.log_start_offset));
+                write_fetch_partition(
                     out,
                     partition.partition,
-                    ErrorCode::OffsetOutOfRange,
-                    p.next_offset,
-                    p.log_start_offset,
+                    error.unwrap_or(ErrorCode::UnknownServerError),
+                    high_watermark,
+                    log_start_offset,
                     None,
-                )?,
-                Some(p) => {
-                    // `read_committed` (isolation_level 1) stops at the last
-                    // stable offset and reports the aborted transactions the
-                    // client must filter. `read_uncommitted` sees everything,
-                    // including records inside an open transaction.
-                    let read_committed = req.isolation_level == 1;
-                    let records = if read_committed {
-                        p.read_range(partition.fetch_offset, p.last_stable_offset())
-                    } else {
-                        p.read_from(partition.fetch_offset)
-                    };
-                    let records = if corrupt {
-                        corrupt_record_bytes(&records)
-                    } else {
-                        records
-                    };
-                    let aborted = if read_committed {
-                        p.aborted_transactions_from(partition.fetch_offset)
-                    } else {
-                        Vec::new()
-                    };
-                    write_fetch_partition_with_aborted(
-                        out,
-                        partition.partition,
-                        ErrorCode::None,
-                        p.next_offset,
-                        p.last_stable_offset(),
-                        p.log_start_offset,
-                        &aborted,
-                        Some(&records),
-                    )?;
-                }
-            }
+                )?;
+                continue;
+            };
+            // `read_committed` (isolation_level 1) stops at the last stable
+            // offset and reports the aborted transactions the client must
+            // filter. `read_uncommitted` sees everything, including records
+            // inside an open transaction.
+            let read_committed = req.isolation_level == 1;
+            let records = if read_committed {
+                p.read_range(partition.fetch_offset, p.last_stable_offset())
+            } else {
+                p.read_from(partition.fetch_offset)
+            };
+            record_bytes += records.len();
+            let records = if corrupt {
+                corrupt_record_bytes(&records)
+            } else {
+                records
+            };
+            let aborted = if read_committed {
+                p.aborted_transactions_from(partition.fetch_offset)
+            } else {
+                Vec::new()
+            };
+            write_fetch_partition_with_aborted(
+                out,
+                partition.partition,
+                ErrorCode::None,
+                p.next_offset,
+                p.last_stable_offset(),
+                p.log_start_offset,
+                &aborted,
+                Some(&records),
+            )?;
         }
     }
-    Ok(())
+
+    let min_bytes = usize::try_from(req.min_bytes.max(1)).unwrap_or(1);
+    if !poll.expired && !any_error && req.max_wait_ms > 0 && record_bytes < min_bytes {
+        return Ok(Served::Wait(Duration::from_millis(req.max_wait_ms as u64)));
+    }
+    Ok(Served::Done)
 }
 
 fn write_fetch_partition(
@@ -985,6 +1432,11 @@ fn write_fetch_partition_with_aborted(
 /// task to tick, long enough not to saturate the loopback listener.
 pub(crate) const HEARTBEAT_INTERVAL_MS: i32 = 1_000;
 
+/// How long a KIP-848 member may go without a heartbeat before the
+/// coordinator removes it (Kafka's `group.consumer.session.timeout.ms`
+/// default).
+const CONSUMER_SESSION_TIMEOUT: Duration = Duration::from_secs(45);
+
 /// Acquisition-lock timeout reported in `ShareFetch` responses.
 ///
 /// The fake broker never expires a lock — a record stays acquired until the
@@ -1025,6 +1477,32 @@ fn consumer_group_heartbeat(
     if state.group_coordinator(&req.group_id) != node_id {
         return write_heartbeat_error(out, ErrorCode::NotCoordinator, None, 0);
     }
+    state
+        .consumer_group_heartbeats
+        .push(ConsumerGroupHeartbeatSeen {
+            group_id: req.group_id.clone(),
+            member_id: req.member_id.clone(),
+            member_epoch: req.member_epoch,
+            instance_id: req.instance_id.clone(),
+            server_assignor: req.server_assignor.clone(),
+            full: req.subscribed_topic_names.is_some(),
+        });
+
+    // Members whose session expired leave the group, and their partitions
+    // become assignable. Expiry is applied when a heartbeat reaches the group.
+    let now = tokio::time::Instant::now();
+    if let Some(group) = state.groups.get_mut(&req.group_id) {
+        let before = group.consumer_members.len();
+        group.consumer_members.retain(|id, member| {
+            *id == req.member_id
+                || member
+                    .last_heartbeat
+                    .is_none_or(|at| now.duration_since(at) < CONSUMER_SESSION_TIMEOUT)
+        });
+        if group.consumer_members.len() != before {
+            group.group_epoch += 1;
+        }
+    }
 
     // Leave (-1) and static temporary leave (-2) are heartbeats, not an API.
     if req.member_epoch < 0 {
@@ -1040,6 +1518,13 @@ fn consumer_group_heartbeat(
         out.put_i32(HEARTBEAT_INTERVAL_MS);
         write_heartbeat_assignment(out, None)?;
         return write_empty_tagged_fields(out);
+    }
+
+    // The assignors an Apache Kafka coordinator ships with.
+    if let Some(assignor) = req.server_assignor.as_deref()
+        && !matches!(assignor, "uniform" | "range")
+    {
+        return write_heartbeat_error(out, ErrorCode::UnsupportedAssignor, Some(&req.member_id), 0);
     }
 
     // Snapshot the topic layout before taking a mutable borrow of the group.
@@ -1112,6 +1597,7 @@ fn consumer_group_heartbeat(
             .or_default();
         member.instance_id = req.instance_id.clone();
         member.subscribed_topics = subscribed.clone();
+        member.last_heartbeat = Some(now);
         if let Some(owned) = reported_owned {
             member.owned = owned;
         }
@@ -1367,31 +1853,29 @@ const TIMESTAMP_LATEST: i64 = -1;
 
 fn list_offsets(
     body: &mut Bytes,
+    api_version: i16,
     node_id: i32,
     state: &mut ClusterState,
     out: &mut BytesMut,
 ) -> Result<()> {
-    let req = ListOffsetsReq::read(body)?;
+    let req = ListOffsetsReq::read(body, api_version)?;
 
-    out.put_i32(0); // throttle_time_ms
-    write_array_len(out, req.topics.len())?;
+    let mut topics: Vec<(String, Vec<ListOffsetsAnswer>)> = Vec::with_capacity(req.topics.len());
     for topic in &req.topics {
-        write_string(out, &topic.name)?;
-        write_array_len(out, topic.partitions.len())?;
+        let mut answers = Vec::with_capacity(topic.partitions.len());
         for partition in &topic.partitions {
-            out.put_i32(partition.partition_index);
-            match state.partition(&topic.name, partition.partition_index) {
-                None => {
-                    write_error(out, ErrorCode::UnknownTopicOrPartition);
-                    out.put_i64(-1);
-                    out.put_i64(-1);
-                    out.put_i32(-1);
-                }
+            state.list_offsets_lookups.push(ListOffsetsLookup {
+                node_id,
+                api_version,
+                topic: topic.name.clone(),
+                partition: partition.partition_index,
+                timestamp: partition.timestamp,
+            });
+            let index = partition.partition_index;
+            answers.push(match state.partition(&topic.name, index) {
+                None => ListOffsetsAnswer::error(index, ErrorCode::UnknownTopicOrPartition),
                 Some(p) if p.leader != node_id => {
-                    write_error(out, ErrorCode::NotLeaderForPartition);
-                    out.put_i64(-1);
-                    out.put_i64(-1);
-                    out.put_i32(-1);
+                    ListOffsetsAnswer::error(index, ErrorCode::NotLeaderForPartition)
                 }
                 // Same epoch fencing the Fetch handler applies: a client whose
                 // leader epoch disagrees with the broker's is working from a
@@ -1406,28 +1890,63 @@ fn list_offsets(
                     } else {
                         ErrorCode::UnknownLeaderEpoch
                     };
-                    write_error(out, code);
-                    out.put_i64(-1);
-                    out.put_i64(-1);
-                    out.put_i32(-1);
+                    ListOffsetsAnswer::error(index, code)
                 }
                 Some(p) => {
-                    // The fake log has no per-record timestamps to search, so a
-                    // timestamp lookup resolves to the earliest retained offset.
-                    let offset = match partition.timestamp {
-                        TIMESTAMP_LATEST => p.next_offset,
-                        TIMESTAMP_EARLIEST => p.log_start_offset,
-                        _ => p.log_start_offset,
+                    // "Latest" is the high watermark for `read_uncommitted`
+                    // and the last stable offset for `read_committed`. A
+                    // timestamp resolves to the first record at or after it,
+                    // or to offset -1 when there is none, as Kafka answers.
+                    // The other sentinels (tiered storage, max timestamp)
+                    // resolve to the log start: the fake log has no remote
+                    // tier.
+                    let (timestamp, offset) = match partition.timestamp {
+                        TIMESTAMP_LATEST if req.isolation_level == 1 => {
+                            (-1, p.last_stable_offset())
+                        }
+                        TIMESTAMP_LATEST => (-1, p.next_offset),
+                        TIMESTAMP_EARLIEST => (-1, p.log_start_offset),
+                        ts if ts >= 0 => first_at_or_after(p, ts)?.unwrap_or((-1, -1)),
+                        _ => (-1, p.log_start_offset),
                     };
-                    write_error(out, ErrorCode::None);
-                    out.put_i64(-1); // timestamp
-                    out.put_i64(offset);
-                    out.put_i32(p.leader_epoch);
+                    ListOffsetsAnswer {
+                        partition_index: index,
+                        error_code: ErrorCode::None,
+                        timestamp,
+                        offset,
+                        leader_epoch: p.leader_epoch,
+                    }
                 }
+            });
+        }
+        topics.push((topic.name.clone(), answers));
+    }
+    write_list_offsets_response(out, api_version, &topics)
+}
+
+/// The `(timestamp, offset)` of the first data record at or after
+/// `timestamp` in a partition's retained log.
+fn first_at_or_after(
+    partition: &super::state::PartitionState,
+    timestamp: i64,
+) -> Result<Option<(i64, i64)>> {
+    for stored in &partition.log {
+        let mut buf = stored.clone();
+        let batch = crate::protocol::RecordBatch::decode(&mut buf)?;
+        if batch.attributes.is_control_batch || batch.max_timestamp < timestamp {
+            continue;
+        }
+        for record in &batch.records {
+            let offset = batch
+                .base_offset
+                .saturating_add(i64::from(record.offset_delta));
+            let record_timestamp = batch.base_timestamp.saturating_add(record.timestamp_delta);
+            if offset >= partition.log_start_offset && record_timestamp >= timestamp {
+                return Ok(Some((record_timestamp, offset)));
             }
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 // ---------------------------------------------------------------------------
@@ -1713,6 +2232,13 @@ fn leave_group(
         return write_array_len(out, 0);
     }
 
+    for (member_id, instance) in &req.members {
+        state.leave_group_members.push(LeaveGroupMemberSeen {
+            group_id: req.group_id.clone(),
+            member_id: member_id.clone(),
+            group_instance_id: instance.clone(),
+        });
+    }
     if let Some(group) = state.groups.get_mut(&req.group_id) {
         group
             .members
@@ -1738,19 +2264,42 @@ fn leave_group(
 // Offsets
 // ---------------------------------------------------------------------------
 
+/// Serve `OffsetCommit` v7–v9.
+///
+/// A group with KIP-848 members validates the commit as Kafka's consumer
+/// group does: a commit without a member and epoch passes only while the
+/// group is empty, the member must be known (`UNKNOWN_MEMBER_ID`), must commit
+/// at v9 or later (`UNSUPPORTED_VERSION`), and must send its current member
+/// epoch (`STALE_MEMBER_EPOCH` below it, `FENCED_MEMBER_EPOCH` above it).
+/// Any other group validates the classic generation and member ID.
 fn offset_commit(
     body: &mut Bytes,
+    api_version: i16,
     node_id: i32,
     state: &mut ClusterState,
     out: &mut BytesMut,
 ) -> Result<()> {
-    let req = OffsetCommitReq::read(body)?;
+    let req = OffsetCommitReq::read(body, api_version)?;
 
     // A commit is rejected if it is misrouted, or if the member has been
     // rebalanced out from under it. Both make the client re-join rather than
     // silently committing against a stale generation.
     let rejection = coordinator_check(state, &req.group_id, node_id).or_else(|| {
         let group = state.groups.get(&req.group_id)?;
+        if !group.consumer_members.is_empty() {
+            let Some(member) = group.consumer_members.get(&req.member_id) else {
+                return Some(ErrorCode::UnknownMemberId);
+            };
+            return if api_version < 9 {
+                Some(ErrorCode::UnsupportedVersion)
+            } else if req.generation_id < member.member_epoch {
+                Some(ErrorCode::StaleMemberEpoch)
+            } else if req.generation_id > member.member_epoch {
+                Some(ErrorCode::FencedMemberEpoch)
+            } else {
+                None
+            };
+        }
         // `generation_id == -1` is how a consumer with no group commits.
         if req.generation_id >= 0 && group.generation_id != req.generation_id {
             Some(ErrorCode::IllegalGeneration)
@@ -1779,17 +2328,42 @@ fn offset_commit(
         }
     }
 
+    write_offset_commit_response(out, api_version, &req, rejection.unwrap_or(ErrorCode::None))
+}
+
+/// One `code` for every partition of `req`, in the v7 or the flexible v8–v9
+/// layout.
+fn write_offset_commit_response(
+    out: &mut BytesMut,
+    api_version: i16,
+    req: &OffsetCommitReq,
+    code: ErrorCode,
+) -> Result<()> {
     out.put_i32(0); // throttle_time_ms
-    write_array_len(out, req.topics.len())?;
+    if api_version < 8 {
+        write_array_len(out, req.topics.len())?;
+        for topic in &req.topics {
+            write_string(out, &topic.name)?;
+            write_array_len(out, topic.partitions.len())?;
+            for partition in &topic.partitions {
+                out.put_i32(partition.partition_index);
+                write_error(out, code);
+            }
+        }
+        return Ok(());
+    }
+    write_compact_array_len(out, req.topics.len())?;
     for topic in &req.topics {
-        write_string(out, &topic.name)?;
-        write_array_len(out, topic.partitions.len())?;
+        write_compact_string(out, &topic.name)?;
+        write_compact_array_len(out, topic.partitions.len())?;
         for partition in &topic.partitions {
             out.put_i32(partition.partition_index);
-            write_error(out, rejection.unwrap_or(ErrorCode::None));
+            write_error(out, code);
+            write_empty_tagged_fields(out)?;
         }
+        write_empty_tagged_fields(out)?;
     }
-    Ok(())
+    write_empty_tagged_fields(out)
 }
 
 /// Offset returned for a partition the group has never committed.
@@ -1861,46 +2435,157 @@ fn offset_fetch(
 // Producer IDs
 // ---------------------------------------------------------------------------
 
-fn init_producer_id(body: &mut Bytes, state: &mut ClusterState, out: &mut BytesMut) -> Result<()> {
-    let req = InitProducerIdReq::read(body)?;
+/// Serve `InitProducerId` v0–v6.
+///
+/// A plain idempotent producer always gets a fresh producer ID at epoch 0.
+/// A transactional ID runs the coordinator's rules (KIP-98, KIP-360):
+///
+/// - A new transactional ID gets a new producer ID at epoch 0; naming a
+///   producer ID for one is `INVALID_PRODUCER_ID_MAPPING`.
+/// - A known one keeps its producer ID and gets the next epoch, which fences
+///   the previous incarnation. When the request names the producer ID and
+///   epoch it holds (v3+), the epoch must be the current one; the previous
+///   one is a retry and gets the current epoch back; anything else is
+///   `PRODUCER_FENCED` (`INVALID_PRODUCER_EPOCH` below v4).
+/// - An open transaction is aborted first, with its markers written at a
+///   bumped epoch, and the request is answered `CONCURRENT_TRANSACTIONS`; the
+///   retry gets the next epoch. With `keep_prepared_txn` (v6, KIP-939) the
+///   transaction is kept and reported instead.
+/// - While markers are pending the answer is `CONCURRENT_TRANSACTIONS`.
+fn init_producer_id(
+    body: &mut Bytes,
+    api_version: i16,
+    node_id: i32,
+    state: &mut ClusterState,
+    out: &mut BytesMut,
+) -> Result<()> {
+    let req = InitProducerIdReq::read(body, api_version)?;
 
-    let (producer_id, producer_epoch) = match req.transactional_id {
-        // A plain idempotent producer gets a fresh identity every time: there
-        // is nothing to fence, because nothing persists across sessions.
-        None => state.allocate_producer_id(),
-        // A transactional producer gets its **existing** producer ID back with
-        // a higher epoch. That is the whole of KIP-360 zombie fencing: the
-        // previous incarnation keeps writing with the old epoch and every one
-        // of its requests is now rejected. Minting a fresh ID instead — which
-        // this handler used to do — fences nothing, and a test written against
-        // it would pass with the fencing removed from the client.
+    let mut ongoing = (-1, -1);
+    let outcome = match &req.transactional_id {
+        None => Ok(state.allocate_producer_id()),
         Some(transactional_id) => {
-            let next_id = state.next_producer_id;
-            let txn = state
-                .transactions
-                .entry(transactional_id)
-                .or_insert_with(|| TransactionState {
-                    producer_id: next_id,
-                    producer_epoch: -1,
-                    ..TransactionState::default()
-                });
-            if txn.producer_id == next_id {
-                state.next_producer_id += 1;
-            }
-            txn.producer_epoch = txn.producer_epoch.saturating_add(1);
-            // A transaction left open by the previous incarnation is abandoned,
-            // as a real coordinator does before handing out the new epoch.
-            txn.open = false;
-            txn.partitions.clear();
-            txn.staged_offsets.clear();
-            (txn.producer_id, txn.producer_epoch)
+            init_transactional_producer(state, transactional_id, &req, api_version, node_id).map(
+                |(identity, kept)| {
+                    if let Some(kept) = kept {
+                        ongoing = kept;
+                    }
+                    identity
+                },
+            )
         }
     };
+    let (code, (producer_id, producer_epoch)) = match outcome {
+        Ok(identity) => (ErrorCode::None, identity),
+        Err(code) => (code, (-1, -1)),
+    };
+    write_init_producer_id(
+        out,
+        api_version,
+        state.throttle(ApiKey::InitProducerId),
+        code,
+        producer_id,
+        producer_epoch,
+        ongoing,
+    )
+}
 
-    out.put_i32(0); // throttle_time_ms
-    write_error(out, ErrorCode::None);
+/// The coordinator half of [`init_producer_id`]: the identity to return,
+/// and the open transaction kept by `keep_prepared_txn`, if any.
+#[allow(clippy::type_complexity)]
+fn init_transactional_producer(
+    state: &mut ClusterState,
+    transactional_id: &str,
+    req: &InitProducerIdReq,
+    api_version: i16,
+    node_id: i32,
+) -> std::result::Result<((i64, i16), Option<(i64, i16)>), ErrorCode> {
+    if let Some(code) = txn_coordinator_check(state, transactional_id, node_id) {
+        return Err(code);
+    }
+    if req.transaction_timeout_ms <= 0
+        || req.transaction_timeout_ms > state.transaction_max_timeout_ms
+    {
+        return Err(ErrorCode::InvalidTransactionTimeout);
+    }
+    let fenced = fenced_code(ApiKey::InitProducerId, api_version);
+    let expected = (req.producer_id >= 0 && req.producer_epoch >= 0)
+        .then_some((req.producer_id, req.producer_epoch));
+
+    let Some(txn) = state.transactions.get(transactional_id) else {
+        if expected.is_some() {
+            return Err(ErrorCode::InvalidProducerIdMapping);
+        }
+        let (producer_id, producer_epoch) = state.allocate_producer_id();
+        state.transactions.insert(
+            transactional_id.to_string(),
+            BrokerTransaction {
+                producer_id,
+                producer_epoch,
+                last_producer_epoch: -1,
+                transaction_timeout_ms: req.transaction_timeout_ms,
+                ..BrokerTransaction::default()
+            },
+        );
+        return Ok(((producer_id, producer_epoch), None));
+    };
+
+    if let Some((producer_id, _)) = expected
+        && producer_id != txn.producer_id
+    {
+        return Err(ErrorCode::InvalidProducerIdMapping);
+    }
+    match txn.status {
+        TxnStatus::PrepareCommit | TxnStatus::PrepareAbort => {
+            return Err(ErrorCode::ConcurrentTransactions);
+        }
+        TxnStatus::Ongoing if req.keep_prepared_txn => {
+            let identity = (txn.producer_id, txn.producer_epoch);
+            return Ok((identity, Some(identity)));
+        }
+        TxnStatus::Ongoing => {
+            state.fence_transaction(transactional_id);
+            return Err(ErrorCode::ConcurrentTransactions);
+        }
+        _ => {}
+    }
+
+    let Some(txn) = state.transactions.get_mut(transactional_id) else {
+        return Err(ErrorCode::InvalidProducerIdMapping);
+    };
+    match expected {
+        Some((_, epoch)) if epoch == txn.producer_epoch => txn.bump_epoch(),
+        // The bump this producer asked for already happened; its response was
+        // lost.
+        Some((_, epoch)) if epoch == txn.last_producer_epoch => {}
+        Some(_) => return Err(fenced),
+        None => txn.bump_epoch(),
+    }
+    txn.transaction_timeout_ms = req.transaction_timeout_ms;
+    Ok(((txn.producer_id, txn.producer_epoch), None))
+}
+
+/// Write an `InitProducerId` response for any version from 0 to 6.
+fn write_init_producer_id(
+    out: &mut BytesMut,
+    api_version: i16,
+    throttle_time_ms: i32,
+    code: ErrorCode,
+    producer_id: i64,
+    producer_epoch: i16,
+    ongoing: (i64, i16),
+) -> Result<()> {
+    out.put_i32(throttle_time_ms);
+    write_error(out, code);
     out.put_i64(producer_id);
     out.put_i16(producer_epoch);
+    if api_version >= 6 {
+        out.put_i64(ongoing.0);
+        out.put_i16(ongoing.1);
+    }
+    if api_version >= 2 {
+        write_empty_tagged_fields(out)?;
+    }
     Ok(())
 }
 
@@ -1908,39 +2593,76 @@ fn init_producer_id(body: &mut Bytes, state: &mut ClusterState, out: &mut BytesM
 // Transactions (KIP-98, KIP-360, KIP-447, KIP-890)
 // ---------------------------------------------------------------------------
 
-/// Reject a transactional request that is misrouted or carries a stale
-/// identity.
-///
-/// Two independent rejections, in the order a real coordinator applies them:
+/// The error a transaction coordinator answers a fenced producer with:
+/// `PRODUCER_FENCED` from the versions that know it, `INVALID_PRODUCER_EPOCH`
+/// before them.
+fn fenced_code(api_key: ApiKey, api_version: i16) -> ErrorCode {
+    let first = match api_key {
+        ApiKey::InitProducerId => 4,
+        ApiKey::AddPartitionsToTxn | ApiKey::AddOffsetsToTxn | ApiKey::EndTxn => 2,
+        _ => i16::MAX,
+    };
+    if api_version >= first {
+        ErrorCode::ProducerFenced
+    } else {
+        ErrorCode::InvalidProducerEpoch
+    }
+}
+
+/// Reject a request that reached a broker which does not coordinate this
+/// transactional ID.
+fn txn_coordinator_check(
+    state: &ClusterState,
+    transactional_id: &str,
+    node_id: i32,
+) -> Option<ErrorCode> {
+    let coordinator = state.txn_coordinator(transactional_id);
+    if coordinator == node_id {
+        None
+    } else if state.broker(coordinator).map(|b| b.online) == Some(true) {
+        Some(ErrorCode::NotCoordinator)
+    } else {
+        Some(ErrorCode::CoordinatorNotAvailable)
+    }
+}
+
+/// Reject a request that adds to a transaction, in the order a real
+/// coordinator checks:
 ///
 /// 1. **Misrouted** — the request reached a broker that does not coordinate
-///    this transactional ID, so the client must re-discover the coordinator.
-/// 2. **Fenced** — the producer ID or epoch is not the one this coordinator
-///    last handed out. A newer epoch exists, so this producer is a zombie and
-///    every write it attempts must fail. Returning `INVALID_PRODUCER_EPOCH`
-///    here is what makes the client's fatal-error latch reachable without a
-///    second live producer.
+///    this transactional ID.
+/// 2. **Unknown producer** — the producer ID is not the one this coordinator
+///    assigned (`INVALID_PRODUCER_ID_MAPPING`).
+/// 3. **Fenced** — the epoch is not the current one, so this producer is a
+///    zombie and every write it attempts must fail.
+/// 4. **Markers in flight** — the previous transaction is still completing
+///    (`CONCURRENT_TRANSACTIONS`, retriable).
 fn txn_check(
     state: &ClusterState,
+    api_key: ApiKey,
+    api_version: i16,
     transactional_id: &str,
     producer_id: i64,
     producer_epoch: i16,
     node_id: i32,
 ) -> Option<ErrorCode> {
-    let coordinator = state.txn_coordinator(transactional_id);
-    if coordinator != node_id {
-        return Some(
-            if state.broker(coordinator).map(|b| b.online) == Some(true) {
-                ErrorCode::NotCoordinator
-            } else {
-                ErrorCode::CoordinatorNotAvailable
-            },
-        );
+    if let Some(code) = txn_coordinator_check(state, transactional_id, node_id) {
+        return Some(code);
     }
     match state.transactions.get(transactional_id) {
         None => Some(ErrorCode::InvalidProducerIdMapping),
         Some(txn) if txn.producer_id != producer_id => Some(ErrorCode::InvalidProducerIdMapping),
-        Some(txn) if txn.producer_epoch != producer_epoch => Some(ErrorCode::InvalidProducerEpoch),
+        Some(txn) if txn.producer_epoch != producer_epoch => {
+            Some(fenced_code(api_key, api_version))
+        }
+        Some(txn)
+            if matches!(
+                txn.status,
+                TxnStatus::PrepareCommit | TxnStatus::PrepareAbort
+            ) =>
+        {
+            Some(ErrorCode::ConcurrentTransactions)
+        }
         Some(_) => None,
     }
 }
@@ -1951,6 +2673,7 @@ fn txn_check(
 /// asserting the request count is zero after a transaction.
 fn add_partitions_to_txn(
     body: &mut Bytes,
+    api_version: i16,
     node_id: i32,
     state: &mut ClusterState,
     out: &mut BytesMut,
@@ -1958,6 +2681,8 @@ fn add_partitions_to_txn(
     let req = AddPartitionsToTxnReq::read(body)?;
     let rejection = txn_check(
         state,
+        ApiKey::AddPartitionsToTxn,
+        api_version,
         &req.transactional_id,
         req.producer_id,
         req.producer_epoch,
@@ -1967,7 +2692,7 @@ fn add_partitions_to_txn(
     if rejection.is_none()
         && let Some(txn) = state.transactions.get_mut(&req.transactional_id)
     {
-        txn.open = true;
+        txn.begin();
         for entry in &req.partitions {
             if !txn.partitions.contains(entry) {
                 txn.partitions.push(entry.clone());
@@ -2000,6 +2725,7 @@ fn add_partitions_to_txn(
 /// Serve `AddOffsetsToTxn` v0 — TV1 only.
 fn add_offsets_to_txn(
     body: &mut Bytes,
+    api_version: i16,
     node_id: i32,
     state: &mut ClusterState,
     out: &mut BytesMut,
@@ -2007,6 +2733,8 @@ fn add_offsets_to_txn(
     let req = AddOffsetsToTxnReq::read(body)?;
     let rejection = txn_check(
         state,
+        ApiKey::AddOffsetsToTxn,
+        api_version,
         &req.transactional_id,
         req.producer_id,
         req.producer_epoch,
@@ -2016,7 +2744,7 @@ fn add_offsets_to_txn(
     if rejection.is_none()
         && let Some(txn) = state.transactions.get_mut(&req.transactional_id)
     {
-        txn.open = true;
+        txn.begin();
         txn.staged_offsets.entry(req.group_id).or_default();
     }
 
@@ -2077,7 +2805,7 @@ fn txn_offset_commit(
     if rejection.is_none()
         && let Some(txn) = state.transactions.get_mut(&req.transactional_id)
     {
-        txn.open = true;
+        txn.begin();
         let staged = txn.staged_offsets.entry(req.group_id.clone()).or_default();
         for offset in &req.offsets {
             staged.insert(
@@ -2115,25 +2843,25 @@ fn txn_offset_commit(
     write_empty_tagged_fields(out)
 }
 
-/// Serve `EndTxn` v3–v5: write the markers and settle the transaction.
+/// Serve `EndTxn` v3–v5.
 ///
-/// Committing does three things, and a broker that skips any of them makes a
-/// green test meaningless:
+/// The protocol is read from the request version, as Kafka's coordinator
+/// reads it: v5 is TV2 (KIP-890), v4 and below TV1.
 ///
-/// 1. Appends a **commit control batch** to every partition in the
-///    transaction. The client uses it to clear its aborted-producer set, so
-///    without it a later transaction from the same producer is filtered out.
-/// 2. Releases the last stable offset, making the records visible to a
-///    `read_committed` consumer.
-/// 3. Applies the staged offsets to the consumer group.
+/// Ending an `Ongoing` transaction writes its markers (see
+/// [`ClusterState::write_transaction_markers`]) — under TV2 at a bumped
+/// epoch, which the v5 response returns. Everything else follows the
+/// coordinator's state table:
 ///
-/// Aborting appends an **abort control batch**, records the aborted range so
-/// the next `read_committed` fetch reports it, and discards the staged
-/// offsets.
+/// | State | Same epoch, same outcome | Same epoch, other outcome |
+/// |---|---|---|
+/// | `PrepareCommit` / `PrepareAbort` | `CONCURRENT_TRANSACTIONS` | `INVALID_TXN_STATE` |
+/// | `CompleteCommit` / `CompleteAbort` | `NONE` (a retry) | `INVALID_TXN_STATE` |
+/// | `Empty` | — | `INVALID_TXN_STATE` |
 ///
-/// Under TV2 (KIP-890) the response carries a bumped producer epoch, which the
-/// client adopts for the next transaction. That is emitted whenever the
-/// negotiated version is v5, which is exactly when the client asks for it.
+/// Under TV2 "same epoch" for a retry is the epoch before the bump, and an
+/// abort with no transaction open bumps the epoch and succeeds. Any other
+/// epoch is `PRODUCER_FENCED`.
 fn end_txn(
     body: &mut Bytes,
     api_version: i16,
@@ -2142,66 +2870,15 @@ fn end_txn(
     out: &mut BytesMut,
 ) -> Result<()> {
     let req = EndTxnReq::read(body)?;
-    let rejection = txn_check(
-        state,
-        &req.transactional_id,
-        req.producer_id,
-        req.producer_epoch,
-        node_id,
-    );
+    let outcome = end_txn_outcome(state, &req, api_version, node_id);
 
-    let mut producer_id = req.producer_id;
-    let mut producer_epoch = req.producer_epoch;
-
-    if rejection.is_none() {
-        let Some(txn) = state.transactions.get(&req.transactional_id) else {
-            unreachable!("txn_check returned None, so the transaction exists");
+    let (producer_id, producer_epoch) =
+        match (&outcome, state.transactions.get(&req.transactional_id)) {
+            (None, Some(txn)) => (txn.producer_id, txn.producer_epoch),
+            _ => (-1, -1),
         };
-        let partitions = txn.partitions.clone();
-        let staged = txn.staged_offsets.clone();
-        let pid = txn.producer_id;
-        let epoch = txn.producer_epoch;
-
-        for (topic, partition) in &partitions {
-            let Some(p) = state.partition_mut(topic, *partition) else {
-                continue;
-            };
-            let first_offset = p.pending_txn_first_offset.take();
-            let marker = control_batch(req.committed, pid, epoch);
-            let marker_offset = p.append(&marker);
-            if !req.committed
-                && let Some(first) = first_offset
-            {
-                p.aborted_transactions.push((pid, first, marker_offset));
-            }
-        }
-
-        if req.committed {
-            for (group_id, offsets) in staged {
-                let group = state.groups.entry(group_id).or_default();
-                for (key, value) in offsets {
-                    group.offsets.insert(key, value);
-                }
-            }
-        }
-
-        let Some(txn) = state.transactions.get_mut(&req.transactional_id) else {
-            unreachable!("the transaction was present a moment ago");
-        };
-        txn.open = false;
-        txn.partitions.clear();
-        txn.staged_offsets.clear();
-        // KIP-890 bumps the epoch at every completion, which is what lets the
-        // coordinator tell a retried `EndTxn` from a new transaction.
-        if api_version >= 5 {
-            txn.producer_epoch = txn.producer_epoch.saturating_add(1);
-        }
-        producer_id = txn.producer_id;
-        producer_epoch = txn.producer_epoch;
-    }
-
-    out.put_i32(0); // throttle_time_ms
-    write_error(out, rejection.unwrap_or(ErrorCode::None));
+    out.put_i32(state.throttle(ApiKey::EndTxn));
+    write_error(out, outcome.unwrap_or(ErrorCode::None));
     if api_version >= 5 {
         out.put_i64(producer_id);
         out.put_i16(producer_epoch);
@@ -2209,41 +2886,61 @@ fn end_txn(
     write_empty_tagged_fields(out)
 }
 
-/// Build a transaction commit or abort marker.
-///
-/// A control batch is a normal v2 record batch with the control bit set and
-/// one record whose key is `(version: i16, type: i16)` — `0` abort, `1`
-/// commit. The client reads the control bit to skip the batch and to clear the
-/// producer from its aborted set, so the marker has to be a *real* batch that
-/// decodes, not a placeholder.
-fn control_batch(committed: bool, producer_id: i64, producer_epoch: i16) -> Bytes {
-    use crate::protocol::{Record, RecordBatch};
+/// Apply an `EndTxn` to the coordinator's state, returning the error to
+/// answer with, if any.
+fn end_txn_outcome(
+    state: &mut ClusterState,
+    req: &EndTxnReq,
+    api_version: i16,
+    node_id: i32,
+) -> Option<ErrorCode> {
+    if let Some(code) = txn_coordinator_check(state, &req.transactional_id, node_id) {
+        return Some(code);
+    }
+    let Some(txn) = state.transactions.get_mut(&req.transactional_id) else {
+        return Some(ErrorCode::InvalidProducerIdMapping);
+    };
+    if txn.producer_id != req.producer_id {
+        return Some(ErrorCode::InvalidProducerIdMapping);
+    }
+    let tv2 = api_version >= 5;
+    let current = req.producer_epoch == txn.producer_epoch;
+    let retry =
+        tv2 && txn.last_producer_epoch >= 0 && req.producer_epoch == txn.last_producer_epoch;
+    let same_outcome = |committed: bool| committed == req.committed;
+    let status = txn.status;
 
-    let mut key = BytesMut::with_capacity(4);
-    key.put_i16(0); // control-record format version
-    key.put_i16(if committed { 1 } else { 0 });
-
-    let mut batch = RecordBatch::new();
-    batch.attributes.is_transactional = true;
-    batch.attributes.is_control_batch = true;
-    batch.producer_id = producer_id;
-    batch.producer_epoch = producer_epoch;
-    batch.base_sequence = 0;
-    batch.last_offset_delta = 0;
-    batch.add_record(Record {
-        attributes: 0,
-        timestamp_delta: 0,
-        offset_delta: 0,
-        key: Some(key.freeze()),
-        value: Some(Bytes::new()),
-        headers: Vec::new(),
-    });
-
-    // Encoding a single-record batch with no compression cannot fail; falling
-    // back to an empty marker would silently produce a partition whose
-    // transaction never completes, so the panic-free path returns something
-    // the test will notice instead.
-    batch.encode().unwrap_or_else(|_| Bytes::new())
+    match status {
+        TxnStatus::Ongoing if current => {
+            state.end_transaction(&req.transactional_id, req.committed, tv2);
+            None
+        }
+        TxnStatus::PrepareCommit | TxnStatus::PrepareAbort if (current && !tv2) || retry => {
+            if same_outcome(status == TxnStatus::PrepareCommit) {
+                Some(ErrorCode::ConcurrentTransactions)
+            } else {
+                Some(ErrorCode::InvalidTxnState)
+            }
+        }
+        TxnStatus::CompleteCommit | TxnStatus::CompleteAbort if (current && !tv2) || retry => {
+            if same_outcome(status == TxnStatus::CompleteCommit) {
+                None
+            } else {
+                Some(ErrorCode::InvalidTxnState)
+            }
+        }
+        TxnStatus::Empty | TxnStatus::CompleteCommit | TxnStatus::CompleteAbort
+            if current && tv2 && !req.committed =>
+        {
+            if let Some(txn) = state.transactions.get_mut(&req.transactional_id) {
+                txn.bump_epoch();
+                txn.status = TxnStatus::CompleteAbort;
+            }
+            None
+        }
+        _ if current => Some(ErrorCode::InvalidTxnState),
+        _ => Some(fenced_code(ApiKey::EndTxn, api_version)),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2316,7 +3013,7 @@ fn delete_topics(
     out.put_i32(0); // throttle_time_ms
     write_array_len(out, req.topic_names.len())?;
     for name in &req.topic_names {
-        let code = if state.topics.remove(name).is_some() {
+        let code = if state.delete_topic(name) {
             ErrorCode::None
         } else {
             ErrorCode::UnknownTopicOrPartition
@@ -2357,16 +3054,25 @@ fn share_group_heartbeat(
         return write_heartbeat_error(out, ErrorCode::NotCoordinator, None, 0);
     }
 
+    if req.member_id.is_empty() {
+        return write_heartbeat_error(out, ErrorCode::InvalidRequest, None, 0);
+    }
+
     if req.member_epoch < 0 {
         if let Some(group) = state.share_groups.get_mut(&req.group_id) {
             group.members.remove(&req.member_id);
             group.group_epoch += 1;
-            // Whatever the departing member was holding is nobody's now.
-            if group.members.is_empty() {
-                group.release_in_flight();
-            }
+            // Whatever the departing member was holding goes back to the pool.
+            group.release_member(&req.member_id);
         }
         return write_share_heartbeat(out, &req.member_id, req.member_epoch, None);
+    }
+
+    // A member joins by naming what it subscribes to; a null subscription
+    // means "unchanged", which a joining member has nothing to be unchanged
+    // from.
+    if req.member_epoch == 0 && req.subscribed_topic_names.is_none() {
+        return write_heartbeat_error(out, ErrorCode::InvalidRequest, Some(&req.member_id), 0);
     }
 
     let partition_counts: HashMap<String, i32> = state
@@ -2459,7 +3165,8 @@ fn share_group_heartbeat(
         if is_new || rejoining || subscription_changed || member.member_epoch == 0 {
             member.member_epoch = group_epoch;
         }
-        let dirty = member.assignment_dirty;
+        // A (re)joining member always receives its assignment.
+        let dirty = member.assignment_dirty || is_new || rejoining;
         member.assignment_dirty = false;
         (member.member_epoch, dirty)
     };
@@ -2516,21 +3223,26 @@ fn topic_name_for_id(state: &ClusterState, topic_id: [u8; 16]) -> Option<String>
         .map(|(name, _)| name.clone())
 }
 
-/// Apply every acknowledgement batch a share request piggybacked onto one
-/// partition, returning the error to report in the acknowledge-error field.
+/// Validate and apply every acknowledgement batch a share request carried for
+/// one partition, returning the error to report for it.
 ///
 /// A batch whose `acknowledge_types` array has one entry applies that type to
 /// the whole range; otherwise there must be exactly one type per offset, which
-/// is what the KIP-932 format specifies. Anything else is `INVALID_REQUEST` —
-/// the same answer a real broker gives, and worth modelling because the
-/// client builds these arrays itself.
+/// is what the KIP-932 format specifies. Anything else, an unknown type, or
+/// `RENEW` below v2 is `INVALID_REQUEST`. Every acknowledged record must be
+/// held by `member_id`, or the whole partition's acknowledgements are refused
+/// with `INVALID_RECORD_STATE` and nothing changes, as on a broker.
+#[allow(clippy::too_many_arguments)]
 fn apply_share_acks(
     state: &mut ClusterState,
+    api_version: i16,
     group_id: &str,
+    member_id: &str,
     topic: &str,
     partition: i32,
     batches: &[ShareAckBatch],
 ) -> ErrorCode {
+    let mut plan: Vec<(i64, i8)> = Vec::new();
     for batch in batches {
         if batch.last_offset < batch.first_offset {
             return ErrorCode::InvalidRequest;
@@ -2541,17 +3253,31 @@ fn apply_share_acks(
             n if n as i64 == span => batch.acknowledge_types.clone(),
             _ => return ErrorCode::InvalidRequest,
         };
-        let share_partition = state
-            .share_groups
-            .entry(group_id.to_string())
-            .or_default()
-            .partitions
-            .entry((topic.to_string(), partition))
-            .or_default();
         for (i, &ack_type) in types.iter().enumerate() {
-            let offset = batch.first_offset + i as i64;
-            share_partition.acknowledge(offset, offset, ack_type);
+            if !(0..=4).contains(&ack_type) || (ack_type == 4 && api_version < 2) {
+                return ErrorCode::InvalidRequest;
+            }
+            plan.push((batch.first_offset + i as i64, ack_type));
         }
+    }
+    if plan.is_empty() {
+        return ErrorCode::None;
+    }
+    let share_partition = state
+        .share_groups
+        .entry(group_id.to_string())
+        .or_default()
+        .partitions
+        .entry((topic.to_string(), partition))
+        .or_default();
+    if !plan
+        .iter()
+        .all(|&(offset, _)| share_partition.held_by(offset, offset, member_id))
+    {
+        return ErrorCode::InvalidRecordState;
+    }
+    for (offset, ack_type) in plan {
+        share_partition.acknowledge(offset, ack_type);
     }
     ErrorCode::None
 }
@@ -2564,14 +3290,14 @@ fn apply_share_acks(
 /// client that forgot to set them pass every test here and fail against a
 /// real broker.
 ///
-/// Returns the group ID when both are present and non-empty.
+/// Returns `(group_id, member_id)` when both are present and non-empty.
 fn required_share_identity(
     group_id: &Option<String>,
     member_id: &Option<String>,
-) -> Option<String> {
+) -> Option<(String, String)> {
     let group = group_id.as_deref().filter(|g| !g.is_empty())?;
-    member_id.as_deref().filter(|m| !m.is_empty())?;
-    Some(group.to_string())
+    let member = member_id.as_deref().filter(|m| !m.is_empty())?;
+    Some((group.to_string(), member.to_string()))
 }
 
 /// Record a request that closes its share session (epoch `-1`).
@@ -2580,7 +3306,7 @@ fn record_share_session_close(
     api_key: ApiKey,
     node_id: i32,
     group_id: &str,
-    member_id: Option<&str>,
+    member_id: &str,
     share_session_epoch: i32,
 ) {
     if share_session_epoch == -1 {
@@ -2588,183 +3314,435 @@ fn record_share_session_close(
             api_key,
             node_id,
             group_id: group_id.to_string(),
-            member_id: member_id.unwrap_or_default().to_string(),
+            member_id: member_id.to_string(),
         });
     }
 }
 
-/// Serve a `ShareFetch` (API key 78, v1).
+/// Apply the share-session rules to one request, returning the top-level
+/// error to answer with, if any (KIP-932):
 ///
-/// Acknowledgements piggybacked on the request are applied *before* records
-/// are acquired, which is the ordering a real broker uses and the reason a
-/// client can accept a batch and fetch the next one in a single round trip.
+/// - Epoch `0` opens a session (replacing any the member had on this broker).
+///   A `ShareFetch` opening one must not carry acknowledgements
+///   (`INVALID_REQUEST`); a `ShareAcknowledge` cannot open one
+///   (`INVALID_SHARE_SESSION_EPOCH`).
+/// - Any other epoch needs an open session (`SHARE_SESSION_NOT_FOUND`); a
+///   positive one must be the session's next epoch
+///   (`INVALID_SHARE_SESSION_EPOCH`), which then advances. Epoch `-1` closes
+///   the session.
+#[allow(clippy::too_many_arguments)]
+fn check_share_session(
+    state: &mut ClusterState,
+    api_key: ApiKey,
+    node_id: i32,
+    group_id: &str,
+    member_id: &str,
+    epoch: i32,
+    has_acks: bool,
+    requested: &[(String, i32)],
+    forgotten: &[(String, i32)],
+) -> Option<ErrorCode> {
+    let key = (node_id, group_id.to_string(), member_id.to_string());
+    if epoch == 0 {
+        if api_key == ApiKey::ShareAcknowledge {
+            return Some(ErrorCode::InvalidShareSessionEpoch);
+        }
+        if has_acks {
+            return Some(ErrorCode::InvalidRequest);
+        }
+        state.share_sessions.insert(
+            key,
+            ShareSession {
+                epoch: 1,
+                partitions: requested.iter().cloned().collect(),
+            },
+        );
+        return None;
+    }
+    let Some(session) = state.share_sessions.get_mut(&key) else {
+        return Some(ErrorCode::ShareSessionNotFound);
+    };
+    if epoch == -1 {
+        state.share_sessions.remove(&key);
+        return None;
+    }
+    if epoch != session.epoch {
+        return Some(ErrorCode::InvalidShareSessionEpoch);
+    }
+    session.advance();
+    session.partitions.extend(requested.iter().cloned());
+    for entry in forgotten {
+        session.partitions.remove(entry);
+    }
+    None
+}
+
+/// Write a `ShareFetch` response carrying only a top-level error.
+fn write_share_fetch_error(out: &mut BytesMut, code: ErrorCode, message: &str) -> Result<()> {
+    out.put_i32(0); // throttle_time_ms
+    write_error(out, code);
+    write_compact_nullable_string(out, Some(message))?;
+    out.put_i32(ACQUISITION_LOCK_TIMEOUT_MS);
+    write_compact_array_len(out, 0)?; // responses
+    write_compact_array_len(out, 0)?; // node_endpoints
+    write_empty_tagged_fields(out)
+}
+
+/// Write a `ShareAcknowledge` response carrying only a top-level error.
+fn write_share_acknowledge_error(
+    out: &mut BytesMut,
+    api_version: i16,
+    code: ErrorCode,
+    message: &str,
+) -> Result<()> {
+    out.put_i32(0); // throttle_time_ms
+    write_error(out, code);
+    write_compact_nullable_string(out, Some(message))?;
+    if api_version >= 2 {
+        out.put_i32(ACQUISITION_LOCK_TIMEOUT_MS);
+    }
+    write_compact_array_len(out, 0)?; // responses
+    write_compact_array_len(out, 0)?; // node_endpoints
+    write_empty_tagged_fields(out)
+}
+
+/// Resolve `(topic_id, partition)` pairs to names, dropping unknown IDs.
+fn share_partition_names(state: &ClusterState, ids: &[([u8; 16], i32)]) -> Vec<(String, i32)> {
+    ids.iter()
+        .filter_map(|(topic_id, partition)| {
+            topic_name_for_id(state, *topic_id).map(|name| (name, *partition))
+        })
+        .collect()
+}
+
+/// Acquire records of one share partition for `member_id`, returning the
+/// batches to send and the acquired ranges as
+/// `(first_offset, last_offset, delivery_count)`.
+///
+/// Whole batches are returned, as a broker returns them; only the records in
+/// the acquired ranges belong to the member. `budget` is the request's
+/// remaining `max_records`: in batch-optimized mode (KIP-1206 mode 0) it is
+/// checked between batches and may be overshot to finish one, in
+/// record-limit mode (1) it is exact.
+fn acquire_share_records(
+    state: &mut ClusterState,
+    group_id: &str,
+    member_id: &str,
+    topic: &str,
+    partition: i32,
+    budget: &mut i64,
+    record_limit: bool,
+) -> (Bytes, Vec<(i64, i64, i16)>) {
+    let Some(log) = state.partition(topic, partition).map(|p| p.log.clone()) else {
+        return (Bytes::new(), Vec::new());
+    };
+    let share_partition = state
+        .share_groups
+        .entry(group_id.to_string())
+        .or_default()
+        .partitions
+        .entry((topic.to_string(), partition))
+        .or_default();
+
+    let mut records = Vec::new();
+    let mut acquired: Vec<(i64, i16)> = Vec::new();
+    for batch in &log {
+        if *budget <= 0 {
+            break;
+        }
+        let base = batch_base_offset(batch).unwrap_or(0);
+        let count = batch_record_count(batch).unwrap_or(0);
+        let mut taken = 0;
+        for offset in base..base + count {
+            if record_limit && taken >= *budget {
+                break;
+            }
+            if share_partition.is_available(offset) {
+                acquired.push((offset, share_partition.acquire(offset, member_id)));
+                taken += 1;
+            }
+        }
+        if taken > 0 {
+            records.extend_from_slice(batch);
+            *budget -= taken;
+        }
+    }
+
+    let mut ranges: Vec<(i64, i64, i16)> = Vec::new();
+    for (offset, delivery_count) in acquired {
+        match ranges.last_mut() {
+            Some((_, last, count)) if *last + 1 == offset && *count == delivery_count => {
+                *last = offset;
+            }
+            _ => ranges.push((offset, offset, delivery_count)),
+        }
+    }
+    (Bytes::from(records), ranges)
+}
+
+/// Serve a `ShareFetch` (API key 78, v1–v2).
+///
+/// The session check and the piggybacked acknowledgements run first, once,
+/// which is the ordering a real broker uses and the reason a client can
+/// accept a batch and fetch the next one in a single round trip. Then records
+/// are acquired for the member across the requested partitions and any other
+/// partition in its session, up to `max_records`. With nothing to acquire the
+/// request is held for up to `max_wait_ms`. A closing request (epoch `-1`)
+/// and a KIP-1222 renew request (`IsRenewAck`) acquire nothing and do not
+/// wait; closing releases every record the member still holds.
 fn share_fetch(
     body: &mut Bytes,
     api_version: i16,
     node_id: i32,
     state: &mut ClusterState,
+    poll: &mut LongPoll,
     out: &mut BytesMut,
-) -> Result<()> {
+) -> Result<Served> {
     let req = ShareFetchReq::read(body, api_version)?;
-    let Some(group_id) = required_share_identity(&req.group_id, &req.member_id) else {
-        out.put_i32(0); // throttle_time_ms
-        write_error(out, ErrorCode::InvalidRequest);
-        write_compact_nullable_string(out, Some("ShareFetch requires a group ID and member ID"))?;
-        out.put_i32(ACQUISITION_LOCK_TIMEOUT_MS);
-        write_compact_array_len(out, 0)?; // responses
-        write_compact_array_len(out, 0)?; // node_endpoints
-        return write_empty_tagged_fields(out);
+    let Some((group_id, member_id)) = required_share_identity(&req.group_id, &req.member_id) else {
+        write_share_fetch_error(
+            out,
+            ErrorCode::InvalidRequest,
+            "ShareFetch requires a group ID and member ID",
+        )?;
+        return Ok(Served::Done);
     };
-    record_share_session_close(
-        state,
-        ApiKey::ShareFetch,
-        node_id,
-        &group_id,
-        req.member_id.as_deref(),
-        req.share_session_epoch,
-    );
 
-    out.put_i32(0); // throttle_time_ms
-    write_error(out, ErrorCode::None);
-    write_compact_nullable_string(out, None)?; // error_message
-    out.put_i32(ACQUISITION_LOCK_TIMEOUT_MS);
-
-    // Group the flat (topic_id, partition) list back into topics, preserving
-    // first-seen order so the response mirrors the request.
-    let mut order: Vec<[u8; 16]> = Vec::new();
-    let mut grouped: HashMap<[u8; 16], Vec<&ShareTopicPartitionAcks>> = HashMap::new();
-    for tp in &req.topics {
-        if !grouped.contains_key(&tp.topic_id) {
-            order.push(tp.topic_id);
-        }
-        grouped.entry(tp.topic_id).or_default().push(tp);
-    }
-
-    write_compact_array_len(out, order.len())?;
-    for topic_id in &order {
-        out.put_slice(topic_id);
-        let entries = grouped.get(topic_id).map_or(&[][..], Vec::as_slice);
-        write_compact_array_len(out, entries.len())?;
-        for entry in entries {
-            let Some(topic) = topic_name_for_id(state, *topic_id) else {
-                write_share_fetch_partition(
-                    out,
-                    entry.partition_index,
-                    ErrorCode::UnknownTopicId,
-                    ErrorCode::None,
-                    -1,
-                    -1,
-                    None,
-                    &[],
-                )?;
-                continue;
-            };
-
-            let ack_error = apply_share_acks(
+    let ack_errors = match poll.share_acks.take() {
+        Some(acks) => acks,
+        None => {
+            record_share_session_close(
                 state,
+                ApiKey::ShareFetch,
+                node_id,
                 &group_id,
-                &topic,
-                entry.partition_index,
-                &entry.acknowledgement_batches,
+                &member_id,
+                req.share_session_epoch,
             );
-
-            let Some(p) = state.partition(&topic, entry.partition_index) else {
-                write_share_fetch_partition(
-                    out,
-                    entry.partition_index,
-                    ErrorCode::UnknownTopicOrPartition,
-                    ack_error,
-                    -1,
-                    -1,
-                    None,
-                    &[],
-                )?;
-                continue;
-            };
-            if p.leader != node_id {
-                let (leader, epoch) = (p.leader, p.leader_epoch);
-                write_share_fetch_partition(
-                    out,
-                    entry.partition_index,
-                    ErrorCode::NotLeaderForPartition,
-                    ack_error,
-                    leader,
-                    epoch,
-                    None,
-                    &[],
-                )?;
-                continue;
+            let requested: Vec<([u8; 16], i32)> = req
+                .topics
+                .iter()
+                .map(|tp| (tp.topic_id, tp.partition_index))
+                .collect();
+            let requested = share_partition_names(state, &requested);
+            let forgotten = share_partition_names(state, &req.forgotten);
+            let has_acks = req
+                .topics
+                .iter()
+                .any(|tp| !tp.acknowledgement_batches.is_empty());
+            if let Some(code) = check_share_session(
+                state,
+                ApiKey::ShareFetch,
+                node_id,
+                &group_id,
+                &member_id,
+                req.share_session_epoch,
+                has_acks,
+                &requested,
+                &forgotten,
+            ) {
+                write_share_fetch_error(out, code, &format!("{code:?}"))?;
+                return Ok(Served::Done);
             }
-
-            // Snapshot what the log holds before borrowing the share state.
-            let (leader, leader_epoch, log, next_offset) =
-                (p.leader, p.leader_epoch, p.log.clone(), p.next_offset);
-
-            let share_partition = state
-                .share_groups
-                .entry(group_id.clone())
-                .or_default()
-                .partitions
-                .entry((topic.clone(), entry.partition_index))
-                .or_default();
-            let cursor = share_partition
-                .next_acquire
-                .max(share_partition.start_offset);
-
-            // Acquire whole batches, stopping once `max_records` is reached.
-            // Batch granularity is what a real broker uses too: it never
-            // splits a batch to honour the cap exactly.
-            let mut records = Vec::new();
-            let mut acquired_first = i64::MAX;
-            let mut acquired_last = -1i64;
-            let mut taken = 0i64;
-            for batch in &log {
-                let base = batch_base_offset(batch).unwrap_or(0);
-                let count = batch_record_count(batch).unwrap_or(0);
-                if base + count <= cursor {
+            let mut acks = HashMap::new();
+            for entry in &req.topics {
+                let Some(topic) = topic_name_for_id(state, entry.topic_id) else {
+                    continue;
+                };
+                if state
+                    .partition(&topic, entry.partition_index)
+                    .is_none_or(|p| p.leader != node_id)
+                {
                     continue;
                 }
-                if req.max_records > 0 && taken >= i64::from(req.max_records) {
-                    break;
-                }
-                records.extend_from_slice(batch);
-                acquired_first = acquired_first.min(base.max(cursor));
-                acquired_last = acquired_last.max(base + count - 1);
-                taken += count;
+                let code = apply_share_acks(
+                    state,
+                    api_version,
+                    &group_id,
+                    &member_id,
+                    &topic,
+                    entry.partition_index,
+                    &entry.acknowledgement_batches,
+                );
+                acks.insert((entry.topic_id, entry.partition_index), code);
             }
+            if req.share_session_epoch == -1
+                && let Some(group) = state.share_groups.get_mut(&group_id)
+            {
+                group.release_member(&member_id);
+            }
+            acks
+        }
+    };
 
-            let acquired = if acquired_last >= acquired_first {
-                let delivery_count = share_partition.acquire(acquired_first, acquired_last);
-                vec![(acquired_first, acquired_last, delivery_count)]
-            } else {
-                Vec::new()
+    let fetching = req.share_session_epoch != -1 && !req.is_renew_ack;
+
+    // The partitions to answer for: the requested ones, then any other
+    // partition of the session.
+    let mut targets: Vec<([u8; 16], i32, bool)> = req
+        .topics
+        .iter()
+        .map(|tp| (tp.topic_id, tp.partition_index, true))
+        .collect();
+    let session_key = (node_id, group_id.clone(), member_id.clone());
+    if fetching && let Some(session) = state.share_sessions.get(&session_key) {
+        for (topic, partition) in &session.partitions {
+            let Some(topic_id) = state.topics.get(topic).map(|t| t.topic_id) else {
+                continue;
             };
-            debug_assert!(
-                acquired.is_empty() || acquired_last < next_offset,
-                "acquired past the high watermark"
-            );
+            if !targets
+                .iter()
+                .any(|(id, p, _)| *id == topic_id && p == partition)
+            {
+                targets.push((topic_id, *partition, false));
+            }
+        }
+    }
 
-            let records = Bytes::from(records);
-            write_share_fetch_partition(
-                out,
-                entry.partition_index,
+    let mut budget = if req.max_records > 0 {
+        i64::from(req.max_records)
+    } else {
+        i64::MAX
+    };
+    let record_limit = req.share_acquire_mode == 1;
+    let mut any_error = false;
+    let mut any_acquired = false;
+    // (topic_id, partition, error, ack_error, leader, epoch, records, acquired)
+    type ShareFetchEntry = (
+        [u8; 16],
+        i32,
+        ErrorCode,
+        ErrorCode,
+        i32,
+        i32,
+        Bytes,
+        Vec<(i64, i64, i16)>,
+    );
+    let mut entries: Vec<ShareFetchEntry> = Vec::new();
+    for (topic_id, partition, requested) in targets {
+        let ack_error = ack_errors
+            .get(&(topic_id, partition))
+            .copied()
+            .unwrap_or(ErrorCode::None);
+        let Some(topic) = topic_name_for_id(state, topic_id) else {
+            any_error = true;
+            entries.push((
+                topic_id,
+                partition,
+                ErrorCode::UnknownTopicId,
+                ack_error,
+                -1,
+                -1,
+                Bytes::new(),
+                Vec::new(),
+            ));
+            continue;
+        };
+        let Some((leader, leader_epoch)) = state
+            .partition(&topic, partition)
+            .map(|p| (p.leader, p.leader_epoch))
+        else {
+            any_error = true;
+            entries.push((
+                topic_id,
+                partition,
+                ErrorCode::UnknownTopicOrPartition,
+                ack_error,
+                -1,
+                -1,
+                Bytes::new(),
+                Vec::new(),
+            ));
+            continue;
+        };
+        if leader != node_id {
+            any_error = true;
+            entries.push((
+                topic_id,
+                partition,
+                ErrorCode::NotLeaderForPartition,
+                ack_error,
+                leader,
+                leader_epoch,
+                Bytes::new(),
+                Vec::new(),
+            ));
+            continue;
+        }
+        let (records, acquired) = if fetching {
+            acquire_share_records(
+                state,
+                &group_id,
+                &member_id,
+                &topic,
+                partition,
+                &mut budget,
+                record_limit,
+            )
+        } else {
+            (Bytes::new(), Vec::new())
+        };
+        any_acquired |= !acquired.is_empty();
+        if requested || !acquired.is_empty() {
+            entries.push((
+                topic_id,
+                partition,
                 ErrorCode::None,
                 ack_error,
                 leader,
                 leader_epoch,
+                records,
+                acquired,
+            ));
+        }
+    }
+
+    if fetching && !poll.expired && !any_error && !any_acquired && req.max_wait_ms > 0 {
+        poll.share_acks = Some(ack_errors);
+        return Ok(Served::Wait(Duration::from_millis(req.max_wait_ms as u64)));
+    }
+
+    out.put_i32(state.throttle(ApiKey::ShareFetch));
+    write_error(out, ErrorCode::None);
+    write_compact_nullable_string(out, None)?; // error_message
+    out.put_i32(ACQUISITION_LOCK_TIMEOUT_MS);
+
+    // Group the entries back into topics, preserving first-seen order so the
+    // response mirrors the request.
+    let mut order: Vec<[u8; 16]> = Vec::new();
+    for entry in &entries {
+        if !order.contains(&entry.0) {
+            order.push(entry.0);
+        }
+    }
+    write_compact_array_len(out, order.len())?;
+    for topic_id in &order {
+        out.put_slice(topic_id);
+        let topic_entries: Vec<&ShareFetchEntry> =
+            entries.iter().filter(|e| e.0 == *topic_id).collect();
+        write_compact_array_len(out, topic_entries.len())?;
+        for (_, partition, error, ack_error, leader, epoch, records, acquired) in topic_entries {
+            write_share_fetch_partition(
+                out,
+                *partition,
+                *error,
+                *ack_error,
+                *leader,
+                *epoch,
                 if records.is_empty() {
                     None
                 } else {
-                    Some(&records)
+                    Some(records)
                 },
-                &acquired,
+                acquired,
             )?;
         }
         write_empty_tagged_fields(out)?; // topic tagged fields
     }
 
     write_compact_array_len(out, 0)?; // node_endpoints
-    write_empty_tagged_fields(out)
+    write_empty_tagged_fields(out)?;
+    Ok(Served::Done)
 }
 
 /// Write one partition of a `ShareFetch` response.
@@ -2798,7 +3776,9 @@ fn write_share_fetch_partition(
     write_empty_tagged_fields(out) // partition tagged fields
 }
 
-/// Serve a `ShareAcknowledge` (API key 79, v1).
+/// Serve a `ShareAcknowledge` (API key 79, v1–v2), under the same session
+/// rules as `ShareFetch`. Closing the session (epoch `-1`) releases every
+/// record the member still holds after its acknowledgements apply.
 fn share_acknowledge(
     body: &mut Bytes,
     api_version: i16,
@@ -2807,29 +3787,42 @@ fn share_acknowledge(
     out: &mut BytesMut,
 ) -> Result<()> {
     let req = ShareAcknowledgeReq::read(body, api_version)?;
-    let Some(group_id) = required_share_identity(&req.group_id, &req.member_id) else {
-        out.put_i32(0); // throttle_time_ms
-        write_error(out, ErrorCode::InvalidRequest);
-        write_compact_nullable_string(
+    let Some((group_id, member_id)) = required_share_identity(&req.group_id, &req.member_id) else {
+        return write_share_acknowledge_error(
             out,
-            Some("ShareAcknowledge requires a group ID and member ID"),
-        )?;
-        write_compact_array_len(out, 0)?; // responses
-        write_compact_array_len(out, 0)?; // node_endpoints
-        return write_empty_tagged_fields(out);
+            api_version,
+            ErrorCode::InvalidRequest,
+            "ShareAcknowledge requires a group ID and member ID",
+        );
     };
     record_share_session_close(
         state,
         ApiKey::ShareAcknowledge,
         node_id,
         &group_id,
-        req.member_id.as_deref(),
+        &member_id,
         req.share_session_epoch,
     );
+    if let Some(code) = check_share_session(
+        state,
+        ApiKey::ShareAcknowledge,
+        node_id,
+        &group_id,
+        &member_id,
+        req.share_session_epoch,
+        true,
+        &[],
+        &[],
+    ) {
+        return write_share_acknowledge_error(out, api_version, code, &format!("{code:?}"));
+    }
 
-    out.put_i32(0); // throttle_time_ms
+    out.put_i32(state.throttle(ApiKey::ShareAcknowledge));
     write_error(out, ErrorCode::None);
     write_compact_nullable_string(out, None)?; // error_message
+    if api_version >= 2 {
+        out.put_i32(ACQUISITION_LOCK_TIMEOUT_MS);
+    }
 
     let mut order: Vec<[u8; 16]> = Vec::new();
     let mut grouped: HashMap<[u8; 16], Vec<&ShareTopicPartitionAcks>> = HashMap::new();
@@ -2857,7 +3850,9 @@ fn share_acknowledge(
                         let (leader, epoch) = (p.leader, p.leader_epoch);
                         let code = apply_share_acks(
                             state,
+                            api_version,
                             &group_id,
+                            &member_id,
                             &topic,
                             entry.partition_index,
                             &entry.acknowledgement_batches,
@@ -2877,18 +3872,66 @@ fn share_acknowledge(
         write_empty_tagged_fields(out)?; // topic tagged fields
     }
 
+    if req.share_session_epoch == -1
+        && let Some(group) = state.share_groups.get_mut(&group_id)
+    {
+        group.release_member(&member_id);
+    }
+
     write_compact_array_len(out, 0)?; // node_endpoints
     write_empty_tagged_fields(out)
+}
+
+/// Whether an injected share-API error belongs on each partition rather than
+/// at the top level of the response.
+fn share_partition_scoped(code: ErrorCode) -> bool {
+    matches!(
+        code,
+        ErrorCode::NotLeaderForPartition
+            | ErrorCode::UnknownTopicOrPartition
+            | ErrorCode::UnknownTopicId
+            | ErrorCode::FencedLeaderEpoch
+            | ErrorCode::UnknownLeaderEpoch
+            | ErrorCode::InvalidRecordState
+    )
+}
+
+/// Write the topics array of a share response with one entry per requested
+/// partition, grouped by topic in request order.
+fn write_share_partitions(
+    out: &mut BytesMut,
+    topics: &[ShareTopicPartitionAcks],
+    mut write_partition: impl FnMut(&mut BytesMut, i32) -> Result<()>,
+) -> Result<()> {
+    let mut order: Vec<[u8; 16]> = Vec::new();
+    for tp in topics {
+        if !order.contains(&tp.topic_id) {
+            order.push(tp.topic_id);
+        }
+    }
+    write_compact_array_len(out, order.len())?;
+    for topic_id in &order {
+        out.put_slice(topic_id);
+        let partitions: Vec<i32> = topics
+            .iter()
+            .filter(|tp| tp.topic_id == *topic_id)
+            .map(|tp| tp.partition_index)
+            .collect();
+        write_compact_array_len(out, partitions.len())?;
+        for partition in partitions {
+            write_partition(out, partition)?;
+        }
+        write_empty_tagged_fields(out)?;
+    }
+    Ok(())
 }
 
 // ── UpdateFeatures (KIP-584) ─────────────────────────────────────────────
 
 /// Serve an `UpdateFeatures` (API key 57).
 ///
-/// The controller-only routing is the point: sending this to an arbitrary
-/// broker is what used to surface a controller failover as a blanket-retriable
-/// protocol error, so the fake broker answers `NOT_CONTROLLER` from anywhere
-/// else exactly as a real one does.
+/// Controller-only: the fake broker answers `NOT_CONTROLLER` from any other
+/// node, exactly as a real one does.
 ///
 /// The updates are recorded on the cluster so a test can assert what the
 /// controller was actually asked to do — including, when `validate_only` is
@@ -3108,7 +4151,7 @@ mod tests {
     #[test]
     fn each_api_is_advertised_exactly_once() {
         let versions = supported_versions();
-        let mut keys: Vec<i16> = versions.iter().map(|(k, _)| k.to_i16()).collect();
+        let mut keys: Vec<i16> = versions.iter().map(|(k, _, _)| k.to_i16()).collect();
         keys.sort_unstable();
         let unique = {
             let mut u = keys.clone();
@@ -3118,7 +4161,7 @@ mod tests {
         assert_eq!(keys, unique, "an API is advertised more than once");
 
         assert!(
-            versions.iter().any(|(k, _)| *k == ApiKey::ApiVersions),
+            versions.iter().any(|(k, _, _)| *k == ApiKey::ApiVersions),
             "ApiVersions must be advertised or no client can complete a handshake"
         );
     }

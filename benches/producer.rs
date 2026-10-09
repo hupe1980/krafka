@@ -7,7 +7,7 @@
 use bytes::BytesMut;
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 
-use krafka::protocol::{Compression, RecordBatch, RecordBatchBuilder};
+use krafka::__private::protocol::{Compression, RecordBatch, RecordBatchBuilder};
 
 fn ok<T, E: std::fmt::Display>(result: Result<T, E>) -> T {
     match result {
@@ -64,11 +64,8 @@ fn bench_compression(c: &mut Criterion) {
     #[allow(clippy::single_element_loop)]
     for compression in [
         Compression::None,
-        #[cfg(feature = "gzip")]
         Compression::Gzip,
-        #[cfg(feature = "snappy")]
         Compression::Snappy,
-        #[cfg(feature = "lz4")]
         Compression::Lz4,
         #[cfg(feature = "zstd")]
         Compression::Zstd,
@@ -120,7 +117,7 @@ fn bench_murmur2(c: &mut Criterion) {
 
 /// Benchmark varint encoding (hot path in protocol layer).
 fn bench_varint(c: &mut Criterion) {
-    use krafka::util::varint::{encode_signed_varint, encode_unsigned_varint};
+    use krafka::__private::util::varint::{encode_signed_varint, encode_unsigned_varint};
 
     let mut group = c.benchmark_group("varint");
 
@@ -190,22 +187,19 @@ fn bench_roundtrip_latency(c: &mut Criterion) {
 
 /// Benchmark partitioner performance (called for every message).
 fn bench_partitioners(c: &mut Criterion) {
-    use krafka::producer::{
-        DefaultPartitioner, HashPartitioner, Partitioner, RoundRobinPartitioner, StickyPartitioner,
-    };
+    use krafka::producer::{Partitioner, RoundRobinPartitioner, murmur2};
 
     let mut group = c.benchmark_group("partitioners");
 
     let keys: Vec<Vec<u8>> = (0..1000).map(|i| format!("key-{i}").into_bytes()).collect();
     let partition_count = 32;
 
-    // DefaultPartitioner with keys
-    let default_partitioner = DefaultPartitioner::new();
+    // Keyed routing: the murmur2 hash every keyed record pays.
     group.throughput(Throughput::Elements(1000));
-    group.bench_function("default_keyed", |b| {
+    group.bench_function("murmur2_keyed", |b| {
         b.iter(|| {
             for key in &keys {
-                let p = default_partitioner.partition("topic", Some(key), partition_count);
+                let p = (murmur2(key) & 0x7fff_ffff) % partition_count as u32;
                 black_box(p);
             }
         });
@@ -217,28 +211,6 @@ fn bench_partitioners(c: &mut Criterion) {
         b.iter(|| {
             for _ in 0..1000 {
                 let p = round_robin.partition("topic", None, partition_count);
-                black_box(p);
-            }
-        });
-    });
-
-    // StickyPartitioner
-    let sticky = StickyPartitioner::new();
-    group.bench_function("sticky", |b| {
-        b.iter(|| {
-            for _ in 0..1000 {
-                let p = sticky.partition("topic", None, partition_count);
-                black_box(p);
-            }
-        });
-    });
-
-    // HashPartitioner
-    let hash_partitioner = HashPartitioner::new();
-    group.bench_function("hash_keyed", |b| {
-        b.iter(|| {
-            for key in &keys {
-                let p = hash_partitioner.partition("topic", Some(key), partition_count);
                 black_box(p);
             }
         });

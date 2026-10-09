@@ -1,30 +1,22 @@
-//! Integration tests for Krafka.
+//! Integration tests against a real Apache Kafka broker in Docker.
 //!
-//! These tests require Docker to be running.
+//! One broker container serves every test in this binary; each test uses its
+//! own topics and groups. The tests are ignored by default:
 //!
-//! Run with:
+//! ```sh
+//! just integration                         # apache/kafka-native:3.9.0
+//! KAFKA_IMAGE=apache/kafka KAFKA_VERSION=4.3.0 just integration
 //! ```
-//! cargo test --test integration_tests
-//! ```
-//!
-//! Note: These tests are ignored by default as they require Docker.
-//! Enable with: `cargo test --test integration_tests -- --ignored`
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use testcontainers::core::{ContainerPort, ContainerState, ExecCommand, WaitFor};
-use testcontainers::{ContainerAsync, Image, runners::AsyncRunner};
-
-// ---------------------------------------------------------------------------
-// Timing constants — tweak these for CI vs local runs
-// ---------------------------------------------------------------------------
-
-/// Time to wait after container start for Kafka to stabilize.
-const CONTAINER_SETTLE: Duration = Duration::from_secs(10);
+use testcontainers::{Image, ImageExt, runners::AsyncRunner};
 
 /// Time to wait after topic creation for metadata propagation.
 const TOPIC_READY: Duration = Duration::from_secs(2);
@@ -163,123 +155,56 @@ impl Image for ApacheKafka {
     }
 }
 
-/// Helper to get a Kafka container.
+static KAFKA: OnceLock<Result<String, String>> = OnceLock::new();
+
+/// The bootstrap address of the broker shared by every test in this binary.
 ///
-/// Image name is read from `KAFKA_IMAGE` (default: `apache/kafka-native`).
-/// Image tag is read from `KAFKA_VERSION` (default: `3.9.0`).
-///
-/// `apache/kafka-native` (GraalVM) segfaults on `Pwd.getpwuid` in some CI
-/// environments; set `KAFKA_IMAGE=apache/kafka` to use the JVM image instead.
-async fn kafka_container() -> (ContainerAsync<ApacheKafka>, String) {
-    let image = std::env::var("KAFKA_IMAGE").unwrap_or_else(|_| "apache/kafka-native".to_string());
-    let tag = std::env::var("KAFKA_VERSION").unwrap_or_else(|_| "3.9.0".to_string());
-
-    let max_attempts = 3;
-    let mut last_err = None;
-
-    for attempt in 1..=max_attempts {
-        match ApacheKafka::new(&image, &tag).start().await {
-            Ok(container) => {
-                // Wait for Kafka to be fully ready
-                tokio::time::sleep(CONTAINER_SETTLE).await;
-
-                let host_port = container
-                    .get_host_port_ipv4(KAFKA_PORT)
-                    .await
-                    .expect("Failed to get host port");
-
-                let bootstrap_servers = format!("127.0.0.1:{}", host_port);
-                return (container, bootstrap_servers);
-            }
-            Err(e) => {
-                eprintln!("Kafka container start attempt {attempt}/{max_attempts} failed: {e}");
-                last_err = Some(e);
-                if attempt < max_attempts {
-                    let backoff = Duration::from_secs(2u64.pow(attempt as u32));
-                    tokio::time::sleep(backoff).await;
-                }
-            }
-        }
-    }
-
-    panic!(
-        "Failed to start Kafka container after {max_attempts} attempts: {}",
-        last_err.unwrap()
-    );
-}
-
-/// Helper to subscribe with retry for coordinator availability.
-async fn subscribe_with_retry(
-    consumer: &krafka::consumer::Consumer,
-    topics: &[&str],
-    max_retries: u32,
-) -> Result<(), krafka::error::KrafkaError> {
-    use krafka::error::KrafkaError;
-
-    let mut last_error = None;
-    for attempt in 0..max_retries {
-        match consumer.subscribe(topics).await {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                // Check if it's a coordinator not available error
-                let is_coordinator_error = matches!(&e, KrafkaError::Broker { .. });
-                if is_coordinator_error && attempt < max_retries - 1 {
-                    eprintln!(
-                        "Subscribe attempt {} failed (coordinator not ready), retrying in 2s...",
-                        attempt + 1
-                    );
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    last_error = Some(e);
-                } else {
-                    return Err(e);
-                }
-            }
-        }
-    }
-    Err(last_error.unwrap())
-}
-
-/// Helper to initialize transactions with retry for coordinator warm-up.
-async fn init_transactions_with_retry(
-    producer: &krafka::producer::TransactionalProducer,
-    max_retries: u32,
-) -> Result<(), krafka::error::KrafkaError> {
-    use krafka::error::{ErrorCode, KrafkaError};
-
-    let attempts = max_retries.max(1);
-    let mut last_error = None;
-    for attempt in 0..attempts {
-        match producer.init_transactions().await {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                let is_coordinator_warmup_error = matches!(
-                    &e,
-                    KrafkaError::Broker {
-                        code: ErrorCode::CoordinatorLoadInProgress
-                            | ErrorCode::CoordinatorNotAvailable
-                            | ErrorCode::NotCoordinator,
-                        ..
+/// Image name is read from `KAFKA_IMAGE` (default: `apache/kafka-native`),
+/// tag from `KAFKA_VERSION` (default: `3.9.0`). The container is started
+/// once, on a thread whose runtime keeps it alive for the life of the
+/// process; `just integration` removes it afterwards by its label. It is ready
+/// when the broker logs "Kafka Server started".
+fn kafka() -> String {
+    KAFKA
+        .get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime for the shared broker");
+                rt.block_on(async move {
+                    let image = std::env::var("KAFKA_IMAGE")
+                        .unwrap_or_else(|_| "apache/kafka-native".to_string());
+                    let tag =
+                        std::env::var("KAFKA_VERSION").unwrap_or_else(|_| "3.9.0".to_string());
+                    let started = ApacheKafka::new(&image, &tag)
+                        .with_labels([("krafka.test-suite", "integration_tests")])
+                        .with_startup_timeout(Duration::from_secs(180))
+                        .start()
+                        .await;
+                    match started {
+                        Ok(container) => {
+                            let port = container.get_host_port_ipv4(KAFKA_PORT).await;
+                            tx.send(
+                                port.map(|p| format!("127.0.0.1:{p}"))
+                                    .map_err(|e| e.to_string()),
+                            )
+                            .ok();
+                            std::future::pending::<()>().await;
+                            drop(container);
+                        }
+                        Err(e) => {
+                            tx.send(Err(format!("{image}:{tag}: {e}"))).ok();
+                        }
                     }
-                );
-                let should_retry = is_coordinator_warmup_error || e.is_retriable();
-
-                if should_retry && attempt < attempts - 1 {
-                    eprintln!(
-                        "init_transactions attempt {} failed ({e}), retrying in 2s...",
-                        attempt + 1
-                    );
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    last_error = Some(e);
-                } else {
-                    return Err(e);
-                }
-            }
-        }
-    }
-
-    Err(last_error.unwrap_or_else(|| {
-        KrafkaError::invalid_state("init_transactions_with_retry exhausted without attempts")
-    }))
+                });
+            });
+            rx.recv()
+                .unwrap_or_else(|_| Err("the broker thread exited".into()))
+        })
+        .clone()
+        .unwrap_or_else(|e| panic!("Kafka did not start: {e}"))
 }
 
 /// Helper to poll for records with retry.
@@ -329,13 +254,13 @@ async fn create_topic_with_configs(
     partitions: i32,
     configs: &[(&str, &str)],
 ) {
-    use krafka::admin::{AdminClient, NewTopic};
+    use krafka::admin::NewTopic;
 
-    let admin = AdminClient::builder()
-        .bootstrap_servers(bootstrap_servers)
-        .build()
+    let admin = krafka::Kafka::builder(bootstrap_servers)
+        .connect()
         .await
-        .expect("Failed to create admin client");
+        .expect("Failed to create admin client")
+        .admin();
 
     let mut new_topic = NewTopic::new(topic, partitions, 1).unwrap();
     for (key, value) in configs {
@@ -343,7 +268,7 @@ async fn create_topic_with_configs(
     }
 
     admin
-        .create_topics(vec![new_topic], Duration::from_secs(10), false)
+        .create_topics(vec![new_topic], Default::default())
         .await
         .expect("Failed to create topic");
 
@@ -354,40 +279,45 @@ async fn create_topic_with_configs(
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_producer_send_receive() {
-    use krafka::consumer::{AutoOffsetReset, Consumer};
-    use krafka::producer::Producer;
+    use krafka::consumer::AutoOffsetReset;
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
     // Create topic first
     let topic = "test-topic";
     create_topic(&bootstrap_servers, topic, 1).await;
 
     // Create producer
-    let producer = Producer::builder()
-        .bootstrap_servers(&bootstrap_servers)
+    let producer = krafka::Kafka::builder(&bootstrap_servers)
         .client_id("test-producer")
+        .connect()
+        .await
+        .expect("Failed to create producer")
+        .producer()
         .build()
         .await
         .expect("Failed to create producer");
 
     let metadata = producer
-        .send(topic, Some(b"test-key"), Some(b"test-value"))
+        .send(krafka::Record::new(topic, "test-value").key("test-key"))
         .await
         .expect("Failed to send message");
 
     assert!(metadata.offset >= 0);
 
     // Create consumer
-    let consumer = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .group_id("test-group")
+    let consumer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create consumer")
+        .consumer("test-group")
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .build()
         .await
         .expect("Failed to create consumer");
 
-    subscribe_with_retry(&consumer, &[topic], 5)
+    consumer
+        .subscribe(&[topic])
         .await
         .expect("Failed to subscribe");
 
@@ -397,34 +327,34 @@ async fn test_producer_send_receive() {
     assert!(!records.is_empty(), "Expected at least one record");
 
     let record = &records[0];
-    assert_eq!(record.topic, topic);
+    assert_eq!(&*record.topic, topic);
     assert_eq!(record.key_str(), Some("test-key"));
     assert_eq!(record.value_str(), Some("test-value"));
 
     consumer.close().await.expect("consumer close");
-    producer.close().await;
+    producer.close().await.unwrap();
 }
 
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_admin_client() {
-    use krafka::admin::{AdminClient, NewTopic};
+    use krafka::admin::NewTopic;
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
-    let admin = AdminClient::builder()
-        .bootstrap_servers(&bootstrap_servers)
+    let admin = krafka::Kafka::builder(&bootstrap_servers)
         .client_id("test-admin")
-        .build()
+        .connect()
         .await
-        .expect("Failed to create admin client");
+        .expect("Failed to create admin client")
+        .admin();
 
     // Create a topic
     let topic_name = "admin-test-topic";
     let new_topic = NewTopic::new(topic_name, 3, 1).unwrap();
 
     admin
-        .create_topics(vec![new_topic], Duration::from_secs(10), false)
+        .create_topics(vec![new_topic], Default::default())
         .await
         .expect("Failed to create topic");
 
@@ -432,7 +362,10 @@ async fn test_admin_client() {
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // List topics
-    let topics = admin.list_topics().await.expect("Failed to list topics");
+    let topics = admin
+        .list_topics(Default::default())
+        .await
+        .expect("Failed to list topics");
     assert!(
         topics.iter().any(|t| t == topic_name),
         "Topic not found in list"
@@ -440,14 +373,17 @@ async fn test_admin_client() {
 
     // Describe cluster
     let cluster = admin
-        .describe_cluster()
+        .describe_cluster(Default::default())
         .await
         .expect("Failed to describe cluster");
     assert!(!cluster.brokers.is_empty(), "No brokers found");
 
     // Delete topic
     admin
-        .delete_topics(vec![topic_name.to_string()], Duration::from_secs(10))
+        .delete_topics(
+            vec![topic_name.to_string()],
+            krafka::admin::DeleteTopicsOptions::default(),
+        )
         .await
         .expect("Failed to delete topic");
 }
@@ -455,19 +391,16 @@ async fn test_admin_client() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_compression_roundtrip() {
-    use krafka::consumer::{AutoOffsetReset, Consumer};
-    use krafka::producer::Producer;
-    use krafka::protocol::Compression;
+    use krafka::consumer::AutoOffsetReset;
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    use krafka::Compression;
+
+    let bootstrap_servers = kafka();
 
     for compression in [
         Compression::None,
-        #[cfg(feature = "gzip")]
         Compression::Gzip,
-        #[cfg(feature = "snappy")]
         Compression::Snappy,
-        #[cfg(feature = "lz4")]
         Compression::Lz4,
         // Zstd is not supported by the apache/kafka-native GraalVM image.
     ] {
@@ -476,33 +409,42 @@ async fn test_compression_roundtrip() {
         let value = format!("test-value-for-{:?}", compression);
 
         // Create producer with compression
-        let producer = Producer::builder()
-            .bootstrap_servers(&bootstrap_servers)
+        let producer = krafka::Kafka::builder(&bootstrap_servers)
             .client_id("compression-test-producer")
+            .connect()
+            .await
+            .expect("Failed to create producer")
+            .producer()
             .compression(compression)
             .build()
             .await
             .expect("Failed to create producer");
 
         let metadata = producer
-            .send(&topic, None, Some(value.as_bytes()))
+            .send(krafka::Record::new(
+                &topic,
+                bytes::Bytes::copy_from_slice(value.as_bytes()),
+            ))
             .await
             .expect("Failed to send message");
 
         assert!(metadata.offset >= 0, "Expected valid offset");
 
-        producer.close().await;
+        producer.close().await.unwrap();
 
         // Create consumer
-        let consumer = Consumer::builder()
-            .bootstrap_servers(&bootstrap_servers)
-            .group_id(format!("compression-test-group-{:?}", compression).to_lowercase())
+        let consumer = krafka::Kafka::builder(&bootstrap_servers)
+            .connect()
+            .await
+            .expect("Failed to create consumer")
+            .consumer(format!("compression-test-group-{:?}", compression).to_lowercase())
             .auto_offset_reset(AutoOffsetReset::Earliest)
             .build()
             .await
             .expect("Failed to create consumer");
 
-        subscribe_with_retry(&consumer, &[&topic], 5)
+        consumer
+            .subscribe(&[&topic])
             .await
             .expect("Failed to subscribe");
 
@@ -523,34 +465,101 @@ async fn test_compression_roundtrip() {
     }
 }
 
+/// A topic with `compression.type=snappy` makes the broker recompress an
+/// uncompressed produce with snappy-java, which writes xerial framing. The
+/// consumer must decode it.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_broker_recompressed_snappy_is_consumed() {
+    use krafka::consumer::AutoOffsetReset;
+
+    use krafka::Compression;
+
+    let bootstrap_servers = kafka();
+    let topic = "broker-snappy-topic";
+    create_topic_with_configs(
+        &bootstrap_servers,
+        topic,
+        1,
+        &[("compression.type", "snappy")],
+    )
+    .await;
+
+    let producer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create producer")
+        .producer()
+        .compression(Compression::None)
+        .build()
+        .await
+        .expect("Failed to create producer");
+    let values: Vec<String> = (0..50)
+        .map(|i| format!("recompressed-{i}-{}", "x".repeat(200)))
+        .collect();
+    for value in &values {
+        let _ = producer
+            .send(krafka::Record::new(
+                topic,
+                bytes::Bytes::copy_from_slice(value.as_bytes()),
+            ))
+            .await
+            .expect("Failed to send message");
+    }
+    producer.close().await.unwrap();
+
+    let consumer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create consumer")
+        .consumer("broker-snappy-group")
+        .auto_offset_reset(AutoOffsetReset::Earliest)
+        .build()
+        .await
+        .expect("Failed to create consumer");
+    consumer
+        .subscribe(&[topic])
+        .await
+        .expect("Failed to subscribe");
+    let records = poll_for_records(&consumer, values.len(), Duration::from_secs(5), 10).await;
+    let received: Vec<&str> = records.iter().filter_map(|r| r.value_str()).collect();
+    assert_eq!(
+        received,
+        values.iter().map(String::as_str).collect::<Vec<_>>()
+    );
+    consumer.close().await.expect("consumer close");
+}
+
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_multiple_partitions() {
-    use krafka::admin::{AdminClient, NewTopic};
-    use krafka::producer::Producer;
+    use krafka::admin::NewTopic;
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
     // Create topic with multiple partitions
-    let admin = AdminClient::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .build()
+    let admin = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
         .await
-        .expect("Failed to create admin client");
+        .expect("Failed to create admin client")
+        .admin();
 
     let topic_name = "multi-partition-topic";
     let new_topic = NewTopic::new(topic_name, 6, 1).unwrap();
 
     admin
-        .create_topics(vec![new_topic], Duration::from_secs(10), false)
+        .create_topics(vec![new_topic], Default::default())
         .await
         .expect("Failed to create topic");
 
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Create producer
-    let producer = Producer::builder()
-        .bootstrap_servers(&bootstrap_servers)
+    let producer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create producer")
+        .producer()
         .build()
         .await
         .expect("Failed to create producer");
@@ -560,7 +569,10 @@ async fn test_multiple_partitions() {
     for i in 0..100 {
         let key = format!("key-{}", i);
         let metadata = producer
-            .send(topic_name, Some(key.as_bytes()), Some(b"value"))
+            .send(
+                krafka::Record::new(topic_name, "value")
+                    .key(bytes::Bytes::copy_from_slice(key.as_bytes())),
+            )
             .await
             .expect("Failed to send message");
         partition_set.insert(metadata.partition);
@@ -573,39 +585,41 @@ async fn test_multiple_partitions() {
         partition_set
     );
 
-    producer.close().await;
+    producer.close().await.unwrap();
 }
 
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_consumer_group_rebalance() {
-    use krafka::admin::{AdminClient, NewTopic};
-    use krafka::consumer::{AutoOffsetReset, Consumer};
-    use krafka::producer::Producer;
+    use krafka::admin::NewTopic;
+    use krafka::consumer::AutoOffsetReset;
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
     let topic_name = "consumer-group-test";
     let group_id = "test-consumer-group";
 
     // Create topic with 4 partitions
-    let admin = AdminClient::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .build()
+    let admin = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
         .await
-        .expect("Failed to create admin client");
+        .expect("Failed to create admin client")
+        .admin();
 
     let new_topic = NewTopic::new(topic_name, 4, 1).unwrap();
     admin
-        .create_topics(vec![new_topic], Duration::from_secs(10), false)
+        .create_topics(vec![new_topic], Default::default())
         .await
         .expect("Failed to create topic");
 
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Produce some messages
-    let producer = Producer::builder()
-        .bootstrap_servers(&bootstrap_servers)
+    let producer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create producer")
+        .producer()
         .build()
         .await
         .expect("Failed to create producer");
@@ -614,25 +628,30 @@ async fn test_consumer_group_rebalance() {
         let key = format!("key-{}", i);
         let _ = producer
             .send(
-                topic_name,
-                Some(key.as_bytes()),
-                Some(format!("value-{}", i).as_bytes()),
+                krafka::Record::new(
+                    topic_name,
+                    bytes::Bytes::copy_from_slice(format!("value-{}", i).as_bytes()),
+                )
+                .key(bytes::Bytes::copy_from_slice(key.as_bytes())),
             )
             .await
             .expect("Failed to send message");
     }
-    producer.close().await;
+    producer.close().await.unwrap();
 
     // Create first consumer
-    let consumer1 = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .group_id(group_id)
+    let consumer1 = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create consumer1")
+        .consumer(group_id)
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .build()
         .await
         .expect("Failed to create consumer1");
 
-    subscribe_with_retry(&consumer1, &[topic_name], 5)
+    consumer1
+        .subscribe(&[topic_name])
         .await
         .expect("Failed to subscribe consumer1");
 
@@ -640,15 +659,18 @@ async fn test_consumer_group_rebalance() {
     let records1 = poll_for_records(&consumer1, 1, Duration::from_secs(5), 5).await;
 
     // Create second consumer in same group
-    let consumer2 = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .group_id(group_id)
+    let consumer2 = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create consumer2")
+        .consumer(group_id)
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .build()
         .await
         .expect("Failed to create consumer2");
 
-    subscribe_with_retry(&consumer2, &[topic_name], 5)
+    consumer2
+        .subscribe(&[topic_name])
         .await
         .expect("Failed to subscribe consumer2");
 
@@ -668,14 +690,18 @@ async fn test_consumer_group_rebalance() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_connection_timeout_handling() {
-    use krafka::producer::Producer;
-
     // Try to connect to a non-existent broker with short timeout
-    let result = Producer::builder()
-        .bootstrap_servers("127.0.0.1:19999") // Non-existent port
-        .client_id("timeout-test")
-        .build()
-        .await;
+    let result = async {
+        krafka::Kafka::builder("127.0.0.1:19999")
+            // Non-existent port
+            .client_id("timeout-test")
+            .connect()
+            .await?
+            .producer()
+            .build()
+            .await
+    }
+    .await;
 
     // Should fail with connection error
     assert!(
@@ -687,16 +713,17 @@ async fn test_connection_timeout_handling() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_producer_continues_after_metadata_refresh() {
-    use krafka::producer::Producer;
-
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
     let topic = "resilience-test-topic";
     create_topic(&bootstrap_servers, topic, 1).await;
 
-    let producer = Producer::builder()
-        .bootstrap_servers(&bootstrap_servers)
+    let producer = krafka::Kafka::builder(&bootstrap_servers)
         .client_id("resilience-test")
+        .connect()
+        .await
+        .expect("Failed to create producer")
+        .producer()
         .build()
         .await
         .expect("Failed to create producer");
@@ -705,9 +732,13 @@ async fn test_producer_continues_after_metadata_refresh() {
     for i in 0..5 {
         let result = producer
             .send(
-                topic,
-                Some(format!("key-{}", i).as_bytes()),
-                Some(format!("value-{}", i).as_bytes()),
+                krafka::Record::new(
+                    topic,
+                    bytes::Bytes::copy_from_slice(format!("value-{}", i).as_bytes()),
+                )
+                .key(bytes::Bytes::copy_from_slice(
+                    format!("key-{}", i).as_bytes(),
+                )),
             )
             .await;
 
@@ -717,15 +748,13 @@ async fn test_producer_continues_after_metadata_refresh() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    producer.close().await;
+    producer.close().await.unwrap();
 }
 
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_topic_survives_a_partial_metadata_refresh_for_another_topic() {
-    use krafka::producer::Producer;
-
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
     let topic_a = "partial-refresh-a";
     let topic_b = "partial-refresh-b";
@@ -735,28 +764,31 @@ async fn test_topic_survives_a_partial_metadata_refresh_for_another_topic() {
     // Short ages reproduce the five-minute defaults without a five-minute test:
     // both topics go stale, and routing a record to topic A then triggers a
     // metadata refresh that names topic A alone.
-    let producer = Producer::builder()
-        .bootstrap_servers(&bootstrap_servers)
+    let producer = krafka::Kafka::builder(&bootstrap_servers)
         .client_id("partial-refresh-test")
         .metadata_max_age(Duration::from_millis(200))
-        .metadata_topic_cache_ttl(Duration::from_millis(200))
+        .metadata_topic_cache_ttl(Some(Duration::from_millis(200)))
+        .connect()
+        .await
+        .expect("Failed to create producer")
+        .producer()
         .build()
         .await
         .expect("Failed to create producer");
 
     let _ = producer
-        .send(topic_a, None, Some(b"warm-a"))
+        .send(krafka::Record::new(topic_a, "warm-a"))
         .await
         .expect("warming topic A should succeed");
     let _ = producer
-        .send(topic_b, None, Some(b"warm-b"))
+        .send(krafka::Record::new(topic_b, "warm-b"))
         .await
         .expect("warming topic B should succeed");
 
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let _ = producer
-        .send(topic_a, None, Some(b"refresh-a"))
+        .send(krafka::Record::new(topic_a, "refresh-a"))
         .await
         .expect("a stale topic refreshes itself");
 
@@ -764,24 +796,26 @@ async fn test_topic_survives_a_partial_metadata_refresh_for_another_topic() {
     // refresh above and then reported as `unknown topic` for the rest of the
     // producer's life, because nothing on the send path re-fetched it.
     let _ = producer
-        .send(topic_b, None, Some(b"after-refresh"))
+        .send(krafka::Record::new(topic_b, "after-refresh"))
         .await
         .expect("topic B must stay usable after a partial refresh for topic A");
 
-    producer.close().await;
+    producer.close().await.unwrap();
 }
 
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_send_to_a_nonexistent_topic_reports_the_broker_error() {
     use krafka::error::{ErrorCode, KrafkaError};
-    use krafka::producer::Producer;
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
-    let producer = Producer::builder()
-        .bootstrap_servers(&bootstrap_servers)
+    let producer = krafka::Kafka::builder(&bootstrap_servers)
         .client_id("unknown-topic-test")
+        .connect()
+        .await
+        .expect("Failed to create producer")
+        .producer()
         // Bound the metadata wait so the test does not sit out the 60 s default.
         .max_block(Duration::from_secs(5))
         .build()
@@ -789,7 +823,7 @@ async fn test_send_to_a_nonexistent_topic_reports_the_broker_error() {
         .expect("Failed to create producer");
 
     let error = producer
-        .send("no-such-topic-anywhere", None, Some(b"v"))
+        .send(krafka::Record::new("no-such-topic-anywhere", "v"))
         .await
         .expect_err("a topic the cluster does not have cannot be produced to");
 
@@ -804,50 +838,53 @@ async fn test_send_to_a_nonexistent_topic_reports_the_broker_error() {
         "expected the broker's own topic error, got: {error}"
     );
 
-    producer.close().await;
+    producer.close().await.unwrap();
 }
 
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_auto_create_topics_materialises_the_topic() {
-    use krafka::producer::Producer;
-
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
     // The broker runs with `auto.create.topics.enable=true` (Kafka's default),
     // so the only thing standing between this send and a created topic is
     // whether the client says it is willing.
-    let producer = Producer::builder()
-        .bootstrap_servers(&bootstrap_servers)
+    let producer = krafka::Kafka::builder(&bootstrap_servers)
         .client_id("auto-create-test")
         .allow_auto_create_topics(true)
+        .connect()
+        .await
+        .expect("Failed to create producer")
+        .producer()
         .max_block(Duration::from_secs(20))
         .build()
         .await
         .expect("Failed to create producer");
 
     let metadata = producer
-        .send("created-by-the-producer", None, Some(b"v"))
+        .send(krafka::Record::new("created-by-the-producer", "v"))
         .await
         .expect("the broker creates the topic because the client asked it to");
     assert_eq!(metadata.topic, "created-by-the-producer");
 
-    producer.close().await;
+    producer.close().await.unwrap();
 }
 
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_standalone_subscription_picks_up_a_topic_created_later() {
-    use krafka::consumer::{AutoOffsetReset, Consumer};
-    use krafka::producer::Producer;
+    use krafka::consumer::AutoOffsetReset;
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
     let topic = "appears-after-subscribe";
 
-    let consumer = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
+    let consumer = krafka::Kafka::builder(&bootstrap_servers)
         .client_id("late-topic-consumer")
+        .connect()
+        .await
+        .expect("Failed to create consumer")
+        .consumer_without_group()
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .build()
         .await
@@ -864,16 +901,19 @@ async fn test_standalone_subscription_picks_up_a_topic_created_later() {
 
     create_topic(&bootstrap_servers, topic, 1).await;
 
-    let producer = Producer::builder()
-        .bootstrap_servers(&bootstrap_servers)
+    let producer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create producer")
+        .producer()
         .build()
         .await
         .expect("Failed to create producer");
     let _ = producer
-        .send(topic, None, Some(b"after-creation"))
+        .send(krafka::Record::new(topic, "after-creation"))
         .await
         .expect("produce to the new topic");
-    producer.close().await;
+    producer.close().await.unwrap();
 
     let records = poll_for_records(&consumer, 1, Duration::from_millis(500), 30).await;
     assert_eq!(
@@ -889,19 +929,21 @@ async fn test_standalone_subscription_picks_up_a_topic_created_later() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_standalone_subscription_picks_up_added_partitions() {
-    use krafka::admin::AdminClient;
-    use krafka::consumer::{AutoOffsetReset, Consumer};
+    use krafka::consumer::AutoOffsetReset;
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
     let topic = "scaled-up-under-a-consumer";
     create_topic(&bootstrap_servers, topic, 1).await;
 
-    let consumer = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
+    let consumer = krafka::Kafka::builder(&bootstrap_servers)
         .client_id("grow-partitions-consumer")
-        .auto_offset_reset(AutoOffsetReset::Earliest)
         .metadata_max_age(Duration::from_millis(500))
+        .connect()
+        .await
+        .expect("Failed to create consumer")
+        .consumer_without_group()
+        .auto_offset_reset(AutoOffsetReset::Earliest)
         .build()
         .await
         .expect("Failed to create consumer");
@@ -909,13 +951,13 @@ async fn test_standalone_subscription_picks_up_added_partitions() {
     consumer.subscribe(&[topic]).await.expect("subscribe");
     assert_eq!(consumer.assignment().await[topic].len(), 1);
 
-    let admin = AdminClient::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .build()
+    let admin = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
         .await
-        .expect("Failed to create admin client");
+        .expect("Failed to create admin client")
+        .admin();
     admin
-        .create_partitions(topic, 3, Duration::from_secs(10), false)
+        .create_partitions([(topic, 3)], Default::default())
         .await
         .expect("Failed to add partitions");
 
@@ -938,38 +980,43 @@ async fn test_standalone_subscription_picks_up_added_partitions() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_consumer_handles_no_messages_gracefully() {
-    use krafka::consumer::{AutoOffsetReset, Consumer};
-    use krafka::producer::Producer;
+    use krafka::consumer::AutoOffsetReset;
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
     let topic = "empty-topic-test";
     create_topic(&bootstrap_servers, topic, 1).await;
 
     // Create producer and send one message so topic has offsets
-    let producer = Producer::builder()
-        .bootstrap_servers(&bootstrap_servers)
+    let producer = krafka::Kafka::builder(&bootstrap_servers)
         .client_id("create-topic")
+        .connect()
+        .await
+        .expect("Failed to create producer")
+        .producer()
         .build()
         .await
         .expect("Failed to create producer");
 
     let _ = producer
-        .send(topic, None, Some(b"setup"))
+        .send(krafka::Record::new(topic, "setup"))
         .await
         .expect("Failed to send setup message");
-    producer.close().await;
+    producer.close().await.unwrap();
 
     // Consumer starting from latest should see no new messages
-    let consumer = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .group_id("empty-test-group")
+    let consumer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create consumer")
+        .consumer("empty-test-group")
         .auto_offset_reset(AutoOffsetReset::Latest)
         .build()
         .await
         .expect("Failed to create consumer");
 
-    subscribe_with_retry(&consumer, &[topic], 5)
+    consumer
+        .subscribe(&[topic])
         .await
         .expect("Failed to subscribe");
 
@@ -984,25 +1031,30 @@ async fn test_consumer_handles_no_messages_gracefully() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_multiple_producers_same_topic() {
-    use krafka::consumer::{AutoOffsetReset, Consumer};
-    use krafka::producer::Producer;
+    use krafka::consumer::AutoOffsetReset;
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
     let topic = "multi-producer-topic";
     create_topic(&bootstrap_servers, topic, 1).await;
 
     // Create multiple producers
-    let producer1 = Producer::builder()
-        .bootstrap_servers(&bootstrap_servers)
+    let producer1 = krafka::Kafka::builder(&bootstrap_servers)
         .client_id("producer-1")
+        .connect()
+        .await
+        .expect("Failed to create producer 1")
+        .producer()
         .build()
         .await
         .expect("Failed to create producer 1");
 
-    let producer2 = Producer::builder()
-        .bootstrap_servers(&bootstrap_servers)
+    let producer2 = krafka::Kafka::builder(&bootstrap_servers)
         .client_id("producer-2")
+        .connect()
+        .await
+        .expect("Failed to create producer 2")
+        .producer()
         .build()
         .await
         .expect("Failed to create producer 2");
@@ -1010,29 +1062,44 @@ async fn test_multiple_producers_same_topic() {
     // Send from both producers
     for i in 0..3 {
         let _ = producer1
-            .send(topic, Some(b"p1"), Some(format!("p1-msg-{}", i).as_bytes()))
+            .send(
+                krafka::Record::new(
+                    topic,
+                    bytes::Bytes::copy_from_slice(format!("p1-msg-{}", i).as_bytes()),
+                )
+                .key("p1"),
+            )
             .await
             .expect("Producer 1 failed");
 
         let _ = producer2
-            .send(topic, Some(b"p2"), Some(format!("p2-msg-{}", i).as_bytes()))
+            .send(
+                krafka::Record::new(
+                    topic,
+                    bytes::Bytes::copy_from_slice(format!("p2-msg-{}", i).as_bytes()),
+                )
+                .key("p2"),
+            )
             .await
             .expect("Producer 2 failed");
     }
 
-    producer1.close().await;
-    producer2.close().await;
+    producer1.close().await.unwrap();
+    producer2.close().await.unwrap();
 
     // Verify all messages were received
-    let consumer = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .group_id("multi-producer-consumer")
+    let consumer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create consumer")
+        .consumer("multi-producer-consumer")
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .build()
         .await
         .expect("Failed to create consumer");
 
-    subscribe_with_retry(&consumer, &[topic], 5)
+    consumer
+        .subscribe(&[topic])
         .await
         .expect("Failed to subscribe");
 
@@ -1046,17 +1113,19 @@ async fn test_multiple_producers_same_topic() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_large_message_handling() {
-    use krafka::consumer::{AutoOffsetReset, Consumer};
-    use krafka::producer::Producer;
+    use krafka::consumer::AutoOffsetReset;
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
     let topic = "large-message-topic";
     create_topic(&bootstrap_servers, topic, 1).await;
 
-    let producer = Producer::builder()
-        .bootstrap_servers(&bootstrap_servers)
+    let producer = krafka::Kafka::builder(&bootstrap_servers)
         .client_id("large-message-producer")
+        .connect()
+        .await
+        .expect("Failed to create producer")
+        .producer()
         .build()
         .await
         .expect("Failed to create producer");
@@ -1065,23 +1134,29 @@ async fn test_large_message_handling() {
     let large_value = vec![b'X'; 100 * 1024];
 
     let metadata = producer
-        .send(topic, Some(b"large-key"), Some(&large_value))
+        .send(
+            krafka::Record::new(topic, bytes::Bytes::copy_from_slice(&large_value))
+                .key("large-key"),
+        )
         .await
         .expect("Failed to send large message");
 
     assert!(metadata.offset >= 0);
-    producer.close().await;
+    producer.close().await.unwrap();
 
     // Verify consumer can read it
-    let consumer = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .group_id("large-message-consumer")
+    let consumer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create consumer")
+        .consumer("large-message-consumer")
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .build()
         .await
         .expect("Failed to create consumer");
 
-    subscribe_with_retry(&consumer, &[topic], 5)
+    consumer
+        .subscribe(&[topic])
         .await
         .expect("Failed to subscribe");
 
@@ -1102,17 +1177,19 @@ async fn test_large_message_handling() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_message_headers() {
-    use krafka::consumer::{AutoOffsetReset, Consumer};
-    use krafka::producer::Producer;
+    use krafka::consumer::AutoOffsetReset;
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
     let topic = "headers-test-topic";
     create_topic(&bootstrap_servers, topic, 1).await;
 
-    let producer = Producer::builder()
-        .bootstrap_servers(&bootstrap_servers)
+    let producer = krafka::Kafka::builder(&bootstrap_servers)
         .client_id("header-test-producer")
+        .connect()
+        .await
+        .expect("Failed to create producer")
+        .producer()
         .build()
         .await
         .expect("Failed to create producer");
@@ -1132,23 +1209,30 @@ async fn test_message_headers() {
 
     // Send message with headers
     let metadata = producer
-        .send_with_headers(topic, Some(b"header-key"), Some(b"header-value"), headers)
+        .send({
+            let mut r = krafka::Record::new(topic, "header-value").key("header-key");
+            r.headers = headers;
+            r
+        })
         .await
         .expect("Failed to send message with headers");
 
     assert!(metadata.offset >= 0);
-    producer.close().await;
+    producer.close().await.unwrap();
 
     // Verify consumer receives headers
-    let consumer = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .group_id("header-test-consumer")
+    let consumer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create consumer")
+        .consumer("header-test-consumer")
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .build()
         .await
         .expect("Failed to create consumer");
 
-    subscribe_with_retry(&consumer, &[topic], 5)
+    consumer
+        .subscribe(&[topic])
         .await
         .expect("Failed to subscribe");
 
@@ -1158,24 +1242,25 @@ async fn test_message_headers() {
     let record = &records[0];
 
     // Verify headers are present
-    assert!(record.header(b"trace-id").is_some());
+    assert!(record.header("trace-id").is_some());
     consumer.close().await.expect("consumer close");
 }
 
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_idempotent_producer() {
-    use krafka::producer::Producer;
-
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
     let topic = "idempotent-test-topic";
     create_topic(&bootstrap_servers, topic, 1).await;
 
     // Create idempotent producer (enabled by default since KIP-679)
-    let producer = Producer::builder()
-        .bootstrap_servers(&bootstrap_servers)
+    let producer = krafka::Kafka::builder(&bootstrap_servers)
         .client_id("idempotent-producer-test")
+        .connect()
+        .await
+        .expect("Failed to create idempotent producer")
+        .producer()
         .build()
         .await
         .expect("Failed to create idempotent producer");
@@ -1184,9 +1269,13 @@ async fn test_idempotent_producer() {
     for i in 0..5 {
         let metadata = producer
             .send(
-                topic,
-                Some(format!("key-{}", i).as_bytes()),
-                Some(format!("value-{}", i).as_bytes()),
+                krafka::Record::new(
+                    topic,
+                    bytes::Bytes::copy_from_slice(format!("value-{}", i).as_bytes()),
+                )
+                .key(bytes::Bytes::copy_from_slice(
+                    format!("key-{}", i).as_bytes(),
+                )),
             )
             .await
             .expect("Failed to send message");
@@ -1195,30 +1284,32 @@ async fn test_idempotent_producer() {
         assert!(metadata.offset >= 0);
     }
 
-    producer.close().await;
+    producer.close().await.unwrap();
 }
 
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_null_key_and_value() {
-    use krafka::consumer::{AutoOffsetReset, Consumer};
-    use krafka::producer::Producer;
+    use krafka::consumer::AutoOffsetReset;
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
     let topic = "null-test-topic";
     create_topic(&bootstrap_servers, topic, 1).await;
 
-    let producer = Producer::builder()
-        .bootstrap_servers(&bootstrap_servers)
+    let producer = krafka::Kafka::builder(&bootstrap_servers)
         .client_id("null-test-producer")
+        .connect()
+        .await
+        .expect("Failed to create producer")
+        .producer()
         .build()
         .await
         .expect("Failed to create producer");
 
     // Send message with null key
     let metadata = producer
-        .send(topic, None, Some(b"value-with-null-key"))
+        .send(krafka::Record::new(topic, "value-with-null-key"))
         .await
         .expect("Failed to send message with null key");
     assert!(metadata.offset >= 0);
@@ -1226,29 +1317,32 @@ async fn test_null_key_and_value() {
     // Send a null value (a tombstone) and a zero-length value, which the wire
     // format distinguishes from each other and from the record above.
     let metadata = producer
-        .send(topic, Some(b"key-with-null-value"), None)
+        .send(krafka::Record::tombstone(topic, "key-with-null-value"))
         .await
         .expect("Failed to send tombstone");
     assert!(metadata.offset >= 0);
 
     let metadata = producer
-        .send(topic, Some(b"key-with-empty-value"), Some(b""))
+        .send(krafka::Record::new(topic, "").key("key-with-empty-value"))
         .await
         .expect("Failed to send empty value");
     assert!(metadata.offset >= 0);
 
-    producer.close().await;
+    producer.close().await.unwrap();
 
     // Verify consumer receives the message
-    let consumer = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .group_id("null-test-consumer")
+    let consumer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create consumer")
+        .consumer("null-test-consumer")
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .build()
         .await
         .expect("Failed to create consumer");
 
-    subscribe_with_retry(&consumer, &[topic], 5)
+    consumer
+        .subscribe(&[topic])
         .await
         .expect("Failed to subscribe");
 
@@ -1287,10 +1381,10 @@ async fn test_null_key_and_value() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_tombstone_round_trip_on_compacted_topic() {
-    use krafka::consumer::{AutoOffsetReset, Consumer};
-    use krafka::producer::{Producer, ProducerRecord};
+    use krafka::consumer::AutoOffsetReset;
+    use krafka::producer::Record;
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
     let topic = "compacted-tombstone-topic";
     create_topic_with_configs(
@@ -1308,23 +1402,26 @@ async fn test_tombstone_round_trip_on_compacted_topic() {
     )
     .await;
 
-    let producer = Producer::builder()
-        .bootstrap_servers(&bootstrap_servers)
+    let producer = krafka::Kafka::builder(&bootstrap_servers)
         .client_id("tombstone-producer")
+        .connect()
+        .await
+        .expect("Failed to create producer")
+        .producer()
         .build()
         .await
         .expect("Failed to create producer");
 
     let value_meta = producer
-        .send(topic, Some(b"user-42"), Some(b"alice"))
+        .send(krafka::Record::new(topic, "alice").key("user-42"))
         .await
         .expect("Failed to send valued record");
 
     let tombstone_meta = producer
-        .send_record(
-            ProducerRecord::tombstone(topic, "user-42")
-                .with_header("X-Reason", &b"gdpr-erasure"[..])
-                .with_null_header("X-Flag"),
+        .send(
+            Record::tombstone(topic, "user-42")
+                .header("X-Reason", &b"gdpr-erasure"[..])
+                .null_header("X-Flag"),
         )
         .await
         .expect("Failed to send tombstone");
@@ -1334,17 +1431,20 @@ async fn test_tombstone_round_trip_on_compacted_topic() {
         "the tombstone must share a partition with the key it deletes"
     );
 
-    producer.close().await;
+    producer.close().await.unwrap();
 
-    let consumer = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .group_id("tombstone-consumer")
+    let consumer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create consumer")
+        .consumer("tombstone-consumer")
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .build()
         .await
         .expect("Failed to create consumer");
 
-    subscribe_with_retry(&consumer, &[topic], 5)
+    consumer
+        .subscribe(&[topic])
         .await
         .expect("Failed to subscribe");
 
@@ -1363,12 +1463,12 @@ async fn test_tombstone_round_trip_on_compacted_topic() {
     assert!(tombstone.is_tombstone());
 
     // Header nullness survives the broker too.
-    assert_eq!(tombstone.headers[0].0.as_ref(), b"X-Reason");
+    assert_eq!(tombstone.headers[0].0, "X-Reason");
     assert_eq!(
         tombstone.headers[0].1.as_deref(),
         Some(&b"gdpr-erasure"[..])
     );
-    assert_eq!(tombstone.headers[1].0.as_ref(), b"X-Flag");
+    assert_eq!(tombstone.headers[1].0, "X-Flag");
     assert_eq!(tombstone.headers[1].1, None);
 
     consumer.close().await.expect("consumer close");
@@ -1377,44 +1477,49 @@ async fn test_tombstone_round_trip_on_compacted_topic() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_multiple_topics_subscription() {
-    use krafka::consumer::{AutoOffsetReset, Consumer};
-    use krafka::producer::Producer;
+    use krafka::consumer::AutoOffsetReset;
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
     let topic1 = "multi-topic-1";
     let topic2 = "multi-topic-2";
     create_topic(&bootstrap_servers, topic1, 1).await;
     create_topic(&bootstrap_servers, topic2, 1).await;
 
-    let producer = Producer::builder()
-        .bootstrap_servers(&bootstrap_servers)
+    let producer = krafka::Kafka::builder(&bootstrap_servers)
         .client_id("multi-topic-producer")
+        .connect()
+        .await
+        .expect("Failed to create producer")
+        .producer()
         .build()
         .await
         .expect("Failed to create producer");
 
     // Send messages to both topics
     let _ = producer
-        .send(topic1, Some(b"key1"), Some(b"value1"))
+        .send(krafka::Record::new(topic1, "value1").key("key1"))
         .await
         .expect("send failed");
     let _ = producer
-        .send(topic2, Some(b"key2"), Some(b"value2"))
+        .send(krafka::Record::new(topic2, "value2").key("key2"))
         .await
         .expect("send failed");
-    producer.close().await;
+    producer.close().await.unwrap();
 
     // Consumer subscribed to both topics
-    let consumer = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .group_id("multi-topic-consumer")
+    let consumer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create consumer")
+        .consumer("multi-topic-consumer")
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .build()
         .await
         .expect("Failed to create consumer");
 
-    subscribe_with_retry(&consumer, &[topic1, topic2], 5)
+    consumer
+        .subscribe(&[topic1, topic2])
         .await
         .expect("Failed to subscribe");
 
@@ -1424,8 +1529,7 @@ async fn test_multiple_topics_subscription() {
     assert_eq!(all_records.len(), 2, "Expected 2 messages from 2 topics");
 
     // Verify we got messages from both topics
-    let topics: std::collections::HashSet<_> =
-        all_records.iter().map(|r| r.topic.as_str()).collect();
+    let topics: std::collections::HashSet<_> = all_records.iter().map(|r| &*r.topic).collect();
     assert!(
         topics.contains(topic1) && topics.contains(topic2),
         "Should contain messages from both topics, got: {:?}",
@@ -1437,32 +1541,35 @@ async fn test_multiple_topics_subscription() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_admin_describe_configs() {
-    use krafka::admin::{AdminClient, NewTopic};
+    use krafka::admin::NewTopic;
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
-    let admin = AdminClient::builder()
-        .bootstrap_servers(&bootstrap_servers)
+    let admin = krafka::Kafka::builder(&bootstrap_servers)
         .client_id("config-test-admin")
-        .build()
+        .connect()
         .await
-        .expect("Failed to create admin client");
+        .expect("Failed to create admin client")
+        .admin();
 
     // Create a topic first
     let topic_name = "config-test-topic";
     let new_topic = NewTopic::new(topic_name, 1, 1).unwrap();
     admin
-        .create_topics(vec![new_topic], Duration::from_secs(10), false)
+        .create_topics(vec![new_topic], Default::default())
         .await
         .expect("Failed to create topic");
 
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Describe topic configs
-    use krafka::admin::DescribeConfigsRequest;
+    use krafka::admin::ConfigResource;
     let configs = admin
-        .describe_configs(DescribeConfigsRequest::for_topic(topic_name))
+        .describe_configs([ConfigResource::topic(topic_name)], Default::default())
         .await
+        .expect("Failed to describe configs")
+        .remove(&ConfigResource::topic(topic_name))
+        .expect("the topic is answered")
         .expect("Failed to describe configs");
 
     // Should have some configuration entries
@@ -1470,7 +1577,10 @@ async fn test_admin_describe_configs() {
 
     // Clean up
     admin
-        .delete_topics(vec![topic_name.to_string()], Duration::from_secs(10))
+        .delete_topics(
+            vec![topic_name.to_string()],
+            krafka::admin::DeleteTopicsOptions::default(),
+        )
         .await
         .ok();
 }
@@ -1478,10 +1588,9 @@ async fn test_admin_describe_configs() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_concurrent_producers() {
-    use krafka::consumer::{AutoOffsetReset, Consumer};
-    use krafka::producer::Producer;
+    use krafka::consumer::AutoOffsetReset;
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
     let topic = "concurrent-producer-topic";
     create_topic(&bootstrap_servers, topic, 3).await;
@@ -1492,9 +1601,12 @@ async fn test_concurrent_producers() {
         .map(|i| {
             let bs = bootstrap.clone();
             tokio::spawn(async move {
-                let producer = Producer::builder()
-                    .bootstrap_servers(&bs)
+                let producer = krafka::Kafka::builder(&bs)
                     .client_id(format!("concurrent-producer-{}", i))
+                    .connect()
+                    .await
+                    .expect("Failed to create producer")
+                    .producer()
                     .build()
                     .await
                     .expect("Failed to create producer");
@@ -1502,14 +1614,20 @@ async fn test_concurrent_producers() {
                 for j in 0..5 {
                     let _ = producer
                         .send(
-                            "concurrent-producer-topic",
-                            Some(format!("key-{}-{}", i, j).as_bytes()),
-                            Some(format!("value-{}-{}", i, j).as_bytes()),
+                            krafka::Record::new(
+                                "concurrent-producer-topic",
+                                bytes::Bytes::copy_from_slice(
+                                    format!("value-{}-{}", i, j).as_bytes(),
+                                ),
+                            )
+                            .key(bytes::Bytes::copy_from_slice(
+                                format!("key-{}-{}", i, j).as_bytes(),
+                            )),
                         )
                         .await
                         .expect("Failed to send");
                 }
-                producer.close().await;
+                producer.close().await.unwrap();
             })
         })
         .collect();
@@ -1520,15 +1638,18 @@ async fn test_concurrent_producers() {
     }
 
     // Verify all 15 messages were received
-    let consumer = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .group_id("concurrent-producer-consumer")
+    let consumer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create consumer")
+        .consumer("concurrent-producer-consumer")
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .build()
         .await
         .expect("Failed to create consumer");
 
-    subscribe_with_retry(&consumer, &[topic], 5)
+    consumer
+        .subscribe(&[topic])
         .await
         .expect("Failed to subscribe");
 
@@ -1545,19 +1666,22 @@ async fn test_concurrent_producers() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_producer_with_batching() {
-    use krafka::consumer::{AutoOffsetReset, Consumer};
-    use krafka::producer::Producer;
+    use krafka::consumer::AutoOffsetReset;
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
     let topic = "batch-test-topic";
     create_topic(&bootstrap_servers, topic, 1).await;
 
     // Create producer with batching enabled (linger > 0)
-    let producer = Producer::builder()
-        .bootstrap_servers(&bootstrap_servers)
+    let producer = krafka::Kafka::builder(&bootstrap_servers)
         .client_id("batch-producer")
-        .linger(Duration::from_millis(50)) // Enable batching
+        .connect()
+        .await
+        .expect("Failed to create producer")
+        .producer()
+        .linger(Duration::from_millis(50))
+        // Enable batching
         .batch_size(16384)
         .build()
         .await
@@ -1567,25 +1691,32 @@ async fn test_producer_with_batching() {
     for i in 0..10 {
         let _ = producer
             .send(
-                topic,
-                Some(format!("key-{}", i).as_bytes()),
-                Some(format!("value-{}", i).as_bytes()),
+                krafka::Record::new(
+                    topic,
+                    bytes::Bytes::copy_from_slice(format!("value-{}", i).as_bytes()),
+                )
+                .key(bytes::Bytes::copy_from_slice(
+                    format!("key-{}", i).as_bytes(),
+                )),
             )
             .await
             .expect("Failed to send");
     }
-    producer.close().await;
+    producer.close().await.unwrap();
 
     // Verify consumer receives all messages
-    let consumer = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .group_id("batch-consumer")
+    let consumer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create consumer")
+        .consumer("batch-consumer")
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .build()
         .await
         .expect("Failed to create consumer");
 
-    subscribe_with_retry(&consumer, &[topic], 5)
+    consumer
+        .subscribe(&[topic])
         .await
         .expect("Failed to subscribe");
 
@@ -1602,15 +1733,15 @@ async fn test_producer_with_batching() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_admin_create_partitions() {
-    use krafka::admin::{AdminClient, NewTopic};
+    use krafka::admin::NewTopic;
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
-    let admin = AdminClient::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .build()
+    let admin = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
         .await
-        .expect("Failed to create admin client");
+        .expect("Failed to create admin client")
+        .admin();
 
     let topic_name = "partition-increase-topic";
 
@@ -1618,8 +1749,7 @@ async fn test_admin_create_partitions() {
     admin
         .create_topics(
             vec![NewTopic::new(topic_name, 2, 1).unwrap()],
-            Duration::from_secs(10),
-            false,
+            Default::default(),
         )
         .await
         .expect("Failed to create topic");
@@ -1628,14 +1758,17 @@ async fn test_admin_create_partitions() {
 
     // Verify initial partition count
     let count = admin
-        .partition_count(topic_name)
+        .describe_topics([topic_name], Default::default())
         .await
-        .expect("Failed to get count");
+        .expect("Failed to describe")
+        .remove(topic_name)
+        .and_then(Result::ok)
+        .map(|t| t.partitions.len());
     assert_eq!(count, Some(2), "Expected 2 partitions initially");
 
     // Increase to 4 partitions
     admin
-        .create_partitions(topic_name, 4, Duration::from_secs(10), false)
+        .create_partitions([(topic_name, 4)], Default::default())
         .await
         .expect("Failed to create partitions");
 
@@ -1643,14 +1776,20 @@ async fn test_admin_create_partitions() {
 
     // Verify new partition count
     let count = admin
-        .partition_count(topic_name)
+        .describe_topics([topic_name], Default::default())
         .await
-        .expect("Failed to get count");
+        .expect("Failed to describe")
+        .remove(topic_name)
+        .and_then(Result::ok)
+        .map(|t| t.partitions.len());
     assert_eq!(count, Some(4), "Expected 4 partitions after increase");
 
     // Clean up
     admin
-        .delete_topics(vec![topic_name.to_string()], Duration::from_secs(10))
+        .delete_topics(
+            vec![topic_name.to_string()],
+            krafka::admin::DeleteTopicsOptions::default(),
+        )
         .await
         .ok();
 }
@@ -1658,15 +1797,15 @@ async fn test_admin_create_partitions() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_admin_alter_topic_config() {
-    use krafka::admin::{AdminClient, NewTopic};
+    use krafka::admin::NewTopic;
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
-    let admin = AdminClient::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .build()
+    let admin = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
         .await
-        .expect("Failed to create admin client");
+        .expect("Failed to create admin client")
+        .admin();
 
     let topic_name = "config-alter-topic";
 
@@ -1674,8 +1813,7 @@ async fn test_admin_alter_topic_config() {
     admin
         .create_topics(
             vec![NewTopic::new(topic_name, 1, 1).unwrap()],
-            Duration::from_secs(10),
-            false,
+            Default::default(),
         )
         .await
         .expect("Failed to create topic");
@@ -1683,21 +1821,31 @@ async fn test_admin_alter_topic_config() {
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Alter topic config - set retention to 1 hour
-    let mut configs = std::collections::HashMap::new();
-    configs.insert("retention.ms".to_string(), "3600000".to_string());
-
+    use krafka::admin::{ConfigOp, ConfigResource};
+    let resource = ConfigResource::topic(topic_name);
     let result = admin
-        .alter_topic_config(topic_name, configs)
+        .incremental_alter_configs(
+            [(
+                resource.clone(),
+                vec![ConfigOp::set("retention.ms", "3600000")],
+            )],
+            Default::default(),
+        )
         .await
         .expect("Failed to alter config");
 
-    assert!(result.error.is_none(), "Config alteration should succeed");
+    assert!(
+        result[&resource].is_ok(),
+        "Config alteration should succeed"
+    );
 
     // Verify the config was changed
-    use krafka::admin::DescribeConfigsRequest;
     let topic_configs = admin
-        .describe_configs(DescribeConfigsRequest::for_topic(topic_name))
+        .describe_configs([resource.clone()], Default::default())
         .await
+        .expect("Failed to describe config")
+        .remove(&resource)
+        .expect("the topic is answered")
         .expect("Failed to describe config");
 
     let retention_config = topic_configs
@@ -1713,25 +1861,26 @@ async fn test_admin_alter_topic_config() {
 
     // Clean up
     admin
-        .delete_topics(vec![topic_name.to_string()], Duration::from_secs(10))
+        .delete_topics(
+            vec![topic_name.to_string()],
+            krafka::admin::DeleteTopicsOptions::default(),
+        )
         .await
         .ok();
 }
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_admin_describe_cluster() {
-    use krafka::admin::AdminClient;
+    let bootstrap_servers = kafka();
 
-    let (_container, bootstrap_servers) = kafka_container().await;
-
-    let admin = AdminClient::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .build()
+    let admin = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
         .await
-        .expect("Failed to create admin client");
+        .expect("Failed to create admin client")
+        .admin();
 
     let cluster = admin
-        .describe_cluster()
+        .describe_cluster(Default::default())
         .await
         .expect("Failed to describe cluster");
 
@@ -1745,21 +1894,21 @@ async fn test_admin_describe_cluster() {
     let broker = &cluster.brokers[0];
     assert!(!broker.host.is_empty(), "Broker should have a host");
     assert!(broker.port > 0, "Broker should have a valid port");
-    assert!(broker.broker_id >= 0, "Broker should have a valid ID");
+    assert!(broker.id >= 0, "Broker should have a valid ID");
 }
 
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_admin_describe_topics() {
-    use krafka::admin::{AdminClient, NewTopic};
+    use krafka::admin::NewTopic;
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
-    let admin = AdminClient::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .build()
+    let admin = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
         .await
-        .expect("Failed to create admin client");
+        .expect("Failed to create admin client")
+        .admin();
 
     // Create test topics
     let topic1 = "describe-topic-1";
@@ -1771,8 +1920,7 @@ async fn test_admin_describe_topics() {
                 NewTopic::new(topic1, 2, 1).unwrap(),
                 NewTopic::new(topic2, 3, 1).unwrap(),
             ],
-            Duration::from_secs(10),
-            false,
+            Default::default(),
         )
         .await
         .expect("Failed to create topics");
@@ -1781,14 +1929,14 @@ async fn test_admin_describe_topics() {
 
     // Describe the topics
     let topics = admin
-        .describe_topics(&[topic1, topic2])
+        .describe_topics([topic1, topic2], Default::default())
         .await
         .expect("Failed to describe topics");
 
     assert_eq!(topics.len(), 2, "Should describe 2 topics");
 
-    let t1 = topics.get(topic1).expect("topic1 not found");
-    let t2 = topics.get(topic2).expect("topic2 not found");
+    let t1 = topics[topic1].as_ref().expect("topic1 not found");
+    let t2 = topics[topic2].as_ref().expect("topic2 not found");
 
     assert_eq!(t1.partitions.len(), 2, "topic1 should have 2 partitions");
     assert_eq!(t2.partitions.len(), 3, "topic2 should have 3 partitions");
@@ -1797,7 +1945,7 @@ async fn test_admin_describe_topics() {
     admin
         .delete_topics(
             vec![topic1.to_string(), topic2.to_string()],
-            Duration::from_secs(10),
+            krafka::admin::DeleteTopicsOptions::default(),
         )
         .await
         .ok();
@@ -1806,41 +1954,47 @@ async fn test_admin_describe_topics() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_producer_timestamp_propagation() {
-    use krafka::consumer::{AutoOffsetReset, Consumer};
-    use krafka::producer::{Producer, ProducerRecord};
+    use krafka::consumer::AutoOffsetReset;
+    use krafka::producer::Record;
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
     let topic = "timestamp-test-topic";
     create_topic(&bootstrap_servers, topic, 1).await;
 
-    let producer = Producer::builder()
-        .bootstrap_servers(&bootstrap_servers)
+    let producer = krafka::Kafka::builder(&bootstrap_servers)
         .client_id("timestamp-test-producer")
+        .connect()
+        .await
+        .expect("Failed to create producer")
+        .producer()
         .build()
         .await
         .expect("Failed to create producer");
 
     // Send with explicit timestamp
     let timestamp = 1700000000000_i64; // Unix epoch ms
-    let record = ProducerRecord::new(topic, b"hello".to_vec())
-        .with_key(b"ts-key".to_vec())
-        .with_timestamp(timestamp);
+    let record = Record::new(topic, b"hello".to_vec())
+        .key(b"ts-key".to_vec())
+        .timestamp(timestamp);
     let metadata = producer
-        .send_record(record)
+        .send(record)
         .await
         .expect("Failed to send record with timestamp");
 
     assert!(metadata.offset >= 0);
-    producer.close().await;
+    producer.close().await.unwrap();
 
     // Use manual partition assignment (no group coordinator) to avoid
     // a race where ListOffsets(timestamp=-2) transiently returns the high
     // watermark instead of the log start offset for freshly created
     // partitions, AND the group coordinator rejoin in poll() overwrites
     // any seek_to_beginning() the test applies.
-    let consumer = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
+    let consumer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create consumer")
+        .consumer_without_group()
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .build()
         .await
@@ -1879,39 +2033,45 @@ async fn test_producer_timestamp_propagation() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_consumer_manual_assign() {
-    use krafka::consumer::{AutoOffsetReset, Consumer};
-    use krafka::producer::{Producer, ProducerRecord};
+    use krafka::consumer::AutoOffsetReset;
+    use krafka::producer::Record;
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
     let topic = "manual-assign-topic";
     create_topic(&bootstrap_servers, topic, 2).await;
 
-    let producer = Producer::builder()
-        .bootstrap_servers(&bootstrap_servers)
+    let producer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create producer")
+        .producer()
         .build()
         .await
         .expect("Failed to create producer");
 
     // Send messages explicitly to partition 0 so the test is deterministic
     for i in 0..5 {
-        let record = ProducerRecord::new(topic, format!("val-{}", i).into_bytes())
-            .with_partition(0)
-            .with_key(format!("k-{}", i).into_bytes());
-        let _ = producer.send_record(record).await.expect("send failed");
+        let record = Record::new(topic, format!("val-{}", i).into_bytes())
+            .partition(0)
+            .key(format!("k-{}", i).into_bytes());
+        let _ = producer.send(record).await.expect("send failed");
     }
     // Also send some to partition 1 (should NOT be received)
     for i in 0..5 {
-        let record = ProducerRecord::new(topic, format!("val-p1-{}", i).into_bytes())
-            .with_partition(1)
-            .with_key(format!("k1-{}", i).into_bytes());
-        let _ = producer.send_record(record).await.expect("send failed");
+        let record = Record::new(topic, format!("val-p1-{}", i).into_bytes())
+            .partition(1)
+            .key(format!("k1-{}", i).into_bytes());
+        let _ = producer.send(record).await.expect("send failed");
     }
-    producer.close().await;
+    producer.close().await.unwrap();
 
     // Create consumer WITHOUT group_id — manual assignment mode
-    let consumer = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
+    let consumer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create consumer")
+        .consumer_without_group()
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .build()
         .await
@@ -1936,10 +2096,9 @@ async fn test_consumer_manual_assign() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_admin_list_consumer_groups() {
-    use krafka::admin::AdminClient;
-    use krafka::consumer::{AutoOffsetReset, Consumer};
+    use krafka::consumer::AutoOffsetReset;
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
     let topic = "group-list-topic";
     create_topic(&bootstrap_servers, topic, 1).await;
@@ -1947,15 +2106,18 @@ async fn test_admin_list_consumer_groups() {
     let group_id = "group-list-test-group";
 
     // Create a consumer and join a group
-    let consumer = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .group_id(group_id)
+    let consumer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create consumer")
+        .consumer(group_id)
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .build()
         .await
         .expect("Failed to create consumer");
 
-    subscribe_with_retry(&consumer, &[topic], 5)
+    consumer
+        .subscribe(&[topic])
         .await
         .expect("Failed to subscribe");
 
@@ -1963,16 +2125,19 @@ async fn test_admin_list_consumer_groups() {
     let _ = poll_for_records(&consumer, 0, Duration::from_secs(3), 3).await;
 
     // Admin client should be able to list the group
-    let admin = AdminClient::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .build()
+    let admin = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
         .await
-        .expect("Failed to create admin client");
+        .expect("Failed to create admin client")
+        .admin();
 
-    let groups = admin
-        .list_consumer_groups(&krafka::admin::GroupListing::all())
+    let groups: Vec<_> = admin
+        .list_consumer_groups(Default::default())
         .await
-        .expect("Failed to list groups");
+        .expect("Failed to list groups")
+        .into_values()
+        .flat_map(|per_broker| per_broker.expect("ListGroups failed on a broker"))
+        .collect();
 
     assert!(
         groups.iter().any(|g| g.group_id == group_id),
@@ -1986,23 +2151,26 @@ async fn test_admin_list_consumer_groups() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_consumer_unsubscribe() {
-    use krafka::consumer::{AutoOffsetReset, Consumer};
+    use krafka::consumer::AutoOffsetReset;
     use krafka::error::{ErrorCode, KrafkaError};
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
     let topic = "unsub-test-topic";
     create_topic(&bootstrap_servers, topic, 1).await;
 
-    let consumer = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .group_id("unsub-test-group")
+    let consumer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create consumer")
+        .consumer("unsub-test-group")
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .build()
         .await
         .expect("Failed to create consumer");
 
-    subscribe_with_retry(&consumer, &[topic], 5)
+    consumer
+        .subscribe(&[topic])
         .await
         .expect("Failed to subscribe");
 
@@ -2040,16 +2208,17 @@ async fn test_consumer_unsubscribe() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_producer_metrics() {
-    use krafka::producer::Producer;
-
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
     let topic = "metrics-test-topic";
     create_topic(&bootstrap_servers, topic, 1).await;
 
-    let producer = Producer::builder()
-        .bootstrap_servers(&bootstrap_servers)
+    let producer = krafka::Kafka::builder(&bootstrap_servers)
         .client_id("metrics-test-producer")
+        .connect()
+        .await
+        .expect("Failed to create producer")
+        .producer()
         .build()
         .await
         .expect("Failed to create producer");
@@ -2057,17 +2226,23 @@ async fn test_producer_metrics() {
     // Send some messages
     for i in 0..5 {
         let _ = producer
-            .send(topic, Some(format!("k-{}", i).as_bytes()), Some(b"value"))
+            .send(
+                krafka::Record::new(topic, "value")
+                    .key(bytes::Bytes::copy_from_slice(format!("k-{}", i).as_bytes())),
+            )
             .await
             .expect("send failed");
     }
 
     let metrics = producer.metrics();
-    assert_eq!(metrics.records_sent, 5, "Should have sent 5 records");
-    assert!(metrics.bytes_sent > 0, "Should have sent bytes");
-    assert_eq!(metrics.errors, 0, "Should have no errors");
+    assert_eq!(
+        metrics.producer.records_sent, 5,
+        "Should have sent 5 records"
+    );
+    assert!(metrics.producer.bytes_sent > 0, "Should have sent bytes");
+    assert_eq!(metrics.producer.errors, 0, "Should have no errors");
 
-    producer.close().await;
+    producer.close().await.unwrap();
     assert!(producer.is_closed(), "Producer should be closed");
 }
 
@@ -2075,86 +2250,100 @@ async fn test_producer_metrics() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_send_after_producer_close() {
-    use krafka::producer::Producer;
-
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
     let topic = "send-after-close-topic";
     create_topic(&bootstrap_servers, topic, 1).await;
 
-    let producer = Producer::builder()
-        .bootstrap_servers(&bootstrap_servers)
+    let producer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create producer")
+        .producer()
         .build()
         .await
         .expect("Failed to create producer");
 
-    producer.close().await;
+    producer.close().await.unwrap();
     assert!(producer.is_closed());
 
-    let result = producer.send(topic, None, Some(b"should-fail")).await;
+    let result = producer
+        .send(krafka::Record::new(topic, "should-fail"))
+        .await;
     assert!(result.is_err(), "Send after close should return an error");
 }
 
-/// Test consumer commit_sync and verified resume from committed offset.
+/// Test consumer commit and verified resume from committed offset.
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_consumer_commit_and_resume_verified() {
-    use krafka::consumer::{AutoOffsetReset, Consumer};
-    use krafka::producer::Producer;
+    use krafka::consumer::AutoOffsetReset;
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
     let topic = "commit-verify-topic";
     let group_id = "commit-verify-group";
     create_topic(&bootstrap_servers, topic, 1).await;
 
-    let producer = Producer::builder()
-        .bootstrap_servers(&bootstrap_servers)
+    let producer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create producer")
+        .producer()
         .build()
         .await
         .expect("Failed to create producer");
 
     for i in 0..10 {
         let _ = producer
-            .send(topic, None, Some(format!("msg-{}", i).as_bytes()))
+            .send(krafka::Record::new(
+                topic,
+                bytes::Bytes::copy_from_slice(format!("msg-{}", i).as_bytes()),
+            ))
             .await
             .expect("send failed");
     }
-    producer.close().await;
+    producer.close().await.unwrap();
 
     // First consumer: read all and commit
     {
-        let consumer = Consumer::builder()
-            .bootstrap_servers(&bootstrap_servers)
-            .group_id(group_id)
+        let consumer = krafka::Kafka::builder(&bootstrap_servers)
+            .connect()
+            .await
+            .expect("Failed to create consumer")
+            .consumer(group_id)
             .auto_offset_reset(AutoOffsetReset::Earliest)
             .enable_auto_commit(false)
             .build()
             .await
             .expect("Failed to create consumer");
 
-        subscribe_with_retry(&consumer, &[topic], 5)
+        consumer
+            .subscribe(&[topic])
             .await
             .expect("Failed to subscribe");
 
         let all = poll_for_records(&consumer, 10, Duration::from_secs(3), 8).await;
         assert_eq!(all.len(), 10, "Should read all 10 messages");
-        consumer.commit_sync().await.expect("commit failed");
+        consumer.commit().await.expect("commit failed");
         consumer.close().await.expect("consumer close");
     }
 
     // Second consumer: should get NO new messages (all committed)
     {
-        let consumer = Consumer::builder()
-            .bootstrap_servers(&bootstrap_servers)
-            .group_id(group_id)
+        let consumer = krafka::Kafka::builder(&bootstrap_servers)
+            .connect()
+            .await
+            .expect("Failed to create consumer")
+            .consumer(group_id)
             .auto_offset_reset(AutoOffsetReset::Earliest)
             .enable_auto_commit(false)
             .build()
             .await
             .expect("Failed to create consumer");
 
-        subscribe_with_retry(&consumer, &[topic], 5)
+        consumer
+            .subscribe(&[topic])
             .await
             .expect("Failed to subscribe");
 
@@ -2173,46 +2362,52 @@ async fn test_consumer_commit_and_resume_verified() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_consumer_recv() {
-    use krafka::consumer::{AutoOffsetReset, Consumer};
-    use krafka::producer::Producer;
+    use krafka::consumer::AutoOffsetReset;
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
     let topic = "recv-test-topic";
     create_topic(&bootstrap_servers, topic, 1).await;
 
-    let producer = Producer::builder()
-        .bootstrap_servers(&bootstrap_servers)
+    let producer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .unwrap()
+        .producer()
         .build()
         .await
         .unwrap();
 
     for i in 0..3 {
         let _ = producer
-            .send(topic, None, Some(format!("recv-msg-{}", i).as_bytes()))
+            .send(krafka::Record::new(
+                topic,
+                bytes::Bytes::copy_from_slice(format!("recv-msg-{}", i).as_bytes()),
+            ))
             .await
             .unwrap();
     }
-    producer.close().await;
+    producer.close().await.unwrap();
 
-    let consumer = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .group_id("recv-test-group")
+    let consumer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .unwrap()
+        .consumer("recv-test-group")
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .build()
         .await
         .unwrap();
 
-    subscribe_with_retry(&consumer, &[topic], 5).await.unwrap();
+    consumer.subscribe(&[topic]).await.unwrap();
 
     // Use recv() to receive individual records
     let mut received = Vec::new();
     for _ in 0..3 {
         match tokio::time::timeout(Duration::from_secs(30), consumer.recv()).await {
-            Ok(Ok(record)) => received.push(record),
-            Ok(Err(krafka::RecvError::Closed)) => break,
-            Ok(Err(krafka::RecvError::Error(e))) => panic!("recv error: {}", e),
-            Ok(Err(_)) => panic!("unexpected non-exhaustive RecvError variant"),
+            Ok(Ok(Some(record))) => received.push(record),
+            Ok(Ok(None)) => break,
+            Ok(Err(e)) => panic!("recv error: {e}"),
             Err(_elapsed) => panic!("recv timed out before collecting expected records"),
         }
     }
@@ -2225,19 +2420,22 @@ async fn test_consumer_recv() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_producer_flush() {
-    use krafka::consumer::{AutoOffsetReset, Consumer};
-    use krafka::producer::Producer;
+    use krafka::consumer::AutoOffsetReset;
+
     use std::sync::Arc;
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
     let topic = "flush-test-topic";
     create_topic(&bootstrap_servers, topic, 1).await;
 
     let producer = Arc::new(
-        Producer::builder()
-            .bootstrap_servers(&bootstrap_servers)
-            .linger(Duration::from_secs(30)) // Long linger to accumulate
+        krafka::Kafka::builder(&bootstrap_servers)
+            .connect()
+            .await
+            .unwrap()
+            .producer()
+            .linger(Duration::from_secs(30))
             .build()
             .await
             .unwrap(),
@@ -2250,7 +2448,10 @@ async fn test_producer_flush() {
         let t = topic.to_string();
         handles.push(tokio::spawn(async move {
             let _ = p
-                .send(&t, None, Some(format!("flush-{}", i).as_bytes()))
+                .send(krafka::Record::new(
+                    &t,
+                    bytes::Bytes::copy_from_slice(format!("flush-{}", i).as_bytes()),
+                ))
                 .await
                 .unwrap();
         }));
@@ -2267,17 +2468,19 @@ async fn test_producer_flush() {
         h.await.unwrap();
     }
 
-    producer.close().await;
+    producer.close().await.unwrap();
 
-    let consumer = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .group_id("flush-test-group")
+    let consumer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .unwrap()
+        .consumer("flush-test-group")
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .build()
         .await
         .unwrap();
 
-    subscribe_with_retry(&consumer, &[topic], 5).await.unwrap();
+    consumer.subscribe(&[topic]).await.unwrap();
 
     let all = poll_for_records(&consumer, 5, Duration::from_secs(3), 8).await;
     assert_eq!(all.len(), 5, "All 5 flushed messages should be received");
@@ -2288,24 +2491,25 @@ async fn test_producer_flush() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_admin_describe_consumer_group() {
-    use krafka::admin::AdminClient;
-    use krafka::consumer::{AutoOffsetReset, Consumer};
+    use krafka::consumer::AutoOffsetReset;
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
     let topic = "describe-group-topic";
     let group_id = "describe-group-test";
     create_topic(&bootstrap_servers, topic, 1).await;
 
-    let consumer = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .group_id(group_id)
+    let consumer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .unwrap()
+        .consumer(group_id)
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .build()
         .await
         .unwrap();
 
-    subscribe_with_retry(&consumer, &[topic], 5).await.unwrap();
+    consumer.subscribe(&[topic]).await.unwrap();
 
     // Drive the rebalance until the consumer actually has partitions assigned.
     // On Kafka 3.9 under CI load, JoinGroup/SyncGroup can take many polls.
@@ -2332,16 +2536,19 @@ async fn test_admin_describe_consumer_group() {
     }
 
     // Verify the group is listed by the broker before describing it.
-    let admin = AdminClient::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .build()
+    let admin = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
         .await
-        .unwrap();
+        .unwrap()
+        .admin();
 
-    let listed = admin
-        .list_consumer_groups(&krafka::admin::GroupListing::all())
+    let listed: Vec<_> = admin
+        .list_consumer_groups(Default::default())
         .await
-        .unwrap();
+        .unwrap()
+        .into_values()
+        .flat_map(|per_broker| per_broker.unwrap_or_default())
+        .collect();
     eprintln!(
         "list_consumer_groups: [{}]",
         listed
@@ -2360,9 +2567,12 @@ async fn test_admin_describe_consumer_group() {
         let _ = consumer.poll(Duration::from_secs(2)).await;
 
         descriptions = admin
-            .describe_consumer_groups(vec![group_id.to_string()])
+            .describe_consumer_groups([group_id], Default::default())
             .await
-            .expect("describe_consumer_groups failed");
+            .expect("describe_consumer_groups failed")
+            .into_values()
+            .map(|d| d.expect("describe_consumer_groups failed"))
+            .collect();
         if descriptions.len() == 1 && !descriptions[0].members.is_empty() {
             eprintln!(
                 "describe_consumer_groups succeeded on attempt {}/30: {} members, state={}, type={:?}",
@@ -2397,24 +2607,25 @@ async fn test_admin_describe_consumer_group() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_consumer_close_leaves_group() {
-    use krafka::admin::AdminClient;
-    use krafka::consumer::{AutoOffsetReset, Consumer};
+    use krafka::consumer::AutoOffsetReset;
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
     let topic = "close-leaves-group-topic";
     let group_id = "close-leaves-group";
     create_topic(&bootstrap_servers, topic, 1).await;
 
-    let consumer = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .group_id(group_id)
+    let consumer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .unwrap()
+        .consumer(group_id)
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .build()
         .await
         .unwrap();
 
-    subscribe_with_retry(&consumer, &[topic], 5).await.unwrap();
+    consumer.subscribe(&[topic]).await.unwrap();
     // Poll multiple times to ensure group join completes
     let _ = poll_for_records(&consumer, 0, Duration::from_secs(3), 3).await;
 
@@ -2422,16 +2633,19 @@ async fn test_consumer_close_leaves_group() {
     consumer.close().await.expect("consumer close");
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    let admin = AdminClient::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .build()
+    let admin = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
         .await
-        .unwrap();
+        .unwrap()
+        .admin();
 
-    let descriptions = admin
-        .describe_consumer_groups(vec![group_id.to_string()])
+    let descriptions: Vec<_> = admin
+        .describe_consumer_groups([group_id], Default::default())
         .await
-        .expect("describe_consumer_groups failed");
+        .expect("describe_consumer_groups failed")
+        .into_values()
+        .map(|d| d.expect("describe_consumer_groups failed"))
+        .collect();
 
     assert!(
         !descriptions.is_empty(),
@@ -2448,33 +2662,40 @@ async fn test_consumer_close_leaves_group() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_empty_value_message() {
-    use krafka::consumer::{AutoOffsetReset, Consumer};
-    use krafka::producer::Producer;
+    use krafka::consumer::AutoOffsetReset;
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
     let topic = "empty-value-topic";
     create_topic(&bootstrap_servers, topic, 1).await;
 
-    let producer = Producer::builder()
-        .bootstrap_servers(&bootstrap_servers)
+    let producer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .unwrap()
+        .producer()
         .build()
         .await
         .unwrap();
 
-    let metadata = producer.send(topic, Some(b"key"), Some(b"")).await.unwrap();
+    let metadata = producer
+        .send(krafka::Record::new(topic, "").key("key"))
+        .await
+        .unwrap();
     assert!(metadata.offset >= 0);
-    producer.close().await;
+    producer.close().await.unwrap();
 
-    let consumer = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .group_id("empty-value-group")
+    let consumer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .unwrap()
+        .consumer("empty-value-group")
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .build()
         .await
         .unwrap();
 
-    subscribe_with_retry(&consumer, &[topic], 5).await.unwrap();
+    consumer.subscribe(&[topic]).await.unwrap();
 
     let records = poll_for_records(&consumer, 1, Duration::from_secs(3), 5).await;
     assert!(!records.is_empty(), "Should receive the empty-value record");
@@ -2490,23 +2711,25 @@ async fn test_empty_value_message() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_admin_describe_broker_config() {
-    use krafka::admin::AdminClient;
-    use krafka::admin::DescribeConfigsRequest;
+    use krafka::admin::ConfigResource;
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
-    let admin = AdminClient::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .build()
+    let admin = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
         .await
-        .unwrap();
+        .unwrap()
+        .admin();
 
-    let cluster = admin.describe_cluster().await.unwrap();
-    let broker_id = cluster.brokers[0].broker_id;
+    let cluster = admin.describe_cluster(Default::default()).await.unwrap();
+    let broker_id = cluster.brokers[0].id;
 
     let configs = admin
-        .describe_configs(DescribeConfigsRequest::for_broker(broker_id))
+        .describe_configs([ConfigResource::broker(broker_id)], Default::default())
         .await
+        .expect("describe_configs failed")
+        .remove(&ConfigResource::broker(broker_id))
+        .expect("the broker is answered")
         .expect("describe_configs failed");
 
     assert!(!configs.is_empty(), "Broker should have config entries");
@@ -2523,31 +2746,32 @@ async fn test_admin_describe_broker_config() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_many_partitions_topic() {
-    use krafka::admin::{AdminClient, NewTopic};
-    use krafka::consumer::{AutoOffsetReset, Consumer};
-    use krafka::producer::Producer;
+    use krafka::admin::NewTopic;
+    use krafka::consumer::AutoOffsetReset;
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
-    let admin = AdminClient::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .build()
+    let admin = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
         .await
-        .unwrap();
+        .unwrap()
+        .admin();
 
     let topic = "many-partitions-topic";
     admin
         .create_topics(
             vec![NewTopic::new(topic, 12, 1).unwrap()],
-            Duration::from_secs(10),
-            false,
+            Default::default(),
         )
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    let producer = Producer::builder()
-        .bootstrap_servers(&bootstrap_servers)
+    let producer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .unwrap()
+        .producer()
         .build()
         .await
         .unwrap();
@@ -2555,21 +2779,26 @@ async fn test_many_partitions_topic() {
     // Send 60 messages with keys to distribute across partitions
     for i in 0..60 {
         let _ = producer
-            .send(topic, Some(format!("k-{}", i).as_bytes()), Some(b"v"))
+            .send(
+                krafka::Record::new(topic, "v")
+                    .key(bytes::Bytes::copy_from_slice(format!("k-{}", i).as_bytes())),
+            )
             .await
             .unwrap();
     }
-    producer.close().await;
+    producer.close().await.unwrap();
 
-    let consumer = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .group_id("many-partitions-group")
+    let consumer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .unwrap()
+        .consumer("many-partitions-group")
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .build()
         .await
         .unwrap();
 
-    subscribe_with_retry(&consumer, &[topic], 5).await.unwrap();
+    consumer.subscribe(&[topic]).await.unwrap();
 
     let all = poll_for_records(&consumer, 60, Duration::from_secs(3), 20).await;
     assert_eq!(all.len(), 60, "All 60 messages should be received");
@@ -2588,38 +2817,45 @@ async fn test_many_partitions_topic() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_consumer_pause_resume_verified() {
-    use krafka::consumer::{AutoOffsetReset, Consumer};
-    use krafka::producer::Producer;
+    use krafka::consumer::AutoOffsetReset;
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
     let topic = "pause-verify-topic";
     create_topic(&bootstrap_servers, topic, 1).await;
 
-    let producer = Producer::builder()
-        .bootstrap_servers(&bootstrap_servers)
+    let producer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .unwrap()
+        .producer()
         .build()
         .await
         .unwrap();
 
     for i in 0..10 {
         let _ = producer
-            .send(topic, None, Some(format!("pv-{}", i).as_bytes()))
+            .send(krafka::Record::new(
+                topic,
+                bytes::Bytes::copy_from_slice(format!("pv-{}", i).as_bytes()),
+            ))
             .await
             .unwrap();
     }
-    producer.close().await;
+    producer.close().await.unwrap();
 
-    let consumer = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .group_id("pause-verify-group")
+    let consumer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .unwrap()
+        .consumer("pause-verify-group")
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .enable_auto_commit(false)
         .build()
         .await
         .unwrap();
 
-    subscribe_with_retry(&consumer, &[topic], 5).await.unwrap();
+    consumer.subscribe(&[topic]).await.unwrap();
 
     // Poll to get assignment (first poll may only complete rebalance)
     let _ = poll_for_records(&consumer, 0, Duration::from_secs(3), 3).await;
@@ -2648,38 +2884,45 @@ async fn test_consumer_pause_resume_verified() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_consumer_seek_verified() {
-    use krafka::consumer::{AutoOffsetReset, Consumer};
-    use krafka::producer::Producer;
+    use krafka::consumer::AutoOffsetReset;
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
     let topic = "seek-verify-topic";
     create_topic(&bootstrap_servers, topic, 1).await;
 
-    let producer = Producer::builder()
-        .bootstrap_servers(&bootstrap_servers)
+    let producer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .unwrap()
+        .producer()
         .build()
         .await
         .unwrap();
 
     for i in 0..10 {
         let _ = producer
-            .send(topic, None, Some(format!("msg-{}", i).as_bytes()))
+            .send(krafka::Record::new(
+                topic,
+                bytes::Bytes::copy_from_slice(format!("msg-{}", i).as_bytes()),
+            ))
             .await
             .unwrap();
     }
-    producer.close().await;
+    producer.close().await.unwrap();
 
-    let consumer = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .group_id("seek-verify-group")
+    let consumer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .unwrap()
+        .consumer("seek-verify-group")
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .enable_auto_commit(false)
         .build()
         .await
         .unwrap();
 
-    subscribe_with_retry(&consumer, &[topic], 5).await.unwrap();
+    consumer.subscribe(&[topic]).await.unwrap();
 
     // First poll to get assignment (rebalance may consume first poll)
     let _ = poll_for_records(&consumer, 0, Duration::from_secs(3), 3).await;
@@ -2702,15 +2945,15 @@ async fn test_consumer_seek_verified() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_admin_create_topic_with_config() {
-    use krafka::admin::{AdminClient, NewTopic};
+    use krafka::admin::NewTopic;
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
-    let admin = AdminClient::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .build()
+    let admin = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
         .await
-        .unwrap();
+        .unwrap()
+        .admin();
 
     let topic = "configured-topic";
     let new_topic = NewTopic::new(topic, 3, 1)
@@ -2719,15 +2962,21 @@ async fn test_admin_create_topic_with_config() {
         .with_config("cleanup.policy", "compact");
 
     admin
-        .create_topics(vec![new_topic], Duration::from_secs(10), false)
+        .create_topics(vec![new_topic], Default::default())
         .await
         .unwrap();
 
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     let configs = admin
-        .describe_configs(krafka::admin::DescribeConfigsRequest::for_topic(topic))
+        .describe_configs(
+            [krafka::admin::ConfigResource::topic(topic)],
+            Default::default(),
+        )
         .await
+        .unwrap()
+        .remove(&krafka::admin::ConfigResource::topic(topic))
+        .unwrap()
         .unwrap();
     let retention = configs.iter().find(|c| c.name == "retention.ms");
     assert!(retention.is_some(), "Should have retention.ms config");
@@ -2742,48 +2991,55 @@ async fn test_admin_create_topic_with_config() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_consumer_metrics() {
-    use krafka::consumer::{AutoOffsetReset, Consumer};
-    use krafka::producer::Producer;
+    use krafka::consumer::AutoOffsetReset;
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
     let topic = "consumer-metrics-topic";
     create_topic(&bootstrap_servers, topic, 1).await;
 
-    let producer = Producer::builder()
-        .bootstrap_servers(&bootstrap_servers)
+    let producer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .unwrap()
+        .producer()
         .build()
         .await
         .unwrap();
 
     for i in 0..5 {
         let _ = producer
-            .send(topic, None, Some(format!("m-{}", i).as_bytes()))
+            .send(krafka::Record::new(
+                topic,
+                bytes::Bytes::copy_from_slice(format!("m-{}", i).as_bytes()),
+            ))
             .await
             .unwrap();
     }
-    producer.close().await;
+    producer.close().await.unwrap();
 
-    let consumer = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .group_id("consumer-metrics-group")
+    let consumer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .unwrap()
+        .consumer("consumer-metrics-group")
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .build()
         .await
         .unwrap();
 
-    subscribe_with_retry(&consumer, &[topic], 5).await.unwrap();
+    consumer.subscribe(&[topic]).await.unwrap();
 
     let all = poll_for_records(&consumer, 5, Duration::from_secs(3), 8).await;
     let _total = all.len();
 
     let metrics = consumer.metrics();
     assert!(
-        metrics.records_received.get() > 0,
+        metrics.consumer.records_received > 0,
         "Should have received records"
     );
     assert!(
-        metrics.bytes_received.get() > 0,
+        metrics.consumer.bytes_received > 0,
         "Should have received bytes"
     );
     consumer.close().await.expect("consumer close");
@@ -2792,16 +3048,18 @@ async fn test_consumer_metrics() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_offsets_for_times_and_watermarks_and_metadata() {
-    use krafka::consumer::{AutoOffsetReset, Consumer};
-    use krafka::producer::Producer;
+    use krafka::consumer::AutoOffsetReset;
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
     let topic = "offsets-times-topic";
     create_topic(&bootstrap_servers, topic, 2).await;
 
-    let producer = Producer::builder()
-        .bootstrap_servers(&bootstrap_servers)
+    let producer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create producer")
+        .producer()
         .build()
         .await
         .expect("Failed to create producer");
@@ -2812,18 +3070,22 @@ async fn test_offsets_for_times_and_watermarks_and_metadata() {
         let key = format!("k-{}", i);
         let _ = producer
             .send(
-                topic,
-                Some(key.as_bytes()),
-                Some(format!("v-{}", i).as_bytes()),
+                krafka::Record::new(
+                    topic,
+                    bytes::Bytes::copy_from_slice(format!("v-{}", i).as_bytes()),
+                )
+                .key(bytes::Bytes::copy_from_slice(key.as_bytes())),
             )
             .await
             .expect("Failed to send message");
     }
-    producer.close().await;
+    producer.close().await.unwrap();
 
-    let consumer = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .group_id("offsets-times-group")
+    let consumer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create consumer")
+        .consumer("offsets-times-group")
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .build()
         .await
@@ -2919,30 +3181,26 @@ async fn test_offsets_for_times_and_watermarks_and_metadata() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_transactional_producer_commit() {
-    use krafka::consumer::{AutoOffsetReset, Consumer, IsolationLevel};
-    use krafka::producer::TransactionalProducer;
+    use krafka::consumer::{AutoOffsetReset, IsolationLevel};
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
     let topic = "txn-commit-topic";
     create_topic(&bootstrap_servers, topic, 1).await;
 
-    let producer = TransactionalProducer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .transactional_id("txn-commit-test")
-        .build()
+    let producer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create transactional producer")
+        .producer()
+        .build_transactional("txn-commit-test")
         .await
         .expect("Failed to create transactional producer");
 
-    init_transactions_with_retry(&producer, 12)
-        .await
-        .expect("init_transactions failed");
-    producer
-        .begin_transaction()
-        .expect("begin_transaction failed");
+    producer.begin().expect("begin failed");
 
     let metadata = producer
-        .send(topic, Some(b"key"), Some(b"committed-value"))
+        .send(krafka::Record::new(topic, "committed-value").key("key"))
         .await
         .expect("send failed");
     assert!(
@@ -2951,23 +3209,23 @@ async fn test_transactional_producer_commit() {
         metadata.offset
     );
 
-    producer
-        .commit_transaction()
-        .await
-        .expect("commit_transaction failed");
-    producer.close().await;
+    producer.commit().await.expect("commit failed");
+    producer.close().await.unwrap();
 
     // Read with read_committed isolation — should see the committed message.
-    let consumer = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .group_id("txn-commit-consumer")
+    let consumer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create consumer")
+        .consumer("txn-commit-consumer")
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .isolation_level(IsolationLevel::ReadCommitted)
         .build()
         .await
         .expect("Failed to create consumer");
 
-    subscribe_with_retry(&consumer, &[topic], 5)
+    consumer
+        .subscribe(&[topic])
         .await
         .expect("subscribe failed");
 
@@ -2992,64 +3250,54 @@ async fn test_transactional_producer_commit() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_transactional_producer_abort() {
-    use krafka::consumer::{AutoOffsetReset, Consumer, IsolationLevel};
-    use krafka::producer::TransactionalProducer;
+    use krafka::consumer::{AutoOffsetReset, IsolationLevel};
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
     let topic = "txn-abort-topic";
     create_topic(&bootstrap_servers, topic, 1).await;
 
-    let producer = TransactionalProducer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .transactional_id("txn-abort-test")
-        .build()
+    let producer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create transactional producer")
+        .producer()
+        .build_transactional("txn-abort-test")
         .await
         .expect("Failed to create transactional producer");
 
-    init_transactions_with_retry(&producer, 12)
-        .await
-        .expect("init_transactions failed");
-
     // First transaction: send and ABORT.
-    producer
-        .begin_transaction()
-        .expect("begin_transaction failed");
+    producer.begin().expect("begin failed");
     let _ = producer
-        .send(topic, Some(b"key-aborted"), Some(b"aborted-value"))
+        .send(krafka::Record::new(topic, "aborted-value").key("key-aborted"))
         .await
         .expect("send (to-be-aborted) failed");
-    producer
-        .abort_transaction()
-        .await
-        .expect("abort_transaction failed");
+    producer.abort().await.expect("abort_transaction failed");
 
     // Second transaction: send and COMMIT.
-    producer
-        .begin_transaction()
-        .expect("begin_transaction failed");
+    producer.begin().expect("begin failed");
     let _ = producer
-        .send(topic, Some(b"key-committed"), Some(b"committed-value"))
+        .send(krafka::Record::new(topic, "committed-value").key("key-committed"))
         .await
         .expect("send failed");
-    producer
-        .commit_transaction()
-        .await
-        .expect("commit_transaction failed");
+    producer.commit().await.expect("commit failed");
 
-    producer.close().await;
+    producer.close().await.unwrap();
 
     // Read with read_committed — should see ONLY the committed message.
-    let consumer = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .group_id("txn-abort-consumer")
+    let consumer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create consumer")
+        .consumer("txn-abort-consumer")
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .isolation_level(IsolationLevel::ReadCommitted)
         .build()
         .await
         .expect("Failed to create consumer");
 
-    subscribe_with_retry(&consumer, &[topic], 5)
+    consumer
+        .subscribe(&[topic])
         .await
         .expect("subscribe failed");
 
@@ -3086,53 +3334,49 @@ async fn test_transactional_producer_abort() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_transactional_producer_multi_partition() {
-    use krafka::consumer::{AutoOffsetReset, Consumer, IsolationLevel};
-    use krafka::producer::TransactionalProducer;
+    use krafka::consumer::{AutoOffsetReset, IsolationLevel};
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
     let topic = "txn-multi-part-topic";
     create_topic(&bootstrap_servers, topic, 2).await;
 
-    let producer = TransactionalProducer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .transactional_id("txn-multi-part-test")
-        .build()
+    let producer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create transactional producer")
+        .producer()
+        .build_transactional("txn-multi-part-test")
         .await
         .expect("Failed to create transactional producer");
 
-    init_transactions_with_retry(&producer, 12)
-        .await
-        .expect("init_transactions failed");
-    producer
-        .begin_transaction()
-        .expect("begin_transaction failed");
+    producer.begin().expect("begin failed");
 
     let _ = producer
-        .send(topic, Some(b"key-alpha"), Some(b"value-alpha"))
+        .send(krafka::Record::new(topic, "value-alpha").key("key-alpha"))
         .await
         .expect("send alpha failed");
     let _ = producer
-        .send(topic, Some(b"key-beta"), Some(b"value-beta"))
+        .send(krafka::Record::new(topic, "value-beta").key("key-beta"))
         .await
         .expect("send beta failed");
 
-    producer
-        .commit_transaction()
-        .await
-        .expect("commit_transaction failed");
-    producer.close().await;
+    producer.commit().await.expect("commit failed");
+    producer.close().await.unwrap();
 
-    let consumer = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .group_id("txn-multi-part-consumer")
+    let consumer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create consumer")
+        .consumer("txn-multi-part-consumer")
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .isolation_level(IsolationLevel::ReadCommitted)
         .build()
         .await
         .expect("Failed to create consumer");
 
-    subscribe_with_retry(&consumer, &[topic], 5)
+    consumer
+        .subscribe(&[topic])
         .await
         .expect("subscribe failed");
 
@@ -3164,67 +3408,61 @@ async fn test_transactional_producer_multi_partition() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_transactional_producer_multiple_transactions() {
-    use krafka::consumer::{AutoOffsetReset, Consumer, IsolationLevel};
-    use krafka::producer::TransactionalProducer;
+    use krafka::consumer::{AutoOffsetReset, IsolationLevel};
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
     let topic = "txn-multi-txn-topic";
     create_topic(&bootstrap_servers, topic, 1).await;
 
-    let producer = TransactionalProducer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .transactional_id("txn-multi-txn-test")
-        .build()
+    let producer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create transactional producer")
+        .producer()
+        .build_transactional("txn-multi-txn-test")
         .await
         .expect("Failed to create transactional producer");
 
-    init_transactions_with_retry(&producer, 12)
-        .await
-        .expect("init_transactions failed");
-
     // Txn 1: commit.
-    producer.begin_transaction().expect("begin 1 failed");
+    producer.begin().expect("begin 1 failed");
     let _ = producer
-        .send(topic, Some(b"k1"), Some(b"v1"))
+        .send(krafka::Record::new(topic, "v1").key("k1"))
         .await
         .expect("send 1 failed");
-    producer
-        .commit_transaction()
-        .await
-        .expect("commit 1 failed");
+    producer.commit().await.expect("commit 1 failed");
 
     // Txn 2: abort.
-    producer.begin_transaction().expect("begin 2 failed");
+    producer.begin().expect("begin 2 failed");
     let _ = producer
-        .send(topic, Some(b"k2"), Some(b"v2-aborted"))
+        .send(krafka::Record::new(topic, "v2-aborted").key("k2"))
         .await
         .expect("send 2 failed");
-    producer.abort_transaction().await.expect("abort 2 failed");
+    producer.abort().await.expect("abort 2 failed");
 
     // Txn 3: commit.
-    producer.begin_transaction().expect("begin 3 failed");
+    producer.begin().expect("begin 3 failed");
     let _ = producer
-        .send(topic, Some(b"k3"), Some(b"v3"))
+        .send(krafka::Record::new(topic, "v3").key("k3"))
         .await
         .expect("send 3 failed");
-    producer
-        .commit_transaction()
+    producer.commit().await.expect("commit 3 failed");
+
+    producer.close().await.unwrap();
+
+    let consumer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
         .await
-        .expect("commit 3 failed");
-
-    producer.close().await;
-
-    let consumer = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .group_id("txn-multi-txn-consumer")
+        .expect("Failed to create consumer")
+        .consumer("txn-multi-txn-consumer")
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .isolation_level(IsolationLevel::ReadCommitted)
         .build()
         .await
         .expect("Failed to create consumer");
 
-    subscribe_with_retry(&consumer, &[topic], 5)
+    consumer
+        .subscribe(&[topic])
         .await
         .expect("subscribe failed");
 
@@ -3261,50 +3499,44 @@ async fn test_transactional_producer_multiple_transactions() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_transactional_producer_epoch_fencing() {
-    use krafka::consumer::{AutoOffsetReset, Consumer, IsolationLevel};
-    use krafka::producer::TransactionalProducer;
+    use krafka::consumer::{AutoOffsetReset, IsolationLevel};
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
     let topic = "txn-fencing-topic";
     create_topic(&bootstrap_servers, topic, 1).await;
     let txn_id = "txn-fencing-test";
 
     // Producer 1: init and commit one message.
-    let producer1 = TransactionalProducer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .transactional_id(txn_id)
-        .build()
+    let producer1 = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create producer 1")
+        .producer()
+        .build_transactional(txn_id)
         .await
         .expect("Failed to create producer 1");
 
-    init_transactions_with_retry(&producer1, 12)
-        .await
-        .expect("init 1 failed");
     let epoch1 = producer1.producer_epoch();
 
-    producer1.begin_transaction().expect("begin 1 failed");
+    producer1.begin().expect("begin 1 failed");
     let _ = producer1
-        .send(topic, Some(b"k1"), Some(b"v1"))
+        .send(krafka::Record::new(topic, "v1").key("k1"))
         .await
         .expect("send 1 failed");
-    producer1
-        .commit_transaction()
-        .await
-        .expect("commit 1 failed");
-    producer1.close().await;
+    producer1.commit().await.expect("commit 1 failed");
+    producer1.close().await.unwrap();
 
     // Producer 2: same transactional_id → broker bumps epoch.
-    let producer2 = TransactionalProducer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .transactional_id(txn_id)
-        .build()
+    let producer2 = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create producer 2")
+        .producer()
+        .build_transactional(txn_id)
         .await
         .expect("Failed to create producer 2");
 
-    init_transactions_with_retry(&producer2, 12)
-        .await
-        .expect("init 2 failed");
     let epoch2 = producer2.producer_epoch();
 
     assert!(
@@ -3312,28 +3544,28 @@ async fn test_transactional_producer_epoch_fencing() {
         "Producer 2 should have a higher epoch ({epoch2}) than producer 1 ({epoch1})"
     );
 
-    producer2.begin_transaction().expect("begin 2 failed");
+    producer2.begin().expect("begin 2 failed");
     let _ = producer2
-        .send(topic, Some(b"k2"), Some(b"v2"))
+        .send(krafka::Record::new(topic, "v2").key("k2"))
         .await
         .expect("send 2 failed");
-    producer2
-        .commit_transaction()
-        .await
-        .expect("commit 2 failed");
-    producer2.close().await;
+    producer2.commit().await.expect("commit 2 failed");
+    producer2.close().await.unwrap();
 
     // Both committed messages should be readable.
-    let consumer = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .group_id("txn-fencing-consumer")
+    let consumer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create consumer")
+        .consumer("txn-fencing-consumer")
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .isolation_level(IsolationLevel::ReadCommitted)
         .build()
         .await
         .expect("Failed to create consumer");
 
-    subscribe_with_retry(&consumer, &[topic], 5)
+    consumer
+        .subscribe(&[topic])
         .await
         .expect("subscribe failed");
 
@@ -3347,20 +3579,20 @@ async fn test_transactional_producer_epoch_fencing() {
     consumer.close().await.expect("consumer close");
 }
 
-/// `send_offsets_to_transaction`: Consume-Transform-Produce (EOS / read-process-write).
+/// `send_offsets`: Consume-Transform-Produce (EOS / read-process-write).
 ///
 /// 1. Write source messages to `src-topic` with a regular producer.
 /// 2. Transactional consumer reads messages and commits offset + result
-///    atomically via `send_offsets_to_transaction`.
+///    atomically via `send_offsets`.
 /// 3. Verify the destination topic contains the transformed messages and the
 ///    committed consumer offset allows resumption without reprocessing.
 #[tokio::test]
 #[ignore = "requires Docker"]
-async fn test_transactional_send_offsets_to_transaction() {
-    use krafka::consumer::{AutoOffsetReset, Consumer, IsolationLevel};
-    use krafka::producer::{Producer, TopicPartitionOffset, TransactionalProducer};
+async fn test_transactional_send_offsets() {
+    use krafka::consumer::{AutoOffsetReset, IsolationLevel};
+    use krafka::producer::TopicPartitionOffset;
 
-    let (_container, bootstrap_servers) = kafka_container().await;
+    let bootstrap_servers = kafka();
 
     let src_topic = "txn-eos-src-topic";
     let dst_topic = "txn-eos-dst-topic";
@@ -3369,8 +3601,11 @@ async fn test_transactional_send_offsets_to_transaction() {
     create_topic(&bootstrap_servers, dst_topic, 1).await;
 
     // Step 1: Write source messages with a regular producer.
-    let regular_producer = Producer::builder()
-        .bootstrap_servers(&bootstrap_servers)
+    let regular_producer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create regular producer")
+        .producer()
         .build()
         .await
         .expect("Failed to create regular producer");
@@ -3378,19 +3613,23 @@ async fn test_transactional_send_offsets_to_transaction() {
     for i in 0..3u32 {
         let _ = regular_producer
             .send(
-                src_topic,
-                Some(format!("k{i}").as_bytes()),
-                Some(format!("src-{i}").as_bytes()),
+                krafka::Record::new(
+                    src_topic,
+                    bytes::Bytes::copy_from_slice(format!("src-{i}").as_bytes()),
+                )
+                .key(bytes::Bytes::copy_from_slice(format!("k{i}").as_bytes())),
             )
             .await
             .expect("send to src failed");
     }
-    regular_producer.close().await;
+    regular_producer.close().await.unwrap();
 
     // Step 2: Create the read-committed source consumer (no group auto-commit).
-    let src_consumer = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .group_id(group_id)
+    let src_consumer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create source consumer")
+        .consumer(group_id)
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .enable_auto_commit(false)
         .isolation_level(IsolationLevel::ReadCommitted)
@@ -3398,7 +3637,8 @@ async fn test_transactional_send_offsets_to_transaction() {
         .await
         .expect("Failed to create source consumer");
 
-    subscribe_with_retry(&src_consumer, &[src_topic], 5)
+    src_consumer
+        .subscribe(&[src_topic])
         .await
         .expect("subscribe failed");
 
@@ -3406,16 +3646,14 @@ async fn test_transactional_send_offsets_to_transaction() {
     assert_eq!(src_records.len(), 3, "Should read 3 source messages");
 
     // Step 3: Process each message transactionally.
-    let txn_producer = TransactionalProducer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .transactional_id("txn-eos-producer")
-        .build()
+    let txn_producer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create transactional producer")
+        .producer()
+        .build_transactional("txn-eos-producer")
         .await
         .expect("Failed to create transactional producer");
-
-    init_transactions_with_retry(&txn_producer, 12)
-        .await
-        .expect("init_transactions failed");
 
     for record in &src_records {
         let transformed_value = record
@@ -3424,18 +3662,11 @@ async fn test_transactional_send_offsets_to_transaction() {
             .map(|v| format!("processed:{}", String::from_utf8_lossy(v)))
             .unwrap_or_default();
 
-        txn_producer
-            .begin_transaction()
-            .expect("begin_transaction failed");
+        txn_producer.begin().expect("begin failed");
 
-        let _ = txn_producer
-            .send(
-                dst_topic,
-                record.key.as_deref(),
-                Some(transformed_value.as_bytes()),
-            )
-            .await
-            .expect("send to dst failed");
+        let mut out = krafka::Record::new(dst_topic, transformed_value);
+        out.key = record.key.clone();
+        let _ = txn_producer.send(out).await.expect("send to dst failed");
 
         // Commit the consumer offset atomically with the output message.
         let offsets = [TopicPartitionOffset::new(
@@ -3456,29 +3687,29 @@ async fn test_transactional_send_offsets_to_transaction() {
             "consumer group metadata must carry a real generation for EOS"
         );
         txn_producer
-            .send_offsets_to_transaction(&offsets, &group_metadata)
+            .send_offsets(&offsets, &group_metadata)
             .await
-            .expect("send_offsets_to_transaction failed");
+            .expect("send_offsets failed");
 
-        txn_producer
-            .commit_transaction()
-            .await
-            .expect("commit_transaction failed");
+        txn_producer.commit().await.expect("commit failed");
     }
 
-    txn_producer.close().await;
+    txn_producer.close().await.unwrap();
 
     // Step 4: Verify destination contains the transformed messages.
-    let dst_consumer = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .group_id("txn-eos-dst-consumer")
+    let dst_consumer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create dst consumer")
+        .consumer("txn-eos-dst-consumer")
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .isolation_level(IsolationLevel::ReadCommitted)
         .build()
         .await
         .expect("Failed to create dst consumer");
 
-    subscribe_with_retry(&dst_consumer, &[dst_topic], 5)
+    dst_consumer
+        .subscribe(&[dst_topic])
         .await
         .expect("subscribe failed");
 
@@ -3504,9 +3735,11 @@ async fn test_transactional_send_offsets_to_transaction() {
 
     // Step 5: Verify committed offsets — restarting the src consumer should
     // not reprocess messages (offsets were committed transactionally).
-    let resumed_consumer = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .group_id(group_id)
+    let resumed_consumer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create resumed consumer")
+        .consumer(group_id)
         .auto_offset_reset(AutoOffsetReset::Latest)
         .enable_auto_commit(false)
         .isolation_level(IsolationLevel::ReadCommitted)
@@ -3514,7 +3747,8 @@ async fn test_transactional_send_offsets_to_transaction() {
         .await
         .expect("Failed to create resumed consumer");
 
-    subscribe_with_retry(&resumed_consumer, &[src_topic], 5)
+    resumed_consumer
+        .subscribe(&[src_topic])
         .await
         .expect("subscribe failed");
 

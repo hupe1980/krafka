@@ -1,0 +1,12 @@
+diff -ruN a/src/producer/transaction.rs b/src/producer/transaction.rs
+--- a/src/producer/transaction.rs
++++ b/src/producer/transaction.rs
+@@ -1968,7 +1968,7 @@
+     /// A failed bump is retried before the next transaction writes anything.
+     async fn finish_transaction(&self, send_failed: bool) {
+         let needs_bump = !self.transaction_version().is_v2()
+-            && (self.end_txn_unanswered.load(Ordering::SeqCst) || send_failed);
++            && send_failed;
+         if needs_bump {
+             self.reinit_required.store(true, Ordering::SeqCst);
+             if let Err(error) = self.ensure_reinitialised().await {

@@ -28,7 +28,7 @@ use tokio_util::sync::ReusableBoxFuture;
 
 use super::Consumer;
 use super::record::ConsumerRecord;
-use crate::error::{RecvError, Result};
+use crate::error::Result;
 
 /// Async stream of [`ConsumerRecord`]s from a [`Consumer`].
 ///
@@ -41,14 +41,19 @@ use crate::error::{RecvError, Result};
 ///
 /// This type also implements [`FusedStream`], so stream combinators such as
 /// `futures::stream::select` can detect termination without an extra poll.
+///
+/// # Cancel safety
+///
+/// This type is cancel safe. Each item comes from [`Consumer::recv`]: dropping
+/// the stream, or a pending `next()`, loses no record and moves no position.
 pub struct ConsumerStream<'a> {
     consumer: &'a Consumer,
     /// Reusable boxed future for the in-progress `recv()` call.
     /// Avoids a fresh heap allocation per record by reusing the box
     /// when the future's size and alignment match (which they always
     /// do since `recv()` returns the same concrete type each time).
-    fut: ReusableBoxFuture<'a, std::result::Result<ConsumerRecord, RecvError>>,
-    /// Set to `true` once `recv()` returns `Err(RecvError::Closed)`.
+    fut: ReusableBoxFuture<'a, Result<Option<ConsumerRecord>>>,
+    /// Set to `true` once `recv()` returns `Ok(None)`.
     /// After that, `poll_next` returns `None` without starting new calls.
     done: bool,
 }
@@ -77,17 +82,17 @@ impl Stream for ConsumerStream<'_> {
         match this.fut.poll(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(result) => match result {
-                Ok(record) => {
+                Ok(Some(record)) => {
                     // Reuse the allocation for the next recv() call.
                     this.fut.set(this.consumer.recv());
                     Poll::Ready(Some(Ok(record)))
                 }
-                Err(RecvError::Closed) => {
+                Ok(None) => {
                     // Consumer closed — fuse the stream.
                     this.done = true;
                     Poll::Ready(None)
                 }
-                Err(RecvError::Error(e)) => {
+                Err(e) => {
                     // Reuse the allocation for the next recv() call.
                     this.fut.set(this.consumer.recv());
                     Poll::Ready(Some(Err(e)))

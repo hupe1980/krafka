@@ -3,7 +3,7 @@
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
 
-use krafka::protocol::{Decode, KafkaArray, KafkaString};
+use krafka::__private::protocol::{Decode, KafkaArray, KafkaString};
 
 fuzz_target!(|data: &[u8]| {
     let mut buf = Bytes::copy_from_slice(data);

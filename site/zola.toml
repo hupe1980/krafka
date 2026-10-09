@@ -16,7 +16,7 @@
 
 base_url = "https://hupe1980.github.io/krafka"
 title = "krafka"
-description = "A pure-Rust, async-native Apache Kafka client. No librdkafka, no C toolchain, no unsafe, no panics."
+description = "A pure-Rust, async-native Apache Kafka client. No C library, no system dependency, no unsafe, no panics."
 author = "krafka contributors"
 
 default_language = "en"
@@ -66,12 +66,12 @@ crate = "https://crates.io/crates/krafka"
 api_docs = "https://docs.rs/krafka"
 # Shown in the footer and the JSON-LD `softwareVersion`. Kept in step with
 # Cargo.toml by `just docs-check`.
-version = "0.26.0"
+version = "0.27.0"
 license = "MIT OR Apache-2.0"
 # Social preview card. Referenced by og:image and twitter:image.
 og_image = "og.png"
 
-# Documentation navigation. Grouping is deliberate: a flat 14-item list gives a
+# Documentation navigation. Grouping is deliberate: a flat list gives a
 # reader no way to tell "I need this now" from "I need this eventually".
 #
 # Page URLs stay flat (`/docs/producer/`) rather than nested under the group,
@@ -79,7 +79,7 @@ og_image = "og.png"
 # grouping is reconsidered.
 [[extra.nav]]
 title = "Start here"
-pages = ["getting-started", "cookbook", "configuration"]
+pages = ["getting-started", "cookbook", "configuration", "upgrading", "migrating-from-rdkafka"]
 
 [[extra.nav]]
 title = "Clients"
@@ -87,7 +87,7 @@ pages = ["producer", "consumer", "share-consumer", "admin"]
 
 [[extra.nav]]
 title = "Integration"
-pages = ["authentication", "interceptors"]
+pages = ["authentication", "cloud", "interceptors"]
 
 [[extra.nav]]
 title = "Operations"
@@ -95,4 +95,4 @@ pages = ["metrics", "performance", "testing", "errors"]
 
 [[extra.nav]]
 title = "Reference"
-pages = ["protocol", "architecture"]
+pages = ["protocol", "architecture", "governance"]

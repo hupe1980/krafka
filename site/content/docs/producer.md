@@ -9,14 +9,10 @@ slug_id = "producer"
 
 ## Overview
 
-The krafka producer is an async-native, high-performance message producer for Apache Kafka. Key features include:
-
-- Async/await API with Tokio
-- Automatic batching for throughput
-- Multiple compression codecs (gzip, snappy, lz4, zstd)
-- Flexible partitioning strategies
-- Automatic metadata refresh
-- Interceptor hooks for observability
+The producer is idempotent by default, batches per partition, compresses with
+gzip, snappy, lz4 or zstd, partitions keys as the Java client does, and
+supports exactly-once transactions, typed serializers, interceptors, metrics
+and `tracing` spans.
 
 ## Basic Usage
 
@@ -26,78 +22,54 @@ use krafka::error::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let producer = Producer::builder()
-        .bootstrap_servers("localhost:9092")
+    let producer = krafka::Kafka::builder("localhost:9092")
+        .connect()
+        .await?
+        .producer()
         .build()
         .await?;
 
     // Simple send
-    producer.send("topic", None, Some(b"value")).await?;
+    producer.send(krafka::Record::new("topic", "value")).await?;
 
     // Send with key (for partitioning)
-    producer.send("topic", Some(b"key"), Some(b"value")).await?;
+    producer.send(krafka::Record::new("topic", "value").key("key")).await?;
 
-    producer.close().await;
+    producer.close().await?;
     Ok(())
 }
 ```
 
-## Authentication
-
-Connect to secured Kafka clusters using SASL or TLS:
-
-```rust,compile
-use krafka::producer::Producer;
-
-// SASL/SCRAM-SHA-256
-let producer = Producer::builder()
-    .bootstrap_servers("broker:9093")
-    .sasl_scram_sha256("username", "password")
-    .build()
-    .await?;
-
-// AWS MSK IAM
-use krafka::auth::AuthConfig;
-let auth = AuthConfig::aws_msk_iam("access_key", "secret_key", "us-east-1");
-let producer = Producer::builder()
-    .bootstrap_servers("broker:9094")
-    .auth(auth)
-    .build()
-    .await?;
-```
-
-See the [Authentication Guide](@/docs/authentication.md) for all supported mechanisms.
+Security (TLS, SASL, AWS MSK IAM) is set once on the `Kafka` builder and applies
+to every producer built from it — see the
+[Authentication Guide](@/docs/authentication.md).
 
 ## Producer Configuration
 
 ### Acknowledgments
 
-Control durability vs. latency with the `acks` setting:
+| `acks` | Waits for | Notes |
+|---|---|---|
+| `Acks::All` (default) | every in-sync replica | required by idempotence |
+| `Acks::Leader` | the partition leader | needs `.idempotent(false)` |
+| `Acks::None` | nothing | needs `.idempotent(false)`; no delivery confirmation and no quota feedback |
 
 ```rust,compile
 use krafka::producer::{Producer, Acks};
 
-// Fire and forget (lowest latency, risk of data loss)
-let producer = Producer::builder()
-    .bootstrap_servers("localhost:9092")
-    .acks(Acks::None)
-    .build()
-    .await?;
-
-// Wait for leader (balanced)
-let producer = Producer::builder()
-    .bootstrap_servers("localhost:9092")
+let producer = krafka::Kafka::builder("localhost:9092")
+    .connect()
+    .await?
+    .producer()
     .acks(Acks::Leader)
-    .build()
-    .await?;
-
-// Wait for all in-sync replicas (highest durability)
-let producer = Producer::builder()
-    .bootstrap_servers("localhost:9092")
-    .acks(Acks::All)
+    .idempotent(false) // idempotence requires Acks::All
     .build()
     .await?;
 ```
+
+With `Acks::None` the broker sends no response, so the producer never sees a
+`throttle_time_ms` (KIP-219) and keeps writing at full rate until the broker
+mutes the connection. Prefer `Acks::Leader` unless you measured the difference.
 
 ### Compression
 
@@ -105,48 +77,44 @@ Choose the right compression codec for your workload:
 
 ```rust,compile
 use krafka::producer::Producer;
-use krafka::protocol::Compression;
+use krafka::Compression;
 
-let producer = Producer::builder()
-    .bootstrap_servers("localhost:9092")
-    .compression(Compression::Lz4)  // Fast compression
+let producer = krafka::Kafka::builder("localhost:9092")
+    .connect()
+    .await?
+    .producer()
+    .compression(Compression::Lz4)
     .build()
     .await?;
 ```
 
-| Codec | Cargo Feature | Speed | Ratio | Use Case |
-|-------|---------------|-------|-------|----------|
-| None | — | N/A | 1:1 | Low CPU, high bandwidth |
-| Gzip | `gzip` | Slow | Best | Archival, infrequent writes |
-| Snappy | `snappy` | Fast | Good | General purpose |
-| LZ4 | `lz4` | Fastest | Good | High-throughput, real-time |
-| Zstd | `zstd` | Medium | Best | Best balance of speed/ratio |
+| Codec | Cargo feature | Speed | Ratio |
+|-------|---------------|-------|-------|
+| None (default) | — | — | 1:1 |
+| Gzip | always on | slow | high |
+| Snappy | always on | fast | good |
+| LZ4 | always on | fastest | good |
+| Zstd | `zstd` (encode only) | medium | high |
 
-The default `compression` convenience feature enables the pure-Rust codecs:
-gzip, snappy, and LZ4. Zstd remains available through the explicit `zstd` or
-`compression-all` feature because it requires a C toolchain via `zstd-sys`.
-
-To trim binary size further, disable defaults and select only the codecs you need:
+Encoding Zstd needs the `zstd` feature, which compiles libzstd (C);
+selecting `Compression::Zstd` without it fails at `build()`. Every codec,
+Zstd included, decodes in pure Rust in every build.
 
 ```sh
-# Only the codecs you need. `--no-default-features` also drops the default
-# `ring` TLS backend, so a crypto backend must be named explicitly.
-cargo add krafka --no-default-features --features lz4,ring
-
-# Or every codec, including zstd:
-cargo add krafka --features compression-all
+cargo add krafka --features zstd
 ```
 
 #### Compression level
 
-`Gzip` and `Zstd` accept a level. `Snappy` has none in its format, and krafka
-encodes LZ4 with `lz4_flex`, whose frame encoder exposes none.
+`Gzip` and `Zstd` accept a level; Snappy and LZ4 take none.
 
 ```rust,compile
-let producer = Producer::builder()
-    .bootstrap_servers("localhost:9092")
+let producer = krafka::Kafka::builder("localhost:9092")
+    .connect()
+    .await?
+    .producer()
     .compression(Compression::Zstd)
-    .compression_level(Some(1))   // favour throughput over ratio
+    .compression_level(Some(1))
     .build()
     .await?;
 ```
@@ -157,108 +125,41 @@ let producer = Producer::builder()
 | Zstd | what the linked libzstd reports — negative "fast" levels through 22 | 3 |
 | Snappy, LZ4 | takes no level | — |
 
-Setting a level alongside a codec that takes none is **rejected at build
-time**, as is a level outside the codec's range, and per-topic codec overrides
-are validated against it too. Neither case is silently ignored: a tuning knob
-that quietly does nothing is how a deployment ships believing it was tuned.
-
-The level applies to the plain producer and to the `TransactionalProducer`
-alike, enforced by one shared validator, so a codec check cannot exist on one
-producer and not the other.
-
-Higher is not better. zstd's output size is **not monotonic** in level — the
-match-finding strategy changes as levels rise, and on realistic record payloads
-level 3 can be *larger* than level 1. Above roughly level 9 the CPU cost climbs
-much faster than the byte savings, so on a throughput-bound producer the high
-levels are usually a net loss. Measure against your own payloads.
+A level on a codec that takes none, or outside the codec's range, is rejected
+at `build()` (and `build_transactional`); per-topic codec overrides are checked
+against it too. Higher zstd levels are not reliably smaller and cost much more
+CPU above about 9 — measure against your own payloads.
 
 ### Batching
-
-Batching improves throughput by combining multiple messages:
 
 ```rust,compile
 use krafka::producer::Producer;
 use std::time::Duration;
 
-let producer = Producer::builder()
-    .bootstrap_servers("localhost:9092")
-    .batch_size(65536)                      // Max bytes per batch (64KB)
-    .linger(Duration::from_millis(5))       // Wait up to 5ms for more messages
+let producer = krafka::Kafka::builder("localhost:9092")
+    .connect()
+    .await?
+    .producer()
+    .batch_size(65536)                  // bytes per partition batch (default 16384, ≥ 1)
+    .linger(Duration::from_millis(5))   // default 5 ms
+    .max_request_size(1024 * 1024)      // default 100 MiB, ≥ batch_size
     .build()
     .await?;
 ```
 
-### What `linger` actually controls
+Records are accumulated per partition. A batch is sent when it reaches
+`batch_size`, when its `linger` window expires, when `flush()`, `close()` or a
+transaction commit seals it, or — with `linger = 0` — as soon as the partition
+has no batch in flight. `linger` bounds how long a batch may wait for more
+records; it never turns batching off.
 
-Every send goes through the record accumulator — there is no separate
-unbatched path, at any `linger` setting. Records are accumulated per
-partition and a batch is dispatched when:
+### One request per broker, one batch per partition
 
-- it reaches `batch_size` bytes, **or**
-- the `linger` window expires, **or**
-- the partition has no batch in flight (this is the `linger = 0` case).
-
-`linger` is therefore "how long may a batch *wait* for company", not "may this
-producer batch at all". At `linger = 0` the first record goes out immediately —
-nothing is on the wire, so there is nothing to wait for — and the records that
-arrive during that round trip coalesce into the next batch, which is dispatched
-the instant the acknowledgement lands. You pay no added latency and still get
-batching under load. This is what `linger.ms = 0` means in the Java client, and
-it is worth an order of magnitude: 200 concurrent sends to one partition leave
-krafka as **3** Produce requests, not 200.
-
-Raise `linger` when you want to trade a bounded amount of latency for larger
-batches even when the producer is *not* saturated — a bursty, low-rate
-publisher will not fill a batch on its own.
-
-### One batch per partition on the wire
-
-krafka keeps exactly **one** batch per partition in flight, and batches take
-their turn in the order the accumulator sealed them. Different partitions
-proceed concurrently and are never serialised against each other.
-
-That is a stronger guarantee than the Java client's, and it is why krafka has
-no `max.in.flight.requests.per.connection` knob to get wrong: sequence order
-and wire order cannot diverge, so idempotent production needs no
-"≤ 5 in flight" rule, and a retry cannot reorder a partition. The per-connection
-in-flight ceiling that *does* exist is a transport concern — see
-[`TransportConfig::max_in_flight_requests`](@/docs/configuration.md).
-
-> **Note:** `batch_size` must be at least 1. Setting `batch_size` to 0 will cause the builder to return a configuration error.
-
-### Request Size Cap
-
-Use `max_request_size` when you want the producer to fail locally before sending a Produce request frame larger than your broker or network budget:
-
-```rust,compile
-use krafka::producer::Producer;
-
-let producer = Producer::builder()
-    .bootstrap_servers("localhost:9092")
-    .max_request_size(1 * 1024 * 1024)      // 1 MiB encoded Produce frame cap
-    .build()
-    .await?;
-```
-
-The producer encodes the final request using the negotiated Produce API version and rejects frames that exceed `max_request_size` before any broker I/O. The default is 100 MiB, matching Kafka's protocol request-size ceiling. Leave some headroom between `batch_size` and `max_request_size` for request headers and topic names; the builder rejects configurations where `batch_size > max_request_size`. The same knob is available on `TransactionalProducer::builder()`.
-
-```rust,compile
-// High-throughput configuration
-let producer = Producer::builder()
-    .bootstrap_servers("localhost:9092")
-    .batch_size(131072)                     // 128KB batches
-    .linger(Duration::from_millis(10))      // Wait up to 10ms
-    .compression(Compression::Lz4)          // Fast compression
-    .build()
-    .await?;
-
-// Low-latency configuration (this is also the default)
-let producer = Producer::builder()
-    .bootstrap_servers("localhost:9092")
-    .linger(Duration::ZERO)                 // Never wait; still coalesces under load
-    .build()
-    .await?;
-```
+Each partition has exactly one batch in flight, sent in order, so a retry
+cannot reorder a partition. Ready batches for all partitions a broker leads
+travel in one Produce request (at most 5 in flight per broker), up to
+`max_request_size`. A request that would exceed `max_request_size` fails
+locally before any I/O.
 
 ### Memory Backpressure
 
@@ -268,93 +169,82 @@ The producer limits memory usage to prevent unbounded growth under high load:
 use krafka::producer::Producer;
 use std::time::Duration;
 
-let producer = Producer::builder()
-    .bootstrap_servers("localhost:9092")
-    .buffer_memory(64 * 1024 * 1024)        // 64MB buffer limit
-    .max_block(Duration::from_secs(30))     // Total time send() may block
+let producer = krafka::Kafka::builder("localhost:9092")
+    .connect()
+    .await?
+    .producer()
+    .buffer_memory(64 * 1024 * 1024) // 64MB buffer limit
+    .max_block(Duration::from_secs(30))
     .build()
     .await?;
 ```
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `buffer_memory` | 32 MB | Maximum total memory for buffering records |
-| `max_block` | 60s | Total time `send()` may block: resolving the topic, then waiting for buffer memory |
+| `buffer_memory` | 32 MiB | Maximum total memory for buffering records; must be ≥ 1 |
+| `max_block` | 60 s | Total time `send()`/`enqueue()` may wait: resolving the topic plus waiting for buffer memory |
 
-Once a record is admitted it holds a share of the producer memory budget until
-it is acknowledged or fails. If memory is unavailable, `send()` blocks the
-caller before returning an error — the Kafka Java client's `max.block.ms`
-behaviour, which prevents both OOM conditions and unnecessary record loss under
-bursty load. `max_block` is one budget for the whole call, so time already spent
-resolving the topic is deducted from this wait.
-
-That wait is charged against `delivery_timeout`: the clock starts when you call
-`send()`, not when the record reaches a batch, so a record that spent 30 s
-blocked on backpressure does not then get a full fresh delivery budget.
+A record holds its share of `buffer_memory` until it has an outcome; when the
+budget is exhausted, `enqueue()` waits (Java `max.block.ms`). An `enqueue()`
+future dropped while waiting queued nothing. A `send()` future dropped after
+the record was queued does not cancel delivery — sending the record again may
+write it twice.
 
 ## Flushing
 
-Call `flush()` whenever you need a durability barrier over records that have already been handed to the producer:
+`flush()` sends everything queued before the call without waiting for
+`linger`, and returns when each of those records has its outcome:
 
 ```rust,compile
-// Send multiple records
 for i in 0..100 {
-    producer.send("topic", Some(format!("key-{}", i).as_bytes()), Some(b"value")).await?;
+    producer.enqueue(krafka::producer::Record::new("topic", format!("v{i}"))).await?;
 }
-
-// Ensure all records are sent before closing
 producer.flush().await?;
-producer.close().await;
+producer.close().await?;
 ```
+
+It covers exactly the sends queued before it: a send queued afterwards neither
+holds it up nor, by completing first, ends it early. It never blocks other
+sends — partitions on healthy brokers keep flowing while a flush waits on a
+slow one. It is cancel safe: dropping it stops the wait, not the sends.
 
 ## Tombstones and Compacted Topics
 
 On a `cleanup.policy=compact` topic, a record with a **null value** is a
-*tombstone*: it marks its key for deletion. A null value is not an empty one —
-the record format encodes null as a `-1` length prefix and zero-length as `0`,
-and compaction deletes on the first while keeping the second. krafka models the
-distinction as `Option<Bytes>` on both sides of the wire.
+*tombstone*: it marks its key for deletion. A zero-length value is not null and
+does not delete. Values are `Option<Bytes>` on both sides.
 
 ```rust,compile
-use krafka::producer::ProducerRecord;
+use krafka::producer::Record;
 
 // A tombstone needs a key: a null value on a keyless record deletes nothing.
 producer
-    .send_record(ProducerRecord::tombstone("users", "user-42"))
+    .send(Record::tombstone("users", "user-42"))
     .await?;
 
-// The same thing, without building a record.
-producer.send("users", Some(b"user-42"), None).await?;
-
 // A zero-length value is NOT a tombstone — compaction keeps this record.
-producer.send("users", Some(b"user-42"), Some(b"")).await?;
+producer.send(krafka::Record::new("users", "").key("user-42")).await?;
 ```
 
 `without_value()` turns an existing record into one, keeping its key and
-headers; `with_value()` reverses that. `is_tombstone()` reports whether a
+headers; `value(..)` sets a value again. `is_tombstone()` reports whether a
 record has a key and no value, using the same rule as
 `ConsumerRecord::is_tombstone()`.
 
-Two things worth knowing:
-
-- **A configured `value_serializer` is skipped for a tombstone**, and a
-  `key_serializer` for a null key. Framing a null value would emit a short
-  record that compaction reads as ordinary data. See
-  [`Serializer`](https://docs.rs/krafka/latest/krafka/serdes/trait.Serializer.html).
-- **The tombstone must share a partition with the records it retires**, since
-  compaction runs per partition. The default partitioner hashes the key, so
-  reusing the key is enough — do not pin `partition` on one and not the other.
+`TypedProducer` does not serialize a `None` value, so a typed tombstone stays
+null. A tombstone must land in the same partition as the records it retires;
+with the default partitioner the same key is enough.
 
 ### Null header values
 
 Header values carry the same distinction, as `Vec<(String, Option<Bytes>)>`:
 
 ```rust,compile
-use krafka::producer::ProducerRecord;
+use krafka::producer::Record;
 
-let record = ProducerRecord::new("events", b"payload".to_vec())
-    .with_header("X-Source", &b"api"[..])   // an ordinary header value
-    .with_null_header("X-Flag");            // null, not zero-length
+let record = Record::new("events", b"payload".to_vec())
+    .header("X-Source", &b"api"[..])   // an ordinary header value
+    .null_header("X-Flag");            // null, not zero-length
 ```
 
 On the read side, `ConsumerRecord::is_tombstone()` classifies a record and
@@ -363,45 +253,74 @@ removed from the table and reported as a `TableChange` with `is_delete()`.
 
 ## Partitioning
 
-### Default Partitioner
+### Default partitioning
 
-The default partitioner uses murmur2 hashing (Java-compatible) for keyed messages and round-robin for null keys:
+Without a `.partitioner(..)`, the producer partitions as Java's built-in
+partitioner does (KIP-794):
+
+- a keyed record goes to `murmur2(key) mod partitions`, the partition a Java
+  producer picks;
+- keyless records stick to one partition until at least `batch_size` bytes
+  were routed to it, then switch to a different partition chosen at random —
+  at any `linger`, however batches are sealed.
 
 ```rust,compile
 // Messages with the same key go to the same partition
-producer.send("topic", Some(b"user-123"), Some(b"event1")).await?;
-producer.send("topic", Some(b"user-123"), Some(b"event2")).await?;  // Same partition
+producer.send(krafka::Record::new("topic", "event1").key("user-123")).await?;
+producer.send(krafka::Record::new("topic", "event2").key("user-123")).await?;  // Same partition
 
-// Messages without keys are distributed round-robin
-producer.send("topic", None, Some(b"event")).await?;
+// Keyless messages stay on one partition for about `batch_size` bytes
+producer.send(krafka::Record::new("topic", "event")).await?;
 ```
+
+The keyless switch is uniform: it is not weighted by broker queue size and does
+not avoid slow brokers (Java's `partitioner.adaptive.partitioning.enable` and
+`partitioner.availability.timeout.ms` have no equivalent).
+
+### Rack-aware partitioning (KIP-1123)
+
+With `client_rack` set and `partitioner_rack_aware(true)`, a keyless switch
+chooses only partitions whose current leader is in the client's rack, which
+keeps produce traffic in one availability zone. When no partition of the topic
+is led from that rack, keyless records spread over all partitions. Keyed
+records always follow their key's hash.
+
+```rust,compile
+use krafka::producer::Producer;
+
+let producer = krafka::Kafka::builder("localhost:9092")
+    .connect()
+    .await?
+    .producer()
+    .client_rack("eu-west-1a")
+    .partitioner_rack_aware(true)
+    .build()
+    .await?;
+```
+
+Rack-aware partitioning without a `client_rack`, or together with a custom
+partitioner, is a configuration error.
 
 ### Custom Partitioners
 
-krafka provides several built-in partitioners:
+`RoundRobinPartitioner` is the one built-in alternative:
 
 ```rust,compile
-use krafka::producer::{
-    DefaultPartitioner,
-    RoundRobinPartitioner,
-    StickyPartitioner,
-    HashPartitioner,
-};
+use krafka::producer::{Producer, RoundRobinPartitioner};
 
 // Round-robin: ignores keys, distributes evenly
-let partitioner = RoundRobinPartitioner::new();
-
-// Sticky: sticks to one partition, auto-advances after batch_threshold records (default 100)
-let partitioner = StickyPartitioner::new();
-
-// Sticky with custom batch threshold
-let partitioner = StickyPartitioner::with_batch_threshold(500);
-
-// Hash: uses Rust's default hasher instead of murmur2
-let partitioner = HashPartitioner::new();
+let producer = krafka::Kafka::builder("localhost:9092")
+    .connect()
+    .await?
+    .producer()
+    .partitioner(RoundRobinPartitioner::new())
+    .build()
+    .await?;
 ```
 
-### Implementing Custom Partitioners
+A custom partitioner sees only topic, key and partition count. A partition it
+returns outside `[0, partition_count)` fails the send with
+`KrafkaError::Config` before the record is queued.
 
 ```rust,compile
 use krafka::producer::Partitioner;
@@ -433,32 +352,26 @@ impl Partitioner for RegionPartitioner {
 
 ## Metadata Topic Cache TTL
 
-krafka caches topic metadata between refreshes. During a *partial* refresh — one that names specific topics — entries that have been **idle** for longer than the TTL are evicted, so topic churn does not grow the cache indefinitely. The default is **5 minutes**, matching Java's `metadata.max.idle.ms`.
-
-Idle means nothing has addressed the topic: producing to it, resolving a leader for it, asking for its partition count, or naming it in a metadata refresh all reset the timer. A topic whose metadata is still current survives regardless.
+Topic metadata idle for longer than `metadata_topic_cache_ttl` (default
+5 minutes, Java `metadata.max.idle.ms`) is evicted; producing to a topic or
+refreshing it resets the timer. `None` disables eviction.
 
 ```rust,compile
 use krafka::producer::Producer;
 use std::time::Duration;
 
-let producer = Producer::builder()
-    .bootstrap_servers("localhost:9092")
-    .metadata_topic_cache_ttl(Duration::from_secs(600))
-    .build()
-    .await?;
-
-let producer = Producer::builder()
-    .bootstrap_servers("localhost:9092")
-    .disable_metadata_topic_cache_ttl()
+let producer = krafka::Kafka::builder("localhost:9092")
+    .metadata_topic_cache_ttl(Some(Duration::from_secs(600)))
+    .connect()
+    .await?
+    .producer()
     .build()
     .await?;
 ```
 
-A full metadata refresh still replaces the cache unconditionally.
-
 ## Topic Resolution
 
-`send()` to a topic the cache does not hold fetches metadata for it and retries until it resolves or the [`max_block`](#configuration) budget expires — the equivalent of `KafkaProducer.waitOnMetadata`. A topic that was never fetched, one evicted as idle, and one still being created all resolve this way.
+`send()` to a topic the cache does not hold fetches its metadata, retrying until it resolves or the [`max_block`](#memory-backpressure) budget expires.
 
 A topic the cluster will not resolve within `max_block` fails with the broker's own reason:
 
@@ -466,12 +379,14 @@ A topic the cluster will not resolve within `max_block` fails with the broker's 
 use krafka::error::{ErrorCode, KrafkaError};
 use krafka::producer::Producer;
 
-let producer = Producer::builder()
-    .bootstrap_servers("localhost:9092")
+let producer = krafka::Kafka::builder("localhost:9092")
+    .connect()
+    .await?
+    .producer()
     .build()
     .await?;
 
-match producer.send("maybe-missing", None, Some(b"v")).await {
+match producer.send(krafka::Record::new("maybe-missing", "v")).await {
     Ok(metadata) => println!("wrote to partition {}", metadata.partition),
     Err(KrafkaError::Broker { code: ErrorCode::TopicAuthorizationFailed, .. }) => {
         // The topic exists; this principal may not write to it.
@@ -483,15 +398,15 @@ match producer.send("maybe-missing", None, Some(b"v")).await {
 }
 ```
 
-`max_block` is one budget for the whole call: time spent resolving the topic is deducted from the wait for buffer memory, so `send()` never blocks longer than `max_block` in total.
-
-[`partitions_for`](https://docs.rs/krafka/latest/krafka/producer/struct.Producer.html#method.partitions_for) — the equivalent of `KafkaProducer.partitionsFor` — inspects a topic directly, fetching on a cache miss under the same budget:
+[`partitions_for`](https://docs.rs/krafka/latest/krafka/producer/struct.Producer.html#method.partitions_for) inspects a topic directly, fetching on a cache miss under the same budget:
 
 ```rust,compile
 use krafka::producer::Producer;
 
-let producer = Producer::builder()
-    .bootstrap_servers("localhost:9092")
+let producer = krafka::Kafka::builder("localhost:9092")
+    .connect()
+    .await?
+    .producer()
     .build()
     .await?;
 
@@ -500,7 +415,7 @@ for partition in producer.partitions_for("events").await? {
 }
 ```
 
-An explicit partition is range-checked too: partition 7 of a 2-partition topic is rejected by `send()`.
+An explicit partition outside the topic's range is rejected by `send()`.
 
 ### Letting the broker create the topic
 
@@ -509,288 +424,146 @@ An explicit partition is range-checked too: partition 7 of a 2-partition topic i
 ```rust,compile
 use krafka::producer::Producer;
 
-let producer = Producer::builder()
-    .bootstrap_servers("localhost:9092")
+let producer = krafka::Kafka::builder("localhost:9092")
     .allow_auto_create_topics(true)
+    .connect()
+    .await?
+    .producer()
     .build()
     .await?;
 ```
 
-The broker must also run with `auto.create.topics.enable=true`; the client flag only says it is willing.
-
-**Off by default**, unlike the Java producer, which always asks for auto-creation. A typo'd topic name that silently materialises a real topic reports nothing until the traffic is found missing from the topic it was meant for. Turn it on for development and test clusters.
-
-The flag lives on the metadata cache, so a client sharing a [`KrafkaClient`](@/docs/getting-started.md)'s metadata inherits that client's setting instead.
+The broker must also run with `auto.create.topics.enable=true`. The flag is **off by default** (the Java producer always asks), so a misspelled topic name fails instead of creating a topic. It is set on the `Kafka` builder and applies to every client built from the handle.
 
 ## Error Handling
 
 ### Record Validation
 
-Before sending, each `ProducerRecord` is validated against Kafka wire-format limits:
+An empty topic name, a topic name over 32,767 bytes, a key, value or header
+over `i32::MAX` bytes, or more than 10,000 headers fails the send with
+`KrafkaError::Protocol` before the record is queued.
 
-- **Topic name**: max 32,767 bytes (i16 limit)
-- **Key**: max 2,147,483,647 bytes (i32 limit)
-- **Value**: max 2,147,483,647 bytes (i32 limit)
-- **Header keys**: max 2,147,483,647 bytes (i32 limit)
-- **Header values**: max 2,147,483,647 bytes (i32 limit)
+### Retries and delivery timeout
 
-Oversized data returns a descriptive `KrafkaError::protocol` error instead of panicking.
-
-### Built-in Retry
-
-The producer automatically retries transient failures (e.g., `NotLeaderForPartition`, network timeouts) using the configured retry policy. On each retriable error, the producer refreshes metadata to discover the new partition leader before retrying with exponential backoff.
-
-Configure retries via the builder:
+Retriable failures (`NOT_LEADER_OR_FOLLOWER`, `NOT_ENOUGH_REPLICAS`, a timeout,
+a lost connection) are retried with the batch's original sequence numbers, so
+the broker de-duplicates a retry of a batch it already appended. Backoff starts
+at `retry_backoff` (default 100 ms), doubles per attempt with ±20 % jitter,
+and is capped at **1 s**. There is no retry count: `delivery_timeout` (Java
+`delivery.timeout.ms`, default 120 s) bounds the time from a batch's creation
+to its records' outcome, and every record resolves by then.
 
 ```rust,compile
 use krafka::producer::Producer;
 use std::time::Duration;
 
-let producer = Producer::builder()
-    .bootstrap_servers("localhost:9092")
-    .retries(5)                                      // Max retry attempts; defaults to u32::MAX
-    .retry_backoff(Duration::from_millis(100))        // Initial backoff
-    .build()
-    .await?;
-
-// send() automatically retries on transient failures
-producer.send("topic", None, Some(b"value")).await?;
-```
-
-### Delivery Timeout
-
-The `delivery_timeout` setting (analogous to the Java client's `delivery.timeout.ms`) caps the total time from when a record enters the producer to when it must be acknowledged. This includes time spent in the accumulator's linger window, backpressure waits, and all retry attempts.
-
-```rust,compile
-use krafka::producer::Producer;
-use std::time::Duration;
-
-let producer = Producer::builder()
-    .bootstrap_servers("localhost:9092")
-    .delivery_timeout(Duration::from_secs(120))  // Total delivery budget
-    .linger(Duration::from_millis(5))             // Batching window
-    .retries(u32::MAX)                            // Retry until timeout
+let producer = krafka::Kafka::builder("localhost:9092")
+    .connect()
+    .await?
+    .producer()
+    .retry_backoff(Duration::from_millis(100))
+    .delivery_timeout(Duration::from_secs(120))
     .build()
     .await?;
 ```
 
-The producer defaults to `delivery_timeout = 120s` and `retries = u32::MAX`, so transient failures are retried until the delivery budget is exhausted. Backoff durations are clamped to the remaining budget so the producer does not overshoot. If the budget is exhausted, the send fails immediately regardless of the remaining retry count.
+It must be at least `linger + request_timeout`; a smaller value is a
+configuration error, as in Java.
 
-> **Note:** By default `linger` is `0`, so a record never waits for a batching
-> window and the delivery timeout is essentially backpressure + network + retry
-> time. With `linger > 0`, add the maximum linger window to the budget.
+A record that times out fails with
+`KrafkaError::DeliveryTimeout { possibly_written, .. }`. `possibly_written` is
+`false` only when its batch never reached a connection, or every attempt that
+did was answered with an error that proves it was not appended. A timeout, a
+lost connection, `NOT_ENOUGH_REPLICAS_AFTER_APPEND` or `REQUEST_TIMED_OUT`
+leave it `true`: the broker may hold the record, so resending it yourself may
+duplicate it.
 
-### Manual Retry
+### Resending after a failure
 
-For additional retry control beyond the built-in behavior, handle errors explicitly:
+The producer has already retried every retriable failure when `send()`
+returns, so a resend is a decision about duplicates, not a retry loop:
 
 ```rust,compile
+use krafka::Record;
+use krafka::error::KrafkaError;
 use krafka::producer::Producer;
-use krafka::error::{KrafkaError, Result};
 
-async fn send_with_retry(
-    producer: &Producer,
-    topic: &str,
-    key: Option<&[u8]>,
-    value: &[u8],
-    max_retries: u32,
-) -> Result<()> {
-    let mut attempts = 0;
-    
-    loop {
-        match producer.send(topic, key, Some(value)).await {
-            Ok(metadata) => {
-                println!("Sent to {}:{}", metadata.partition, metadata.offset);
-                return Ok(());
-            }
-            Err(e) if e.is_retriable() && attempts < max_retries => {
-                println!("Send failed (attempt {}): {}", attempts + 1, e);
-                attempts += 1;
-                tokio::time::sleep(std::time::Duration::from_millis(100 * attempts as u64)).await;
-            }
-            Err(e) => return Err(e),
+async fn send_once_more(producer: &Producer, record: Record) -> krafka::Result<()> {
+    match producer.send(record.clone()).await {
+        Ok(_) => Ok(()),
+        // Never written: a resend cannot duplicate it.
+        Err(KrafkaError::DeliveryTimeout { possibly_written: false, .. }) => {
+            producer.send(record).await.map(|_| ())
         }
+        // Possibly written: a resend may duplicate it. Keep the error, or
+        // resend only if the consumer de-duplicates.
+        Err(e) => Err(e),
     }
 }
 ```
 
-### Using RetryPolicy
+## Idempotence
 
-For more sophisticated retry handling with exponential backoff:
+The producer is idempotent by default (KIP-679): every batch carries
+`(producer id, epoch, base sequence)`, unchanged across retries, so an
+acknowledged record is written exactly once.
 
-```rust,compile
-use krafka::producer::{Producer, RetryPolicy, RetryContext};
-use krafka::error::Result;
+- A batch that fails for good moves the producer to the next epoch (KIP-360)
+  once nothing stamped under the old one is unresolved.
+- `OUT_OF_ORDER_SEQUENCE_NUMBER` (the broker lost an earlier batch) fails the
+  batch with the non-fatal `KrafkaError::OutOfOrderSequence`, bumps the epoch
+  and increments the `data_loss_detected` metric.
+- `UNKNOWN_PRODUCER_ID` after retention removed the producer's state bumps the
+  epoch and resends; otherwise it is handled as an out-of-order sequence.
+- `DUPLICATE_SEQUENCE_NUMBER` is success.
 
-async fn send_with_policy(
-    producer: &Producer,
-    topic: &str,
-    value: &[u8],
-) -> Result<()> {
-    let policy = RetryPolicy::new()
-        .with_max_retries(5)
-        .with_initial_backoff(std::time::Duration::from_millis(100))
-        .with_max_backoff(std::time::Duration::from_secs(10))
-        .with_backoff_multiplier(2.0)
-        .with_jitter_factor(0.1);  // Add 10% jitter to prevent thundering herd
-    
-    let mut ctx = RetryContext::new(policy, "send_message");
-    
-    loop {
-        match producer.send(topic, None, Some(value)).await {
-            Ok(metadata) => {
-                ctx.record_success();
-                return Ok(());
-            }
-            Err(e) => {
-                if let Some(backoff) = ctx.record_failure(&e) {
-                    ctx.wait(backoff).await;
-                } else {
-                    return Err(e);
-                }
-            }
-        }
-    }
-}
-```
-
-## Performance Tips
-
-### High Throughput
-
-For maximum throughput:
-
-```rust,compile
-use krafka::producer::{Producer, Acks};
-use krafka::protocol::Compression;
-use std::time::Duration;
-
-let producer = Producer::builder()
-    .bootstrap_servers("localhost:9092")
-    .acks(Acks::Leader)                     // Don't wait for all replicas
-    .compression(Compression::Lz4)           // Fast compression
-    .batch_size(1048576)                     // 1MB batches
-    .linger(Duration::from_millis(10))       // Allow batching
-    .build()
-    .await?;
-```
-
-### Low Latency
-
-For minimum latency:
-
-```rust,compile
-use krafka::producer::{Producer, Acks};
-use std::time::Duration;
-
-let producer = Producer::builder()
-    .bootstrap_servers("localhost:9092")
-    .acks(Acks::None)                        // Don't wait for acks
-    .batch_size(1)                           // No batching
-    .linger(Duration::ZERO)                  // Send immediately
-    .build()
-    .await?;
-```
-
-> **`acks=0` also gives up quota feedback.** The broker sends no response, so
-> there is no `throttle_time_ms` to read (KIP-219) and a producer sending
-> *only* `acks=0` traffic never learns it is being throttled. A throttle
-> learned from any other API on the same connection is still honoured, but a
-> pure `acks=0` client keeps writing at full rate until the broker mutes the
-> channel itself. Combined with the loss of delivery confirmation, `acks=0`
-> gives up more than durability alone — prefer `acks=1` unless you have
-> measured that the difference matters.
-
-### Durability
-
-For maximum durability:
-
-```rust,compile
-use krafka::producer::{Producer, Acks};
-use krafka::protocol::Compression;
-use std::time::Duration;
-
-let producer = Producer::builder()
-    .bootstrap_servers("localhost:9092")
-    .retries(10)                             // Retry on failure
-    .build()
-    .await?;
-```
-
-> **Idempotent by default (KIP-679):** Since Kafka 3.0, idempotent production is the default.
-> The regular `Producer` obtains a Producer ID via `InitProducerId` at startup,
-> tracks sequence numbers per partition, and de-duplicates retries automatically.
-> `acks = All` is required when idempotent is enabled. Unlike the Java client
-> and librdkafka there is no in-flight-request limit to observe: krafka keeps
-> exactly one batch per partition on the wire, so sequence order and wire order
-> cannot diverge and KIP-679's "≤ 5 in flight" rule has nothing to protect.
-> The `InitProducerId` call retries on retriable errors (e.g. `CoordinatorLoadInProgress`)
-> with exponential backoff, rotating through available brokers on each attempt.
->
-> **Error handling:**
-> - `OutOfOrderSequenceNumber` triggers a sequence reset and batch rebuild before retrying.
-> - `DuplicateSequenceNumber` is treated as success (broker already committed the batch;
->   idempotent dedup worked). The returned offset is `-1` since the broker does not echo
->   the original offset for duplicates.
-> - Multi-record batches acknowledge the *last* sequence (`base + count − 1`), matching
->   the Kafka Java client's `ProducerBatch.lastSequence()` semantics.
->
-> For cross-session exactly-once semantics (transactions), use `TransactionalProducer`.
-
-### Concurrency control
-
-There is nothing to configure for per-partition ordering: the accumulator's
-dispatch FIFO already permits exactly one batch per partition on the wire, and
-batches take their turn in seal order. A retry cannot reorder a partition, and
-an idempotent producer's sequence order always matches its wire order.
-
-Concurrency across partitions is bounded in two independent places:
-
-- **Per connection** — [`TransportConfig::max_in_flight_requests`](@/docs/configuration.md)
-  caps how many requests may be outstanding on a single broker socket.
-- **Per producer** — the accumulator caps how many batch-send tasks run at
-  once, so an overlapping burst of linger waves cannot spawn unboundedly.
-
-Both are transport concerns. Neither affects ordering, because ordering is not
-bought with concurrency limits here.
+For exactly-once across producer restarts, use `TransactionalProducer`.
+In-flight limits are fixed (one batch per partition, 5 requests per broker);
+the connection-level [`max_in_flight_requests`](@/docs/configuration.md)
+applies underneath. See [Performance](@/docs/performance.md) for tuning.
 
 ## Graceful Shutdown
 
-Always close producers properly to flush pending messages. The `close()` method is a barrier over all started sends, not just batches still resident in the accumulator. It blocks new sends, waits for buffered and already-in-flight work to finish, then tears down connections. Calling `close()` more than once is a no-op:
+`close()` refuses new sends, sends everything queued, waits for every record's
+outcome and closes the interceptors. Calling `close()` more than once is a
+no-op:
 
-```rust
+```rust,compile
 use krafka::producer::Producer;
 
-let producer = Producer::builder()
-    .bootstrap_servers("localhost:9092")
+let producer = krafka::Kafka::builder("localhost:9092")
+    .connect()
+    .await?
+    .producer()
     .build()
     .await?;
 
 // ... send messages ...
 
-// Flush and close — waits for all in-flight batches to complete
-producer.flush().await?;
-producer.close().await;
+producer.close().await?;
 ```
 
-If you need a bounded shutdown window, use `close_with_timeout()` instead. On timeout, krafka tears down the connection pool and returns a timeout error, causing any remaining in-flight work to fail fast instead of hanging shutdown indefinitely:
+`close_with(CloseOptions::new().timeout(..))` bounds the wait; records still
+without an outcome then fail with `KrafkaError::Closed`:
 
 ```rust,compile
+use krafka::CloseOptions;
 use std::time::Duration;
 
-producer.close_with_timeout(Duration::from_secs(10)).await?;
+producer
+    .close_with(CloseOptions::new().timeout(Duration::from_secs(10)))
+    .await?;
 ```
+
+A producer dropped without `close()`, or a `close()` future dropped after its
+first poll, still delivers what is buffered in the background, but nothing
+waits for it. Bound the wait with `close_with`, not by dropping the future.
 
 ## Transactional Producer
 
-For exactly-once semantics across multiple partitions and topics, use the `TransactionalProducer`.
-This is the **recommended** approach for idempotent and exactly-once production.
-
-The transactional producer:
-- Automatically obtains a Producer ID (PID) and epoch from the broker via `InitProducerId`
-- Sets `producer_id`, `producer_epoch`, and `base_sequence` on every record batch
-- Marks batches as transactional (attribute bit 0x10)
-- Tracks sequence numbers per topic-partition for idempotent delivery
+`TransactionalProducer` writes records across partitions and topics — and
+consumer offsets — atomically. Building it registers the transactional id and
+fences any earlier instance with the same id.
 
 ### Basic Usage
 
@@ -800,25 +573,18 @@ use krafka::error::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Create transactional producer with unique ID
-    let producer = TransactionalProducer::builder()
-        .bootstrap_servers("localhost:9092")
-        .transactional_id("my-unique-transaction-id")
-        .build()
+    let producer = krafka::Kafka::builder("localhost:9092")
+        .connect()
+        .await?
+        .producer()
+        .build_transactional("my-unique-transaction-id")
         .await?;
 
-    // Initialize transactions (once per producer)
-    producer.init_transactions().await?;
+    producer.begin()?;
+    producer.send(krafka::Record::new("topic-a", "value1").key("key1")).await?;
+    producer.send(krafka::Record::new("topic-b", "value2").key("key2")).await?;
 
-    // Start transaction
-    producer.begin_transaction()?;
-
-    // Send messages atomically
-    producer.send("topic-a", Some(b"key1"), Some(b"value1")).await?;
-    producer.send("topic-b", Some(b"key2"), Some(b"value2")).await?;
-
-    // Commit transaction (all or nothing)
-    producer.commit_transaction().await?;
+    producer.commit().await?;
 
     Ok(())
 }
@@ -826,245 +592,118 @@ async fn main() -> Result<()> {
 
 ### Configuration
 
-`TransactionalProducerBuilder` mirrors `ProducerBuilder` setter for setter:
-compression and compression levels, delivery timeout, interceptors, a
-dead-letter queue, a state store, `with_client`, the metadata cache TTLs, and
-the synchronous `build_config()` terminal. `tests/builder_surface.rs` asserts
-that at compile time, so the two builders cannot drift apart.
+A transactional producer is built from the same `ProducerBuilder` as a plain
+one — `kafka.producer()…build_transactional(id)` — so every producer setter
+applies: compression and compression levels, delivery timeout, interceptors,
+partitioning (including `client_rack` and `partitioner_rack_aware`). Two
+setters only take effect there: `transaction_timeout` and `two_phase_commit`.
 
 ```rust,compile
-use krafka::producer::TransactionalProducer;
-use krafka::protocol::Compression;
+use krafka::Compression;
 use std::time::Duration;
 
-let producer = TransactionalProducer::builder()
-    .bootstrap_servers("localhost:9092")
-    .transactional_id("order-processor-1")
-    .client_id("my-app")
-    .transaction_timeout(Duration::from_secs(60))          // coordinator's deadline
-    .request_timeout(Duration::from_secs(30))
-    .delivery_timeout(Duration::from_secs(45))             // bound on one batch in flight
+let producer = kafka
+    .producer()
+    .transaction_timeout(Duration::from_secs(60)) // coordinator's deadline
+    .delivery_timeout(Duration::from_secs(45)) // bound on one batch in flight
     .compression(Compression::Zstd)
     .compression_level(Some(1))
-    .build()
+    .build_transactional("order-processor-1")
     .await?;
 ```
 
-Two setters are **deliberately absent**, because the transactional protocol
-fixes both:
+Two settings are **fixed** by the transactional protocol; `build_transactional`
+rejects a builder that changed them:
 
-| Absent setter | Why |
+| Setting | Fixed to |
 |---|---|
-| `acks` | Fixed to `Acks::All`. The coordinator can only guarantee atomicity over fully replicated writes, so a weaker setting would silently break the guarantee the type exists to provide. |
-| `idempotent` | Always on. A transactional producer *is* an idempotent producer with a stable `transactional.id`; there is nothing to disable. |
+| `acks` | `Acks::All` |
+| `idempotent` | `true` |
 
-#### Delivery timeout
+`transaction_timeout` defaults to 60 s. Keep `delivery_timeout` at or below it:
+a retrying batch holds the transaction open (blocking `read_committed`
+consumers), and the coordinator aborts at `transaction_timeout` anyway.
+`build_transactional` logs a warning when `delivery_timeout` is larger.
 
-`delivery_timeout` bounds how long one batch may spend in flight, including
-batching, retries and backoff. It matters more here than on the plain producer:
-a batch that keeps retrying holds the transaction open, and an open transaction
-blocks every `read_committed` consumer at its first offset.
-
-Keep it at or below `transaction_timeout` — the coordinator aborts at that point
-regardless. `build()` and `build_config()` warn when the two disagree.
-
-#### Validating without a broker
-
-`build_config()` runs exactly the checks `build()` runs and returns the
-validated `TransactionalProducerConfig` without connecting — for a
-`validate-config` subcommand, a startup check, or a unit test:
-
-```rust,compile
-let config = TransactionalProducer::builder()
-    .bootstrap_servers("localhost:9092")
-    .transactional_id("order-processor-1")
-    .compression(Compression::Zstd)
-    .compression_level(Some(1))
-    .build_config()?;      // no cluster required
-
-assert_eq!(config.compression_level(), Some(1));
-```
-
-#### Flushing
-
-`flush()` dispatches every buffered record and waits for the in-flight sends to
-complete. You do **not** need it before `commit_transaction()`, which flushes
-first and must — a commit marker written while records were still buffered would
-leave them outside the transaction they were sent in.
-
-It is there for two other reasons: forcing buffered records onto the wire
-mid-transaction so their failures surface with the record's context rather than
-at commit time, and writing code generic over "a producer" without special-casing
-which of the two you hold.
-
-Unlike `Producer::flush`, it does not make the records visible to a
-`read_committed` consumer — only `commit_transaction()` does.
-
-### Authentication
-
-Connect a transactional producer to secured Kafka clusters:
-
-```rust
-use krafka::producer::TransactionalProducer;
-
-// SASL/SCRAM-SHA-256 over cleartext (development only)
-let producer = TransactionalProducer::builder()
-    .bootstrap_servers("broker:9093")
-    .transactional_id("my-txn-id")
-    .sasl_scram_sha256("username", "password")
-    .build()
-    .await?;
-
-// SASL_SSL + SCRAM-SHA-512 — what a managed cluster almost always wants
-use krafka::auth::{AuthConfig, TlsConfig};
-let producer = TransactionalProducer::builder()
-    .bootstrap_servers("broker:9093")
-    .transactional_id("my-txn-id")
-    .auth(AuthConfig::sasl_scram_sha512_ssl("username", "password", TlsConfig::new()))
-    .build()
-    .await?;
-
-// Or use AuthConfig for advanced auth (e.g., AWS MSK IAM)
-use krafka::auth::AuthConfig;
-let auth = AuthConfig::aws_msk_iam("access_key", "secret_key", "us-east-1");
-let producer = TransactionalProducer::builder()
-    .bootstrap_servers("broker:9094")
-    .transactional_id("my-txn-id")
-    .auth(auth)
-    .build()
-    .await?;
-```
-
-See the [Authentication Guide](@/docs/authentication.md) for all supported mechanisms.
+`commit()` flushes by itself. `flush()` mid-transaction surfaces send failures
+early; it does not make records visible — only `commit()` does.
 
 ### Transaction Lifecycle
 
-1. **Initialize**: Call `init_transactions()` once when producer starts
-2. **Begin**: Call `begin_transaction()` to start a new transaction
-3. **Send**: Send messages with `send()` or `send_record()`
-4. **End**: Call `commit_transaction()` or `abort_transaction()`
-5. **Close**: Call `close()` when done — aborts any active transaction and cleans up resources
+`build_transactional(id)` → `begin()` → `send()`/`enqueue()` → `commit()` or
+`abort()` → … → `close()`.
 
-```rust
-// Error handling with abort
-producer.begin_transaction()?;
+```rust,compile
+use krafka::producer::TransactionalProducer;
+
+async fn do_work(producer: &TransactionalProducer) -> krafka::Result<()> {
+    producer.send(krafka::Record::new("orders", "created")).await?;
+    Ok(())
+}
+
+let producer = kafka.producer().build_transactional("orders-writer").await?;
+producer.begin()?;
 
 match do_work(&producer).await {
-    Ok(()) => producer.commit_transaction().await?,
+    Ok(()) => producer.commit().await?,
     Err(e) => {
-        producer.abort_transaction().await?;
+        producer.abort().await?;
         return Err(e);
     }
 }
 
-// When finished with the producer, always close it
-producer.close().await;
+producer.close().await?;
 ```
 
-> **`send_offsets_to_transaction` must complete inside the transaction.** A
-> commit waits for an offset commit that is already in flight, so the `EndTxn`
-> marker is never written around one. An offset commit started *after* the
-> commit has begun is refused with the same `Committing` error as a send. Both
-> orderings are safe; there is no arrangement in which the offsets land outside
-> the transaction.
-
-> **A commit closes the transaction before it drains it.** The moment
-> `commit_transaction()` is entered it transitions out of `InTransaction`, so
-> any concurrent `send()` from another task is refused with an
-> `InvalidState` error naming the `Committing` state. This is deliberate: a
-> record admitted after the drain had begun would still be buffered when
-> `EndTxn` went out, and would land in the *next* transaction — vanishing if
-> that one aborted. If you share a `TransactionalProducer` across tasks, treat
-> that error as "the transaction closed under me" and retry the record in the
-> next one.
-
-> **Never abort after a commit times out.** If `commit_transaction()` fails with
-> a timeout or a connection loss, the coordinator may already have committed —
-> the response was simply lost. Aborting then is the
-> [KAFKA-17754](https://issues.apache.org/jira/browse/KAFKA-17754) trigger: the
-> delayed `EndTxn` can be applied to a *later* transaction and tear it. The Java
-> client's documentation recommends aborting in this case; that advice predates
-> KAFKA-17754 and krafka deliberately does not follow it.
->
-> krafka enforces this rather than relying on you to remember it. A commit whose
-> outcome is unknown moves the producer to `TransactionState::CommitIndeterminate`,
-> from which:
->
-> - `abort_transaction()` returns an error explaining why, instead of performing
->   an abort that could silently corrupt data;
-> - `close()` leaves the transaction alone rather than auto-aborting it, and logs
->   that it did so;
-> - `commit_transaction()` may be retried — `EndTxn` is idempotent for the same
->   producer id and epoch, so a duplicate commit either lands or is recognised by
->   the coordinator as the one it already applied.
->
-> If you cannot retry, drop the producer. The coordinator resolves the
-> transaction on its own via `transaction.timeout.ms`.
->
-> A commit that fails with a *broker error code* is different: the coordinator
-> answered and declined, so the transaction is definitively still open and the
-> producer returns to `InTransaction`, where aborting is safe.
+- **Commit drains.** A send belongs to the transaction once it is queued.
+  `commit()` refuses new sends and `send_offsets` calls (`Committing` state),
+  sends what is buffered, waits for every queued send and any in-flight
+  `send_offsets`, then sends `EndTxn`.
+- **A failed send fails the transaction.** If any send of the transaction
+  failed, awaited or not, later sends and `commit()` return
+  `KrafkaError::TransactionAbortable` carrying the first failure. Abort and
+  start again.
+- **Abort drops buffered records.** `abort()` fails buffered records with
+  `TransactionAbortable`, waits for those already on the wire, then sends
+  `EndTxn(abort)`.
+- **Commit outcome unknown.** If any `EndTxn(commit)` attempt went unanswered,
+  the coordinator may have committed, and aborting could tear a later
+  transaction ([KAFKA-17754](https://issues.apache.org/jira/browse/KAFKA-17754)).
+  The producer enters `TransactionState::CommitUnknown`: `abort()` returns an
+  error without sending anything, `close()` leaves the transaction to the
+  coordinator, and `commit()` may be retried (it is idempotent). Under TV1 the
+  producer also bumps its epoch before the next transaction, fencing a late
+  `EndTxn`. A commit whose every attempt was answered with an error returns to
+  `Open`, where aborting is safe.
+- **Cancellation.** `commit()` and `abort()` are not cancel safe but leave a
+  state to continue from: call the same method again. A `send_offsets()`
+  dropped after it started makes the transaction abortable.
 
 ### Graceful Shutdown (Transactional)
 
-Always close transactional producers properly. The `close()` method:
-- Blocks new sends and waits for already-started transactional produce requests to finish
-- Aborts any active transaction to avoid dangling open transactions on the broker
-- Transitions the producer to `FatalError` state, preventing further use
-- Closes the underlying connection pool
-- Is idempotent — calling it more than once is a no-op
+`close()` refuses new sends, aborts an open transaction, leaves a
+`CommitUnknown` or `Prepared` one to the coordinator, and closes the
+interceptors. It is idempotent; later calls on the producer fail with
+`KrafkaError::Closed`. `close_with(CloseOptions::new().timeout(..))` bounds it.
 
-```rust,compile
-// Graceful shutdown
-producer.close().await;
-// Producer is no longer usable after close()
-```
+### Retries and fencing
 
-For bounded shutdown windows, `close_with_timeout()` provides the same semantics with an explicit deadline:
+Sends retry as on the plain producer, bounded by `delivery_timeout`. A batch
+that fails for good makes the transaction abortable. The coordinator RPCs (`InitProducerId`, `AddPartitionsToTxn`,
+`AddOffsetsToTxn`, `TxnOffsetCommit`, `EndTxn`) retry until `max_block`, with
+the same backoff (from `retry_backoff`, capped at 1 s); there is no retry
+count.
 
-```rust,compile
-use std::time::Duration;
+- On `NotCoordinator`, `CoordinatorNotAvailable`, `CoordinatorLoadInProgress`,
+  a timeout or a lost connection, the cached coordinator is dropped and
+  re-discovered before the next attempt.
+- Fatal errors are never retried. A fenced producer (`ProducerFenced`,
+  `InvalidProducerEpoch`, `TransactionCoordinatorFenced`) reports
+  `KrafkaError::Fenced` and moves to `TransactionState::Fatal`.
 
-producer.close_with_timeout(Duration::from_secs(10)).await?;
-```
+### Transaction version
 
-### Built-in Retry Logic
-
-The transactional producer automatically retries sends on transient failures:
-- Uses the shared `RetryPolicy` (default: 3 retries, exponential backoff with jitter)
-- Metadata is refreshed on transient errors before retrying
-- `OutOfOrderSequenceNumber` errors trigger a sequence number reset and batch rebuild with a fresh sequence before retrying
-- Sequence numbers and the batch are allocated once and reused across normal retries to maintain idempotent semantics
-- Non-retriable errors (auth failures, invalid topics) fail immediately
-
-### Coordinator Re-discovery
-
-All coordinator RPCs (`InitProducerId`, `AddPartitionsToTxn`, `AddOffsetsToTxn`, `EndTxn`)
-automatically handle coordinator failover:
-
-- On `NotCoordinator`, `CoordinatorNotAvailable`, or `CoordinatorLoadInProgress` the cached
-  coordinator is invalidated and a fresh `FindCoordinator` is issued before retrying.
-- Network and timeout errors to the coordinator trigger the same invalidation + re-discovery flow.
-- The retry uses the producer's `RetryPolicy` for exponential backoff between attempts.
-- Fatal errors (`TransactionCoordinatorFenced`, `ProducerFenced`, `InvalidProducerEpoch`,
-  `InvalidTxnState`) are never retried.
-- If no coordinator is cached (e.g. after invalidation), `coordinator_connection()` auto-discovers
-  one transparently before returning the connection.
-
-### KIP-890 Epoch Bumping (Kafka 3.7+)
-
-Kafka 3.7+ brokers implement **KIP-890 epoch bumping**: after every successful `EndTxn` (commit
-or abort) the broker increments the producer epoch and returns the new `ProducerId` and
-`ProducerEpoch` in the `EndTxn` v4+ response. krafka reads these fields and automatically applies
-them to the local identity, so subsequent `AddPartitionsToTxn` requests use the correct epoch.
-
-For brokers that do not support `EndTxn` v4+ (Kafka < 3.7), the response omits these fields and
-krafka continues with the unchanged epoch — the pre-KIP-890 protocol is used transparently.
-
-#### Negotiated transaction version
-
-krafka negotiates one protocol level for the cluster and reports it at
-`init_transactions()`:
+krafka negotiates one transaction protocol level for the cluster:
 
 | Level | `transaction.version` | What changes |
 |---|---|---|
@@ -1072,129 +711,78 @@ krafka negotiates one protocol level for the cluster and reports it at
 | `TV2` | 2 | KIP-890. Partitions register implicitly via `Produce`; the epoch bumps on every `EndTxn` |
 | `TV3` | 3 | KIP-939. Everything TV2 does, plus the coordinator honours `enable2Pc` |
 
-Two rules govern the negotiation, and both exist because getting them wrong is
-silent:
-
-- **The level alone is not evidence.** Finalized features are cluster-wide
-  metadata and can be observed before every broker has restarted into a build
-  that serves the matching API versions. krafka additionally requires the API
-  versions each level depends on — `Produce`, `TxnOffsetCommit` and `EndTxn`
-  for TV2, `InitProducerId` v6 for TV3. A broker that cannot encode `enable2Pc`
-  does not *reject* it; the field is simply absent, and the coordinator applies
-  `transaction.max.timeout.ms` to a transaction the caller believes is exempt.
-- **The cluster level is the minimum across brokers.** One lagging broker
-  during a rolling upgrade holds the whole cluster at the level it can serve,
-  so 2PC never turns on before every broker can honour it.
-
-`two_phase_commit(true)` on a cluster below TV3 fails at `init_transactions()`
-with a message naming the feature level, the API version and the ACL required
-— rather than surfacing the broker's bare `UNSUPPORTED_VERSION`.
-
-### Persisting Producer State
-
-`ProducerStateStore` is a hook for saving and restoring the producer's identity
-— its producer ID, epoch and per-partition sequence numbers — across restarts.
-Attach one with `state_store()` on either producer builder:
-
-```rust,compile
-use krafka::producer::{ProducerIdentitySnapshot, ProducerStateStore, TransactionalProducer};
-
-struct FileStateStore {
-    path: std::path::PathBuf,
-}
-
-impl ProducerStateStore for FileStateStore {
-    async fn load(&self) -> krafka::Result<Option<ProducerIdentitySnapshot>> {
-        // Read and deserialise the snapshot; `Ok(None)` on first run.
-        Ok(None)
-    }
-
-    async fn store(&self, snapshot: &ProducerIdentitySnapshot) -> krafka::Result<()> {
-        // Persist it. Errors are logged at WARN and never fail the send.
-        Ok(())
-    }
-}
-
-let producer = TransactionalProducer::builder()
-    .bootstrap_servers("localhost:9092")
-    .transactional_id("orders-processor-1")
-    .state_store(FileStateStore { path: "/var/lib/app/producer.json".into() })
-    .build()
-    .await?;
-```
-
-`load()` is called once during `build()`; `store()` is called after each
-successful batch acknowledgement.
-
-> **A restored snapshot is only honoured when it is safe to honour.** krafka
-> applies it only if the stored `producer_id` **and** `producer_epoch` match
-> what the broker returned from `InitProducerId`. For a plain idempotent
-> producer that can never happen — the broker issues a fresh PID with epoch 0
-> on every call — so restored sequences are ignored and the store is useful
-> only for observability. It carries real weight for a **transactional**
-> producer with a stable `transactional.id`, where the broker may hand back the
-> same PID with a bumped epoch.
+A level is used only when the finalized feature is set **and** every broker
+serves the API versions it needs (`Produce`, `TxnOffsetCommit`, `EndTxn` for
+TV2; `InitProducerId` v6 for TV3), so one lagging broker holds the cluster at
+the lower level. `two_phase_commit(true)` below TV3 fails at
+`build_transactional` with a message naming the feature level, API version and
+ACL required.
 
 ### Timestamps
 
-Both `Producer` and `TransactionalProducer` propagate the `timestamp` field from `ProducerRecord` to the Kafka record batch. If set, the timestamp is used as the `base_timestamp` of the record batch:
+Each record keeps its own timestamp: `Record::timestamp`, or the send time
+when unset.
 
 ```rust,compile
-use krafka::producer::ProducerRecord;
+use krafka::producer::Record;
 
-let mut record = ProducerRecord::new("my-topic", b"value".to_vec());
-record.timestamp = Some(1700000000000); // epoch millis
-producer.send_record(record).await?;
+let record = Record::new("my-topic", b"value".to_vec()).timestamp(1700000000000);
+producer.send(record).await?;
 ```
-
-> **Note:** If `timestamp` is not set, the broker defaults apply (typically `LogAppendTime` or `CreateTime` depending on topic configuration).
 
 ### Consume-Transform-Produce (Exactly-Once)
 
-For read-process-write patterns with exactly-once guarantees:
+```rust,compile
+use krafka::Record;
+use krafka::producer::TopicPartitionOffset;
 
-```rust
-use krafka::producer::TransactionalProducer;
-use std::collections::HashMap;
+let producer = kafka.producer().build_transactional("enricher-1").await?;
+let records = consumer.poll(Duration::from_secs(1)).await?;
 
 // Commit consumer offsets atomically with produce
-producer.begin_transaction()?;
+producer.begin()?;
 
 // Process records and produce output
-for record in consumer_records {
-    let output = transform(&record)?;
-    producer.send("output-topic", record.key, Some(&output)).await?;
+let mut offsets = Vec::new();
+for record in &records {
+    let mut output = Record::new("output-topic", record.value.clone().unwrap_or_default());
+    output.key = record.key.clone();
+    producer.send(output).await?;
+    // The offset of the NEXT record to consume.
+    offsets.push(TopicPartitionOffset::new(&*record.topic, record.partition, record.offset + 1));
 }
 
-// Commit offsets as part of the transaction.
-//
 // KIP-447: pass the consumer's live group metadata so the group coordinator
 // can fence a zombie committer. Re-read it every transaction — the generation
-// changes on every rebalance, and a cached value defeats the fencing.
-let offsets = [TopicPartitionOffset::new(topic, partition, next_offset)];
-let group_metadata = consumer.group_metadata().await?;
-producer.send_offsets_to_transaction(&offsets, &group_metadata).await?;
+// changes on every rebalance.
+let Some(group_metadata) = consumer.group_metadata().await else {
+    producer.abort().await?;
+    return Ok(());
+};
+producer.send_offsets(&offsets, &group_metadata).await?;
 
 // Atomic commit of messages and offsets
-producer.commit_transaction().await?;
+producer.commit().await?;
 ```
+
+After an abort, the consumer's position is already past the aborted records.
+Seek each partition back to its committed offset (`consumer.committed(..)`)
+before the next poll, or those records are skipped. See the
+[Cookbook](@/docs/cookbook.md#exactly-once-consume-transform-produce).
 
 ### Transaction States
 
-The producer maintains a state machine with atomic CAS (compare-and-swap) transitions for thread safety:
-
 | State | Description |
 |-------|-------------|
-| `Uninitialized` | Producer created, `init_transactions()` not called |
+| `Uninitialized` | Before `build_transactional` registered the transactional id |
+| `Initializing` | `build_transactional` is registering the transactional id |
 | `Ready` | Ready to begin a new transaction |
-| `InTransaction` | Transaction in progress |
-| `Committing` | Transaction being committed |
-| `Aborting` | Transaction being aborted |
+| `Open` | A transaction accepts sends |
+| `Committing` | `commit()` is running; sends are refused |
+| `CommitUnknown` | A commit attempt went unanswered; only another commit is allowed |
+| `Aborting` | `abort()` is running |
 | `Prepared` | Prepared under two-phase commit; awaiting an external decision |
-| `CommitIndeterminate` | `EndTxn(commit)` was dispatched and its outcome is unknown |
-| `FatalError` | Unrecoverable error, producer must be recreated |
-
-> **Note:** State transitions are protected by atomic compare-and-swap operations, preventing race conditions when multiple tasks interact with the transactional producer concurrently.
+| `Fatal` | Unrecoverable error, producer must be recreated |
 
 ### Two-phase commit (KIP-939)
 
@@ -1202,66 +790,58 @@ The producer maintains a state machine with atomic CAS (compare-and-swap) transi
 `transaction.version` 3, and both `WRITE` and `TWO_PHASE_COMMIT` on the
 transactional-id resource.*
 
-Kafka transactions are atomic within Kafka. They are not atomic with anything
-*else* — so a service that must write to Kafka **and** a database, either both
-or neither, has no way to express that with `commit_transaction()` alone.
-KIP-939 supplies the missing half: an external coordinator (a database, an XA
-manager, a workflow engine) owns the commit decision, and Kafka's side is held
-in doubt until that decision arrives.
-
-The obstacle is `transaction.max.timeout.ms`. Ordinarily the coordinator aborts
-a transaction that stays open too long — which is exactly right when Kafka owns
-the decision, and exactly wrong when it does not. `two_phase_commit(true)` sends
-`enable2Pc` on `InitProducerId`, and the broker then never times these
-transactions out.
+Two-phase commit lets an external coordinator (a database, an XA manager)
+own the commit decision while Kafka holds the transaction prepared.
+`two_phase_commit(true)` sends `enable2Pc` on `InitProducerId`, so the broker
+never times these transactions out.
 
 ```rust,ignore
 use krafka::producer::{PreparedTxnState, TransactionOutcome, TransactionalProducer};
 
-let producer = TransactionalProducer::builder()
-    .bootstrap_servers("localhost:9092")
-    .transactional_id("orders-sink")
-    .two_phase_commit(true)   // contradicts transaction_timeout; setting both is an error
-    .build()
+let producer = krafka::Kafka::builder("localhost:9092")
+    .connect()
+    .await?
+    .producer()
+    .two_phase_commit(true)
+    .build_transactional("orders-sink")
     .await?;
 
-producer.init_transactions().await?;
-producer.begin_transaction()?;
-producer.send("orders", None, Some(b"...")).await?;
+producer.begin()?;
+producer.send(krafka::Record::new("orders", "...")).await?;
 
 // Prepare: flush everything, then stop accepting records. Sends no request —
 // the prepare *is* the flush, and the coordinator was already told to hold.
-let prepared: PreparedTxnState = producer.prepare_transaction().await?;
+let prepared: PreparedTxnState = producer.prepare().await?;
 
 // Store it in the SAME external transaction as the rest of your work.
 db.execute("INSERT INTO kafka_prepared (id, state) VALUES ($1, $2)",
            &[&"orders-sink", &prepared.to_string()])?;
 db.commit()?;
 
-producer.commit_transaction().await?;
+producer.commit().await?;
 ```
 
-**Recovery is the point of all this.** If the process dies between the flush and
-the database commit, the replacement asks the coordinator what it is still
-holding and compares:
+If the process dies between the prepare and the database commit, the
+replacement compares what the coordinator holds with the stored state:
 
 ```rust,ignore
-let producer = TransactionalProducer::builder()
-    .bootstrap_servers("localhost:9092")
-    .transactional_id("orders-sink")
+let producer = krafka::Kafka::builder("localhost:9092")
+    .connect()
+    .await?
+    .producer()
     .two_phase_commit(true)
-    .build()
+    .build_transactional("orders-sink")
     .await?;
 
-// Unlike init_transactions(), this does NOT abort what the previous
-// incarnation left open.
-if let Some(_ongoing) = producer.init_transactions_keeping_prepared().await? {
+// With two_phase_commit, build_transactional keeps what the previous
+// incarnation left prepared instead of aborting it.
+if let Some(_ongoing) = producer.prepared_transaction() {
     let stored: PreparedTxnState = db
         .query_one("SELECT state FROM kafka_prepared WHERE id = $1", &[&"orders-sink"])?
         .get::<_, String>(0)
         .parse()?;
 
-    match producer.complete_transaction(stored).await? {
+    match producer.complete(stored).await? {
         // The stored state names the transaction still open: the prepare was
         // durably recorded, so the external side committed and this must match.
         TransactionOutcome::Committed => println!("recovered and committed"),
@@ -1276,31 +856,77 @@ if let Some(_ongoing) = producer.init_transactions_keeping_prepared().await? {
 `PreparedTxnState` renders as `producer_id:epoch` through `Display` and parses
 back through `FromStr`, so storing it needs no bespoke serialisation.
 
-> **A prepared transaction with no stored state cannot be resolved by anything
-> except a human.** It sits in doubt indefinitely — that is what disabling the
-> timeout buys — and blocks `read_committed` consumers on its partitions the
-> whole time. Write the state durably *before* you report the prepare as
-> successful, and treat a prepared transaction you cannot match as an incident.
+> **A prepared transaction with no stored state never times out** and blocks
+> `read_committed` consumers on its partitions until an operator resolves it.
+> Store the state durably before reporting the prepare as successful.
+
+## Typed keys and values
+
+`TypedProducer<K, V>` serializes typed keys and values with a
+`Serializer<K>` and a `Serializer<V>` before the record enters the producer.
+A serializer is synchronous and may add headers — where a schema registry
+puts its schema id. `BytesSerializer` passes byte values through,
+`StringSerializer` encodes strings as UTF-8, and `NoKey` is the key serializer
+of a producer that never sends keys. The key is serialized first, then the
+value; the interceptors see the encoded record. A `None` key or value is not
+serialized, so a `None` value is a tombstone. A serializer error fails the send
+with `KrafkaError::Serialization` before anything is reserved or queued.
+`producer()` reaches the producer underneath for `flush` and `metrics`.
+
+```rust,compile
+use bytes::Bytes;
+use krafka::Headers;
+use krafka::producer::{Producer, TypedProducer};
+use krafka::serdes::{Serializer, StringSerializer};
+
+/// Big-endian `u64`, tagged with a content type.
+struct BigEndian;
+
+impl Serializer<u64> for BigEndian {
+    fn serialize(
+        &self,
+        _topic: &str,
+        headers: &mut Headers,
+        value: &u64,
+    ) -> krafka::Result<Bytes> {
+        headers.push(("content-type".into(), Some(Bytes::from_static(b"u64-be"))));
+        Ok(Bytes::copy_from_slice(&value.to_be_bytes()))
+    }
+}
+
+let producer = krafka::Kafka::builder("localhost:9092")
+    .connect()
+    .await?
+    .producer()
+    .build()
+    .await?;
+let counters: TypedProducer<str, u64> = TypedProducer::new(producer, StringSerializer, BigEndian);
+counters.send("counters", Some("page-views"), Some(&42)).await?;
+counters.close().await?;
+```
 
 ## Producer Interceptors
 
 Interceptors allow you to observe and modify records before they are sent, and
-observe the acknowledgement (or error) after a send completes. Each record
+observe the outcome after a send completes: `on_acknowledgement` receives
+`Result<&RecordMetadata, &KrafkaError>` exactly once per record, and both
+producers call `close()` once. A panic in `on_send` fails that record's send
+(it is not produced); an `Err` is logged and the chain continues. Each record
 carries a `RecordContext` from one hook to the other, so an interceptor can hold
 a span or a timer across the send — see the
 [Interceptors Guide](@/docs/interceptors.md) for full details.
 
-```rust
+```rust,compile
 use krafka::interceptor::{InterceptorResult, ProducerInterceptor, RecordContext};
-use krafka::producer::{Producer, ProducerRecord, RecordHeaders, RecordMetadata};
+use krafka::Headers;
+use krafka::producer::{Producer, Record, RecordMetadata};
 use krafka::error::KrafkaError;
-use std::sync::Arc;
 
 #[derive(Debug)]
 struct AuditInterceptor;
 
 impl ProducerInterceptor for AuditInterceptor {
-    fn on_send(&self, record: &mut ProducerRecord, _ctx: &mut RecordContext) -> InterceptorResult {
+    fn on_send(&self, record: &mut Record, _ctx: &mut RecordContext) -> InterceptorResult {
         // Add a tracing header to every record
         record.headers.push(("x-trace-id".to_string(), Some(b"abc123".to_vec().into())));
         Ok(())
@@ -1308,31 +934,53 @@ impl ProducerInterceptor for AuditInterceptor {
 
     fn on_acknowledgement(
         &self,
-        metadata: &RecordMetadata,
-        error: Option<&KrafkaError>,
-        _headers: &RecordHeaders,
+        topic: &str,
+        partition: i32,
+        result: Result<&RecordMetadata, &KrafkaError>,
+        _headers: &Headers,
         _ctx: &mut RecordContext,
     ) -> InterceptorResult {
-        if let Some(err) = error {
-            eprintln!("Send failed: {}", err);
-        } else {
-            println!("Sent to {}:{}", metadata.topic, metadata.partition);
+        match result {
+            Ok(metadata) => println!("Sent to {topic}:{partition} at {}", metadata.offset),
+            Err(err) => eprintln!("Send to {topic}:{partition} failed: {err}"),
         }
         Ok(())
     }
 }
 
-let producer = Producer::builder()
-    .bootstrap_servers("localhost:9092")
-    .interceptor(Arc::new(AuditInterceptor))
+let producer = krafka::Kafka::builder("localhost:9092")
+    .connect()
+    .await?
+    .producer()
+    .interceptor(AuditInterceptor)
     .build()
     .await?;
 ```
 
+## Failed sends and dead-letter topics
+
+A send that fails returns its error to the caller; the producer does not
+reroute records anywhere. `send` and `enqueue` take the record by value, so
+clone it first if you want to write it somewhere else on failure. To
+dead-letter a *consumed* record that cannot be processed, build the record with
+`krafka::dlq::record_for` and send it with an ordinary producer — see
+[Dead Letter Queue](@/docs/errors.md#dead-letter-queue).
+
+## Metrics and telemetry
+
+`producer.metrics()` returns an owned `krafka::metrics::Metrics` snapshot;
+`prometheus_text()` renders it. Each record's send is a `tracing` span. The
+producer pushes its metrics to the brokers when the cluster subscribes to them
+(KIP-714); `metrics_push(false)` turns that off. See [Metrics](@/docs/metrics.md).
+
+```rust,compile
+let producer = kafka.producer().metrics_push(false).build().await?;
+let snapshot = producer.metrics();
+println!("{}", snapshot.prometheus_text());
+```
+
 ## Next Steps
 
-- [Dead Letter Queue](@/docs/errors.md#dead-letter-queue) - Route permanently-failed records to an error topic
 - [Interceptors Guide](@/docs/interceptors.md) - Producer and consumer interceptor hooks
 - [Consumer Guide](@/docs/consumer.md) - Learn about consuming messages
 - [Configuration Reference](@/docs/configuration.md) - All producer options
-- [Architecture Overview](@/docs/architecture.md) - How the producer works internally

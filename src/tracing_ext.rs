@@ -1,525 +1,220 @@
-//! Tracing extensions for observability.
+//! The spans the clients emit, on OpenTelemetry messaging semantic
+//! conventions [`OTEL_SEMCONV_VERSION`].
 //!
-//! This module provides OpenTelemetry-compatible tracing utilities:
-//! - Span helpers for producer and consumer operations
-//! - Semantic conventions for Kafka messaging
-//! - Error recording utilities
+//! Every span goes through `tracing`. The name the conventions want,
+//! `{operation} {destination}`, and the span kind travel in the `otel.name`
+//! and `otel.kind` fields, which a `tracing` → OpenTelemetry bridge reads.
+//! Span macros evaluate no field when no subscriber is interested, so a
+//! process without one pays a callsite check per operation and nothing more.
 //!
-//! # OpenTelemetry Semantic Conventions
-//!
-//! This module follows the [OpenTelemetry Semantic Conventions for Messaging](https://opentelemetry.io/docs/specs/semconv/messaging/).
-//!
-//! # Example
-//!
-//! ```ignore
-//! use krafka::tracing_ext::{kafka_producer_span, kafka_consumer_span, record_error};
-//! use tracing::{Instrument, info_span};
-//!
-//! async fn produce() {
-//!     let span = kafka_producer_span("my-topic", Some(0), Some(b"key"));
-//!     async {
-//!         // produce message
-//!     }.instrument(span).await;
-//! }
-//! ```
+//! No span records record keys or values, or anything derived from a key
+//! but its size.
 
-use crate::PartitionId;
-use sha2::{Digest, Sha256};
-use tracing::{Level, Span};
+use std::borrow::Cow;
 
-/// OpenTelemetry semantic convention: messaging system.
-pub const MESSAGING_SYSTEM: &str = "messaging.system";
-/// OpenTelemetry semantic convention: messaging destination.
-pub const MESSAGING_DESTINATION: &str = "messaging.destination.name";
-/// OpenTelemetry semantic convention: messaging operation.
-pub const MESSAGING_OPERATION: &str = "messaging.operation";
-/// OpenTelemetry semantic convention: Kafka partition.
-pub const MESSAGING_KAFKA_PARTITION: &str = "messaging.kafka.destination.partition";
-/// OpenTelemetry semantic convention: Kafka message offset.
-pub const MESSAGING_KAFKA_OFFSET: &str = "messaging.kafka.message.offset";
-/// OpenTelemetry semantic convention: Kafka consumer group.
-pub const MESSAGING_KAFKA_CONSUMER_GROUP: &str = "messaging.kafka.consumer.group";
-/// OpenTelemetry semantic convention: message key.
-pub const MESSAGING_MESSAGE_KEY: &str = "messaging.message.id";
-/// Krafka-specific: message key size in bytes.
-pub const KRAFKA_MESSAGE_KEY_SIZE: &str = "krafka.message.key.size";
-/// Krafka-specific: SHA-256 hash of the message key, hex encoded.
-pub const KRAFKA_MESSAGE_KEY_SHA256: &str = "krafka.message.key.sha256";
-/// OpenTelemetry semantic convention: message body size.
-pub const MESSAGING_MESSAGE_BODY_SIZE: &str = "messaging.message.body.size";
-/// OpenTelemetry semantic convention: batch message count.
-pub const MESSAGING_BATCH_MESSAGE_COUNT: &str = "messaging.batch.message_count";
-/// Krafka-specific: correlation ID.
-pub const KRAFKA_CORRELATION_ID: &str = "krafka.correlation_id";
-/// Krafka-specific: compression type.
-pub const KRAFKA_COMPRESSION: &str = "krafka.compression";
-/// Krafka-specific: acks.
-pub const KRAFKA_ACKS: &str = "krafka.acks";
+use tracing::Span;
 
-/// Create a span for a Kafka producer send operation.
-///
-/// This span follows OpenTelemetry semantic conventions for messaging.
-///
-/// # Arguments
-///
-/// * `topic` - The destination topic name
-/// * `partition` - Optional partition ID (if known before send)
-/// * `key` - Optional message key. Raw key bytes are never recorded; spans
-///   include only key length and a SHA-256 hash.
-///
-/// # Returns
-///
-/// A tracing `Span` configured with Kafka producer attributes.
+use crate::error::KrafkaError;
+
+/// The OpenTelemetry semantic-conventions version krafka's span names and
+/// attributes follow. The messaging conventions are still marked
+/// *Development*; krafka moves to a newer version deliberately, as a
+/// breaking change.
+pub const OTEL_SEMCONV_VERSION: &str = "1.44.0";
+
+/// One `send` span per record, from `send`/`enqueue` to the record's outcome.
+/// The partition and offset are recorded as they become known.
 #[inline]
-pub fn kafka_producer_span(
-    topic: &str,
-    partition: Option<PartitionId>,
-    key: Option<&[u8]>,
-) -> Span {
-    if !tracing::enabled!(target: module_path!(), Level::INFO) {
-        return Span::none();
-    }
-
-    let span = tracing::span!(
-        Level::INFO,
-        "kafka.produce",
-        { MESSAGING_SYSTEM } = tracing::field::Empty,
-        { MESSAGING_OPERATION } = tracing::field::Empty,
-        { MESSAGING_DESTINATION } = tracing::field::Empty,
-        { MESSAGING_KAFKA_PARTITION } = tracing::field::Empty,
-        { KRAFKA_MESSAGE_KEY_SIZE } = tracing::field::Empty,
-        { KRAFKA_MESSAGE_KEY_SHA256 } = tracing::field::Empty,
+pub(crate) fn send_span(topic: &str, client_id: &str, key: Option<&[u8]>, tombstone: bool) -> Span {
+    tracing::info_span!(
+        target: "krafka::producer",
+        "send",
+        otel.name = %format_args!("send {topic}"),
+        otel.kind = "producer",
         otel.status_code = tracing::field::Empty,
-        error.message = tracing::field::Empty,
-    );
-
-    span.record(MESSAGING_SYSTEM, "kafka");
-    span.record(MESSAGING_OPERATION, "publish");
-    span.record(MESSAGING_DESTINATION, topic);
-
-    if let Some(p) = partition {
-        span.record(MESSAGING_KAFKA_PARTITION, p);
-    }
-
-    if let Some(key_bytes) = key
-        && !span.is_disabled()
-    {
-        span.record(KRAFKA_MESSAGE_KEY_SIZE, key_bytes.len() as u64);
-        let key_hash = sha256_hex(key_bytes);
-        span.record(KRAFKA_MESSAGE_KEY_SHA256, key_hash.as_str());
-    }
-
-    span
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-
-    let digest = Sha256::digest(bytes);
-    let mut output = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        output.push(HEX[(byte >> 4) as usize] as char);
-        output.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    output
-}
-
-/// Create a span for a Kafka consumer poll operation.
-///
-/// # Arguments
-///
-/// * `group_id` - Optional consumer group ID
-/// * `topics` - Topics being polled
-///
-/// # Returns
-///
-/// A tracing `Span` configured with Kafka consumer attributes.
-#[inline]
-pub fn kafka_consumer_poll_span(group_id: Option<&str>, topics: &[String]) -> Span {
-    if !tracing::enabled!(target: module_path!(), Level::INFO) {
-        return Span::none();
-    }
-
-    let topics_str = topics.join(",");
-    let span = tracing::span!(
-        Level::INFO,
-        "kafka.poll",
-        { MESSAGING_SYSTEM } = "kafka",
-        { MESSAGING_OPERATION } = "receive",
-        topics = %topics_str,
-        { MESSAGING_KAFKA_CONSUMER_GROUP } = tracing::field::Empty,
-        otel.status_code = tracing::field::Empty,
-        error.message = tracing::field::Empty,
-    );
-
-    if let Some(gid) = group_id {
-        span.record(MESSAGING_KAFKA_CONSUMER_GROUP, gid);
-    }
-
-    span
-}
-
-/// Create a span for a Kafka consumer fetch operation on a specific partition.
-///
-/// # Arguments
-///
-/// * `topic` - The topic name
-/// * `partition` - The partition ID
-/// * `offset` - The starting offset for the fetch
-///
-/// # Returns
-///
-/// A tracing `Span` configured with Kafka fetch attributes.
-#[inline]
-pub fn kafka_fetch_span(topic: &str, partition: PartitionId, offset: i64) -> Span {
-    tracing::span!(
-        Level::DEBUG,
-        "kafka.fetch",
-        { MESSAGING_SYSTEM } = "kafka",
-        { MESSAGING_OPERATION } = "receive",
-        { MESSAGING_DESTINATION } = topic,
-        { MESSAGING_KAFKA_PARTITION } = partition,
-        { MESSAGING_KAFKA_OFFSET } = offset,
-        otel.status_code = tracing::field::Empty,
-        error.message = tracing::field::Empty,
+        messaging.system = "kafka",
+        messaging.operation.name = "send",
+        messaging.operation.type = "send",
+        messaging.destination.name = topic,
+        messaging.destination.partition.id = tracing::field::Empty,
+        messaging.kafka.offset = tracing::field::Empty,
+        messaging.kafka.message.tombstone = tombstone.then_some(true),
+        messaging.client.id = client_id,
+        krafka.message.key.size = key.map(|k| k.len() as u64),
+        error.type = tracing::field::Empty,
     )
 }
 
-/// Create a span for a Kafka consumer commit operation.
-///
-/// # Arguments
-///
-/// * `group_id` - Optional consumer group ID
-/// * `topic` - The topic name
-/// * `partition` - The partition ID
-/// * `offset` - The offset being committed
-///
-/// # Returns
-///
-/// A tracing `Span` configured with Kafka commit attributes.
+/// One `poll` span per `poll`/`recv` of a consumer or share consumer. Name
+/// it after its topic with [`record_destination`].
 #[inline]
-pub fn kafka_commit_span(
-    group_id: Option<&str>,
-    topic: &str,
-    partition: PartitionId,
-    offset: i64,
-) -> Span {
-    let span = tracing::span!(
-        Level::DEBUG,
-        "kafka.commit",
-        { MESSAGING_SYSTEM } = "kafka",
-        { MESSAGING_OPERATION } = "settle",
-        { MESSAGING_DESTINATION } = topic,
-        { MESSAGING_KAFKA_PARTITION } = partition,
-        { MESSAGING_KAFKA_OFFSET } = offset,
-        { MESSAGING_KAFKA_CONSUMER_GROUP } = tracing::field::Empty,
+pub(crate) fn poll_span(group: Option<&str>, client_id: &str) -> Span {
+    tracing::info_span!(
+        target: "krafka::consumer",
+        "poll",
+        otel.name = "poll",
+        otel.kind = "client",
         otel.status_code = tracing::field::Empty,
-        error.message = tracing::field::Empty,
-    );
-
-    if let Some(gid) = group_id {
-        span.record(MESSAGING_KAFKA_CONSUMER_GROUP, gid);
-    }
-
-    span
+        messaging.system = "kafka",
+        messaging.operation.name = "poll",
+        messaging.operation.type = "receive",
+        messaging.destination.name = tracing::field::Empty,
+        messaging.consumer.group.name = group,
+        messaging.client.id = client_id,
+        messaging.batch.message_count = tracing::field::Empty,
+        error.type = tracing::field::Empty,
+    )
 }
 
-/// Create a span for a Kafka admin operation.
-///
-/// # Arguments
-///
-/// * `operation` - The admin operation name (e.g., "create_topic", "delete_topic")
-/// * `resource` - Optional resource name (e.g., topic name)
-///
-/// # Returns
-///
-/// A tracing `Span` configured with Kafka admin attributes.
+/// One `commit` span per offset or acknowledgement commit. Name it after its
+/// topic with [`record_destination`].
 #[inline]
-pub fn kafka_admin_span(operation: &str, resource: Option<&str>) -> Span {
-    if !tracing::enabled!(target: module_path!(), Level::INFO) {
-        return Span::none();
-    }
-
-    let span = tracing::span!(
-        Level::INFO,
-        "kafka.admin",
-        { MESSAGING_SYSTEM } = "kafka",
-        operation = operation,
-        resource = tracing::field::Empty,
+pub(crate) fn commit_span(group: Option<&str>, client_id: &str) -> Span {
+    tracing::info_span!(
+        target: "krafka::consumer",
+        "commit",
+        otel.name = "commit",
+        otel.kind = "client",
         otel.status_code = tracing::field::Empty,
-        error.message = tracing::field::Empty,
-    );
+        messaging.system = "kafka",
+        messaging.operation.name = "commit",
+        messaging.operation.type = "settle",
+        messaging.destination.name = tracing::field::Empty,
+        messaging.consumer.group.name = group,
+        messaging.client.id = client_id,
+        error.type = tracing::field::Empty,
+    )
+}
 
-    if let Some(res) = resource {
-        span.record("resource", res);
+/// One `rebalance` span per applied assignment change, classic or KIP-848.
+/// Not a semantic-conventions operation: internal kind, `krafka.*` fields.
+#[inline]
+pub(crate) fn rebalance_span(group: &str, protocol: &str, generation: Option<i32>) -> Span {
+    tracing::info_span!(
+        target: "krafka::consumer",
+        "rebalance",
+        otel.name = %format_args!("rebalance {group}"),
+        otel.kind = "internal",
+        messaging.system = "kafka",
+        messaging.consumer.group.name = group,
+        krafka.rebalance.protocol = protocol,
+        krafka.rebalance.generation = generation,
+        krafka.rebalance.assigned = tracing::field::Empty,
+        krafka.rebalance.revoked = tracing::field::Empty,
+        krafka.rebalance.partitions = tracing::field::Empty,
+    )
+}
+
+/// Name a `poll` or `commit` span after `topics` when there is exactly one;
+/// with several the name stays the bare operation. Callers skip computing
+/// `topics` for a span that [`is_disabled`](Span::is_disabled).
+pub(crate) fn record_destination<'a>(
+    span: &Span,
+    operation: &'static str,
+    topics: impl IntoIterator<Item = &'a str>,
+) {
+    let mut topics = topics.into_iter();
+    if let (Some(topic), None) = (topics.next(), topics.next()) {
+        span.record(
+            "otel.name",
+            tracing::field::display(OperationName(operation, Some(topic))),
+        );
+        span.record("messaging.destination.name", topic);
     }
-
-    span
 }
 
-/// Create a span for a Kafka connection operation.
-///
-/// # Arguments
-///
-/// * `broker_address` - The broker address (host:port)
-/// * `operation` - The connection operation (e.g., "connect", "disconnect")
-///
-/// # Returns
-///
-/// A tracing `Span` configured with connection attributes.
-#[inline]
-pub fn kafka_connection_span(broker_address: &str, operation: &str) -> Span {
-    tracing::span!(
-        Level::DEBUG,
-        "kafka.connection",
-        { MESSAGING_SYSTEM } = "kafka",
-        broker = broker_address,
-        operation = operation,
-    )
-}
+/// `{operation} {topic}`, or the operation alone without a single topic.
+struct OperationName<'a>(&'static str, Option<&'a str>);
 
-/// Create a span for a Kafka request/response cycle.
-///
-/// # Arguments
-///
-/// * `api_key` - The Kafka API key name
-/// * `correlation_id` - The correlation ID for the request
-///
-/// # Returns
-///
-/// A tracing `Span` configured with request attributes.
-#[inline]
-pub fn kafka_request_span(api_key: &str, correlation_id: i32) -> Span {
-    tracing::span!(
-        Level::DEBUG,
-        "kafka.request",
-        { MESSAGING_SYSTEM } = "kafka",
-        api_key = api_key,
-        { KRAFKA_CORRELATION_ID } = correlation_id,
-    )
-}
-
-/// Create a span for consumer group coordination operations.
-///
-/// # Arguments
-///
-/// * `group_id` - The consumer group ID
-/// * `operation` - The operation (e.g., "join", "sync", "heartbeat", "leave")
-///
-/// # Returns
-///
-/// A tracing `Span` configured with group coordination attributes.
-#[inline]
-pub fn kafka_group_span(group_id: &str, operation: &str) -> Span {
-    tracing::span!(
-        Level::DEBUG,
-        "kafka.group",
-        { MESSAGING_SYSTEM } = "kafka",
-        { MESSAGING_KAFKA_CONSUMER_GROUP } = group_id,
-        operation = operation,
-    )
-}
-
-/// Create a span for consumer rebalance operations.
-///
-/// # Arguments
-///
-/// * `group_id` - The consumer group ID
-/// * `event` - The rebalance event type (e.g., "assigned", "revoked", "lost")
-/// * `partition_count` - Number of partitions affected
-///
-/// # Returns
-///
-/// A tracing `Span` configured with rebalance attributes.
-#[inline]
-pub fn kafka_rebalance_span(group_id: &str, event: &str, partition_count: usize) -> Span {
-    if !tracing::enabled!(target: module_path!(), Level::INFO) {
-        return Span::none();
+impl std::fmt::Display for OperationName<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.1 {
+            Some(topic) => write!(f, "{} {topic}", self.0),
+            None => f.write_str(self.0),
+        }
     }
-
-    tracing::span!(
-        Level::INFO,
-        "kafka.rebalance",
-        { MESSAGING_SYSTEM } = "kafka",
-        { MESSAGING_KAFKA_CONSUMER_GROUP } = group_id,
-        event = event,
-        partition_count = partition_count,
-    )
 }
 
-/// Record an error on the current span.
-///
-/// This function records error information following OpenTelemetry conventions.
-///
-/// # Arguments
-///
-/// * `error` - The error to record
-#[inline]
-pub fn record_error(error: &dyn std::error::Error) {
-    let span = Span::current();
-    span.record("otel.status_code", "ERROR");
-    span.record("error.message", error.to_string().as_str());
+/// Close out a `poll` span: the number of records returned, or the error.
+pub(crate) fn record_poll_outcome(span: &Span, outcome: std::result::Result<usize, &KrafkaError>) {
+    match outcome {
+        Ok(count) => {
+            span.record("messaging.batch.message_count", count as u64);
+        }
+        Err(error) => record_error(span, error),
+    }
 }
 
-/// Record an error message on the current span.
-///
-/// # Arguments
-///
-/// * `message` - The error message
-#[inline]
-pub fn record_error_message(message: &str) {
-    let span = Span::current();
-    span.record("otel.status_code", "ERROR");
-    span.record("error.message", message);
+/// Mark `span` failed with `error`'s type.
+pub(crate) fn record_error(span: &Span, error: &KrafkaError) {
+    if !span.is_disabled() {
+        span.record("error.type", error_type(error).as_ref());
+        span.record("otel.status_code", "error");
+    }
 }
 
-/// Record success on the current span.
-#[inline]
-pub fn record_success() {
-    let span = Span::current();
-    span.record("otel.status_code", "OK");
+/// The `error.type` of `error`: the Kafka error-code name where the broker
+/// sent one, else a short name of krafka's error kind.
+pub(crate) fn error_type(error: &KrafkaError) -> Cow<'static, str> {
+    match error {
+        KrafkaError::Broker { code, .. } => Cow::Owned(screaming_snake(&format!("{code:?}"))),
+        KrafkaError::OutOfOrderSequence { .. } => "OUT_OF_ORDER_SEQUENCE_NUMBER".into(),
+        KrafkaError::UnknownTopic { .. } => "UNKNOWN_TOPIC_OR_PARTITION".into(),
+        KrafkaError::Network(_) => "network".into(),
+        KrafkaError::Protocol { .. } => "protocol".into(),
+        KrafkaError::Auth { .. } => "auth".into(),
+        KrafkaError::Timeout { .. } => "timeout".into(),
+        KrafkaError::DeliveryTimeout { .. } => "delivery_timeout".into(),
+        KrafkaError::Config { .. } => "config".into(),
+        KrafkaError::Compression { .. } => "compression".into(),
+        KrafkaError::Serialization { .. } => "serialization".into(),
+        KrafkaError::RecordDeserialization { .. } => "record_deserialization".into(),
+        KrafkaError::Closed { .. } => "closed".into(),
+        KrafkaError::Wakeup => "wakeup".into(),
+        KrafkaError::Fenced { .. } => "fenced".into(),
+        KrafkaError::TransactionAbortable { .. } => "transaction_abortable".into(),
+        KrafkaError::NoOffset { .. } => "no_offset".into(),
+        KrafkaError::IllegalState { .. } => "illegal_state".into(),
+    }
 }
 
-/// Record the number of records in a batch.
-///
-/// # Arguments
-///
-/// * `count` - The number of records
-#[inline]
-pub fn record_batch_count(count: usize) {
-    let span = Span::current();
-    span.record(MESSAGING_BATCH_MESSAGE_COUNT, count);
+/// `NotEnoughReplicas` → `NOT_ENOUGH_REPLICAS`; `Unknown(42)` → `UNKNOWN`.
+fn screaming_snake(camel: &str) -> String {
+    let name = camel.split('(').next().unwrap_or(camel);
+    let mut out = String::with_capacity(name.len() + 8);
+    for (i, ch) in name.chars().enumerate() {
+        if ch.is_ascii_uppercase() && i > 0 {
+            out.push('_');
+        }
+        out.push(ch.to_ascii_uppercase());
+    }
+    out
 }
 
-/// Record the message body size.
-///
-/// # Arguments
-///
-/// * `size` - The message body size in bytes
-#[inline]
-pub fn record_message_size(size: usize) {
-    let span = Span::current();
-    span.record(MESSAGING_MESSAGE_BODY_SIZE, size);
-}
-
-/// Record the offset after a successful produce or fetch.
-///
-/// # Arguments
-///
-/// * `offset` - The Kafka offset
-#[inline]
-pub fn record_offset(offset: i64) {
-    let span = Span::current();
-    span.record(MESSAGING_KAFKA_OFFSET, offset);
-}
-
-/// Record the partition.
-///
-/// # Arguments
-///
-/// * `partition` - The partition ID
-#[inline]
-pub fn record_partition(partition: PartitionId) {
-    let span = Span::current();
-    span.record(MESSAGING_KAFKA_PARTITION, partition);
-}
+#[cfg(all(test, feature = "test-broker"))]
+mod broker_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-
-    // Note: Without a tracing subscriber, spans may be disabled.
-    // These tests verify the span creation functions don't panic
-    // and return valid Span objects.
+    use crate::error::ErrorCode;
 
     #[test]
-    fn test_kafka_producer_span() {
-        let _span = kafka_producer_span("test-topic", Some(0), Some(b"key"));
-        let _binary_key_span =
-            kafka_producer_span("test-topic", Some(0), Some(&[0, 159, 146, 150]));
-        // Also test without partition and key
-        let _span2 = kafka_producer_span("test-topic", None, None);
+    fn broker_errors_are_typed_by_their_kafka_name() {
+        let error = KrafkaError::broker(ErrorCode::NotEnoughReplicas, "x");
+        assert_eq!(error_type(&error), "NOT_ENOUGH_REPLICAS");
+        let error = KrafkaError::broker(ErrorCode::UnknownTopicOrPartition, "x");
+        assert_eq!(error_type(&error), "UNKNOWN_TOPIC_OR_PARTITION");
+        assert_eq!(error_type(&KrafkaError::closed("x")), "closed");
     }
 
     #[test]
-    fn test_sha256_hex_for_message_key() {
+    fn the_operation_name_omits_a_missing_destination() {
         assert_eq!(
-            sha256_hex(b"key"),
-            "2c70e12b7a0646f92279f427c7b38e7334d8e5389cff167a1dc30e73f826b683"
+            OperationName("poll", Some("orders")).to_string(),
+            "poll orders"
         );
-    }
-
-    #[test]
-    fn test_kafka_consumer_poll_span() {
-        let topics = vec!["topic1".to_string(), "topic2".to_string()];
-        let _span = kafka_consumer_poll_span(Some("my-group"), &topics);
-        // Also test without group ID
-        let _span2 = kafka_consumer_poll_span(None, &topics);
-    }
-
-    #[test]
-    fn test_kafka_fetch_span() {
-        let _span = kafka_fetch_span("test-topic", 0, 100);
-    }
-
-    #[test]
-    fn test_kafka_commit_span() {
-        let _span = kafka_commit_span(Some("my-group"), "test-topic", 0, 100);
-        let _span2 = kafka_commit_span(None, "test-topic", 1, 200);
-    }
-
-    #[test]
-    fn test_kafka_admin_span() {
-        let _span = kafka_admin_span("create_topic", Some("new-topic"));
-        let _span2 = kafka_admin_span("list_topics", None);
-    }
-
-    #[test]
-    fn test_kafka_connection_span() {
-        let _span = kafka_connection_span("localhost:9092", "connect");
-    }
-
-    #[test]
-    fn test_kafka_request_span() {
-        let _span = kafka_request_span("Produce", 42);
-    }
-
-    #[test]
-    fn test_kafka_group_span() {
-        let _span = kafka_group_span("my-group", "join");
-    }
-
-    #[test]
-    fn test_kafka_rebalance_span() {
-        let _span = kafka_rebalance_span("my-group", "assigned", 3);
-    }
-
-    #[test]
-    fn test_record_helpers() {
-        // These should not panic even with no active span
-        record_batch_count(10);
-        record_message_size(1024);
-        record_offset(12345);
-        record_partition(0);
-        record_success();
-        record_error_message("test error");
-    }
-
-    #[test]
-    fn test_semantic_conventions() {
-        // Verify constants have expected values
-        assert_eq!(MESSAGING_SYSTEM, "messaging.system");
-        assert_eq!(MESSAGING_DESTINATION, "messaging.destination.name");
-        assert_eq!(MESSAGING_OPERATION, "messaging.operation");
-        assert_eq!(
-            MESSAGING_KAFKA_PARTITION,
-            "messaging.kafka.destination.partition"
-        );
-        assert_eq!(MESSAGING_KAFKA_OFFSET, "messaging.kafka.message.offset");
-        assert_eq!(
-            MESSAGING_KAFKA_CONSUMER_GROUP,
-            "messaging.kafka.consumer.group"
-        );
+        assert_eq!(OperationName("poll", None).to_string(), "poll");
     }
 }

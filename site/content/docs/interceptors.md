@@ -7,25 +7,25 @@ weight = 90
 slug_id = "interceptors"
 +++
 
-Interceptors hook into the producer and consumer pipelines at defined points. They are modelled on the Kafka Java client's `ProducerInterceptor` and `ConsumerInterceptor`, including **ordered chains**.
+Interceptors hook into the producer and consumer pipelines, as the Kafka Java
+client's `ProducerInterceptor` and `ConsumerInterceptor` do, in ordered chains.
 
 ## Overview
 
 | Hook | Pipeline | When |
 |------|----------|------|
-| `on_send` | Producer | Before a record is partitioned and sent |
+| `on_send` | Producer | Before a record is partitioned and sent; may mutate it |
 | `on_acknowledgement` | Producer | After a record reaches its terminal outcome |
 | `close` | Producer | When the producer is shutting down |
-| `on_consume` | Consumer | After records are fetched, before returned to the application |
+| `on_consume` | Consumer | After records are fetched, before they are returned to the application |
 | `on_commit` | Consumer | After offsets are committed |
 | `close` | Consumer | When the consumer is shutting down |
 
-Use cases:
-- **Observability**: Count records, measure latency, log errors
-- **Record enrichment**: Add tracing headers, inject metadata
-- **Distributed tracing**: Open a span in `on_send`, close it in `on_acknowledgement` — see [Per-Record State](#per-record-state)
-- **Auditing**: Track what was produced and consumed
-- **Metrics collection**: Feed data into Prometheus, StatsD, etc.
+krafka already emits a `send` span per record (see
+[Metrics](@/docs/metrics.md#spans)); use an interceptor for what it does not
+do, such as trace-context propagation headers, auditing, or a span of your own
+held from `on_send` to `on_acknowledgement` — see
+[Per-Record State](#per-record-state).
 
 ## Producer Interceptor
 
@@ -35,149 +35,102 @@ Use cases:
 pub type InterceptorResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 pub trait ProducerInterceptor: Send + Sync + fmt::Debug {
-    /// Called before a record is sent (before partitioning).
-    /// The record can be mutated (e.g., adding headers), and `ctx` is this
-    /// record's scratch space — see "Per-Record State" below.
-    fn on_send(&self, _record: &mut ProducerRecord, _ctx: &mut RecordContext) -> InterceptorResult { Ok(()) }
+    /// Before partitioning. The record may be mutated; `ctx` is this
+    /// record's scratch space.
+    fn on_send(&self, _record: &mut Record, _ctx: &mut RecordContext) -> InterceptorResult { Ok(()) }
 
-    /// Called after a record reaches its terminal outcome.
-    /// `error` is `None` on success. `headers` is the record's final,
-    /// read-only header set. `ctx` is the same context `on_send` saw.
+    /// After the terminal outcome. `headers` is the record's final,
+    /// read-only header set; `ctx` is the context `on_send` saw.
     fn on_acknowledgement(
         &self,
-        _metadata: &RecordMetadata,
-        _error: Option<&KrafkaError>,
-        _headers: &RecordHeaders,
+        _topic: &str,
+        _partition: PartitionId,
+        _result: Result<&RecordMetadata, &KrafkaError>,
+        _headers: &Headers,
         _ctx: &mut RecordContext,
     ) -> InterceptorResult { Ok(()) }
 
-    /// Called when the producer is being closed.
-    /// Use this to release any resources held by the interceptor.
+    /// When the producer is closed.
     fn close(&self) -> InterceptorResult { Ok(()) }
 }
 ```
 
-All methods have default no-op implementations, so you only need to override the hooks you care about.
+Every method has a no-op default. `on_acknowledgement` runs on the producer's
+send task and must not block. A `None` value is a tombstone; an interceptor
+that rewrites values should leave it alone.
 
 ### The pairing guarantee
 
-`on_acknowledgement` fires **exactly once for every record `on_send` observed** —
-on success, on permanent failure, and for records rejected before they ever
-reach the accumulator (a failing serializer, failed validation, a topic that
-does not resolve, `max.block.ms` exhausted). It holds at every `linger` setting
-and on the `TransactionalProducer`.
+`on_acknowledgement` fires **exactly once for every record `on_send`
+observed**: on success, on permanent failure, and for records rejected before
+they are queued (failed validation, an unresolved topic, `max_block`
+exhausted, a panic in `on_send`). This holds on both producers and is not
+suppressed by dropping the `DeliveryHandle` or the `send()` future. A record
+rejected before it was routed reports `Err` with partition
+`krafka::producer::UNKNOWN_PARTITION`.
 
-Dropping the `DeliveryHandle` does not suppress it: the handle discards the
-*caller's* view of the acknowledgement, not the interceptor's. Nor does dropping
-the `send()` future itself — a `tokio::time::timeout` that elapses, a `select!`
-branch that loses — because a record whose future was abandoned will never be
-delivered, and the context has to come back either way. The one exception is a
-panic inside krafka's own send task.
-
-A record that failed before it was routed reports `DeliveryConfirmation::Failed`,
-offset `-1` and `krafka::producer::UNKNOWN_PARTITION`.
-
-That is what makes it safe to hold a span, a timer or a permit across the two
+That makes it safe to hold a span, a timer or a permit across the two
 callbacks.
 
 ### Example: Tracing Headers
 
-```rust
+```rust,compile
 use krafka::interceptor::{InterceptorResult, ProducerInterceptor, RecordContext};
-use krafka::producer::{Producer, ProducerRecord, RecordHeaders, RecordMetadata};
+use krafka::Headers;
+use krafka::producer::{Record, RecordMetadata};
 use krafka::error::KrafkaError;
-use std::sync::Arc;
-use uuid::Uuid;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-#[derive(Debug)]
-struct TracingInterceptor;
+#[derive(Debug, Default)]
+struct TracingInterceptor {
+    next_id: AtomicU64,
+}
 
 impl ProducerInterceptor for TracingInterceptor {
-    fn on_send(&self, record: &mut ProducerRecord, _ctx: &mut RecordContext) -> InterceptorResult {
-        let trace_id = Uuid::new_v4().to_string();
+    fn on_send(&self, record: &mut Record, _ctx: &mut RecordContext) -> InterceptorResult {
+        // Use your tracer's id here; a counter keeps the sample dependency-free.
+        let trace_id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
         record.headers.push(("x-trace-id".to_string(), Some(trace_id.into_bytes().into())));
         Ok(())
     }
 
     fn on_acknowledgement(
         &self,
-        metadata: &RecordMetadata,
-        error: Option<&KrafkaError>,
-        _headers: &RecordHeaders,
+        topic: &str,
+        partition: i32,
+        result: Result<&RecordMetadata, &KrafkaError>,
+        _headers: &Headers,
         _ctx: &mut RecordContext,
     ) -> InterceptorResult {
-        match error {
-            None => tracing::info!(
-                topic = %metadata.topic,
-                partition = metadata.partition,
+        match result {
+            Ok(metadata) => tracing::info!(
+                topic,
+                partition,
                 offset = metadata.offset,
                 "record acknowledged"
             ),
-            Some(e) => tracing::error!("send failed: {}", e),
+            Err(e) => tracing::error!("send failed: {}", e),
         }
         Ok(())
     }
 }
 
-let producer = Producer::builder()
-    .bootstrap_servers("localhost:9092")
-    .add_interceptor(Arc::new(TracingInterceptor))
+let producer = krafka::Kafka::builder("localhost:9092")
+    .connect()
+    .await?
+    .producer()
+    .interceptor(TracingInterceptor::default())
     .build()
     .await?;
 ```
 
-### Example: Metrics Counter
-
-```rust,compile
-use krafka::interceptor::{InterceptorResult, ProducerInterceptor, RecordContext};
-use krafka::producer::{ProducerRecord, RecordHeaders, RecordMetadata};
-use krafka::error::KrafkaError;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-#[derive(Debug)]
-struct MetricsInterceptor {
-    sent: AtomicU64,
-    errors: AtomicU64,
-}
-
-impl MetricsInterceptor {
-    fn new() -> Self {
-        Self {
-            sent: AtomicU64::new(0),
-            errors: AtomicU64::new(0),
-        }
-    }
-}
-
-impl ProducerInterceptor for MetricsInterceptor {
-    fn on_acknowledgement(
-        &self,
-        _metadata: &RecordMetadata,
-        error: Option<&KrafkaError>,
-        _headers: &RecordHeaders,
-        _ctx: &mut RecordContext,
-    ) -> InterceptorResult {
-        if error.is_some() {
-            self.errors.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.sent.fetch_add(1, Ordering::Relaxed);
-        }
-        Ok(())
-    }
-}
-```
-
 ## Per-Record State
 
-`on_send` gets the record. `on_acknowledgement` gets a `RecordMetadata` — topic,
-partition, offset, timestamp — plus the final headers, but nothing identifying
-*which* record this was to the interceptor that sent it: no key, no identifier,
-and the partition is not chosen until after `on_send` returns.
-
-`RecordContext` closes that gap. The library creates one per record before
-`on_send`, carries it through the accumulator, batching, retries and
-`MESSAGE_TOO_LARGE` batch splits, and hands the *same* context back to
-`on_acknowledgement`.
+`on_acknowledgement` gets the topic, partition, outcome and headers, but
+nothing that identifies the record to the interceptor that saw it in
+`on_send`. `RecordContext` carries that: krafka creates one per record before
+`on_send` and hands the same context to `on_acknowledgement`, through
+batching, retries and batch splits.
 
 ```rust
 pub struct RecordContext { /* ... */ }
@@ -191,14 +144,15 @@ impl RecordContext {
 }
 ```
 
-Values are keyed by type. One interceptor may store any number of *distinct*
-types; storing the same type twice replaces the previous value and returns it.
+Values are keyed by type within one interceptor; storing the same type again
+replaces and returns the previous value.
 
 ### Example: End-to-end delivery latency
 
 ```rust,compile
 use krafka::interceptor::{InterceptorResult, ProducerInterceptor, RecordContext};
-use krafka::producer::{ProducerRecord, RecordHeaders, RecordMetadata};
+use krafka::Headers;
+use krafka::producer::{Record, RecordMetadata};
 use krafka::error::KrafkaError;
 use std::time::Instant;
 
@@ -210,25 +164,26 @@ struct SendStart(Instant);
 struct LatencyInterceptor;
 
 impl ProducerInterceptor for LatencyInterceptor {
-    fn on_send(&self, _record: &mut ProducerRecord, ctx: &mut RecordContext) -> InterceptorResult {
+    fn on_send(&self, _record: &mut Record, ctx: &mut RecordContext) -> InterceptorResult {
         ctx.insert(SendStart(Instant::now()));
         Ok(())
     }
 
     fn on_acknowledgement(
         &self,
-        metadata: &RecordMetadata,
-        error: Option<&KrafkaError>,
-        _headers: &RecordHeaders,
+        topic: &str,
+        _partition: i32,
+        result: Result<&RecordMetadata, &KrafkaError>,
+        _headers: &Headers,
         ctx: &mut RecordContext,
     ) -> InterceptorResult {
         // `take` rather than `get`: this is the end of the value's life.
         if let Some(SendStart(started)) = ctx.take::<SendStart>() {
             let elapsed = started.elapsed();
             tracing::info!(
-                topic = %metadata.topic,
+                topic,
                 millis = elapsed.as_millis(),
-                ok = error.is_none(),
+                ok = result.is_ok(),
                 "end-to-end delivery latency"
             );
         }
@@ -237,16 +192,16 @@ impl ProducerInterceptor for LatencyInterceptor {
 }
 ```
 
-The clock covers serialization, the `linger` window, backpressure on
-`buffer_memory`, every retry and the broker round trip. Timing the `send()`
-future from the application side measures the same span only if the caller
-awaits every handle immediately, which defeats pipelining.
+The measured time covers topic resolution, the wait for `buffer_memory`, the
+`linger` window, every retry and the broker round trip — not serialization,
+which a `TypedProducer` does before `on_send`.
 
 ### Example: Retaining and completing a span
 
 ```rust,compile
 use krafka::interceptor::{InterceptorResult, ProducerInterceptor, RecordContext};
-use krafka::producer::{ProducerRecord, RecordHeaders, RecordMetadata};
+use krafka::Headers;
+use krafka::producer::{Record, RecordMetadata};
 use krafka::error::KrafkaError;
 use tracing::Span;
 
@@ -261,7 +216,7 @@ struct ProduceSpan(Span);
 struct SpanInterceptor;
 
 impl ProducerInterceptor for SpanInterceptor {
-    fn on_send(&self, record: &mut ProducerRecord, ctx: &mut RecordContext) -> InterceptorResult {
+    fn on_send(&self, record: &mut Record, ctx: &mut RecordContext) -> InterceptorResult {
         let span = tracing::info_span!(
             "kafka.produce",
             topic = %record.topic,
@@ -280,18 +235,20 @@ impl ProducerInterceptor for SpanInterceptor {
 
     fn on_acknowledgement(
         &self,
-        metadata: &RecordMetadata,
-        error: Option<&KrafkaError>,
-        _headers: &RecordHeaders,
+        _topic: &str,
+        _partition: i32,
+        result: Result<&RecordMetadata, &KrafkaError>,
+        _headers: &Headers,
         ctx: &mut RecordContext,
     ) -> InterceptorResult {
         if let Some(ProduceSpan(span)) = ctx.take::<ProduceSpan>() {
-            span.record("offset", metadata.offset);
-            if let Some(e) = error {
-                tracing::error!(parent: &span, error = %e, "produce failed");
+            match result {
+                Ok(metadata) => {
+                    span.record("offset", metadata.offset);
+                }
+                Err(e) => tracing::error!(parent: &span, error = %e, "produce failed"),
             }
-            // Dropping the span here closes it — at the acknowledgement, which
-            // is what makes the span's duration mean something.
+            // Dropping the span closes it at the acknowledgement.
             drop(span);
         }
         Ok(())
@@ -299,99 +256,88 @@ impl ProducerInterceptor for SpanInterceptor {
 }
 ```
 
-Because of [the pairing guarantee](#the-pairing-guarantee), this span is always
-closed, including on the paths that reject a record before it is ever queued.
+By [the pairing guarantee](#the-pairing-guarantee), the span is always closed,
+including for records rejected before they are queued.
 
 ### Isolation between chained interceptors
 
-Values are keyed by `(interceptor, type)`, not by type alone. Two interceptors
-in the same chain that both store a `Span` each see their own, and neither can
-read, overwrite or `take` the other's. An interceptor's behaviour therefore
-cannot be changed by what its neighbours in the chain happen to store — the same
-isolation the chain already gives you for errors and panics.
+Values are keyed by `(interceptor, type)`: two interceptors in one chain that
+both store a `Span` each see only their own.
 
-### Cost
+### Cost and lifetime
 
-An unused context allocates nothing, so records flowing past an interceptor that
-stores nothing — or through a producer with no interceptor — pay no heap
-traffic. The first `insert` allocates once, and one allocation serves the whole
-chain.
-
-What you store is held for the record's entire buffered lifetime, up to
-`delivery.timeout.ms`, and is **not** counted against `buffer_memory`. Store
-handles — a span, an `Instant`, an ID — not payloads, and keep their `Drop`
-cheap: they are dropped on the producer's send task.
-
-`T: Send + Sync` because the context travels into the accumulator's send tasks,
-where the batch holding it is borrowed across `await` points. Spans, `Instant`s,
-IDs and OpenTelemetry contexts are all `Sync`; wrap anything that is not in a
+An unused context does not allocate; the first `insert` allocates once for the
+whole chain. Stored values live until the record's outcome — up to
+`delivery_timeout` — are **not** counted against `buffer_memory`, and are
+dropped on the producer's send task. Store handles (a span, an `Instant`, an
+ID), not payloads, and keep their `Drop` cheap. Wrap non-`Sync` values in a
 `Mutex`.
-
-### Why not just await the `DeliveryHandle`?
-
-An application can hold state around `producer.enqueue(..).await?` and finish it
-when the handle resolves — but only in code it controls at every call site. A
-reusable interceptor plugged in with `add_interceptor` never sees the handle.
 
 ### Headers at acknowledgement
 
-`on_acknowledgement` also receives the record's **final** header set, read-only:
-everything this interceptor, the ones after it in the chain, and the configured
-serializers wrote. `on_send` cannot show you that, because it runs before the
-rest of the chain. Mirrors the Java client's
-[KIP-512](https://cwiki.apache.org/confluence/display/KAFKA/KIP-512%3A+make+Record+Headers+available+in+onAcknowledgement)
-(Kafka 4.1).
+`on_acknowledgement` receives the record's **final** header set: everything
+this interceptor, later interceptors and a `TypedProducer`'s serializers
+wrote — the Java client's `onAcknowledgement(RecordMetadata, Exception, Headers)`
+([KIP-512](https://cwiki.apache.org/confluence/display/KAFKA/KIP-512%3A+make+Record+Headers+available+in+onAcknowledgement)).
 
-```rust
-fn on_acknowledgement(
-    &self,
-    metadata: &RecordMetadata,
-    _error: Option<&KrafkaError>,
-    headers: &RecordHeaders,
-    _ctx: &mut RecordContext,
-) -> InterceptorResult {
-    // Audit exactly what was produced, alongside where it landed.
-    for (key, value) in headers {
-        tracing::debug!(offset = metadata.offset, %key, present = value.is_some());
+```rust,compile
+use krafka::interceptor::{InterceptorResult, ProducerInterceptor, RecordContext};
+use krafka::Headers;
+use krafka::producer::RecordMetadata;
+use krafka::error::KrafkaError;
+
+#[derive(Debug)]
+struct HeaderAudit;
+
+impl ProducerInterceptor for HeaderAudit {
+    fn on_acknowledgement(
+        &self,
+        _topic: &str,
+        partition: i32,
+        _result: Result<&RecordMetadata, &KrafkaError>,
+        headers: &Headers,
+        _ctx: &mut RecordContext,
+    ) -> InterceptorResult {
+        // Audit exactly what was produced, alongside where it landed.
+        for (key, value) in headers {
+            tracing::debug!(partition, %key, present = value.is_some());
+        }
+        Ok(())
     }
-    Ok(())
 }
 ```
 
-Headers tell you what was *sent*; the context carries what you need *back*.
-Prefer the context for correlation: a header key means a side table to maintain,
-and only state that survives being reduced to bytes can go in one — a live
-`Span` cannot.
+Use the context, not a header, to correlate `on_send` with
+`on_acknowledgement`: a live `Span` cannot be encoded in a header.
 
 ## Consumer Interceptor
 
 ### Trait Definition
 
 ```rust
+pub type CommitOffsets = HashMap<(String, PartitionId), Offset>;
+
 pub trait ConsumerInterceptor: Send + Sync + fmt::Debug {
-    /// Called after records are fetched, before returned to the application.
+    /// After records are fetched, before they are returned to the application.
     fn on_consume(&self, _records: &[ConsumerRecord]) -> InterceptorResult { Ok(()) }
 
-    /// Called after offsets are committed.
-    /// The map keys are `(topic, partition)` and values are the committed offsets.
+    /// After offsets are committed (or the commit failed).
     fn on_commit(
         &self,
-        _offsets: &HashMap<(String, PartitionId), Offset>,
+        _offsets: &CommitOffsets,
         _error: Option<&KrafkaError>,
     ) -> InterceptorResult { Ok(()) }
 
-    /// Called when the consumer is being closed.
-    /// Use this to release any resources held by the interceptor.
+    /// When the consumer is closed.
     fn close(&self) -> InterceptorResult { Ok(()) }
 }
 ```
 
 ### Example: Consumption Logging
 
-```rust
+```rust,compile
 use krafka::interceptor::{ConsumerInterceptor, InterceptorResult};
-use krafka::consumer::{Consumer, ConsumerRecord};
-use std::sync::Arc;
+use krafka::consumer::ConsumerRecord;
 
 #[derive(Debug)]
 struct LoggingInterceptor;
@@ -408,10 +354,11 @@ impl ConsumerInterceptor for LoggingInterceptor {
     }
 }
 
-let consumer = Consumer::builder()
-    .bootstrap_servers("localhost:9092")
-    .group_id("my-group")
-    .add_interceptor(Arc::new(LoggingInterceptor))
+let consumer = krafka::Kafka::builder("localhost:9092")
+    .connect()
+    .await?
+    .consumer("my-group")
+    .interceptor(LoggingInterceptor)
     .build()
     .await?;
 ```
@@ -426,9 +373,6 @@ use krafka::error::KrafkaError;
 struct CommitMonitor;
 
 impl ConsumerInterceptor for CommitMonitor {
-    // `CommitOffsets` is the map type the trait uses. Naming the underlying
-    // `std::collections::HashMap` here would not compile — the trait's map is
-    // an `ahash::AHashMap`, which is a different type.
     fn on_commit(
         &self,
         offsets: &CommitOffsets,
@@ -447,176 +391,76 @@ impl ConsumerInterceptor for CommitMonitor {
 }
 ```
 
-### Per-record state on the consumer side
-
-`RecordContext` is producer-only. The consumer hooks have no per-record terminal
-event to carry state *to*: `on_commit` reports per-partition offsets that may
-cover records the interceptor never saw, and with auto-commit disabled may never
-arrive at all. For consumer-side tracing, extract the parent context from the
-record's headers in `on_consume` and start the span in your own processing code,
-where the unit of work begins and ends.
+`on_commit` receives only offsets of partitions still assigned.
+`RecordContext` is producer-only: for consumer-side tracing, extract the parent
+context from the record's headers and start the span in your processing code.
 
 ## Wiring Interceptors
 
-### Single Interceptor
-
-```rust
-use std::sync::Arc;
-
-let producer = Producer::builder()
-    .bootstrap_servers("localhost:9092")
-    .interceptor(Arc::new(MyProducerInterceptor))
-    .build()
-    .await?;
-```
-
-### Interceptor Chain
-
-Multiple interceptors execute in the order they are added. Each interceptor is
-individually error- and panic-isolated — a failure in one interceptor will
-not prevent the remaining interceptors from running.
-
-For `on_send`, each interceptor sees the record as modified by all preceding
-interceptors in the chain.
-
-> **Error semantics:** In Java, `onSend` returns a new record — if an
-> interceptor throws, the next one receives the record from the last
-> *successful* interceptor. In Rust, `on_send` mutates in-place (`&mut`);
-> if an interceptor returns an error or panics mid-mutation, the next
-> interceptor sees a partially-mutated record. Avoid building chains
-> where later interceptors depend on invariants set by earlier ones.
-
-The *record* is shared down the chain; the [`RecordContext`](#per-record-state)
-is not. Each interceptor addresses its own slot, so a panic in one leaves its
-neighbours' per-record state intact.
-
-```rust
-use std::sync::Arc;
-
-let producer = Producer::builder()
-    .bootstrap_servers("localhost:9092")
-    .add_interceptor(Arc::new(TracingInterceptor))
-    .add_interceptor(Arc::new(MetricsInterceptor))
-    .add_interceptor(Arc::new(AuditInterceptor))
-    .build()
-    .await?;
-```
-
-```rust
-use std::sync::Arc;
-
-let consumer = Consumer::builder()
-    .bootstrap_servers("localhost:9092")
-    .group_id("my-group")
-    .add_interceptor(Arc::new(LoggingInterceptor))
-    .add_interceptor(Arc::new(MetricsInterceptor))
-    .build()
-    .await?;
-```
-
-> **Note:** `interceptor()` replaces any previously added interceptors with a
-> single one. `add_interceptor()` appends to the chain. Don't mix both in the
-> same builder.
-
-### No Interceptor (Default)
-
-When no interceptor is configured, a no-op implementation is used internally.
-There is zero overhead — the no-op methods are inlined away by the compiler, and
-the per-record `RecordContext` nobody writes to never allocates.
-
-## Pipeline Integration Points
-
-### Producer Pipeline
-
-```
-  send_record(record) / enqueue(record)
-       │
-       ▼
-  on_send(&mut record, &mut ctx)        ← modify record, park per-record state
-       │
-       ├─ rejected here (serializer, validation, topic resolution, max.block)
-       │      └─► on_acknowledgement(Failed / UNKNOWN_PARTITION, err, headers, ctx)
-       ▼
-  partitioner.partition()
-       │
-       ▼
-  accumulator: linger, batching, retries, splits   ← ctx rides with the record
-       │
-       ▼
-  encode + send to broker
-       │
-       ├─ success ─► on_acknowledgement(metadata, None,        headers, ctx)
-       └─ failure ─► on_acknowledgement(metadata, Some(error), headers, ctx)
-```
-
-Every arrow out of `on_send` ends at an `on_acknowledgement`.
-
-### Consumer Pipeline
-
-```
-  poll()
-    │
-    ▼
-  fetch from brokers
-    │
-    ▼
-  interceptor.on_consume(&records)     ← Observe records here
-    │
-    ▼
-  return records to application
-    │
-    ▼
-  commit()
-    │
-    ▼
-  interceptor.on_commit(&offsets, error)  ← Only committed offsets (filtered to assigned partitions)
-```
-
-## Thread Safety
-
-Interceptors must implement `Send + Sync + Debug`. Use atomic types or `Mutex`/`RwLock`
-for any mutable state:
+Builders take an interceptor by value; pass an `Arc` to keep a handle to it.
+Each `interceptor()` call appends to the chain, and interceptors run in the
+order they were added. In `on_send`, each interceptor sees the record as the
+previous ones left it.
 
 ```rust,compile
-use std::sync::atomic::{AtomicU64, Ordering};
+use krafka::interceptor::{ConsumerInterceptor, ProducerInterceptor};
+use std::sync::Arc;
 
 #[derive(Debug)]
-struct SafeInterceptor {
-    counter: AtomicU64,
-}
+struct Tracing;
+impl ProducerInterceptor for Tracing {}
 
-// AtomicU64 is Send + Sync, so SafeInterceptor is too
+#[derive(Debug)]
+struct Audit;
+impl ProducerInterceptor for Audit {}
+
+#[derive(Debug)]
+struct Logging;
+impl ConsumerInterceptor for Logging {}
+
+// Keep a handle to read the interceptor's state later.
+let audit = Arc::new(Audit);
+
+let producer = kafka
+    .producer()
+    .interceptor(Tracing)
+    .interceptor(Arc::clone(&audit))
+    .build()
+    .await?;
+
+let consumer = kafka.consumer("my-group").interceptor(Logging).build().await?;
 ```
 
-## Security Considerations
+Interceptors must be `Send + Sync + Debug`; keep mutable state in atomics or
+locks.
 
-- **Headers may contain credentials:** `on_send()` receives all record headers, which
-  may include auth tokens or API keys. Do not log full record contents without sanitization.
-- **Error messages may leak secrets:** `on_acknowledgement()` error messages from auth
-  failures may contain broker-echoed details.
-- **Debug impls may expose secrets:** Never log the interceptor instance itself
-  (e.g. `{:?}`) — user-provided `Debug` implementations may expose credentials.
-- **Contexts hold what you put in them:** a `RecordContext` value lives until the
-  record's terminal callback, which under backpressure can be as long as
-  `delivery.timeout.ms`. Storing a decrypted payload there keeps it in memory far
-  longer than the send itself.
-
-## Error Handling & Panic Safety
-
-All interceptor methods return `InterceptorResult` (`Result<(), Box<dyn Error + Send + Sync>>`).
-Errors are **non-fatal** — the chain continues and the error is logged at `warn!`.
-This gives interceptor authors a clean, idiomatic way to signal failures
-(e.g. a metrics backend is down) without resorting to panics.
-
-As a safety net, all calls are additionally wrapped in `catch_unwind`.
-Panics are caught and logged at `error!` with the panic payload **redacted**
-(user-provided `Debug` impls may leak secrets). The chain continues even after a panic.
+## Errors and Panics
 
 | Outcome | Log level | Chain continues? |
 |---------|-----------|------------------|
 | `Ok(())` | — | Yes |
 | `Err(e)` | `warn!` | Yes |
-| panic | `error!` (payload redacted) | Yes |
+| panic in `on_send` | `error!` (payload redacted) | No — the send fails |
+| panic elsewhere | `error!` (payload redacted) | Yes |
+
+An `Err` from `on_send` keeps whatever changes the interceptor made to the
+record. A panic in `on_send` may leave the record half-modified, so it is not
+produced; the error names the interceptor's position in the chain, and
+`on_acknowledgement` still fires. Other interceptors' per-record state is
+unaffected.
+
+Both producers call every interceptor's `close()` exactly once: on the first
+`close()`, or when the producer is dropped without one.
+
+## Security Considerations
+
+- `on_send` sees every header, which may carry credentials; do not log records
+  unredacted.
+- Error messages in `on_acknowledgement` may echo broker details from
+  authentication failures.
+- Do not log an interceptor with `{:?}`: its `Debug` may expose secrets.
+- A `RecordContext` value lives until the record's outcome, up to
+  `delivery_timeout`; do not store decrypted payloads in it.
 
 ## Next Steps
 

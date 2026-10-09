@@ -609,24 +609,12 @@ impl ApiKey {
     }
 }
 
-impl From<i16> for ApiKey {
-    fn from(key: i16) -> Self {
-        Self::from_i16(key)
-    }
-}
-
 impl std::fmt::Display for ApiKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unknown(key) => write!(f, "Unknown({key})"),
             other => std::fmt::Debug::fmt(other, f),
         }
-    }
-}
-
-impl From<ApiKey> for i16 {
-    fn from(key: ApiKey) -> Self {
-        key.to_i16()
     }
 }
 
@@ -687,8 +675,8 @@ impl ApiVersionRange {
     ///
     /// # Example
     ///
-    /// ```rust
-    /// use krafka::protocol::{ApiKey, ApiVersionRange};
+    /// ```rust,ignore
+    /// use crate::protocol::{ApiKey, ApiVersionRange};
     ///
     /// let broker_range = ApiVersionRange::new(ApiKey::Fetch, 0, 12);
     /// // Client supports v4-v11

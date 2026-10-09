@@ -252,8 +252,7 @@ impl FetchSessionState {
         // Build a keyed map of the desired partitions for O(1) diff lookups
         // and removed-partition detection.  Keyed the same way session state
         // is stored (UUID when available, topic name otherwise) to ensure
-        // correct matching.  This single map replaces both the `changed`
-        // HashMap and the `desired_keys` HashSet used in a previous version.
+        // correct matching.
         let mut desired_map: HashMap<SessionKey, HashMap<PartitionId, &FetchPartitionRequest>> =
             HashMap::with_capacity(desired.len());
         for topic in desired {
@@ -495,11 +494,8 @@ mod tests {
 
     // ── Zero-UUID handling and epoch progression ──────────────────────
     //
-    // Added after `cargo mutants` showed the suite could not distinguish the
-    // real implementations from five different corruptions. All three sites
-    // below fail *quietly* when they are wrong — the client keeps working, it
-    // just stops getting KIP-227's benefit or starts keying sessions wrongly —
-    // which is precisely why nothing noticed.
+    // All three sites below fail *quietly* when wrong — the client keeps
+    // working, it just loses KIP-227's benefit or keys sessions wrongly.
 
     const REAL_UUID: [u8; 16] = [7u8; 16];
 

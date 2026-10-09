@@ -22,7 +22,6 @@ use rustls::{ClientConfig, ConfigBuilder, RootCertStore};
 use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 #[cfg(feature = "native-tls-roots")]
 use rustls_native_certs::load_native_certs;
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
@@ -30,65 +29,6 @@ use tracing::warn;
 
 use crate::auth::TlsConfig;
 use crate::error::{KrafkaError, Result};
-
-/// A stream that can be either plain TCP or TLS.
-#[non_exhaustive]
-pub enum MaybeSecureStream {
-    /// Plain TCP stream.
-    Plain(TcpStream),
-    /// TLS-encrypted stream (boxed to reduce enum size).
-    Tls(Box<TlsStream<TcpStream>>),
-}
-
-impl AsyncRead for MaybeSecureStream {
-    fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            MaybeSecureStream::Plain(stream) => std::pin::Pin::new(stream).poll_read(cx, buf),
-            MaybeSecureStream::Tls(stream) => {
-                std::pin::Pin::new(stream.as_mut()).poll_read(cx, buf)
-            }
-        }
-    }
-}
-
-impl AsyncWrite for MaybeSecureStream {
-    fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        match self.get_mut() {
-            MaybeSecureStream::Plain(stream) => std::pin::Pin::new(stream).poll_write(cx, buf),
-            MaybeSecureStream::Tls(stream) => {
-                std::pin::Pin::new(stream.as_mut()).poll_write(cx, buf)
-            }
-        }
-    }
-
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            MaybeSecureStream::Plain(stream) => std::pin::Pin::new(stream).poll_flush(cx),
-            MaybeSecureStream::Tls(stream) => std::pin::Pin::new(stream.as_mut()).poll_flush(cx),
-        }
-    }
-
-    fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            MaybeSecureStream::Plain(stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
-            MaybeSecureStream::Tls(stream) => std::pin::Pin::new(stream.as_mut()).poll_shutdown(cx),
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Public async API — each function wraps the sync implementation in a single
@@ -151,27 +91,26 @@ pub async fn connect_tls(
     connector
         .connect(server_name, stream)
         .await
-        .map_err(|e| KrafkaError::auth(format!("TLS handshake failed: {e}")))
+        .map_err(handshake_error)
 }
 
-/// Extract `tls-server-end-point` channel binding data from a TLS stream (RFC 5929 §4.1).
+/// Classify a failed TLS handshake.
 ///
-/// Returns the SHA-256 hash of the server's DER-encoded end-entity certificate.
-/// This binding type works with both TLS 1.2 and TLS 1.3.
-///
-/// Returns `None` if the server did not present any certificates (should not
-/// happen after a successful handshake with certificate verification enabled).
-pub fn extract_tls_server_end_point(stream: &TlsStream<TcpStream>) -> Option<Vec<u8>> {
-    use sha2::{Digest, Sha256};
-
-    let (_, conn) = stream.get_ref();
-    let certs = conn.peer_certificates()?;
-    let end_entity = certs.first()?;
-
-    // RFC 5929 §4.1: for certificates using a signature algorithm with
-    // SHA-256 or stronger, the binding data is SHA-256(cert).  Since
-    // MD5/SHA-1 certs are rejected by rustls, SHA-256 is always correct.
-    Some(Sha256::digest(end_entity.as_ref()).to_vec())
+/// A TLS-level failure — a certificate one side rejected, a protocol alert —
+/// reaches us as an `InvalidData` I/O error wrapping a [`rustls::Error`], and
+/// is an authentication error. Anything else is the transport failing
+/// underneath the handshake (a reset, an EOF, a timeout) and is a retriable
+/// network error, like the same failure on a plaintext connection.
+fn handshake_error(error: std::io::Error) -> KrafkaError {
+    let is_tls_failure = error.kind() == std::io::ErrorKind::InvalidData
+        && error
+            .get_ref()
+            .is_some_and(|inner| inner.is::<rustls::Error>());
+    if is_tls_failure {
+        KrafkaError::auth_with_source(format!("TLS handshake failed: {error}"), error)
+    } else {
+        KrafkaError::network(error)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -182,8 +121,15 @@ pub fn extract_tls_server_end_point(stream: &TlsStream<TcpStream>) -> Option<Vec
 /// Build a rustls [`ClientConfig`] synchronously.
 ///
 /// This is the core implementation. The public [`build_tls_config`] wraps this
-/// in `spawn_blocking`.
-fn build_tls_config_sync(config: &TlsConfig) -> Result<ClientConfig> {
+/// in `spawn_blocking`; the OIDC token endpoint's HTTPS client calls it
+/// directly, so both paths share one provider selection and one trust-store
+/// rule.
+pub(crate) fn build_tls_config_sync(config: &TlsConfig) -> Result<ClientConfig> {
+    client_config(resolve_crypto_provider(), config)
+}
+
+/// Build a [`ClientConfig`] on `provider`.
+fn client_config(provider: Arc<CryptoProvider>, config: &TlsConfig) -> Result<ClientConfig> {
     if !config.verify_server_cert {
         // Warn once so operators have log evidence that insecure TLS is active.
         // Setting verify_server_cert=false is itself the explicit opt-in; no
@@ -197,7 +143,7 @@ fn build_tls_config_sync(config: &TlsConfig) -> Result<ClientConfig> {
                  with self-signed certificates. Never use in production."
             );
         });
-        return build_insecure_tls_config(config);
+        return build_insecure_tls_config(provider, config);
     }
 
     let root_store = load_root_store(config)?;
@@ -209,7 +155,7 @@ fn build_tls_config_sync(config: &TlsConfig) -> Result<ClientConfig> {
     // `resolve_crypto_provider` is what makes the additive-backend contract
     // documented in `lib.rs` true on the verifying path, not just the
     // `verify_server_cert = false` one.
-    let builder = ClientConfig::builder_with_provider(resolve_crypto_provider())
+    let builder = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|e| KrafkaError::config(format!("Failed to set protocol versions: {e}")))?
         .with_root_certificates(root_store);
@@ -371,7 +317,10 @@ fn decrypt_pkcs8_key(
         ))
     })?;
 
-    // `decrypted` is a `SecretDocument`, zeroized on drop.
+    // `decrypted` is a `SecretDocument`, zeroized on drop. The one copy made
+    // here is moved into rustls, which consumes it when the config is built;
+    // that buffer and the backend's parsed key are freed by rustls without
+    // zeroizing.
     Ok(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
         decrypted.as_bytes().to_vec(),
     )))
@@ -466,6 +415,9 @@ fn load_default_roots(root_store: &mut RootCertStore, config: &TlsConfig) -> Res
 }
 
 /// Load client certificate + private key, if configured.
+///
+/// A key passphrase with no key to decrypt is an error rather than ignored:
+/// it means the client certificate was meant to be configured and is not.
 fn load_client_auth(
     config: &TlsConfig,
 ) -> Result<Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>> {
@@ -474,15 +426,25 @@ fn load_client_auth(
         let password = config.client_key_password.as_deref().map(String::as_str);
         let key = load_private_key(key_path, password)?;
         Ok(Some((certs, key)))
+    } else if config.client_key_password.is_some() {
+        Err(KrafkaError::config(
+            "a client key passphrase (with_client_key_password) is set but no client key \
+             is configured; set the certificate and key with TlsConfig::with_client_cert",
+        ))
     } else {
         Ok(None)
     }
 }
 
 /// Resolve the crypto provider: prefer the globally-installed default,
-/// fall back to the compiled-in backend (ring by default, aws-lc-rs when
-/// the `rustls-aws-lc-rs` feature is enabled).
-fn resolve_crypto_provider() -> Arc<CryptoProvider> {
+/// fall back to the compiled-in backend (aws-lc-rs when the
+/// `rustls-aws-lc-rs` feature is enabled, else ring).
+///
+/// The aws-lc-rs default offers the hybrid post-quantum `X25519MLKEM768`
+/// first (the crate forwards rustls's `prefer-post-quantum`); ring offers no
+/// post-quantum group. An application that installs its own process-default
+/// provider chooses the key-exchange groups itself.
+pub(crate) fn resolve_crypto_provider() -> Arc<CryptoProvider> {
     CryptoProvider::get_default().cloned().unwrap_or_else(|| {
         #[cfg(feature = "rustls-aws-lc-rs")]
         {
@@ -519,8 +481,11 @@ fn insecure_builder(
 ///
 /// **Warning:** This disables TLS security and must only be used for local
 /// development or testing. A `warn!` log is emitted by callers.
-fn build_insecure_tls_config(config: &TlsConfig) -> Result<ClientConfig> {
-    let builder = insecure_builder(resolve_crypto_provider())?;
+fn build_insecure_tls_config(
+    provider: Arc<CryptoProvider>,
+    config: &TlsConfig,
+) -> Result<ClientConfig> {
+    let builder = insecure_builder(provider)?;
     let client_auth = load_client_auth(config)?;
     let mut tls_config = finish_with_client_auth(builder, client_auth)?;
 
@@ -588,6 +553,45 @@ impl ServerCertVerifier for NoServerCertVerifier {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// A connection reset in the middle of the handshake is the network
+    /// failing, not the credentials: it must be retriable, so a rolling
+    /// broker restart does not look like a revoked certificate.
+    #[test]
+    fn a_reset_during_the_handshake_is_a_network_error() {
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::BrokenPipe,
+        ] {
+            let error = handshake_error(std::io::Error::new(kind, "peer went away"));
+            assert!(
+                matches!(error, KrafkaError::Network(ref io) if io.kind() == kind),
+                "{kind:?} must stay a network error, got: {error:?}"
+            );
+            assert!(error.is_retriable());
+            assert!(!error.is_fatal());
+        }
+    }
+
+    /// A certificate the client rejects is an authentication error, and the
+    /// rustls error stays reachable through `source()`.
+    #[test]
+    fn a_rejected_certificate_is_an_auth_error_with_its_cause() {
+        let tls = rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer);
+        let error = handshake_error(std::io::Error::new(std::io::ErrorKind::InvalidData, tls));
+        assert!(matches!(error, KrafkaError::Auth { .. }), "got: {error:?}");
+        assert!(error.is_fatal());
+        assert!(!error.is_retriable());
+
+        let mut cause = std::error::Error::source(&error);
+        let mut found = false;
+        while let Some(c) = cause {
+            found |= c.downcast_ref::<std::io::Error>().is_some();
+            cause = c.source();
+        }
+        assert!(found, "the I/O error must remain in the cause chain");
+    }
 
     fn setup_crypto_provider() {
         // Install the default crypto provider for tests.
@@ -793,5 +797,160 @@ mod tests {
     fn sha1_prf_is_rejected_with_the_conversion() {
         let err = client_auth_error("client-pbes2-sha1.key", Some("krafka-test"));
         assert!(err.contains("openssl pkcs8 -topk8"), "got: {err}");
+    }
+
+    /// The passphrase would otherwise be dropped silently and the broker
+    /// would see a client without a certificate.
+    #[test]
+    fn a_key_passphrase_without_a_key_is_a_config_error() {
+        setup_crypto_provider();
+        for mut config in [TlsConfig::new(), TlsConfig::insecure()] {
+            config.client_key_password = Some(zeroize::Zeroizing::new("krafka-test".into()));
+            let err = build_tls_config_sync(&config)
+                .expect_err("a passphrase with no key must not be ignored")
+                .to_string();
+            assert!(err.contains("with_client_key_password"), "got: {err}");
+            assert!(err.contains("no client key"), "got: {err}");
+        }
+    }
+
+    // ── key exchange ─────────────────────────────────────────────────────
+
+    #[cfg(feature = "rustls-aws-lc-rs")]
+    /// Accept one TLS 1.3 connection with `server`, then report the group
+    /// the client negotiated and whether it took a HelloRetryRequest.
+    async fn handshake(
+        server: rustls::ServerConfig,
+        client: ClientConfig,
+    ) -> Result<(rustls::NamedGroup, rustls::HandshakeKind)> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let _ = acceptor.accept(tcp).await;
+        });
+
+        let tcp = TcpStream::connect(&addr).await.unwrap();
+        let result = connect_tls(tcp, &addr, None, &TlsConnector::from(Arc::new(client)))
+            .await
+            .map(|tls| {
+                let conn = tls.get_ref().1;
+                (
+                    conn.negotiated_key_exchange_group().unwrap().name(),
+                    conn.handshake_kind().unwrap(),
+                )
+            });
+        server.await.unwrap();
+        result
+    }
+
+    /// A TLS 1.3 server holding `server.pem` (issued by `ca.pem`) that
+    /// accepts exactly `kx_groups`.
+    #[cfg(feature = "rustls-aws-lc-rs")]
+    fn server_offering(
+        kx_groups: Vec<&'static dyn rustls::crypto::SupportedKxGroup>,
+    ) -> rustls::ServerConfig {
+        let provider = CryptoProvider {
+            kx_groups,
+            ..rustls::crypto::aws_lc_rs::default_provider()
+        };
+        rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                load_certs(&testdata("server.pem")).unwrap(),
+                load_private_key(&testdata("server.key"), None).unwrap(),
+            )
+            .unwrap()
+    }
+
+    #[cfg(feature = "rustls-aws-lc-rs")]
+    fn trusting_test_ca() -> TlsConfig {
+        TlsConfig::new().with_ca_cert(testdata("ca.pem"))
+    }
+
+    #[cfg(feature = "rustls-aws-lc-rs")]
+    mod post_quantum {
+        use super::*;
+        use rustls::crypto::aws_lc_rs::{DEFAULT_KX_GROUPS, kx_group};
+        use rustls::{HandshakeKind, NamedGroup};
+
+        /// Independent of other crates' features: `just test-aws-lc` runs
+        /// this without `aws-msk`, whose dependencies also enable
+        /// `prefer-post-quantum`.
+        #[test]
+        fn the_hybrid_group_is_offered_first() {
+            let first = resolve_crypto_provider().kx_groups[0].name();
+            assert_eq!(first, NamedGroup::X25519MLKEM768);
+        }
+
+        #[tokio::test]
+        async fn a_pq_only_server_negotiates_x25519mlkem768() {
+            let (group, kind) = handshake(
+                server_offering(vec![kx_group::X25519MLKEM768]),
+                build_tls_config_sync(&trusting_test_ca()).unwrap(),
+            )
+            .await
+            .expect("aws-lc-rs must complete a handshake with a PQ-only server");
+            assert_eq!(group, NamedGroup::X25519MLKEM768);
+            assert_eq!(kind, HandshakeKind::Full);
+        }
+
+        /// The first ClientHello carries the hybrid share, so a server that
+        /// prefers it needs no HelloRetryRequest.
+        #[tokio::test]
+        async fn a_hybrid_capable_server_negotiates_it_without_a_retry() {
+            let (group, kind) = handshake(
+                server_offering(DEFAULT_KX_GROUPS.to_vec()),
+                build_tls_config_sync(&trusting_test_ca()).unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(group, NamedGroup::X25519MLKEM768);
+            assert_eq!(kind, HandshakeKind::Full);
+        }
+
+        #[tokio::test]
+        async fn a_classical_only_server_falls_back_to_x25519() {
+            let (group, _) = handshake(
+                server_offering(vec![kx_group::X25519]),
+                build_tls_config_sync(&trusting_test_ca()).unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(group, NamedGroup::X25519);
+        }
+
+        /// Negative control: the PQ-only server refuses a client that cannot
+        /// offer the hybrid group, which is what krafka builds on `ring`.
+        #[cfg(feature = "ring")]
+        #[tokio::test]
+        async fn ring_cannot_reach_a_pq_only_server() {
+            let ring = Arc::new(rustls::crypto::ring::default_provider());
+            assert!(
+                ring.kx_groups
+                    .iter()
+                    .all(|g| g.name() != NamedGroup::X25519MLKEM768)
+            );
+            let result = handshake(
+                server_offering(vec![kx_group::X25519MLKEM768]),
+                client_config(ring, &trusting_test_ca()).unwrap(),
+            )
+            .await;
+            assert!(result.is_err(), "ring negotiated {result:?}");
+        }
+    }
+
+    #[cfg(not(feature = "rustls-aws-lc-rs"))]
+    #[test]
+    fn ring_offers_no_post_quantum_group() {
+        assert!(
+            resolve_crypto_provider()
+                .kx_groups
+                .iter()
+                .all(|g| g.name() != rustls::NamedGroup::X25519MLKEM768)
+        );
     }
 }

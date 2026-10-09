@@ -1,0 +1,39 @@
+diff -ruN a/src/producer/engine.rs b/src/producer/engine.rs
+--- a/src/producer/engine.rs
++++ b/src/producer/engine.rs
+@@ -1099,14 +1099,15 @@
+     /// Fail a batch's records. A stamped batch spends its range: the
+     /// idempotent producer moves to the next epoch.
+     fn fail(&mut self, key: &PartitionKey, mut batch: Batch, error: KrafkaError) {
+-        if batch.stamp.take().is_some() {
++        let stamp = batch.stamp.take();
++        if stamp.is_some() {
+             self.stamped_unresolved = self.stamped_unresolved.saturating_sub(1);
+-            if matches!(self.mode, Mode::Idempotent) {
+-                self.bump_requested = true;
+-            }
+         }
+         if let Some(queue) = self.partitions.get_mut(key) {
+             queue.backoff_until = None;
++            if let Some(stamp) = stamp {
++                queue.seq.rewind(stamp.base_sequence);
++            }
+         }
+         if batch.waiters.is_none() {
+             return;
+diff -ruN a/src/producer/identity.rs b/src/producer/identity.rs
+--- a/src/producer/identity.rs
++++ b/src/producer/identity.rs
+@@ -75,6 +75,12 @@
+     }
+ }
+ 
++impl PartitionSeq {
++    pub(crate) fn rewind(&mut self, base: i32) {
++        self.next = base;
++    }
++}
++
+ /// The sequence after a batch of `count` records starting at `base`.
+ #[inline]
+ fn next_sequence(base: i32, count: i32) -> i32 {

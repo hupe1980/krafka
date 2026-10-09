@@ -6,12 +6,17 @@
 //! request, which is what makes request handling serialisable and the
 //! resulting behaviour reproducible.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use bytes::Bytes;
 
 use super::wire;
+use crate::error::ErrorCode;
 use crate::protocol::ApiKey;
+
+/// Batches a partition leader remembers per producer for de-duplication,
+/// matching Kafka's `ProducerStateEntry.NUM_BATCHES_TO_RETAIN`.
+pub(crate) const PRODUCER_STATE_BATCHES: usize = 5;
 
 /// A broker in the fake cluster's metadata.
 #[derive(Debug, Clone)]
@@ -52,14 +57,18 @@ pub struct PartitionState {
     /// broker acknowledges writes immediately, this doubles as the high
     /// watermark.
     pub next_offset: i64,
-    /// Base offset of the currently open transaction's first batch on this
-    /// partition, or `None` when no transaction is open here.
+    /// First offset each producer with an open transaction wrote here, keyed
+    /// by producer ID.
     ///
-    /// This is what pins the last stable offset: a `read_committed` consumer
-    /// must not see past it until the transaction completes. Modelling it is
-    /// the difference between a test that proves exactly-once isolation and
-    /// one that proves records were written.
-    pub pending_txn_first_offset: Option<i64>,
+    /// The smallest of them pins the last stable offset: a `read_committed`
+    /// consumer must not see past it until that transaction completes.
+    pub open_transactions: HashMap<i64, i64>,
+    /// Producer state the leader keeps for idempotence (KIP-98), keyed by
+    /// producer ID: the epoch and the last five appended batches.
+    ///
+    /// It lives on the partition, so it moves with leadership the way a
+    /// replicated producer snapshot does.
+    pub producers: HashMap<i64, ProducerEntry>,
     /// Completed-but-aborted transactions, as
     /// `(producer_id, first_offset, marker_offset)`.
     ///
@@ -87,7 +96,8 @@ impl PartitionState {
             log: Vec::new(),
             log_start_offset: 0,
             next_offset: 0,
-            pending_txn_first_offset: None,
+            open_transactions: HashMap::new(),
+            producers: HashMap::new(),
             aborted_transactions: Vec::new(),
         }
     }
@@ -96,10 +106,128 @@ impl PartitionState {
     /// may not read past.
     ///
     /// Derived rather than stored, so it cannot drift out of step with the
-    /// open transaction it describes. With no transaction open it is the high
-    /// watermark; with one open it is that transaction's first offset.
+    /// open transactions it describes. With no transaction open it is the high
+    /// watermark; otherwise it is the first offset of the oldest open one.
     pub(crate) fn last_stable_offset(&self) -> i64 {
-        self.pending_txn_first_offset.unwrap_or(self.next_offset)
+        self.open_transactions
+            .values()
+            .copied()
+            .min()
+            .unwrap_or(self.next_offset)
+    }
+
+    /// Decide what the leader does with an idempotent or transactional batch,
+    /// applying the broker's producer-state rules (`ProducerAppendInfo`).
+    ///
+    /// - An unknown producer is accepted at any sequence (KIP-360), unless
+    ///   `pre_kip360` is set, which models a broker older than 2.5: a non-zero
+    ///   first sequence is then `UNKNOWN_PRODUCER_ID`.
+    /// - An epoch below the stored one is `INVALID_PRODUCER_EPOCH`; a higher
+    ///   one must restart at sequence 0.
+    /// - At the stored epoch, a batch matching one of the last five is a
+    ///   duplicate, answered with the offset it was first written at; any other
+    ///   batch must continue the sequence or it is
+    ///   `OUT_OF_ORDER_SEQUENCE_NUMBER`.
+    pub(crate) fn check_sequence(
+        &self,
+        producer_id: i64,
+        producer_epoch: i16,
+        first_sequence: i32,
+        record_count: i32,
+        pre_kip360: bool,
+    ) -> SequenceCheck {
+        let last_sequence = last_sequence(first_sequence, record_count);
+        let Some(entry) = self.producers.get(&producer_id) else {
+            return if pre_kip360 && first_sequence != 0 {
+                SequenceCheck::Reject(ErrorCode::UnknownProducerId)
+            } else {
+                SequenceCheck::Append
+            };
+        };
+        if producer_epoch < entry.epoch {
+            return SequenceCheck::Reject(ErrorCode::InvalidProducerEpoch);
+        }
+        if producer_epoch > entry.epoch {
+            return if first_sequence == 0 {
+                SequenceCheck::Append
+            } else {
+                SequenceCheck::Reject(ErrorCode::OutOfOrderSequenceNumber)
+            };
+        }
+        if let Some(duplicate) = entry
+            .batches
+            .iter()
+            .find(|b| b.first_sequence == first_sequence && b.last_sequence == last_sequence)
+        {
+            return SequenceCheck::Duplicate(duplicate.base_offset);
+        }
+        let in_sequence = match entry.batches.back() {
+            Some(last) => next_sequence(last.last_sequence) == first_sequence,
+            None => first_sequence == 0,
+        };
+        if in_sequence {
+            SequenceCheck::Append
+        } else {
+            SequenceCheck::Reject(ErrorCode::OutOfOrderSequenceNumber)
+        }
+    }
+
+    /// Remember an appended batch in its producer's entry, keeping the last
+    /// [`PRODUCER_STATE_BATCHES`]. A new epoch starts a fresh entry.
+    pub(crate) fn record_batch(
+        &mut self,
+        producer_id: i64,
+        producer_epoch: i16,
+        first_sequence: i32,
+        record_count: i32,
+        base_offset: i64,
+    ) {
+        let entry = self.producers.entry(producer_id).or_insert(ProducerEntry {
+            epoch: producer_epoch,
+            batches: VecDeque::new(),
+        });
+        if entry.epoch != producer_epoch {
+            entry.epoch = producer_epoch;
+            entry.batches.clear();
+        }
+        entry.batches.push_back(BatchMetadata {
+            first_sequence,
+            last_sequence: last_sequence(first_sequence, record_count),
+            base_offset,
+        });
+        while entry.batches.len() > PRODUCER_STATE_BATCHES {
+            entry.batches.pop_front();
+        }
+    }
+
+    /// Write a transaction marker for `producer_id` and settle its open
+    /// transaction here, returning the marker's offset.
+    ///
+    /// A marker at a higher epoch moves the producer's entry to that epoch, as
+    /// a control batch does on a real leader, so the fenced epoch's writes are
+    /// rejected from then on.
+    pub(crate) fn append_marker(
+        &mut self,
+        committed: bool,
+        producer_id: i64,
+        producer_epoch: i16,
+    ) -> i64 {
+        let marker = wire::control_batch(committed, producer_id, producer_epoch);
+        let marker_offset = self.append(&marker);
+        let first_offset = self.open_transactions.remove(&producer_id);
+        if !committed && let Some(first) = first_offset {
+            self.aborted_transactions
+                .push((producer_id, first, marker_offset));
+        }
+        let entry = self.producers.entry(producer_id).or_insert(ProducerEntry {
+            epoch: producer_epoch,
+            batches: VecDeque::new(),
+        });
+        if producer_epoch > entry.epoch {
+            entry.epoch = producer_epoch;
+            entry.batches.clear();
+        }
+        marker_offset
     }
 
     /// Append a producer's record batch, stamping it with the offset it was
@@ -159,6 +287,56 @@ impl PartitionState {
     }
 }
 
+/// The last sequence of a batch, wrapping the way Kafka's sequences do.
+fn last_sequence(first_sequence: i32, record_count: i32) -> i32 {
+    let delta = record_count.max(1) - 1;
+    if first_sequence > i32::MAX - delta {
+        delta - (i32::MAX - first_sequence) - 1
+    } else {
+        first_sequence + delta
+    }
+}
+
+/// The sequence that must follow `last_sequence`.
+fn next_sequence(last_sequence: i32) -> i32 {
+    if last_sequence == i32::MAX {
+        0
+    } else {
+        last_sequence + 1
+    }
+}
+
+/// What a partition leader knows about one producer ID.
+#[derive(Debug, Clone, Default)]
+pub struct ProducerEntry {
+    /// Epoch of the producer's latest write or transaction marker here.
+    pub epoch: i16,
+    /// The last appended batches at that epoch, oldest first, at most five.
+    pub batches: VecDeque<BatchMetadata>,
+}
+
+/// One appended batch, as remembered for de-duplication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchMetadata {
+    /// First sequence number in the batch.
+    pub first_sequence: i32,
+    /// Last sequence number in the batch.
+    pub last_sequence: i32,
+    /// Offset the batch was written at.
+    pub base_offset: i64,
+}
+
+/// The leader's verdict on one producer batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SequenceCheck {
+    /// Write it.
+    Append,
+    /// Already written at this offset; acknowledge without writing.
+    Duplicate(i64),
+    /// Refuse it with this error.
+    Reject(ErrorCode),
+}
+
 /// A topic and its partitions.
 #[derive(Debug, Clone)]
 pub struct TopicState {
@@ -175,15 +353,21 @@ pub struct TopicState {
 /// transactional ID returns the **same** producer ID with a **higher** epoch,
 /// which is what makes a zombie producer's writes rejected (KIP-360).
 #[derive(Debug, Clone, Default)]
-pub struct TransactionState {
+pub struct BrokerTransaction {
     /// Producer ID assigned to this transactional ID, stable across
     /// re-initialisation.
     pub producer_id: i64,
-    /// Current epoch. Bumped by every `InitProducerId` and by the completion
-    /// of every transaction under TV2.
+    /// Current epoch. Bumped by every `InitProducerId`, by fencing an open
+    /// transaction, and by every `EndTxn` v5+ (KIP-890).
     pub producer_epoch: i16,
-    /// Whether a transaction is currently open.
-    pub open: bool,
+    /// The epoch before the last bump, or `-1`. Lets the coordinator answer a
+    /// retried `InitProducerId` or `EndTxn` whose first attempt already
+    /// bumped the epoch, instead of fencing the producer that sent it.
+    pub last_producer_epoch: i16,
+    /// Where the transaction is in the coordinator's state machine.
+    pub status: TxnStatus,
+    /// Transaction timeout the producer registered, in milliseconds.
+    pub transaction_timeout_ms: i32,
     /// Partitions this transaction has written to.
     ///
     /// Under TV1 the client registers them with `AddPartitionsToTxn`; under
@@ -197,6 +381,56 @@ pub struct TransactionState {
     /// committed offsets exactly as it found them, which is the half of
     /// exactly-once that a produce-only test never reaches.
     pub staged_offsets: HashMap<String, HashMap<(String, i32), CommittedOffset>>,
+}
+
+impl BrokerTransaction {
+    /// Whether a transaction is open: records or offsets were added and it has
+    /// not been ended.
+    pub fn is_open(&self) -> bool {
+        self.status == TxnStatus::Ongoing
+    }
+
+    /// Bump the epoch, remembering the previous one for retry detection.
+    pub(crate) fn bump_epoch(&mut self) {
+        self.last_producer_epoch = self.producer_epoch;
+        self.producer_epoch = self.producer_epoch.saturating_add(1);
+    }
+
+    /// Mark the transaction ongoing, as the first partition or group added to
+    /// it does.
+    pub(crate) fn begin(&mut self) {
+        if !matches!(
+            self.status,
+            TxnStatus::PrepareCommit | TxnStatus::PrepareAbort
+        ) {
+            self.status = TxnStatus::Ongoing;
+        }
+    }
+}
+
+/// The transaction coordinator's state for one transactional ID, named as
+/// Kafka names it.
+///
+/// `PrepareCommit` and `PrepareAbort` last only while markers are held back
+/// (see [`ClusterState::hold_transaction_markers`]); otherwise the markers are
+/// written within the request that ends the transaction, and it moves straight
+/// to the matching `Complete*` state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TxnStatus {
+    /// No transaction has started since the producer ID was assigned.
+    #[default]
+    Empty,
+    /// A partition or group was added; the transaction is open.
+    Ongoing,
+    /// `EndTxn(commit)` accepted; commit markers not yet written.
+    PrepareCommit,
+    /// `EndTxn(abort)` accepted, or the coordinator fenced or timed out the
+    /// transaction; abort markers not yet written.
+    PrepareAbort,
+    /// Commit markers written.
+    CompleteCommit,
+    /// Abort markers written.
+    CompleteAbort,
 }
 
 /// A member of a consumer group.
@@ -309,6 +543,9 @@ pub struct ConsumerGroupMemberState {
     /// The assignment field is only put on the wire when it moves; a null
     /// assignment means "keep what you have".
     pub assignment_dirty: bool,
+    /// When the member last heartbeat, on Tokio's clock. A member silent for
+    /// the session timeout is removed from the group; `None` never expires.
+    pub last_heartbeat: Option<tokio::time::Instant>,
 }
 
 /// A share group (KIP-932).
@@ -323,21 +560,20 @@ pub struct ConsumerGroupMemberState {
 /// the heartbeat that carries it.
 ///
 /// What *is* modelled is the share-partition state machine that replaces
-/// committed offsets: a start offset (SPSO), a cursor of records handed out
-/// but not yet resolved, and a per-record delivery count. `ACCEPT` and
-/// `REJECT` advance the start offset; `RELEASE` makes the record available
-/// again with a higher delivery count.
+/// committed offsets: a start offset (SPSO), the member holding each acquired
+/// record, the records already acknowledged, and a per-record delivery count.
+/// An acknowledgement is valid only for a record the acknowledging member
+/// holds (`INVALID_RECORD_STATE` otherwise). `ACCEPT`, `REJECT` and `GAP`
+/// archive the record; `RELEASE` makes it available again with a higher
+/// delivery count; `RENEW` (KIP-1222) keeps it acquired.
 ///
-/// Records acquired but never resolved are returned to the pool when the
-/// member holding them leaves, which is what makes the start offset
-/// load-bearing: it is the point a new member starts from, and only an
-/// `ACCEPT` or `REJECT` moves it.
+/// Records a member holds are released when it leaves the group or closes its
+/// share session.
 ///
-/// What is **not** modelled: acquisition-lock *expiry* (an in-flight record
-/// comes back when its holder leaves, never on a timer), the archived state,
-/// `group.share.delivery.attempts` limits, and `RENEW` (KIP-1222) — which is
-/// accepted and has no effect, because with no lock timer there is nothing to
-/// extend. Tests must not be read as validating any of those.
+/// What is **not** modelled: acquisition-lock *expiry* (an acquired record
+/// comes back when its holder leaves, never on a timer) and
+/// `group.share.delivery.attempts` limits. Tests must not be read as
+/// validating those.
 #[derive(Debug, Clone, Default)]
 pub struct ShareGroupState {
     /// Epoch of the group as a whole, bumped when membership or subscriptions
@@ -364,6 +600,78 @@ pub struct ShareSessionClose {
     pub member_id: String,
 }
 
+/// One partition of a `ListOffsets` request, as the broker received it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ListOffsetsLookup {
+    /// The broker the request reached.
+    pub node_id: i32,
+    /// The version the client negotiated.
+    pub api_version: i16,
+    /// Topic name.
+    pub topic: String,
+    /// Partition index.
+    pub partition: i32,
+    /// The requested timestamp or sentinel (`-1` latest, `-2` earliest, …).
+    pub timestamp: i64,
+}
+
+/// One member of a `LeaveGroup` request, as the coordinator received it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct LeaveGroupMemberSeen {
+    /// Group ID.
+    pub group_id: String,
+    /// The leaving member.
+    pub member_id: String,
+    /// Its static instance ID, if any.
+    pub group_instance_id: Option<String>,
+}
+
+/// One `ConsumerGroupHeartbeat` (KIP-848), as the coordinator received it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ConsumerGroupHeartbeatSeen {
+    /// Group ID.
+    pub group_id: String,
+    /// Member ID.
+    pub member_id: String,
+    /// `0` to join, `-1` to leave, `-2` for a static member's temporary
+    /// leave, else the member's current epoch.
+    pub member_epoch: i32,
+    /// Static instance ID, if any.
+    pub instance_id: Option<String>,
+    /// Requested server-side assignor, if any.
+    pub server_assignor: Option<String>,
+    /// Whether the heartbeat carried the subscription.
+    pub full: bool,
+}
+
+/// One open share session on one broker (KIP-932).
+///
+/// Opened by a `ShareFetch` at epoch 0. Every later `ShareFetch` or
+/// `ShareAcknowledge` must carry [`Self::epoch`], which then advances; epoch
+/// `-1` closes it.
+#[derive(Debug, Clone, Default)]
+pub struct ShareSession {
+    /// The epoch the next request in this session must carry.
+    pub epoch: i32,
+    /// Partitions in the session, as `(topic, partition)`.
+    pub partitions: BTreeSet<(String, i32)>,
+}
+
+impl ShareSession {
+    /// Advance to the epoch after `epoch`, wrapping from `i32::MAX` to 1 (0
+    /// always opens a new session).
+    pub(crate) fn advance(&mut self) {
+        self.epoch = if self.epoch == i32::MAX {
+            1
+        } else {
+            self.epoch + 1
+        };
+    }
+}
+
 /// One share-group member's coordinator-side state.
 #[derive(Debug, Clone, Default)]
 pub struct ShareMemberState {
@@ -383,80 +691,108 @@ pub struct SharePartitionState {
     /// Share-partition start offset (SPSO): nothing below this is ever
     /// delivered again.
     pub start_offset: i64,
-    /// Offset of the next record to hand out.
-    ///
-    /// Always at or above [`Self::start_offset`]. The gap between them is the
-    /// set of records that are in flight — acquired by some member and not yet
-    /// resolved.
-    pub next_acquire: i64,
-    /// How many times each offset has been delivered, keyed by offset. Only
-    /// offsets delivered more than once are present.
+    /// Records currently acquired, mapped to the member holding each.
+    pub acquired: BTreeMap<i64, String>,
+    /// Records at or above [`Self::start_offset`] that are acknowledged and
+    /// will not be delivered again. The start offset advances over them as
+    /// soon as they are contiguous with it.
+    pub archived: BTreeSet<i64>,
+    /// How many times each offset has been delivered, keyed by offset.
     pub delivery_counts: HashMap<i64, i16>,
+    /// Every acknowledgement the broker applied, per offset, in the order it
+    /// applied them. A record acknowledged twice, or accepted without the
+    /// application having seen it, shows here.
+    pub acknowledgements: BTreeMap<i64, Vec<ShareAckType>>,
+}
+
+/// One share acknowledgement type, as KIP-932 numbers them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ShareAckType {
+    /// 0: a gap in the log (a control record or a compacted offset).
+    Gap,
+    /// 1: processed.
+    Accept,
+    /// 2: hand to another member.
+    Release,
+    /// 3: archive without processing.
+    Reject,
+    /// 4: extend the acquisition lock (KIP-1222).
+    Renew,
+}
+
+impl ShareAckType {
+    fn from_wire(code: i8) -> Option<Self> {
+        Some(match code {
+            0 => Self::Gap,
+            1 => Self::Accept,
+            2 => Self::Release,
+            3 => Self::Reject,
+            4 => Self::Renew,
+            _ => return None,
+        })
+    }
 }
 
 impl ShareGroupState {
-    /// Return every in-flight record to the pool.
-    ///
-    /// A record between the start offset and the acquisition cursor has been
-    /// handed to a member that has not resolved it. On a real broker it comes
-    /// back when the acquisition lock expires; here the trigger is the holder
-    /// leaving the group, which is the same event a client can actually cause.
-    ///
-    /// This is what makes an unacknowledged record distinguishable from an
-    /// accepted one. Without it the cursor would only ever move forward, and
-    /// "the client accepted the batch" and "the client dropped it on the
-    /// floor" would produce identical broker state.
-    pub(crate) fn release_in_flight(&mut self) {
+    /// Release every record `member_id` holds, as a broker does when the
+    /// member leaves or closes its share session.
+    pub(crate) fn release_member(&mut self, member_id: &str) {
         for partition in self.partitions.values_mut() {
-            partition.next_acquire = partition.start_offset;
+            partition.acquired.retain(|_, holder| holder != member_id);
         }
     }
 }
 
 impl SharePartitionState {
-    /// Record that `[first, last]` was handed to a member, returning the
-    /// delivery count each of those offsets is now on.
-    ///
-    /// A real broker tracks a delivery count per record; this returns the
-    /// maximum over the range, which is what goes in the single
-    /// `delivery_count` field of an `AcquiredRecords` entry.
-    pub(crate) fn acquire(&mut self, first: i64, last: i64) -> i16 {
-        let mut max = 1;
-        for offset in first..=last {
-            let count = self.delivery_counts.entry(offset).or_insert(0);
-            *count = count.saturating_add(1);
-            max = max.max(*count);
-        }
-        self.next_acquire = self.next_acquire.max(last + 1);
-        max
+    /// Whether `offset` can be handed out: at or above the start offset, and
+    /// neither acquired nor archived.
+    pub(crate) fn is_available(&self, offset: i64) -> bool {
+        offset >= self.start_offset
+            && !self.acquired.contains_key(&offset)
+            && !self.archived.contains(&offset)
     }
 
-    /// Apply one acknowledgement to `[first, last]`.
+    /// Hand `offset` to `member_id`, returning its new delivery count.
+    pub(crate) fn acquire(&mut self, offset: i64, member_id: &str) -> i16 {
+        self.acquired.insert(offset, member_id.to_string());
+        let count = self.delivery_counts.entry(offset).or_insert(0);
+        *count = count.saturating_add(1);
+        *count
+    }
+
+    /// Whether every offset in `[first, last]` is acquired by `member_id`, the
+    /// precondition for acknowledging it.
+    pub(crate) fn held_by(&self, first: i64, last: i64, member_id: &str) -> bool {
+        (first..=last).all(|offset| {
+            self.acquired
+                .get(&offset)
+                .is_some_and(|holder| holder == member_id)
+        })
+    }
+
+    /// Apply one acknowledgement to `offset`.
     ///
-    /// `acknowledge_type` is the KIP-932 wire value: 1 = ACCEPT, 2 = RELEASE,
-    /// 3 = REJECT, 4 = RENEW (KIP-1222). `0` is a gap marker and resolves
-    /// nothing.
-    pub(crate) fn acknowledge(&mut self, first: i64, last: i64, acknowledge_type: i8) {
+    /// `acknowledge_type` is the KIP-932 wire value: 0 = GAP, 1 = ACCEPT,
+    /// 2 = RELEASE, 3 = REJECT, 4 = RENEW (KIP-1222).
+    pub(crate) fn acknowledge(&mut self, offset: i64, acknowledge_type: i8) {
+        if let Some(ack) = ShareAckType::from_wire(acknowledge_type) {
+            self.acknowledgements.entry(offset).or_default().push(ack);
+        }
         match acknowledge_type {
-            // ACCEPT and REJECT both retire the record: neither is ever
-            // delivered again. They differ only in what a real broker reports,
-            // which nothing here observes.
-            1 | 3 => {
-                self.start_offset = self.start_offset.max(last + 1);
-                for offset in first..=last {
-                    self.delivery_counts.remove(&offset);
+            0 | 1 | 3 => {
+                self.acquired.remove(&offset);
+                self.delivery_counts.remove(&offset);
+                self.archived.insert(offset);
+                while self.archived.remove(&self.start_offset) {
+                    self.start_offset += 1;
                 }
             }
-            // RELEASE returns the record to the pool. The cursor rewinds so it
-            // is handed out again; the delivery count already recorded by
-            // `acquire` is what makes the redelivery observable.
             2 => {
-                self.next_acquire = self.next_acquire.min(first.max(self.start_offset));
+                self.acquired.remove(&offset);
             }
-            // RENEW extends an acquisition lock. There is no lock timer here,
-            // so there is nothing to extend — but it must not be treated as an
-            // error either, or a client exercising KIP-1222 would see failures
-            // a real broker would not produce.
+            // RENEW extends the acquisition lock. There is no lock timer here,
+            // so the record simply stays acquired.
             _ => {}
         }
     }
@@ -543,10 +879,29 @@ pub struct ClusterState {
     pub default_partitions: i32,
     /// Counter behind allocated producer IDs.
     pub next_producer_id: i64,
-    /// Producer epochs, keyed by producer ID.
-    pub producer_epochs: HashMap<i64, i16>,
-    /// Open and idle transactions, keyed by transactional ID.
-    pub transactions: HashMap<String, TransactionState>,
+    /// Transactions, keyed by transactional ID.
+    pub transactions: HashMap<String, BrokerTransaction>,
+    /// Largest transaction timeout `InitProducerId` accepts
+    /// (`transaction.max.timeout.ms`, default 15 minutes).
+    pub transaction_max_timeout_ms: i32,
+    /// Whether partition leaders enforce producer state: sequence
+    /// de-duplication and ordering, producer-epoch fencing, and the
+    /// transactional checks on `Produce`. On by default, as on every broker;
+    /// switching it off is the negative control for a test that relies on it.
+    pub idempotence: bool,
+    /// Whether `EndTxn` leaves the transaction in `PrepareCommit` or
+    /// `PrepareAbort` instead of writing its markers at once.
+    ///
+    /// While held, the coordinator answers `CONCURRENT_TRANSACTIONS` to the
+    /// same producer's next `InitProducerId`, `AddPartitionsToTxn`,
+    /// `AddOffsetsToTxn` and TV2 `Produce`, as a real coordinator does while
+    /// its markers are in flight.
+    pub hold_transaction_markers: bool,
+    /// `throttle_time_ms` to report per API (KIP-219). APIs without an entry
+    /// report 0.
+    pub throttle_time_ms: HashMap<ApiKey, i32>,
+    /// Open share sessions, keyed by `(node_id, group_id, member_id)`.
+    pub share_sessions: HashMap<(i32, String, String), ShareSession>,
     /// Cluster-finalized feature version levels (KIP-584), keyed by feature
     /// name. Written by `UpdateFeatures`, so a test can assert what the
     /// controller actually applied — or, under `validate_only`, did not.
@@ -566,8 +921,81 @@ pub struct ClusterState {
     pub api_version_overrides: HashMap<ApiKey, (i16, i16)>,
     /// Share sessions closed with the final epoch, in arrival order.
     pub share_session_closes: Vec<ShareSessionClose>,
+    /// Every `ListOffsets` partition lookup, in arrival order.
+    pub list_offsets_lookups: Vec<ListOffsetsLookup>,
+    /// Every member named in a `LeaveGroup` request, in arrival order.
+    pub leave_group_members: Vec<LeaveGroupMemberSeen>,
+    /// Every `ConsumerGroupHeartbeat` that reached its coordinator, in
+    /// arrival order.
+    pub consumer_group_heartbeats: Vec<ConsumerGroupHeartbeatSeen>,
+    /// SASL/PLAIN `(username, password)` every connection must authenticate
+    /// with before any request but `ApiVersions`, or `None` for no SASL.
+    pub sasl_plain: Option<(String, String)>,
+    /// The KIP-714 subscription this cluster's client-telemetry plugin holds,
+    /// or `None` for a cluster without one: `GetTelemetrySubscriptions` and
+    /// `PushTelemetry` are then not advertised.
+    pub telemetry: Option<TelemetrySubscription>,
+    /// `PushTelemetry` requests received, in arrival order.
+    pub telemetry_pushes: Vec<TelemetryPush>,
     /// Counter behind generated topic UUIDs.
     topic_id_seq: u64,
+}
+
+/// The subscription a fake cluster's client-telemetry plugin hands out
+/// (KIP-714).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TelemetrySubscription {
+    /// Metric-name prefixes the plugin wants; `"*"` is every metric, and an
+    /// empty list none.
+    pub requested_metrics: Vec<String>,
+    /// How often clients push.
+    pub push_interval: std::time::Duration,
+    /// Whether sums are pushed as deltas.
+    pub delta_temporality: bool,
+    /// Compression types accepted for pushes, in preference order (Kafka's
+    /// ids: 0 none, 1 gzip, …). Default: none only.
+    pub accepted_compression_types: Vec<i8>,
+    /// The client instance id assigned to a client that asks with the zero
+    /// id.
+    pub client_instance_id: [u8; 16],
+    /// The subscription id; a push naming another is refused with
+    /// `UNKNOWN_SUBSCRIPTION_ID`.
+    pub subscription_id: i32,
+}
+
+impl TelemetrySubscription {
+    /// A subscription to `requested_metrics`, pushed every `push_interval`,
+    /// cumulative and uncompressed.
+    pub fn new(
+        requested_metrics: impl IntoIterator<Item = impl Into<String>>,
+        push_interval: std::time::Duration,
+    ) -> Self {
+        Self {
+            requested_metrics: requested_metrics.into_iter().map(Into::into).collect(),
+            push_interval,
+            delta_temporality: false,
+            accepted_compression_types: vec![0],
+            client_instance_id: *b"krafka-fake-inst",
+            subscription_id: 1,
+        }
+    }
+}
+
+/// A `PushTelemetry` request as the fake broker received it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TelemetryPush {
+    /// The client instance id the push named.
+    pub client_instance_id: [u8; 16],
+    /// The subscription id the push named.
+    pub subscription_id: i32,
+    /// Whether the client is closing.
+    pub terminating: bool,
+    /// The compression type of `metrics`.
+    pub compression_type: i8,
+    /// The OTLP `MetricsData` payload, as sent.
+    pub metrics: bytes::Bytes,
 }
 
 impl ClusterState {
@@ -596,13 +1024,23 @@ impl ClusterState {
             finalized_features_epoch: 0,
             api_version_overrides: HashMap::new(),
             share_session_closes: Vec::new(),
+            list_offsets_lookups: Vec::new(),
+            leave_group_members: Vec::new(),
+            consumer_group_heartbeats: Vec::new(),
+            sasl_plain: None,
+            telemetry: None,
+            telemetry_pushes: Vec::new(),
             group_coordinators: HashMap::new(),
             txn_coordinators: HashMap::new(),
             auto_create_topics: true,
             default_partitions: 1,
             next_producer_id: 1000,
-            producer_epochs: HashMap::new(),
             transactions: HashMap::new(),
+            transaction_max_timeout_ms: 900_000,
+            idempotence: true,
+            hold_transaction_markers: false,
+            throttle_time_ms: HashMap::new(),
+            share_sessions: HashMap::new(),
             topic_id_seq: 1,
         }
     }
@@ -723,8 +1161,131 @@ impl ClusterState {
     pub fn allocate_producer_id(&mut self) -> (i64, i16) {
         let id = self.next_producer_id;
         self.next_producer_id += 1;
-        self.producer_epochs.insert(id, 0);
         (id, 0)
+    }
+
+    /// Delete a topic and everything stored for it. Returns `false` if it did
+    /// not exist.
+    ///
+    /// Creating a topic of the same name afterwards gives it a new topic ID
+    /// and fresh partitions at leader epoch 0, as a real cluster does.
+    pub fn delete_topic(&mut self, name: &str) -> bool {
+        if self.topics.remove(name).is_none() {
+            return false;
+        }
+        for group in self.share_groups.values_mut() {
+            group.partitions.retain(|(topic, _), _| topic != name);
+        }
+        for session in self.share_sessions.values_mut() {
+            session.partitions.retain(|(topic, _)| topic != name);
+        }
+        true
+    }
+
+    /// The `throttle_time_ms` to report for `api_key`.
+    pub(crate) fn throttle(&self, api_key: ApiKey) -> i32 {
+        self.throttle_time_ms.get(&api_key).copied().unwrap_or(0)
+    }
+
+    /// Whether this cluster predates KIP-360: it advertises `InitProducerId`
+    /// below v3, so a partition leader rejects a non-zero first sequence from
+    /// a producer it has no state for with `UNKNOWN_PRODUCER_ID`.
+    pub(crate) fn pre_kip360(&self) -> bool {
+        self.api_version_overrides
+            .get(&ApiKey::InitProducerId)
+            .is_some_and(|&(_, max)| max < 3)
+    }
+
+    /// The transactional ID and state owning `producer_id`, if any.
+    pub(crate) fn transaction_for_producer(&self, producer_id: i64) -> Option<String> {
+        self.transactions
+            .iter()
+            .find(|(_, t)| t.producer_id == producer_id)
+            .map(|(id, _)| id.clone())
+    }
+
+    /// Accept an `EndTxn`: move to `PrepareCommit` or `PrepareAbort`, bump the
+    /// epoch first when `bump_epoch` (KIP-890 TV2), then write the markers
+    /// unless they are held.
+    pub(crate) fn end_transaction(
+        &mut self,
+        transactional_id: &str,
+        committed: bool,
+        bump_epoch: bool,
+    ) {
+        let Some(txn) = self.transactions.get_mut(transactional_id) else {
+            return;
+        };
+        if bump_epoch {
+            txn.bump_epoch();
+        }
+        txn.status = if committed {
+            TxnStatus::PrepareCommit
+        } else {
+            TxnStatus::PrepareAbort
+        };
+        if !self.hold_transaction_markers {
+            self.write_transaction_markers(transactional_id);
+        }
+    }
+
+    /// Fence the open transaction of `transactional_id`: bump the epoch and
+    /// abort it, as the coordinator does when the transactional ID is
+    /// re-initialised or the transaction times out.
+    pub(crate) fn fence_transaction(&mut self, transactional_id: &str) {
+        if let Some(txn) = self.transactions.get_mut(transactional_id)
+            && txn.status == TxnStatus::Ongoing
+        {
+            txn.bump_epoch();
+            // A fenced epoch is never a retry of the new one.
+            txn.last_producer_epoch = -1;
+            txn.status = TxnStatus::PrepareAbort;
+            if !self.hold_transaction_markers {
+                self.write_transaction_markers(transactional_id);
+            }
+        }
+    }
+
+    /// Write the markers of a transaction in `PrepareCommit` or
+    /// `PrepareAbort`, and complete it.
+    ///
+    /// Committing appends a commit marker to every partition in the
+    /// transaction, which releases the last stable offset, and applies the
+    /// staged offsets. Aborting appends an abort marker, records the aborted
+    /// range for `read_committed` fetches, and drops the staged offsets.
+    /// Markers carry the transaction's current epoch, which under TV2 is the
+    /// bumped one.
+    pub(crate) fn write_transaction_markers(&mut self, transactional_id: &str) {
+        let Some(txn) = self.transactions.get_mut(transactional_id) else {
+            return;
+        };
+        let committed = match txn.status {
+            TxnStatus::PrepareCommit => true,
+            TxnStatus::PrepareAbort => false,
+            _ => return,
+        };
+        txn.status = if committed {
+            TxnStatus::CompleteCommit
+        } else {
+            TxnStatus::CompleteAbort
+        };
+        let partitions = std::mem::take(&mut txn.partitions);
+        let staged = std::mem::take(&mut txn.staged_offsets);
+        let (producer_id, producer_epoch) = (txn.producer_id, txn.producer_epoch);
+
+        for (topic, partition) in &partitions {
+            // Markers go to whatever log holds the name now; a deleted topic
+            // has nowhere to write.
+            if let Some(p) = self.partition_mut(topic, *partition) {
+                p.append_marker(committed, producer_id, producer_epoch);
+            }
+        }
+        if committed {
+            for (group_id, offsets) in staged {
+                let group = self.groups.entry(group_id).or_default();
+                group.offsets.extend(offsets);
+            }
+        }
     }
 
     /// Generate the next member ID for a group.

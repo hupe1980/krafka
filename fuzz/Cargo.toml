@@ -13,7 +13,9 @@ bytes = "1"
 
 [dependencies.krafka]
 path = ".."
-features = ["telemetry", "unstable-protocol"]
+# `oauth-oidc` compiles the HTTP parser `fuzz_oidc_http` reaches; `zstd` the
+# encoder `fuzz_decompression_cap` builds zstd bombs with.
+features = ["unstable-protocol", "internal", "oauth-oidc", "zstd"]
 
 # Prevent this from interfering with workspaces
 [workspace]
@@ -51,4 +53,17 @@ doc = false
 [[bin]]
 name = "fuzz_header_primitives"
 path = "fuzz_targets/fuzz_header_primitives.rs"
+doc = false
+
+# The OIDC token client's HTTP/1.1 response parser against its line,
+# header-count and body caps.
+[[bin]]
+name = "fuzz_oidc_http"
+path = "fuzz_targets/fuzz_oidc_http.rs"
+doc = false
+
+# Record-batch decompression under a small cap, in every codec.
+[[bin]]
+name = "fuzz_decompression_cap"
+path = "fuzz_targets/fuzz_decompression_cap.rs"
 doc = false

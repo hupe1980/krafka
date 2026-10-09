@@ -1,338 +1,318 @@
-//! AdminClient operation group: tokens.
+//! Delegation tokens: create, renew, expire, describe.
 
 use std::time::Duration;
 
 use bytes::Bytes;
-use tracing::info;
 
-use crate::error::{KrafkaError, ProtocolErrorKind, Result};
+use crate::error::Result;
 use crate::protocol::{
     ApiKey, CreatableRenewer, CreateDelegationTokenRequest, CreateDelegationTokenResponse,
     DescribeDelegationTokenOwner, DescribeDelegationTokenRequest, DescribeDelegationTokenResponse,
     ExpireDelegationTokenRequest, ExpireDelegationTokenResponse, RenewDelegationTokenRequest,
-    RenewDelegationTokenResponse, VersionedDecode, VersionedEncode, versions,
+    RenewDelegationTokenResponse, versions,
 };
 
-#[allow(clippy::wildcard_imports)]
-use super::*;
+use super::AdminClient;
+use super::driver::{Mode, Target, answer, exchange, negotiate};
 
-impl AdminClient {
-    /// Create a delegation token.
-    ///
-    /// Delegation tokens allow a principal to delegate authentication to
-    /// another principal without sharing credentials (KIP-48). The token
-    /// HMAC can be used for SASL/SCRAM authentication.
-    ///
-    /// `CreateDelegationToken` is a **controller-only** API: the request is
-    /// routed to the current controller and re-issued against a freshly
-    /// resolved controller on `NOT_CONTROLLER`.
-    ///
-    /// # Arguments
-    ///
-    /// * `owner` - Principal the token is issued **for**, as a `(type, name)`
-    ///   pair, or `None` for the authenticated caller. Requesting a token on
-    ///   behalf of another principal is KIP-373 and needs
-    ///   `CreateDelegationToken` v3+ plus `CreateTokens` authorisation on that
-    ///   principal — it is how a superuser provisions a token for a service
-    ///   account that never authenticates interactively. The requester is
-    ///   recorded alongside the owner and comes back on
-    ///   [`DelegationToken::token_requester_principal_name`], which is what an
-    ///   audit trail needs.
-    /// * `renewers` - Principals authorized to renew the token (type, name pairs).
-    ///   Pass an empty slice to allow only the token owner to renew.
-    /// * `max_lifetime` - Maximum token lifetime. Use `None` for the server
-    ///   default (typically 7 days).
-    pub async fn create_delegation_token(
-        &self,
-        owner: Option<(&str, &str)>,
-        renewers: &[(&str, &str)],
-        max_lifetime: Option<Duration>,
-    ) -> Result<CreateDelegationTokenResult> {
-        self.check_not_closed()?;
+/// A principal: type (`User`) and name.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct DelegationTokenPrincipal {
+    /// Principal type, e.g. `User`.
+    pub principal_type: String,
+    /// Principal name.
+    pub principal_name: String,
+}
 
-        let wire_renewers: Vec<CreatableRenewer> = renewers
-            .iter()
-            .map(|(t, n)| CreatableRenewer {
-                principal_type: t.to_string(),
-                principal_name: n.to_string(),
-            })
-            .collect();
-        let max_lifetime_ms = max_lifetime
-            .map(crate::util::duration_to_millis_i64)
-            .unwrap_or(-1);
-        let (owner_principal_type, owner_principal_name) = match owner {
-            Some((principal_type, principal_name)) => (
-                Some(principal_type.to_string()),
-                Some(principal_name.to_string()),
-            ),
-            None => (None, None),
-        };
-
-        // `CreateDelegationToken` is controller-only.
-        let response = self
-            .with_controller("CreateDelegationToken", |conn| {
-                let wire_renewers = &wire_renewers;
-                let owner_principal_type = owner_principal_type.clone();
-                let owner_principal_name = owner_principal_name.clone();
-                async move {
-                    let request = CreateDelegationTokenRequest {
-                        renewers: wire_renewers.clone(),
-                        max_lifetime_ms,
-                        owner_principal_type,
-                        owner_principal_name,
-                    };
-
-                    let version = conn
-                        .negotiate_api_version(
-                            ApiKey::CreateDelegationToken,
-                            versions::CREATE_DELEGATION_TOKEN_MAX,
-                            versions::CREATE_DELEGATION_TOKEN_MIN,
-                        )
-                        .ok_or_else(|| {
-                            KrafkaError::protocol_kind(
-                                ProtocolErrorKind::UnknownApiVersion,
-                                "no mutually supported CreateDelegationToken API version",
-                            )
-                        })?;
-
-                    let response_bytes = conn
-                        .send_request(ApiKey::CreateDelegationToken, version, |buf| {
-                            request.encode_versioned(version, buf)
-                        })
-                        .await?;
-
-                    let mut buf = response_bytes;
-                    let response =
-                        CreateDelegationTokenResponse::decode_versioned(version, &mut buf)?;
-
-                    if super::is_controller_moved(response.error_code) {
-                        return Ok(ControllerAttempt::NotController(response.error_code));
-                    }
-
-                    Ok(ControllerAttempt::Done(response))
-                }
-            })
-            .await?;
-
-        let result = if response.error_code.is_ok() {
-            info!("Created delegation token");
-            CreateDelegationTokenResult {
-                token: Some(DelegationToken {
-                    principal_type: response.principal_type,
-                    principal_name: response.principal_name,
-                    issue_timestamp_ms: response.issue_timestamp_ms,
-                    expiry_timestamp_ms: response.expiry_timestamp_ms,
-                    max_timestamp_ms: response.max_timestamp_ms,
-                    token_id: response.token_id,
-                    hmac: response.hmac,
-                    renewers: Vec::new(),
-                    token_requester_principal_type: response.token_requester_principal_type,
-                    token_requester_principal_name: response.token_requester_principal_name,
-                }),
-                error: None,
-            }
-        } else {
-            CreateDelegationTokenResult {
-                token: None,
-                error: Some(format!("{:?}", response.error_code)),
-            }
-        };
-
-        Ok(result)
+impl DelegationTokenPrincipal {
+    /// A principal of type `principal_type`.
+    pub fn new(principal_type: impl Into<String>, principal_name: impl Into<String>) -> Self {
+        Self {
+            principal_type: principal_type.into(),
+            principal_name: principal_name.into(),
+        }
     }
 
-    /// Renew a delegation token, extending its expiry time.
+    /// A `User` principal.
+    pub fn user(name: impl Into<String>) -> Self {
+        Self::new("User", name)
+    }
+}
+
+/// A delegation token.
+#[non_exhaustive]
+#[derive(Clone)]
+pub struct DelegationToken {
+    /// The principal the token authenticates as.
+    pub owner: DelegationTokenPrincipal,
+    /// The principal that requested the token, when it differs from the
+    /// owner (KIP-373, v3+).
+    pub requester: Option<DelegationTokenPrincipal>,
+    /// Issue time, milliseconds since the epoch.
+    pub issue_timestamp_ms: i64,
+    /// Expiry time, milliseconds since the epoch.
+    pub expiry_timestamp_ms: i64,
+    /// Latest time the token can be renewed to.
+    pub max_timestamp_ms: i64,
+    /// Token ID.
+    pub token_id: String,
+    /// The token's HMAC, used to authenticate with it.
+    pub hmac: Bytes,
+    /// Principals allowed to renew it. Empty when returned by
+    /// [`AdminClient::create_delegation_token`].
+    pub renewers: Vec<DelegationTokenPrincipal>,
+}
+
+impl std::fmt::Debug for DelegationToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DelegationToken")
+            .field("owner", &self.owner)
+            .field("requester", &self.requester)
+            .field("issue_timestamp_ms", &self.issue_timestamp_ms)
+            .field("expiry_timestamp_ms", &self.expiry_timestamp_ms)
+            .field("max_timestamp_ms", &self.max_timestamp_ms)
+            .field("token_id", &self.token_id)
+            .field("hmac", &"[REDACTED]")
+            .field("renewers", &self.renewers)
+            .finish()
+    }
+}
+
+fn principal(
+    principal_type: Option<String>,
+    principal_name: Option<String>,
+) -> Option<DelegationTokenPrincipal> {
+    Some(DelegationTokenPrincipal::new(
+        principal_type?,
+        principal_name?,
+    ))
+}
+
+admin_options! {
+    /// Options for [`AdminClient::create_delegation_token`].
+    CreateDelegationTokenOptions {
+        /// Principals allowed to renew the token.
+        renewers: Vec<DelegationTokenPrincipal>,
+    }
+    optional {
+        /// Create the token for this principal instead of the caller
+        /// (KIP-373, v3+).
+        owner: DelegationTokenPrincipal,
+        /// Maximum lifetime. Default: the broker's.
+        max_lifetime: Duration,
+    }
+}
+
+admin_options! {
+    /// Options for [`AdminClient::renew_delegation_token`].
+    RenewDelegationTokenOptions {}
+    optional {
+        /// Renewal period. Default: the broker's.
+        renew_period: Duration,
+    }
+}
+
+admin_options! {
+    /// Options for [`AdminClient::expire_delegation_token`].
+    ExpireDelegationTokenOptions {}
+    optional {
+        /// Expire this far from now. Default: immediately.
+        expiry_period: Duration,
+    }
+}
+
+admin_options! {
+    /// Options for [`AdminClient::describe_delegation_token`].
+    DescribeDelegationTokenOptions {}
+    optional {
+        /// Only tokens of these owners. Default: every token the caller may
+        /// see.
+        owners: Vec<DelegationTokenPrincipal>,
+    }
+}
+
+impl AdminClient {
+    /// Create a delegation token (controller).
     ///
-    /// # Arguments
+    /// # Errors
     ///
-    /// * `hmac` - HMAC of the token to renew (from [`DelegationToken::hmac`]).
-    /// * `renew_period` - How long to extend the token's lifetime.
+    /// The broker's error, a closed client, or the deadline.
+    pub async fn create_delegation_token(
+        &self,
+        options: CreateDelegationTokenOptions,
+    ) -> Result<DelegationToken> {
+        let call = self.call("CreateDelegationToken", Mode::Write, options.timeout)?;
+        let options = &options;
+        call.single(Target::Controller, |conn| async move {
+            let request = CreateDelegationTokenRequest {
+                renewers: options
+                    .renewers
+                    .iter()
+                    .map(|r| CreatableRenewer {
+                        principal_type: r.principal_type.clone(),
+                        principal_name: r.principal_name.clone(),
+                    })
+                    .collect(),
+                max_lifetime_ms: options
+                    .max_lifetime
+                    .map_or(-1, crate::util::duration_to_millis_i64),
+                owner_principal_type: options.owner.as_ref().map(|o| o.principal_type.clone()),
+                owner_principal_name: options.owner.as_ref().map(|o| o.principal_name.clone()),
+            };
+            let version = negotiate(
+                &conn,
+                ApiKey::CreateDelegationToken,
+                versions::CREATE_DELEGATION_TOKEN_MIN,
+                versions::CREATE_DELEGATION_TOKEN_MAX,
+            )?;
+            let response: CreateDelegationTokenResponse =
+                exchange(&conn, ApiKey::CreateDelegationToken, version, &request).await?;
+            answer(response.error_code, None)?;
+            Ok(DelegationToken {
+                owner: DelegationTokenPrincipal::new(
+                    response.principal_type,
+                    response.principal_name,
+                ),
+                requester: principal(
+                    response.token_requester_principal_type,
+                    response.token_requester_principal_name,
+                ),
+                issue_timestamp_ms: response.issue_timestamp_ms,
+                expiry_timestamp_ms: response.expiry_timestamp_ms,
+                max_timestamp_ms: response.max_timestamp_ms,
+                token_id: response.token_id,
+                hmac: response.hmac,
+                renewers: Vec::new(),
+            })
+        })
+        .await
+    }
+
+    /// Renew a delegation token (any broker). Returns the new expiry time in
+    /// milliseconds since the epoch.
+    ///
+    /// # Errors
+    ///
+    /// The broker's error, a closed client, or the deadline.
     pub async fn renew_delegation_token(
         &self,
         hmac: &[u8],
-        renew_period: Duration,
-    ) -> Result<RenewDelegationTokenResult> {
-        let conn = self.get_any_broker_connection().await?;
-
+        options: RenewDelegationTokenOptions,
+    ) -> Result<i64> {
+        let call = self.call("RenewDelegationToken", Mode::Write, options.timeout)?;
         let request = RenewDelegationTokenRequest {
             hmac: Bytes::copy_from_slice(hmac),
-            renew_period_ms: crate::util::duration_to_millis_i64(renew_period),
+            renew_period_ms: options
+                .renew_period
+                .map_or(-1, crate::util::duration_to_millis_i64),
         };
-
-        let version = conn
-            .negotiate_api_version(
+        let request = &request;
+        call.single(Target::AnyBroker, |conn| async move {
+            let version = negotiate(
+                &conn,
                 ApiKey::RenewDelegationToken,
-                versions::RENEW_DELEGATION_TOKEN_MAX,
                 versions::RENEW_DELEGATION_TOKEN_MIN,
-            )
-            .ok_or_else(|| {
-                KrafkaError::protocol_kind(
-                    ProtocolErrorKind::UnknownApiVersion,
-                    "no mutually supported RenewDelegationToken API version",
-                )
-            })?;
-
-        let response_bytes = conn
-            .send_request(ApiKey::RenewDelegationToken, version, |buf| {
-                request.encode_versioned(version, buf)
-            })
-            .await?;
-
-        let mut buf = response_bytes;
-        let response = RenewDelegationTokenResponse::decode_versioned(version, &mut buf)?;
-
-        if response.error_code.is_ok() {
-            info!("Renewed delegation token");
-        }
-
-        Ok(RenewDelegationTokenResult {
-            expiry_timestamp_ms: response.expiry_timestamp_ms,
-            error: if response.error_code.is_ok() {
-                None
-            } else {
-                Some(format!("{:?}", response.error_code))
-            },
+                versions::RENEW_DELEGATION_TOKEN_MAX,
+            )?;
+            let response: RenewDelegationTokenResponse =
+                exchange(&conn, ApiKey::RenewDelegationToken, version, request).await?;
+            answer(response.error_code, None)?;
+            Ok(response.expiry_timestamp_ms)
         })
+        .await
     }
 
-    /// Expire a delegation token, revoking it before its natural expiry.
+    /// Expire a delegation token (any broker). Returns the new expiry time in
+    /// milliseconds since the epoch.
     ///
-    /// # Arguments
+    /// # Errors
     ///
-    /// * `hmac` - HMAC of the token to expire (from [`DelegationToken::hmac`]).
-    /// * `expiry_period` - How long until the token expires. Pass `None` to
-    ///   expire the token immediately (sends `-1` to the broker).
+    /// The broker's error, a closed client, or the deadline.
     pub async fn expire_delegation_token(
         &self,
         hmac: &[u8],
-        expiry_period: Option<Duration>,
-    ) -> Result<ExpireDelegationTokenResult> {
-        let conn = self.get_any_broker_connection().await?;
-
+        options: ExpireDelegationTokenOptions,
+    ) -> Result<i64> {
+        let call = self.call("ExpireDelegationToken", Mode::Write, options.timeout)?;
         let request = ExpireDelegationTokenRequest {
             hmac: Bytes::copy_from_slice(hmac),
-            expiry_period_ms: expiry_period
-                .map(crate::util::duration_to_millis_i64)
-                .unwrap_or(-1),
+            expiry_period_ms: options
+                .expiry_period
+                .map_or(-1, crate::util::duration_to_millis_i64),
         };
-
-        let version = conn
-            .negotiate_api_version(
+        let request = &request;
+        call.single(Target::AnyBroker, |conn| async move {
+            let version = negotiate(
+                &conn,
                 ApiKey::ExpireDelegationToken,
-                versions::EXPIRE_DELEGATION_TOKEN_MAX,
                 versions::EXPIRE_DELEGATION_TOKEN_MIN,
-            )
-            .ok_or_else(|| {
-                KrafkaError::protocol_kind(
-                    ProtocolErrorKind::UnknownApiVersion,
-                    "no mutually supported ExpireDelegationToken API version",
-                )
-            })?;
-
-        let response_bytes = conn
-            .send_request(ApiKey::ExpireDelegationToken, version, |buf| {
-                request.encode_versioned(version, buf)
-            })
-            .await?;
-
-        let mut buf = response_bytes;
-        let response = ExpireDelegationTokenResponse::decode_versioned(version, &mut buf)?;
-
-        if response.error_code.is_ok() {
-            info!("Expired delegation token");
-        }
-
-        Ok(ExpireDelegationTokenResult {
-            expiry_timestamp_ms: response.expiry_timestamp_ms,
-            error: if response.error_code.is_ok() {
-                None
-            } else {
-                Some(format!("{:?}", response.error_code))
-            },
+                versions::EXPIRE_DELEGATION_TOKEN_MAX,
+            )?;
+            let response: ExpireDelegationTokenResponse =
+                exchange(&conn, ApiKey::ExpireDelegationToken, version, request).await?;
+            answer(response.error_code, None)?;
+            Ok(response.expiry_timestamp_ms)
         })
+        .await
     }
 
-    /// Describe delegation tokens visible to the caller.
+    /// Describe delegation tokens (any broker).
     ///
-    /// # Arguments
+    /// # Errors
     ///
-    /// * `owners` - Filter by token owners (type, name pairs). Pass `None`
-    ///   to return all tokens visible to the caller.
+    /// The broker's error, a closed client, or the deadline.
     pub async fn describe_delegation_token(
         &self,
-        owners: Option<&[(&str, &str)]>,
+        options: DescribeDelegationTokenOptions,
     ) -> Result<Vec<DelegationToken>> {
-        let conn = self.get_any_broker_connection().await?;
-
+        let call = self.call("DescribeDelegationToken", Mode::Read, options.timeout)?;
         let request = DescribeDelegationTokenRequest {
-            owners: owners.map(|o| {
-                o.iter()
-                    .map(|(t, n)| DescribeDelegationTokenOwner {
-                        principal_type: t.to_string(),
-                        principal_name: n.to_string(),
+            owners: options.owners.as_ref().map(|owners| {
+                owners
+                    .iter()
+                    .map(|o| DescribeDelegationTokenOwner {
+                        principal_type: o.principal_type.clone(),
+                        principal_name: o.principal_name.clone(),
                     })
                     .collect()
             }),
         };
-
-        let version = conn
-            .negotiate_api_version(
+        let request = &request;
+        call.single(Target::AnyBroker, |conn| async move {
+            let version = negotiate(
+                &conn,
                 ApiKey::DescribeDelegationToken,
-                versions::DESCRIBE_DELEGATION_TOKEN_MAX,
                 versions::DESCRIBE_DELEGATION_TOKEN_MIN,
-            )
-            .ok_or_else(|| {
-                KrafkaError::protocol_kind(
-                    ProtocolErrorKind::UnknownApiVersion,
-                    "no mutually supported DescribeDelegationToken API version",
-                )
-            })?;
-
-        let response_bytes = conn
-            .send_request(ApiKey::DescribeDelegationToken, version, |buf| {
-                request.encode_versioned(version, buf)
-            })
-            .await?;
-
-        let mut buf = response_bytes;
-        let response = DescribeDelegationTokenResponse::decode_versioned(version, &mut buf)?;
-
-        if !response.error_code.is_ok() {
-            return Err(KrafkaError::broker(
-                response.error_code,
-                "DescribeDelegationToken failed",
-            ));
-        }
-
-        let tokens: Vec<DelegationToken> = response
-            .tokens
-            .into_iter()
-            .map(|t| DelegationToken {
-                principal_type: t.principal_type,
-                principal_name: t.principal_name,
-                issue_timestamp_ms: t.issue_timestamp_ms,
-                expiry_timestamp_ms: t.expiry_timestamp_ms,
-                max_timestamp_ms: t.max_timestamp_ms,
-                token_id: t.token_id,
-                hmac: t.hmac,
-                token_requester_principal_type: t.token_requester_principal_type,
-                token_requester_principal_name: t.token_requester_principal_name,
-                renewers: t
-                    .renewers
-                    .into_iter()
-                    .map(|r| DelegationTokenRenewer {
-                        principal_type: r.principal_type,
-                        principal_name: r.principal_name,
-                    })
-                    .collect(),
-            })
-            .collect();
-
-        info!("Described {} delegation token(s)", tokens.len());
-        Ok(tokens)
+                versions::DESCRIBE_DELEGATION_TOKEN_MAX,
+            )?;
+            let response: DescribeDelegationTokenResponse =
+                exchange(&conn, ApiKey::DescribeDelegationToken, version, request).await?;
+            answer(response.error_code, None)?;
+            Ok(response
+                .tokens
+                .into_iter()
+                .map(|t| DelegationToken {
+                    owner: DelegationTokenPrincipal::new(t.principal_type, t.principal_name),
+                    requester: principal(
+                        t.token_requester_principal_type,
+                        t.token_requester_principal_name,
+                    ),
+                    issue_timestamp_ms: t.issue_timestamp_ms,
+                    expiry_timestamp_ms: t.expiry_timestamp_ms,
+                    max_timestamp_ms: t.max_timestamp_ms,
+                    token_id: t.token_id,
+                    hmac: t.hmac,
+                    renewers: t
+                        .renewers
+                        .into_iter()
+                        .map(|r| DelegationTokenPrincipal::new(r.principal_type, r.principal_name))
+                        .collect(),
+                })
+                .collect())
+        })
+        .await
     }
-
-    // ── Client Quotas ────────────────────────────────────────────────────
 }
 
 #[cfg(test)]
@@ -341,133 +321,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_create_delegation_token_request_maps_renewers_and_lifetime() {
-        let renewers = [("User", "alice"), ("User", "bob")];
-        let request = CreateDelegationTokenRequest {
-            renewers: renewers
-                .iter()
-                .map(|(t, n)| CreatableRenewer {
-                    principal_type: (*t).to_string(),
-                    principal_name: (*n).to_string(),
-                })
-                .collect(),
-            max_lifetime_ms: crate::util::duration_to_millis_i64(Duration::from_secs(3600)),
-            owner_principal_type: None,
-            owner_principal_name: None,
-        };
-
-        assert_eq!(request.renewers.len(), 2);
-        assert_eq!(request.renewers[0].principal_type, "User");
-        assert_eq!(request.renewers[1].principal_name, "bob");
-        assert_eq!(request.max_lifetime_ms, 3_600_000);
-
-        let mut buf = Vec::new();
-        request
-            .encode_versioned(versions::CREATE_DELEGATION_TOKEN_MAX, &mut buf)
-            .expect("CreateDelegationToken must encode");
-        assert!(!buf.is_empty());
-    }
-
-    /// `None` lifetime must send the `-1` sentinel meaning "server default",
-    /// not `0`, which would create an already-expired token.
-    #[test]
-    fn test_absent_max_lifetime_sends_negative_one_sentinel() {
-        let max_lifetime: Option<Duration> = None;
-        let ms = max_lifetime
-            .map(crate::util::duration_to_millis_i64)
-            .unwrap_or(-1);
-        assert_eq!(ms, -1);
-    }
-
-    /// Likewise `None` expiry means "expire immediately" via `-1`.
-    #[test]
-    fn test_expire_delegation_token_sentinel() {
-        let request = ExpireDelegationTokenRequest {
-            hmac: Bytes::from_static(b"hmac-bytes"),
-            expiry_period_ms: None.map(crate::util::duration_to_millis_i64).unwrap_or(-1),
-        };
-        assert_eq!(request.expiry_period_ms, -1);
-
-        let with_period = ExpireDelegationTokenRequest {
-            hmac: Bytes::from_static(b"hmac-bytes"),
-            expiry_period_ms: crate::util::duration_to_millis_i64(Duration::from_secs(60)),
-        };
-        assert_eq!(with_period.expiry_period_ms, 60_000);
-
-        let mut buf = Vec::new();
-        with_period
-            .encode_versioned(versions::EXPIRE_DELEGATION_TOKEN_MAX, &mut buf)
-            .expect("ExpireDelegationToken must encode");
-        assert!(!buf.is_empty());
-    }
-
-    #[test]
-    fn test_renew_delegation_token_request_encodes_hmac() {
-        let request = RenewDelegationTokenRequest {
-            hmac: Bytes::copy_from_slice(&[1, 2, 3, 4]),
-            renew_period_ms: crate::util::duration_to_millis_i64(Duration::from_secs(86_400)),
-        };
-        assert_eq!(request.hmac.len(), 4);
-        assert_eq!(request.renew_period_ms, 86_400_000);
-
-        let mut buf = Vec::new();
-        request
-            .encode_versioned(versions::RENEW_DELEGATION_TOKEN_MAX, &mut buf)
-            .expect("RenewDelegationToken must encode");
-        assert!(!buf.is_empty());
-    }
-
-    #[test]
-    fn test_describe_delegation_token_request_owner_filter() {
-        let owners = [("User", "alice")];
-        let request = DescribeDelegationTokenRequest {
-            owners: Some(
-                owners
-                    .iter()
-                    .map(|(t, n)| DescribeDelegationTokenOwner {
-                        principal_type: (*t).to_string(),
-                        principal_name: (*n).to_string(),
-                    })
-                    .collect(),
-            ),
-        };
-        assert_eq!(request.owners.as_ref().unwrap().len(), 1);
-
-        // None = every token visible to the caller.
-        let all = DescribeDelegationTokenRequest { owners: None };
-        assert!(all.owners.is_none());
-
-        let mut buf = Vec::new();
-        all.encode_versioned(versions::DESCRIBE_DELEGATION_TOKEN_MAX, &mut buf)
-            .expect("DescribeDelegationToken must encode");
-        assert!(!buf.is_empty());
-    }
-
-    /// The token HMAC is a credential; `Debug` must never print it.
-    #[test]
-    fn test_delegation_token_debug_redacts_hmac() {
+    fn a_token_never_prints_its_hmac() {
         let token = DelegationToken {
-            principal_type: "User".into(),
-            principal_name: "alice".into(),
-            issue_timestamp_ms: 1,
-            expiry_timestamp_ms: 2,
-            max_timestamp_ms: 3,
-            token_id: "tid".into(),
-            hmac: Bytes::from_static(b"SUPER-SECRET-HMAC"),
-            renewers: vec![DelegationTokenRenewer {
-                principal_type: "User".into(),
-                principal_name: "bob".into(),
-            }],
-            token_requester_principal_type: Some("User".into()),
-            token_requester_principal_name: Some("admin".into()),
+            owner: DelegationTokenPrincipal::user("alice"),
+            requester: None,
+            issue_timestamp_ms: 0,
+            expiry_timestamp_ms: 0,
+            max_timestamp_ms: 0,
+            token_id: "id".into(),
+            hmac: Bytes::from_static(b"secret-hmac"),
+            renewers: vec![],
         };
-
-        let rendered = format!("{token:?}");
-        assert!(rendered.contains("[REDACTED]"), "got: {rendered}");
-        assert!(
-            !rendered.contains("SUPER-SECRET-HMAC"),
-            "the token HMAC must never be printed: {rendered}"
-        );
-        assert!(rendered.contains("alice"));
+        let printed = format!("{token:?}");
+        assert!(!printed.contains("secret-hmac"));
+        assert!(printed.contains("REDACTED"));
     }
 }

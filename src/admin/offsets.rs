@@ -1,120 +1,213 @@
-//! AdminClient operations: ListOffsets and consumer group lag.
+//! Partition offsets: list, delete records, end offset per leader epoch.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
-use tracing::{debug, warn};
-
+use crate::consumer::TopicPartition;
 use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
 use crate::protocol::{
-    ApiKey, ListOffsetsRequest, ListOffsetsRequestPartition, ListOffsetsRequestTopic,
-    ListOffsetsResponse, VersionedDecode, VersionedEncode, validate_topic_names, versions,
+    ApiKey, DeleteRecordsPartition, DeleteRecordsRequest, DeleteRecordsResponse,
+    DeleteRecordsTopic, ListOffsetsRequest, ListOffsetsRequestPartition, ListOffsetsRequestTopic,
+    ListOffsetsResponse, OffsetForLeaderEpochPartition, OffsetForLeaderEpochRequest,
+    OffsetForLeaderEpochResponse, OffsetForLeaderEpochTopic, versions,
 };
 
-#[allow(clippy::wildcard_imports)]
-use super::*;
+use super::driver::{Mode, Target, answer, exchange, negotiate};
+use super::{AdminClient, validate_topics};
+
+/// Which offset [`AdminClient::list_offsets`] looks up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OffsetSpec {
+    /// The earliest offset (log start).
+    Earliest,
+    /// The end offset (high watermark, or last stable offset with
+    /// `read_committed`).
+    Latest,
+    /// The first offset whose timestamp is at or after these milliseconds
+    /// since the Unix epoch.
+    Timestamp(i64),
+    /// The offset of the record with the largest timestamp (KIP-734,
+    /// `ListOffsets` v7+).
+    MaxTimestamp,
+    /// The earliest offset still in local storage (KIP-405, `ListOffsets`
+    /// v8+).
+    EarliestLocal,
+    /// The last offset copied to remote storage (KIP-1005, `ListOffsets` v9+).
+    LatestTiered,
+    /// The earliest offset not yet copied to remote storage (KIP-1023,
+    /// `ListOffsets` v11+).
+    EarliestPendingUpload,
+}
+
+impl OffsetSpec {
+    /// The wire `timestamp` field for this spec.
+    fn as_timestamp(self) -> i64 {
+        match self {
+            OffsetSpec::Earliest => -2,
+            OffsetSpec::Latest => -1,
+            OffsetSpec::MaxTimestamp => -3,
+            OffsetSpec::EarliestLocal => -4,
+            OffsetSpec::LatestTiered => -5,
+            OffsetSpec::EarliestPendingUpload => -6,
+            OffsetSpec::Timestamp(ts) => ts,
+        }
+    }
+
+    /// Lowest `ListOffsets` version that understands this spec. A broker
+    /// below it would read the negative sentinel as a timestamp and answer
+    /// with the log start, so such a partition fails instead.
+    fn min_api_version(self) -> i16 {
+        match self {
+            OffsetSpec::Earliest | OffsetSpec::Latest | OffsetSpec::Timestamp(_) => {
+                versions::LIST_OFFSETS_MIN
+            }
+            OffsetSpec::MaxTimestamp => 7,
+            OffsetSpec::EarliestLocal => 8,
+            OffsetSpec::LatestTiered => 9,
+            OffsetSpec::EarliestPendingUpload => 11,
+        }
+    }
+}
+
+/// An offset from [`AdminClient::list_offsets`].
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedOffset {
+    /// The offset.
+    pub offset: i64,
+    /// The timestamp of the record at `offset`, when the spec has one.
+    pub timestamp: Option<i64>,
+    /// The leader epoch of the record at `offset`, when known.
+    pub leader_epoch: Option<i32>,
+}
+
+/// The end of a leader epoch, from [`AdminClient::offset_for_leader_epoch`].
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpochEndOffset {
+    /// The epoch the end offset belongs to: the requested one, or the largest
+    /// epoch below it when the log was truncated.
+    pub leader_epoch: i32,
+    /// The end offset of that epoch.
+    pub end_offset: i64,
+}
+
+admin_options! {
+    /// Options for [`AdminClient::list_offsets`].
+    ListOffsetsOptions {
+        /// Report `Latest` as the last stable offset, below any open
+        /// transaction.
+        read_committed: bool,
+    }
+}
+
+admin_options! {
+    /// Options for [`AdminClient::delete_records`].
+    DeleteRecordsOptions {}
+}
+
+admin_options! {
+    /// Options for [`AdminClient::offset_for_leader_epoch`].
+    OffsetForLeaderEpochOptions {}
+}
+
+/// Group partition keys by topic, keeping each key's value.
+fn by_topic<V: Copy>(
+    keys: &[TopicPartition],
+    value: impl Fn(&TopicPartition) -> V,
+) -> BTreeMap<String, Vec<(i32, V)>> {
+    let mut topics: BTreeMap<String, Vec<(i32, V)>> = BTreeMap::new();
+    for tp in keys {
+        topics
+            .entry(tp.topic.clone())
+            .or_default()
+            .push((tp.partition, value(tp)));
+    }
+    topics
+}
 
 impl AdminClient {
-    /// List offsets for one or more topic-partitions.
+    /// Look up offsets per partition at each partition's leader.
     ///
-    /// Each request is routed to the partition's current leader.  Metadata
-    /// is refreshed once on `NotLeaderForPartition` errors before retrying.
+    /// Returns a result per partition: one partition with no reachable leader
+    /// does not fail the others.
     ///
-    /// # Arguments
-    ///
-    /// * `topic_partitions` — slice of `(topic_name, partition_ids)` pairs.
-    /// * `spec` — which offset to fetch (`Earliest`, `Latest`, or `Timestamp`).
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// use krafka::admin::{AdminClient, OffsetSpec};
-    ///
-    /// let results = admin
-    ///     .list_offsets(&[("my-topic", &[0, 1, 2])], OffsetSpec::Latest)
+    /// ```rust,no_run
+    /// # use krafka::admin::{AdminClient, ListOffsetsOptions, OffsetSpec, TopicPartition};
+    /// # async fn example(admin: &AdminClient) -> Result<(), krafka::error::KrafkaError> {
+    /// let ends = admin
+    ///     .list_offsets(
+    ///         (0..3).map(|p| (TopicPartition::new("orders", p), OffsetSpec::Latest)),
+    ///         ListOffsetsOptions::default(),
+    ///     )
     ///     .await?;
-    /// for r in &results {
-    ///     println!("{}/{}: offset={}", r.topic, r.partition, r.offset);
-    /// }
+    /// # let _ = ends;
+    /// # Ok(())
+    /// # }
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// The call fails for a closed client or an invalid topic name.
     pub async fn list_offsets(
         &self,
-        topic_partitions: &[(&str, &[i32])],
-        spec: OffsetSpec,
-    ) -> Result<Vec<ListOffsetResult>> {
-        self.check_not_closed()?;
+        specs: impl IntoIterator<Item = (TopicPartition, OffsetSpec)>,
+        options: ListOffsetsOptions,
+    ) -> Result<HashMap<TopicPartition, Result<ListedOffset>>> {
+        let specs: HashMap<TopicPartition, OffsetSpec> = specs.into_iter().collect();
+        validate_topics(specs.keys().map(|tp| tp.topic.as_str()))?;
+        let call = self.call("ListOffsets", Mode::Read, options.timeout)?;
+        let isolation_level = i8::from(options.read_committed);
+        let specs_ref = &specs;
+        Ok(call
+            .fan_out(
+                specs.keys().cloned().collect(),
+                |tp| Target::Leader(tp.clone()),
+                |conn, partitions| async move {
+                    let version = negotiate(
+                        &conn,
+                        ApiKey::ListOffsets,
+                        versions::LIST_OFFSETS_MIN,
+                        versions::LIST_OFFSETS_MAX,
+                    )?;
+                    let (supported, unsupported): (Vec<TopicPartition>, Vec<TopicPartition>) =
+                        partitions
+                            .into_iter()
+                            .partition(|tp| version >= specs_ref[tp].min_api_version());
+                    let mut results: Vec<(TopicPartition, Result<ListedOffset>)> = unsupported
+                        .into_iter()
+                        .map(|tp| {
+                            let error = KrafkaError::protocol_kind(
+                                ProtocolErrorKind::UnknownApiVersion,
+                                format!(
+                                    "{:?} needs ListOffsets v{}, the broker negotiated v{version}",
+                                    specs_ref[&tp],
+                                    specs_ref[&tp].min_api_version()
+                                ),
+                            );
+                            (tp, Err(error))
+                        })
+                        .collect();
+                    if supported.is_empty() {
+                        return Ok(results);
+                    }
 
-        let topics: Vec<&str> = topic_partitions.iter().map(|(t, _)| *t).collect();
-        validate_topic_names(topics.iter().copied())?;
-
-        let timestamp = spec.as_timestamp();
-
-        for attempt in 0u8..2 {
-            if attempt == 1 {
-                // Await a *real* refresh before retrying. A rate-limited
-                // refresh returns `RateLimited` without contacting a broker; if
-                // that were treated as success the retry would re-issue against
-                // byte-identical stale metadata and reproduce the same
-                // NotLeaderForPartition forever.
-                self.refresh_topics_for_retry(&topics, "ListOffsets").await;
-            }
-
-            let brokers = self.metadata.brokers();
-            if brokers.is_empty() {
-                return Err(KrafkaError::broker(
-                    ErrorCode::UnknownServerError,
-                    "no brokers available",
-                ));
-            }
-
-            // Group partitions by their leader broker, carrying each
-            // partition's cached leader epoch alongside its index.
-            let mut leader_map: HashMap<i32, HashMap<String, Vec<(i32, i32)>>> = HashMap::new();
-            let fallback_broker_id = brokers[0].id();
-
-            for &(topic, partitions) in topic_partitions {
-                for &partition in partitions {
-                    let leader_id = self
-                        .metadata
-                        .leader(topic, partition)
-                        .unwrap_or(fallback_broker_id);
-                    // Send the epoch we believe is current so the broker can
-                    // fence the request (KIP-320). `-1` disables fencing
-                    // entirely and is used only when the epoch is unknown
-                    // (Metadata < v7, or the partition is not in the cache).
-                    let current_leader_epoch =
-                        self.metadata.leader_epoch(topic, partition).unwrap_or(-1);
-                    leader_map
-                        .entry(leader_id)
-                        .or_default()
-                        .entry(topic.to_string())
-                        .or_default()
-                        .push((partition, current_leader_epoch));
-                }
-            }
-
-            let mut results: Vec<ListOffsetResult> = Vec::new();
-            let mut has_stale_leader = false;
-
-            for (broker_id, topics_map) in leader_map {
-                let broker = brokers
-                    .iter()
-                    .find(|b| b.id() == broker_id)
-                    .unwrap_or(&brokers[0]);
-                let conn = self
-                    .pool
-                    .get_connection_by_id(broker.id(), broker.address())
-                    .await?;
-
-                let request = ListOffsetsRequest {
-                    replica_id: -1,     // -1 = consumer
-                    isolation_level: 0, // read_uncommitted
-                    topics: topics_map
+                    let metadata = &self.metadata;
+                    let request = ListOffsetsRequest {
+                        replica_id: -1,
+                        isolation_level,
+                        topics: by_topic(&supported, |tp| {
+                            (
+                                specs_ref[tp].as_timestamp(),
+                                metadata.leader_epoch(&tp.topic, tp.partition).unwrap_or(-1),
+                            )
+                        })
                         .into_iter()
                         .map(|(name, partitions)| ListOffsetsRequestTopic {
                             name,
                             partitions: partitions
                                 .into_iter()
-                                .map(|(partition_index, current_leader_epoch)| {
+                                .map(|(partition_index, (timestamp, current_leader_epoch))| {
                                     ListOffsetsRequestPartition {
                                         partition_index,
                                         current_leader_epoch,
@@ -124,438 +217,213 @@ impl AdminClient {
                                 .collect(),
                         })
                         .collect(),
-                    timeout_ms: None,
-                };
-
-                let version = conn
-                    .negotiate_api_version(
-                        ApiKey::ListOffsets,
-                        versions::LIST_OFFSETS_MAX,
-                        versions::LIST_OFFSETS_MIN,
-                    )
-                    .ok_or_else(|| {
-                        KrafkaError::protocol_kind(
-                            ProtocolErrorKind::UnknownApiVersion,
-                            "no mutually supported ListOffsets API version",
-                        )
-                    })?;
-
-                // The sentinel specs are negative timestamps, so a broker that
-                // predates one does not reject it — it answers as if the value
-                // were an ordinary timestamp, which for a negative number
-                // means the log start. That is a plausible-looking answer to a
-                // question the broker never understood, so the mismatch is
-                // caught here rather than surfacing as silently wrong data.
-                let required = spec.min_api_version();
-                if version < required {
-                    return Err(KrafkaError::protocol_kind(
-                        ProtocolErrorKind::UnknownApiVersion,
-                        format!(
-                            "OffsetSpec::{} needs ListOffsets v{required}, but the broker \
-                             negotiated v{version}; it would answer as though the sentinel \
-                             were an ordinary timestamp",
-                            spec.name()
-                        ),
-                    ));
-                }
-
-                let response_bytes = conn
-                    .send_request(ApiKey::ListOffsets, version, |buf| {
-                        request.encode_versioned(version, buf)
-                    })
-                    .await?;
-
-                let mut buf = response_bytes;
-                let response = ListOffsetsResponse::decode_versioned(version, &mut buf)?;
-
-                for topic in response.topics {
-                    for partition in topic.partitions {
-                        // Now that a real `current_leader_epoch` is sent, the
-                        // broker can also reject the request with a fenced or
-                        // unknown epoch. All three mean "your metadata is
-                        // stale" and are cured by the same refresh.
-                        if matches!(
-                            partition.error_code,
-                            ErrorCode::NotLeaderForPartition
-                                | ErrorCode::FencedLeaderEpoch
-                                | ErrorCode::UnknownLeaderEpoch
-                        ) {
-                            has_stale_leader = true;
+                        timeout_ms: None,
+                    };
+                    let response: ListOffsetsResponse =
+                        exchange(&conn, ApiKey::ListOffsets, version, &request).await?;
+                    for topic in response.topics {
+                        for p in topic.partitions {
+                            let result = answer(p.error_code, None).and_then(|()| {
+                                if p.offset < 0 {
+                                    Err(KrafkaError::broker(
+                                        ErrorCode::OffsetNotAvailable,
+                                        "the broker reported no offset for this spec",
+                                    ))
+                                } else {
+                                    Ok(ListedOffset {
+                                        offset: p.offset,
+                                        timestamp: (p.timestamp >= 0).then_some(p.timestamp),
+                                        leader_epoch: (p.leader_epoch >= 0)
+                                            .then_some(p.leader_epoch),
+                                    })
+                                }
+                            });
+                            results.push((
+                                TopicPartition::new(topic.name.clone(), p.partition_index),
+                                result,
+                            ));
                         }
-                        results.push(ListOffsetResult {
-                            topic: topic.name.clone(),
-                            partition: partition.partition_index,
-                            offset: partition.offset,
-                            timestamp: partition.timestamp,
-                            error: if partition.error_code.is_ok() {
-                                None
-                            } else {
-                                Some(format!("{:?}", partition.error_code))
-                            },
-                        });
                     }
-                }
-            }
-
-            if has_stale_leader && attempt == 0 {
-                warn!("stale leader metadata in ListOffsets response, retrying after a refresh");
-                continue;
-            }
-
-            debug!("ListOffsets returned {} partition result(s)", results.len());
-            return Ok(results);
-        }
-
-        Err(KrafkaError::protocol_kind(
-            ProtocolErrorKind::Malformed,
-            "ListOffsets retry loop exhausted after metadata refresh",
-        ))
+                    Ok(results)
+                },
+            )
+            .await)
     }
 
-    /// Compute consumer group lag for the specified topics.
+    /// Delete the records below the given offsets, at each partition's leader.
     ///
-    /// Lag is defined as `end_offset − committed_offset` for each
-    /// topic-partition.  Partitions with no committed offset have
-    /// `committed_offset = None` and `lag = None`.
+    /// Returns the new log start offset (low watermark) per partition.
     ///
-    /// Partitions whose end offset could not be fetched report
-    /// `end_offset = None`, `lag = None`, and the reason in
-    /// [`ConsumerGroupLag::end_offset_error`] — never `lag = 0`, which would
-    /// make a stalled consumer look healthy.
+    /// # Errors
     ///
-    /// This method issues two parallel-ish requests:
-    /// 1. [`describe_consumer_group_offsets`] for the committed positions.
-    /// 2. [`list_offsets`] with [`OffsetSpec::Latest`] for the end offsets.
-    ///
-    /// The consumer group does **not** need to be stopped.
-    ///
-    /// # Arguments
-    ///
-    /// * `group_id` — consumer group ID.
-    /// * `topic_partitions` — which partitions to measure; pass `None` to
-    ///   measure all partitions that the group has committed offsets for.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let lag = admin
-    ///     .consumer_group_lag("my-group", Some(&[("my-topic", &[0, 1, 2])]))
-    ///     .await?;
-    /// for entry in &lag {
-    ///     println!(
-    ///         "{}/{}: lag={:?}",
-    ///         entry.topic, entry.partition, entry.lag
-    ///     );
-    /// }
-    /// ```
-    ///
-    /// [`describe_consumer_group_offsets`]: AdminClient::describe_consumer_group_offsets
-    /// [`list_offsets`]: AdminClient::list_offsets
-    pub async fn consumer_group_lag(
+    /// The call fails for a closed client or an invalid topic name.
+    pub async fn delete_records(
         &self,
-        group_id: &str,
-        topic_partitions: Option<&[(&str, &[i32])]>,
-    ) -> Result<Vec<ConsumerGroupLag>> {
-        self.check_not_closed()?;
-
-        // 1. Fetch committed offsets.
-        //
-        // `IncludeUnstable`: lag is a monitoring signal, and reporting the
-        // freshest committed position is more useful here than refusing to
-        // answer because some partition has a transaction in flight. A lag
-        // number that dips when a transaction aborts is the honest shape of
-        // the underlying data; an error is not.
-        let committed = self
-            .describe_consumer_group_offsets(
-                group_id,
-                topic_partitions,
-                OffsetVisibility::IncludeUnstable,
+        before: impl IntoIterator<Item = (TopicPartition, i64)>,
+        options: DeleteRecordsOptions,
+    ) -> Result<HashMap<TopicPartition, Result<i64>>> {
+        let before: HashMap<TopicPartition, i64> = before.into_iter().collect();
+        validate_topics(before.keys().map(|tp| tp.topic.as_str()))?;
+        let call = self.call("DeleteRecords", Mode::Write, options.timeout)?;
+        let before_ref = &before;
+        let call_ref = &call;
+        Ok(call
+            .fan_out(
+                before.keys().cloned().collect(),
+                |tp| Target::Leader(tp.clone()),
+                |conn, partitions| async move {
+                    let request = DeleteRecordsRequest {
+                        topics: by_topic(&partitions, |tp| before_ref[tp])
+                            .into_iter()
+                            .map(|(name, partitions)| DeleteRecordsTopic {
+                                name,
+                                partitions: partitions
+                                    .into_iter()
+                                    .map(|(partition_index, offset)| DeleteRecordsPartition {
+                                        partition_index,
+                                        offset,
+                                    })
+                                    .collect(),
+                            })
+                            .collect(),
+                        timeout_ms: call_ref.remaining_ms(),
+                    };
+                    let version = negotiate(
+                        &conn,
+                        ApiKey::DeleteRecords,
+                        versions::DELETE_RECORDS_MIN,
+                        versions::DELETE_RECORDS_MAX,
+                    )?;
+                    let response: DeleteRecordsResponse =
+                        exchange(&conn, ApiKey::DeleteRecords, version, &request).await?;
+                    Ok(response
+                        .topics
+                        .into_iter()
+                        .flat_map(|t| {
+                            let name = t.name;
+                            t.partitions.into_iter().map(move |p| {
+                                (
+                                    TopicPartition::new(name.clone(), p.partition_index),
+                                    answer(p.error_code, None).map(|()| p.low_watermark),
+                                )
+                            })
+                        })
+                        .collect())
+                },
             )
-            .await?;
+            .await)
+    }
 
-        if committed.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // 2. Build the (topic, partitions) list for list_offsets.
-        //    Group by topic, collect unique partition IDs.
-        let mut by_topic: HashMap<String, Vec<i32>> = HashMap::new();
-        for entry in &committed {
-            by_topic
-                .entry(entry.topic.clone())
-                .or_default()
-                .push(entry.partition);
-        }
-
-        // Deduplicate partition lists (describe_consumer_group_offsets may
-        // return duplicate entries if the same partition appears multiple times
-        // in a group's state, which is rare but possible during rebalance).
-        for partitions in by_topic.values_mut() {
-            partitions.sort_unstable();
-            partitions.dedup();
-        }
-
-        let topic_partition_refs: Vec<(&str, &[i32])> = by_topic
-            .iter()
-            .map(|(t, ps)| (t.as_str(), ps.as_slice()))
-            .collect();
-
-        // 3. Fetch end offsets.
-        let end_offsets = self
-            .list_offsets(&topic_partition_refs, OffsetSpec::Latest)
-            .await?;
-
-        // 4. Build a lookup map: (topic, partition) → Ok(end_offset) | Err(reason).
-        //    Both the per-partition error and a negative sentinel offset mean
-        //    the end offset is unknown; neither may be silently coerced to 0.
-        let mut end_map: HashMap<(&str, i32), std::result::Result<i64, String>> = HashMap::new();
-        for r in &end_offsets {
-            let value = match &r.error {
-                Some(e) => Err(e.clone()),
-                None if r.offset < 0 => {
-                    Err(format!("ListOffsets returned sentinel offset {}", r.offset))
-                }
-                None => Ok(r.offset),
-            };
-            end_map.insert((r.topic.as_str(), r.partition), value);
-        }
-
-        // 5. Compute lag for each committed entry.
-        let mut lag_results = Vec::with_capacity(committed.len());
-        for entry in &committed {
-            // Treat -1 as "no committed offset" (Kafka wire sentinel).
-            let committed_offset = if entry.committed_offset == -1 {
-                None
-            } else {
-                Some(entry.committed_offset)
-            };
-
-            let (end_offset, end_offset_error) =
-                match end_map.get(&(entry.topic.as_str(), entry.partition)) {
-                    Some(Ok(offset)) => (Some(*offset), None),
-                    Some(Err(reason)) => (None, Some(reason.clone())),
-                    None => (
-                        None,
-                        Some("no ListOffsets result for this partition".to_string()),
-                    ),
-                };
-
-            // Lag is only meaningful when *both* ends are known. An unknown end
-            // offset must not report lag 0 — that hides a stalled consumer from
-            // alerting.
-            let lag = match (committed_offset, end_offset) {
-                (Some(co), Some(eo)) => Some((eo - co).max(0)),
-                _ => None,
-            };
-
-            if let Some(ref reason) = end_offset_error {
-                warn!(
-                    topic = %entry.topic,
-                    partition = entry.partition,
-                    "end offset unknown, lag cannot be computed: {reason}"
-                );
-            }
-
-            lag_results.push(ConsumerGroupLag {
-                topic: entry.topic.clone(),
-                partition: entry.partition,
-                committed_offset,
-                end_offset,
-                end_offset_error,
-                lag,
-            });
-        }
-
-        debug!(
-            "consumer_group_lag for group {group_id}: {} partition(s)",
-            lag_results.len()
-        );
-        Ok(lag_results)
+    /// Find where each given leader epoch ends, at each partition's leader —
+    /// how a consumer detects log truncation after a leader change.
+    ///
+    /// # Errors
+    ///
+    /// The call fails for a closed client or an invalid topic name.
+    pub async fn offset_for_leader_epoch(
+        &self,
+        epochs: impl IntoIterator<Item = (TopicPartition, i32)>,
+        options: OffsetForLeaderEpochOptions,
+    ) -> Result<HashMap<TopicPartition, Result<EpochEndOffset>>> {
+        let epochs: HashMap<TopicPartition, i32> = epochs.into_iter().collect();
+        validate_topics(epochs.keys().map(|tp| tp.topic.as_str()))?;
+        let call = self.call("OffsetForLeaderEpoch", Mode::Read, options.timeout)?;
+        let epochs_ref = &epochs;
+        Ok(call
+            .fan_out(
+                epochs.keys().cloned().collect(),
+                |tp| Target::Leader(tp.clone()),
+                |conn, partitions| async move {
+                    let request = OffsetForLeaderEpochRequest {
+                        replica_id: -1,
+                        topics: by_topic(&partitions, |tp| epochs_ref[tp])
+                            .into_iter()
+                            .map(|(topic, partitions)| OffsetForLeaderEpochTopic {
+                                topic,
+                                partitions: partitions
+                                    .into_iter()
+                                    .map(|(partition, leader_epoch)| {
+                                        OffsetForLeaderEpochPartition {
+                                            partition,
+                                            current_leader_epoch: -1,
+                                            leader_epoch,
+                                        }
+                                    })
+                                    .collect(),
+                            })
+                            .collect(),
+                    };
+                    let version = negotiate(
+                        &conn,
+                        ApiKey::OffsetForLeaderEpoch,
+                        versions::OFFSET_FOR_LEADER_EPOCH_MIN,
+                        versions::OFFSET_FOR_LEADER_EPOCH_MAX,
+                    )?;
+                    let response: OffsetForLeaderEpochResponse =
+                        exchange(&conn, ApiKey::OffsetForLeaderEpoch, version, &request).await?;
+                    Ok(response
+                        .topics
+                        .into_iter()
+                        .flat_map(|t| {
+                            let name = t.topic;
+                            t.partitions.into_iter().map(move |p| {
+                                (
+                                    TopicPartition::new(name.clone(), p.partition),
+                                    answer(p.error_code, None).map(|()| EpochEndOffset {
+                                        leader_epoch: p.leader_epoch,
+                                        end_offset: p.end_offset,
+                                    }),
+                                )
+                            })
+                        })
+                        .collect())
+                },
+            )
+            .await)
     }
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_offset_spec_as_timestamp() {
+    fn offset_spec_sentinels_match_the_protocol_and_carry_their_minimum_version() {
         assert_eq!(OffsetSpec::Earliest.as_timestamp(), -2);
         assert_eq!(OffsetSpec::Latest.as_timestamp(), -1);
-        assert_eq!(
-            OffsetSpec::Timestamp(1_705_276_800).as_timestamp(),
-            1_705_276_800
-        );
+        assert_eq!(OffsetSpec::MaxTimestamp.as_timestamp(), -3);
+        assert_eq!(OffsetSpec::EarliestLocal.as_timestamp(), -4);
+        assert_eq!(OffsetSpec::LatestTiered.as_timestamp(), -5);
+        assert_eq!(OffsetSpec::EarliestPendingUpload.as_timestamp(), -6);
+        assert_eq!(OffsetSpec::Timestamp(1_700).as_timestamp(), 1_700);
+
+        assert_eq!(OffsetSpec::MaxTimestamp.min_api_version(), 7);
+        assert_eq!(OffsetSpec::EarliestLocal.min_api_version(), 8);
+        assert_eq!(OffsetSpec::LatestTiered.min_api_version(), 9);
+        assert_eq!(OffsetSpec::EarliestPendingUpload.min_api_version(), 11);
+        for spec in [
+            OffsetSpec::Earliest,
+            OffsetSpec::Latest,
+            OffsetSpec::Timestamp(0),
+            OffsetSpec::MaxTimestamp,
+            OffsetSpec::EarliestLocal,
+            OffsetSpec::LatestTiered,
+            OffsetSpec::EarliestPendingUpload,
+        ] {
+            assert!(spec.min_api_version() <= versions::LIST_OFFSETS_MAX);
+        }
     }
 
     #[test]
-    fn test_consumer_group_lag_struct_fields() {
-        let lag = ConsumerGroupLag {
-            topic: "test".to_string(),
-            partition: 0,
-            committed_offset: Some(100),
-            end_offset: Some(150),
-            end_offset_error: None,
-            lag: Some(50),
-        };
-        assert_eq!(lag.lag, Some(50));
-        assert_eq!(lag.end_offset, Some(150));
-        assert_eq!(lag.committed_offset, Some(100));
-    }
-
-    #[test]
-    fn test_list_offset_result_struct() {
-        let r = ListOffsetResult {
-            topic: "my-topic".to_string(),
-            partition: 1,
-            offset: 42,
-            timestamp: -1,
-            error: None,
-        };
-        assert_eq!(r.offset, 42);
-        assert!(r.error.is_none());
-    }
-
-    /// `end_offset` previously defaulted to -1 when ListOffsets failed,
-    /// and `lag = (end_offset - committed).max(0)` then reported 0 — making a
-    /// stalled consumer look perfectly healthy to alerting.
-    #[test]
-    fn test_unknown_end_offset_reports_unknown_lag_not_zero() {
-        let committed = 100i64;
-
-        // What the old code did.
-        let old_end_offset = -1i64;
-        let old_lag = (old_end_offset - committed).max(0);
-        assert_eq!(old_lag, 0, "this is the bug being fixed");
-
-        // What the new code does: no end offset means no lag.
-        let end_offset: Option<i64> = None;
-        let new_lag = match (Some(committed), end_offset) {
-            (Some(co), Some(eo)) => Some((eo - co).max(0)),
-            _ => None,
-        };
-        assert_eq!(new_lag, None);
-    }
-
-    #[test]
-    fn test_lag_is_computed_when_both_ends_are_known() {
-        let lag = match (Some(100i64), Some(150i64)) {
-            (Some(co), Some(eo)) => Some((eo - co).max(0)),
-            _ => None,
-        };
-        assert_eq!(lag, Some(50));
-    }
-
-    /// A commit ahead of the watermark (e.g. after a manual offset reset)
-    /// clamps to zero rather than reporting negative lag.
-    #[test]
-    fn test_lag_clamps_negative_to_zero() {
-        let lag = match (Some(200i64), Some(150i64)) {
-            (Some(co), Some(eo)) => Some((eo - co).max(0)),
-            _ => None,
-        };
-        assert_eq!(lag, Some(0));
-    }
-
-    /// A negative offset from ListOffsets is a sentinel, not a position, and
-    /// must be treated as "unknown" just like an explicit error.
-    #[test]
-    fn test_negative_sentinel_offset_counts_as_unknown() {
-        let classify = |error: Option<&str>, offset: i64| -> std::result::Result<i64, String> {
-            match error {
-                Some(e) => Err(e.to_string()),
-                None if offset < 0 => Err(format!("ListOffsets returned sentinel offset {offset}")),
-                None => Ok(offset),
-            }
-        };
-
-        assert_eq!(classify(None, 150), Ok(150));
-        assert!(
-            classify(None, -1).is_err(),
-            "sentinel must not be a position"
-        );
-        assert!(classify(Some("NotLeaderForPartition"), 150).is_err());
-    }
-
-    /// A partition missing entirely from the ListOffsets response must also
-    /// report unknown, not silently inherit a default.
-    #[test]
-    fn test_missing_partition_reports_unknown_end_offset() {
-        let end_map: HashMap<(&str, i32), std::result::Result<i64, String>> = HashMap::new();
-
-        let (end_offset, err) = match end_map.get(&("orders", 0)) {
-            Some(Ok(o)) => (Some(*o), None),
-            Some(Err(e)) => (None, Some(e.clone())),
-            None => (
-                None,
-                Some("no ListOffsets result for this partition".to_string()),
-            ),
-        };
-
-        assert_eq!(end_offset, None);
-        assert!(err.is_some());
-    }
-
-    /// The cached leader epoch must be sent so the broker can fence a stale
-    /// request (KIP-320). Pinning -1 disabled that protection entirely.
-    #[test]
-    fn test_list_offsets_request_carries_the_leader_epoch() {
-        let request = ListOffsetsRequest {
-            replica_id: -1,
-            isolation_level: 0,
-            topics: vec![ListOffsetsRequestTopic {
-                name: "orders".into(),
-                partitions: vec![
-                    ListOffsetsRequestPartition {
-                        partition_index: 0,
-                        current_leader_epoch: 42,
-                        timestamp: OffsetSpec::Latest.as_timestamp(),
-                    },
-                    ListOffsetsRequestPartition {
-                        partition_index: 1,
-                        // -1 only when the epoch is genuinely unknown.
-                        current_leader_epoch: -1,
-                        timestamp: OffsetSpec::Latest.as_timestamp(),
-                    },
-                ],
-            }],
-            timeout_ms: None,
-        };
-
-        assert_eq!(request.topics[0].partitions[0].current_leader_epoch, 42);
-        assert_eq!(request.topics[0].partitions[1].current_leader_epoch, -1);
-
-        let mut buf = Vec::new();
-        assert!(
-            request
-                .encode_versioned(versions::LIST_OFFSETS_MAX, &mut buf)
-                .is_ok(),
-            "ListOffsets must encode"
-        );
-        assert!(!buf.is_empty());
-    }
-
-    /// Now that a real epoch is sent, the broker can reject with a fenced or
-    /// unknown epoch; all three codes mean "metadata is stale" and must trigger
-    /// the same refresh-and-retry.
-    #[test]
-    fn test_stale_leader_detection_covers_epoch_errors() {
-        let is_stale = |c: ErrorCode| {
-            matches!(
-                c,
-                ErrorCode::NotLeaderForPartition
-                    | ErrorCode::FencedLeaderEpoch
-                    | ErrorCode::UnknownLeaderEpoch
-            )
-        };
-
-        assert!(is_stale(ErrorCode::NotLeaderForPartition));
-        assert!(is_stale(ErrorCode::FencedLeaderEpoch));
-        assert!(is_stale(ErrorCode::UnknownLeaderEpoch));
-
-        assert!(!is_stale(ErrorCode::None));
-        assert!(!is_stale(ErrorCode::OffsetOutOfRange));
-        assert!(!is_stale(ErrorCode::TopicAuthorizationFailed));
+    fn partitions_group_by_topic_with_their_values() {
+        let keys = [
+            TopicPartition::new("b", 0),
+            TopicPartition::new("a", 1),
+            TopicPartition::new("a", 0),
+        ];
+        let grouped = by_topic(&keys, |tp| tp.partition * 10);
+        assert_eq!(grouped["a"].len(), 2);
+        assert_eq!(grouped["b"], vec![(0, 0)]);
     }
 }

@@ -1,18 +1,15 @@
 //! An in-process fake Kafka broker for deterministic client tests.
 //!
-//! `FakeBroker` binds a real TCP listener on `127.0.0.1:0` and speaks the
-//! real Kafka wire protocol, so a real [`Producer`](crate::producer::Producer),
+//! `FakeBroker` speaks the real Kafka wire protocol — over a TCP listener on
+//! `127.0.0.1:0`, or over in-memory streams with
+//! [`FakeBroker::start_in_memory`](crate::testing::FakeBroker::start_in_memory) — so a real
+//! [`Producer`](crate::producer::Producer),
 //! [`Consumer`](crate::consumer::Consumer) or
 //! [`AdminClient`](crate::admin::AdminClient) connects to it exactly as it
 //! would to a broker. What it adds over a real broker is *control*: a test can
 //! inject a specific error on a specific API, delay a specific response, move a
 //! partition leader or a group coordinator, and then assert on what the client
 //! did about it.
-//!
-//! That closes a gap that Docker-based integration tests cannot: reproducing a
-//! `NOT_CONTROLLER` at exactly the right moment, or a response that arrives
-//! after the client gave up on it, is a matter of timing luck against a real
-//! cluster and a single line here.
 //!
 //! # Example
 //!
@@ -21,12 +18,10 @@
 //! retried rather than surfacing the error:
 //!
 //! ```rust,no_run
-//! use std::time::Duration;
-//!
-//! use krafka::admin::{AdminClient, NewTopic};
+//! use krafka::Kafka;
+//! use krafka::admin::{CreateTopicsOptions, NewTopic};
 //! use krafka::error::ErrorCode;
-//! use krafka::protocol::ApiKey;
-//! use krafka::testing::{Control, FakeBroker};
+//! use krafka::testing::{ApiKey, Control, FakeBroker};
 //!
 //! # async fn example() -> Result<(), krafka::error::KrafkaError> {
 //! let broker = FakeBroker::start().await?;
@@ -36,18 +31,12 @@
 //!     Control::Error(ErrorCode::NotController)
 //! });
 //!
-//! let admin = AdminClient::builder()
-//!     .bootstrap_servers(broker.bootstrap_servers())
-//!     .build()
-//!     .await?;
+//! let admin = Kafka::builder(broker.bootstrap_servers()).connect().await?.admin();
 //!
-//! admin
-//!     .create_topics(
-//!         vec![NewTopic::new("orders", 3, 1)?],
-//!         Duration::from_secs(15),
-//!         false,
-//!     )
+//! let results = admin
+//!     .create_topics([NewTopic::new("orders", 3, 1)?], CreateTopicsOptions::default())
 //!     .await?;
+//! assert!(results["orders"].is_ok());
 //!
 //! // Two attempts, with a metadata refresh in between to re-resolve the controller.
 //! assert_eq!(broker.request_count(ApiKey::CreateTopics), 2);
@@ -60,23 +49,40 @@
 //!
 //! `ApiVersions`, `Metadata`, `FindCoordinator`, `Produce`, `Fetch`,
 //! `ListOffsets`, `JoinGroup`, `SyncGroup`, `Heartbeat`, `LeaveGroup`,
-//! `OffsetCommit`, `OffsetFetch`, `CreateTopics` and `DeleteTopics`, plus the
-//! full transaction protocol — `InitProducerId` with KIP-360 fencing,
-//! `AddPartitionsToTxn`, `AddOffsetsToTxn`, `TxnOffsetCommit` and `EndTxn`,
-//! with real commit and abort control batches and `read_committed` isolation.
+//! `OffsetCommit`, `OffsetFetch`, `CreateTopics` and `DeleteTopics`, the
+//! KIP-848 and KIP-932 group APIs, the KIP-714 telemetry APIs once
+//! [`FakeBroker::set_telemetry`](crate::testing::FakeBroker::set_telemetry)
+//! installs a subscription, plus the full transaction protocol —
+//! `InitProducerId` with KIP-360 fencing, `AddPartitionsToTxn`,
+//! `AddOffsetsToTxn`, `TxnOffsetCommit` and `EndTxn`, with real commit and
+//! abort control batches and `read_committed` isolation.
 //! [`FakeBroker::set_transaction_version`](crate::testing::FakeBroker::set_transaction_version)
-//! selects between the TV1 and KIP-890
-//! TV2 protocols the same way a real cluster does.
+//! selects between the TV1 and KIP-890 TV2 protocols the same way a real
+//! cluster does.
+//!
+//! The rules a client depends on are a broker's: partition leaders keep
+//! per-producer state (de-duplication over the last five batches, sequence
+//! and epoch checks), the transaction coordinator runs Kafka's state table,
+//! share sessions are epoch-checked, and a `Fetch` with nothing to return is
+//! held for its `max_wait_ms`.
 //!
 //! Logs are in memory, per topic-partition, and nothing is persisted. Any other
 //! API is simply not advertised in `ApiVersions`, so the client's own version
 //! negotiation refuses it before a request is sent.
 //!
-//! # Version pinning
+//! # Stability
 //!
-//! Each API is advertised with `min == max`, which pins the client onto the one
-//! version this broker implements. See the `wire` module for the rationale and the
-//! per-API choices.
+//! This module is outside krafka's semver promise: any release may change
+//! it. It exists to test applications against a real client, not as a broker
+//! to depend on.
+//!
+//! # Versions
+//!
+//! Most APIs are advertised with `min == max`, which pins the client onto the
+//! one version this broker implements. `Produce`, `InitProducerId`, `EndTxn`,
+//! `ShareFetch` and `ShareAcknowledge` are served over a range, because their
+//! version carries semantics a test needs to reach. See the `wire` module for
+//! the codecs.
 //!
 //! # Determinism and its limits
 //!
@@ -85,20 +91,24 @@
 //! reproducible. Ordering *within* a connection is exactly the order the client
 //! sent, since responses are written before the next request is read.
 //!
-//! What is not deterministic: when a client opens more than one connection —
-//! which `krafka` does, one per broker plus the pool's own — the interleaving
-//! *between* connections is whatever the runtime schedules. Tests that need a
-//! strict global order should assert on per-API counts and sequences rather
-//! than on a total ordering of all requests.
+//! Over TCP the interleaving *between* connections is whatever the runtime
+//! and the operating system schedule, so tests should assert on per-API counts
+//! and sequences rather than on a total ordering of all requests. Over the
+//! in-memory transport, on a current-thread runtime with Tokio's clock paused,
+//! nothing reads the network or the wall clock: with the client's random
+//! draws seeded by [`seed_rng`](crate::testing::seed_rng) and Tokio's runtime seeded too, the same test
+//! sends the same requests at the same simulated times on every run.
 
 mod handlers;
 mod state;
 mod wire;
 
 #[cfg(test)]
+mod fidelity;
+#[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -107,22 +117,31 @@ use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use parking_lot::Mutex;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::task::JoinHandle;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::sync::Notify;
+use tokio::task::{AbortHandle, JoinHandle};
 use tracing::{debug, warn};
 
 use crate::consumer::ConsumerRecord;
 
 use crate::error::{ErrorCode, KrafkaError, Result};
-use crate::protocol::ApiKey;
 use crate::protocol::{Decode, KafkaString, TaggedFields};
 use crate::protocol::{RequestHeader, ResponseHeader};
 
+/// The API a [`Control`] hook or a request count is keyed by.
+pub use crate::protocol::ApiKey;
 pub use state::{
-    BrokerNode, ClassicGroupState, ClusterState, CommittedOffset, GroupMember, GroupState,
-    PartitionState, ShareSessionClose, TopicState,
+    BatchMetadata, BrokerNode, BrokerTransaction, ClassicGroupState, ClusterState, CommittedOffset,
+    ConsumerGroupHeartbeatSeen, ConsumerGroupMemberState, GroupMember, GroupState,
+    LeaveGroupMemberSeen, ListOffsetsLookup, PartitionState, ProducerEntry, ShareAckType,
+    ShareGroupState, ShareMemberState, SharePartitionState, ShareSession, ShareSessionClose,
+    StreamsGroupState, StreamsMemberState, TelemetryPush, TelemetrySubscription, TopicState,
+    TxnStatus,
 };
+
+/// Bytes an in-memory connection buffers in each direction.
+const MEMORY_BUFFER: usize = 256 * 1024;
 
 /// Largest request frame the fake broker will accept, as a guard against a
 /// malformed length prefix.
@@ -172,6 +191,17 @@ pub enum Control {
     /// rather than a silent pass-through, so a test cannot quietly assert
     /// nothing.
     CorruptRecords,
+    /// Serve the request normally — its effects on the cluster happen — then
+    /// answer as the nested control says.
+    ///
+    /// This is the "outcome unknown" fault: `ApplyThen(Disconnect)` writes a
+    /// produce, commits a transaction or acknowledges share records and then
+    /// drops the connection before the response, so the client must retry
+    /// something that already happened. `ApplyThen(Error(code))` answers an
+    /// applied request with an error, as a broker answering
+    /// `REQUEST_TIMED_OUT` after appending does; `ApplyThen(Silence)` and
+    /// `ApplyThen(Delay(..))` hold the applied response back.
+    ApplyThen(Box<Control>),
 }
 
 /// A request the broker received, as recorded for assertions.
@@ -190,6 +220,10 @@ pub struct RecordedRequest {
     pub node_id: i32,
     /// Monotonic sequence number across every request to the whole cluster.
     pub sequence: u64,
+    /// The connection the request arrived on, unique across the cluster.
+    pub connection: u64,
+    /// When the request arrived, on Tokio's clock, since the cluster started.
+    pub at: Duration,
 }
 
 /// The request a control hook is deciding about.
@@ -243,15 +277,74 @@ impl Hooks {
 }
 
 struct Shared {
+    /// Tokio's clock when the cluster started.
+    started: tokio::time::Instant,
+    /// Nodes that refuse connections ([`FakeBroker::crash`]).
+    crashed: Mutex<HashSet<i32>>,
+    /// The serving task of every open connection, by node.
+    open: Mutex<HashMap<i32, Vec<AbortHandle>>>,
     cluster: Mutex<ClusterState>,
     hooks: Mutex<Hooks>,
     log: Mutex<Vec<RecordedRequest>>,
     sequence: AtomicU64,
+    /// Next connection number.
+    connections: AtomicU64,
+    /// Connections open now.
+    open_connections: AtomicU64,
+    /// Woken after every request or test-side change that may have changed
+    /// what a held `Fetch` or `ShareFetch` would return.
+    changed: Notify,
 }
 
 impl Shared {
+    fn new(cluster: ClusterState) -> Self {
+        Self {
+            started: tokio::time::Instant::now(),
+            crashed: Mutex::new(HashSet::new()),
+            open: Mutex::new(HashMap::new()),
+            cluster: Mutex::new(cluster),
+            hooks: Mutex::new(Hooks::default()),
+            log: Mutex::new(Vec::new()),
+            sequence: AtomicU64::new(0),
+            connections: AtomicU64::new(0),
+            open_connections: AtomicU64::new(0),
+            changed: Notify::new(),
+        }
+    }
+
+    /// Mutate the cluster state, then wake any held fetch.
+    fn mutate<T>(&self, f: impl FnOnce(&mut ClusterState) -> T) -> T {
+        let out = f(&mut self.cluster.lock());
+        self.changed.notify_waiters();
+        out
+    }
+
     fn record(&self, request: RecordedRequest) {
         self.log.lock().push(request);
+    }
+
+    /// Serve one accepted connection on its own task, unless the node is
+    /// crashed, in which case the stream is dropped unanswered.
+    fn accept<S>(self: &Arc<Self>, stream: S, node_id: i32)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        if self.crashed.lock().contains(&node_id) {
+            return;
+        }
+        let shared = Arc::clone(self);
+        let connection = shared.connections.fetch_add(1, Ordering::Relaxed);
+        shared.open_connections.fetch_add(1, Ordering::Relaxed);
+        let task = tokio::spawn(async move {
+            let _open = OpenConnection(Arc::clone(&shared));
+            if let Err(e) = serve(stream, node_id, connection, shared).await {
+                debug!(node_id, "fake broker connection ended: {e}");
+            }
+        });
+        let mut open = self.open.lock();
+        let tasks = open.entry(node_id).or_default();
+        tasks.retain(|t| !t.is_finished());
+        tasks.push(task.abort_handle());
     }
 
     fn api_call_index(&self, api_key: ApiKey) -> u64 {
@@ -263,20 +356,39 @@ impl Shared {
     }
 }
 
+/// Counts one open connection; decrements on drop, so an aborted serving task
+/// (crash, shutdown) is counted closed too.
+struct OpenConnection(Arc<Shared>);
+
+impl Drop for OpenConnection {
+    fn drop(&mut self) {
+        self.0.open_connections.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// A fake Kafka broker, or a small cluster of them, running in this process.
 ///
 /// Dropping the handle shuts every listener down and aborts the accept and
 /// connection tasks.
 pub struct FakeBroker {
     shared: Arc<Shared>,
-    addrs: Vec<SocketAddr>,
+    transport: Transport,
     tasks: Vec<JoinHandle<()>>,
+}
+
+/// How clients reach the cluster.
+#[derive(Debug)]
+enum Transport {
+    /// One loopback TCP listener per broker.
+    Tcp(Vec<SocketAddr>),
+    /// In-memory streams; the addresses are `broker-<id>:9092`.
+    Memory(Vec<String>),
 }
 
 impl std::fmt::Debug for FakeBroker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FakeBroker")
-            .field("addrs", &self.addrs)
+            .field("transport", &self.transport)
             .finish_non_exhaustive()
     }
 }
@@ -284,6 +396,9 @@ impl std::fmt::Debug for FakeBroker {
 impl Drop for FakeBroker {
     fn drop(&mut self) {
         for task in &self.tasks {
+            task.abort();
+        }
+        for task in self.shared.open.lock().values().flatten() {
             task.abort();
         }
     }
@@ -320,12 +435,7 @@ impl FakeBroker {
             broker.port = i32::from(addr.port());
         }
 
-        let shared = Arc::new(Shared {
-            cluster: Mutex::new(cluster),
-            hooks: Mutex::new(Hooks::default()),
-            log: Mutex::new(Vec::new()),
-            sequence: AtomicU64::new(0),
-        });
+        let shared = Arc::new(Shared::new(cluster));
 
         let tasks = listeners
             .into_iter()
@@ -339,23 +449,106 @@ impl FakeBroker {
 
         Ok(Self {
             shared,
-            addrs,
+            transport: Transport::Tcp(addrs),
             tasks,
         })
     }
 
-    /// Bootstrap string for every broker, ready to hand to a client builder.
-    pub fn bootstrap_servers(&self) -> String {
-        self.addrs
-            .iter()
-            .map(SocketAddr::to_string)
-            .collect::<Vec<_>>()
-            .join(",")
+    /// Start a cluster of `broker_count` brokers that clients reach over
+    /// in-memory streams instead of TCP.
+    ///
+    /// Nothing touches the operating system's network, so a client built from
+    /// [`FakeBroker::kafka`] runs under `tokio::time::pause` on a
+    /// current-thread runtime and a run is reproducible: the same client
+    /// calls and the same hooks give the same requests at the same simulated
+    /// times. Brokers advertise `broker-<id>:9092`; only [`FakeBroker::kafka`]
+    /// can reach them, so [`FakeBroker::bootstrap_servers`] alone is not
+    /// enough to connect.
+    pub fn start_in_memory(broker_count: usize) -> Self {
+        let broker_count = broker_count.max(1);
+        let mut cluster = ClusterState::new(broker_count);
+        let mut addrs = Vec::with_capacity(broker_count);
+        for broker in &mut cluster.brokers {
+            broker.host = format!("broker-{}", broker.node_id);
+            broker.port = 9092;
+            addrs.push(format!("{}:{}", broker.host, broker.port));
+        }
+        Self {
+            shared: Arc::new(Shared::new(cluster)),
+            transport: Transport::Memory(addrs),
+            tasks: Vec::new(),
+        }
     }
 
-    /// Address of one broker by node ID.
+    /// A [`KafkaBuilder`](crate::KafkaBuilder) for this cluster: its
+    /// bootstrap servers and, for an in-memory cluster, the in-memory
+    /// transport.
+    pub fn kafka(&self) -> crate::KafkaBuilder {
+        let builder = crate::Kafka::builder(self.bootstrap_servers());
+        match &self.transport {
+            Transport::Tcp(_) => builder,
+            Transport::Memory(addrs) => {
+                let shared = Arc::downgrade(&self.shared);
+                let addrs = addrs.clone();
+                builder.connector(Arc::new(move |address: &str| {
+                    let refused = || io::Error::from(io::ErrorKind::ConnectionRefused);
+                    let shared = shared.upgrade().ok_or_else(refused)?;
+                    let node_id = addrs
+                        .iter()
+                        .position(|a| a == address)
+                        .and_then(|i| i32::try_from(i).ok())
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::NotFound,
+                                format!("no in-memory broker at {address}"),
+                            )
+                        })?;
+                    if shared.crashed.lock().contains(&node_id) {
+                        return Err(refused());
+                    }
+                    let (client, server) = tokio::io::duplex(MEMORY_BUFFER);
+                    shared.accept(server, node_id);
+                    Ok(client)
+                }))
+            }
+        }
+    }
+
+    /// Bootstrap string for every broker, ready to hand to a client builder.
+    pub fn bootstrap_servers(&self) -> String {
+        match &self.transport {
+            Transport::Tcp(addrs) => addrs
+                .iter()
+                .map(SocketAddr::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+            Transport::Memory(addrs) => addrs.join(","),
+        }
+    }
+
+    /// Address of one broker by node ID; `None` on an in-memory cluster.
     pub fn broker_addr(&self, node_id: i32) -> Option<SocketAddr> {
-        self.addrs.get(usize::try_from(node_id).ok()?).copied()
+        match &self.transport {
+            Transport::Tcp(addrs) => addrs.get(usize::try_from(node_id).ok()?).copied(),
+            Transport::Memory(_) => None,
+        }
+    }
+
+    /// Crash a broker: drop every open connection to it and refuse new ones
+    /// until [`FakeBroker::restart`]. Its logs and the cluster state are
+    /// kept, as a broker's disk is.
+    pub fn crash(&self, node_id: i32) {
+        self.shared.crashed.lock().insert(node_id);
+        if let Some(tasks) = self.shared.open.lock().remove(&node_id) {
+            for task in tasks {
+                task.abort();
+            }
+        }
+    }
+
+    /// Accept connections to a crashed broker again.
+    pub fn restart(&self, node_id: i32) {
+        self.shared.crashed.lock().remove(&node_id);
     }
 
     // -- control hooks ------------------------------------------------------
@@ -414,6 +607,11 @@ impl FakeBroker {
     /// Every request the broker has served, in arrival order.
     pub fn requests(&self) -> Vec<RecordedRequest> {
         self.shared.log.lock().clone()
+    }
+
+    /// How many client connections are open now.
+    pub fn open_connections(&self) -> u64 {
+        self.shared.open_connections.load(Ordering::Relaxed)
     }
 
     /// How many requests for `api_key` the broker has served.
@@ -502,14 +700,38 @@ impl FakeBroker {
     /// The escape hatch for anything the named helpers below do not cover. The
     /// state lock is held for the duration of the closure, so no request is
     /// served while it runs.
+    ///
+    /// A `Fetch` or `ShareFetch` the broker is holding for data is
+    /// re-evaluated afterwards, so records appended here reach a waiting
+    /// consumer at once.
     pub fn with_state<T>(&self, f: impl FnOnce(&mut ClusterState) -> T) -> T {
-        f(&mut self.shared.cluster.lock())
+        self.shared.mutate(f)
     }
 
     /// Create a topic with `partitions` partitions, spreading leadership over
     /// the online brokers. Returns `false` if the topic already existed.
     pub fn create_topic(&self, name: &str, partitions: i32) -> bool {
-        self.shared.cluster.lock().create_topic(name, partitions)
+        self.with_state(|s| s.create_topic(name, partitions))
+    }
+
+    /// Delete a topic and everything stored for it. Returns `false` if it did
+    /// not exist.
+    ///
+    /// Creating it again with [`create_topic`](Self::create_topic) gives it a
+    /// new topic ID and partitions starting at leader epoch 0 — the
+    /// delete-and-recreate a client must not confuse with the old topic.
+    pub fn delete_topic(&self, name: &str) -> bool {
+        self.with_state(|s| s.delete_topic(name))
+    }
+
+    /// The topic ID of `name`, if it exists.
+    pub fn topic_id(&self, name: &str) -> Option<[u8; 16]> {
+        self.shared
+            .cluster
+            .lock()
+            .topics
+            .get(name)
+            .map(|t| t.topic_id)
     }
 
     /// Grow an existing topic to `partitions` partitions, as a
@@ -519,7 +741,7 @@ impl FakeBroker {
     /// or already has at least that many. Kafka never removes partitions, and
     /// neither does this.
     pub fn add_partitions(&self, topic: &str, partitions: i32) -> usize {
-        self.shared.cluster.lock().add_partitions(topic, partitions)
+        self.with_state(|s| s.add_partitions(topic, partitions))
     }
 
     /// Move a partition's leader to `node_id` and bump its leader epoch.
@@ -529,8 +751,7 @@ impl FakeBroker {
     /// next fetch against the old leader is answered with a leader-epoch error
     /// rather than silently succeeding.
     pub fn set_leader(&self, topic: &str, partition: i32, node_id: i32) -> bool {
-        let mut cluster = self.shared.cluster.lock();
-        match cluster.partition_mut(topic, partition) {
+        self.with_state(|cluster| match cluster.partition_mut(topic, partition) {
             Some(p) => {
                 p.leader = node_id;
                 p.leader_epoch += 1;
@@ -543,21 +764,20 @@ impl FakeBroker {
                 true
             }
             None => false,
-        }
+        })
     }
 
     /// Bump a partition's leader epoch without changing the leader.
     ///
     /// Returns `false` if the topic-partition does not exist.
     pub fn bump_leader_epoch(&self, topic: &str, partition: i32) -> bool {
-        let mut cluster = self.shared.cluster.lock();
-        match cluster.partition_mut(topic, partition) {
+        self.with_state(|cluster| match cluster.partition_mut(topic, partition) {
             Some(p) => {
                 p.leader_epoch += 1;
                 true
             }
             None => false,
-        }
+        })
     }
 
     /// Point a consumer group's coordinator at `node_id`.
@@ -598,6 +818,118 @@ impl FakeBroker {
         }
     }
 
+    /// Set the rack a broker advertises in Metadata, or `None` for no rack.
+    pub fn set_broker_rack(&self, node_id: i32, rack: Option<&str>) {
+        let mut cluster = self.shared.cluster.lock();
+        if let Some(broker) = cluster.brokers.iter_mut().find(|b| b.node_id == node_id) {
+            broker.rack = rack.map(str::to_string);
+        }
+    }
+
+    /// Report `throttle` as `throttle_time_ms` on every response to `api_key`
+    /// (KIP-219); `Duration::ZERO` stops it. The response is still sent at
+    /// once: honouring the throttle is the client's job.
+    ///
+    /// Applies to every API whose response carries the field, including
+    /// `Produce`, except `ApiVersions`.
+    pub fn set_throttle(&self, api_key: ApiKey, throttle: Duration) {
+        let ms = i32::try_from(throttle.as_millis()).unwrap_or(i32::MAX);
+        let mut cluster = self.shared.cluster.lock();
+        if ms == 0 {
+            cluster.throttle_time_ms.remove(&api_key);
+        } else {
+            cluster.throttle_time_ms.insert(api_key, ms);
+        }
+    }
+
+    /// Require SASL/PLAIN with these credentials on every connection, as a
+    /// `SASL_PLAINTEXT` listener does: `ApiVersions`, `SaslHandshake` and
+    /// `SaslAuthenticate` are served, any other request on an
+    /// unauthenticated connection closes it, and wrong credentials are
+    /// answered with `SASL_AUTHENTICATION_FAILED`.
+    pub fn require_sasl_plain(&self, username: &str, password: &str) {
+        self.shared.mutate(|s| {
+            s.sasl_plain = Some((username.to_string(), password.to_string()));
+        });
+    }
+
+    /// Switch producer-state enforcement on partition leaders on or off.
+    ///
+    /// On by default, as on every broker: duplicates of any of a producer's
+    /// last five batches are acknowledged at their original offset without
+    /// being written again, a sequence gap is `OUT_OF_ORDER_SEQUENCE_NUMBER`,
+    /// a stale epoch is `INVALID_PRODUCER_EPOCH`, and a transactional write
+    /// must match the coordinator's producer ID, epoch and partitions. Off,
+    /// every batch is appended as it arrives — the negative control for a
+    /// test that relies on de-duplication.
+    pub fn set_idempotence(&self, enabled: bool) {
+        self.shared.cluster.lock().idempotence = enabled;
+    }
+
+    /// Forget the producer state a partition's leader keeps, as log retention
+    /// or truncation does. The producer's next write there is treated as one
+    /// from a producer the leader has never seen.
+    ///
+    /// Returns `false` if the topic-partition does not exist.
+    pub fn clear_producer_state(&self, topic: &str, partition: i32) -> bool {
+        self.with_state(|cluster| match cluster.partition_mut(topic, partition) {
+            Some(p) => {
+                p.producers.clear();
+                true
+            }
+            None => false,
+        })
+    }
+
+    /// Hold transaction markers back (`true`), or write every held marker now
+    /// and stop holding them (`false`).
+    ///
+    /// While held, an `EndTxn` leaves its transaction in `PrepareCommit` or
+    /// `PrepareAbort`, and the coordinator answers that producer's next
+    /// `InitProducerId`, `AddPartitionsToTxn`, `AddOffsetsToTxn`, TV2
+    /// `Produce` and a retried `EndTxn` with `CONCURRENT_TRANSACTIONS`, as a
+    /// real coordinator does while its markers are in flight.
+    pub fn hold_transaction_markers(&self, hold: bool) {
+        self.with_state(|cluster| {
+            cluster.hold_transaction_markers = hold;
+            if !hold {
+                let ids: Vec<String> = cluster.transactions.keys().cloned().collect();
+                for id in ids {
+                    cluster.write_transaction_markers(&id);
+                }
+            }
+        });
+    }
+
+    /// Abort the open transaction of `transactional_id` as the coordinator
+    /// does when it times out: bump the epoch, which fences the producer, and
+    /// write abort markers.
+    ///
+    /// Returns `false` if no transaction is open for it.
+    pub fn abort_transaction(&self, transactional_id: &str) -> bool {
+        self.with_state(|cluster| {
+            let open = cluster
+                .transactions
+                .get(transactional_id)
+                .is_some_and(BrokerTransaction::is_open);
+            if open {
+                cluster.fence_transaction(transactional_id);
+            }
+            open
+        })
+    }
+
+    /// The coordinator's state for `transactional_id`, if `InitProducerId`
+    /// has run for it.
+    pub fn transaction_status(&self, transactional_id: &str) -> Option<TxnStatus> {
+        self.shared
+            .cluster
+            .lock()
+            .transactions
+            .get(transactional_id)
+            .map(|t| t.status)
+    }
+
     /// Advertise a different `ApiVersions` range for one API.
     ///
     /// The broker normally advertises exactly the one version each handler
@@ -619,6 +951,19 @@ impl FakeBroker {
             .lock()
             .api_version_overrides
             .insert(api_key, (min_version, max_version));
+    }
+
+    /// Act as a cluster with a client-telemetry plugin holding `subscription`
+    /// (KIP-714): `GetTelemetrySubscriptions` and `PushTelemetry` are
+    /// advertised and answered. `None`, the default, is a cluster without a
+    /// plugin: neither API is advertised.
+    pub fn set_telemetry(&self, subscription: Option<TelemetrySubscription>) {
+        self.shared.mutate(|state| state.telemetry = subscription);
+    }
+
+    /// The `PushTelemetry` requests received so far, in arrival order.
+    pub fn telemetry_pushes(&self) -> Vec<TelemetryPush> {
+        self.shared.cluster.lock().telemetry_pushes.clone()
     }
 
     /// Cluster-finalized level of a feature (KIP-584), if `UpdateFeatures` has
@@ -643,9 +988,44 @@ impl FakeBroker {
             .map(|c| c.offset)
     }
 
+    /// Every share acknowledgement the broker applied for one partition of
+    /// `group_id`, per offset, in the order it applied them.
+    pub fn share_acknowledgements(
+        &self,
+        group_id: &str,
+        topic: &str,
+        partition: i32,
+    ) -> std::collections::BTreeMap<i64, Vec<ShareAckType>> {
+        self.shared
+            .cluster
+            .lock()
+            .share_groups
+            .get(group_id)
+            .and_then(|g| g.partitions.get(&(topic.to_string(), partition)))
+            .map(|p| p.acknowledgements.clone())
+            .unwrap_or_default()
+    }
+
     /// Share sessions clients closed with the final epoch, in arrival order.
     pub fn share_session_closes(&self) -> Vec<ShareSessionClose> {
         self.shared.cluster.lock().share_session_closes.clone()
+    }
+
+    /// Every `ListOffsets` partition lookup the brokers served, in arrival
+    /// order.
+    pub fn list_offsets_lookups(&self) -> Vec<ListOffsetsLookup> {
+        self.shared.cluster.lock().list_offsets_lookups.clone()
+    }
+
+    /// Every member named in a `LeaveGroup` request, in arrival order.
+    pub fn leave_group_members(&self) -> Vec<LeaveGroupMemberSeen> {
+        self.shared.cluster.lock().leave_group_members.clone()
+    }
+
+    /// Every `ConsumerGroupHeartbeat` that reached its coordinator, in
+    /// arrival order.
+    pub fn consumer_group_heartbeats(&self) -> Vec<ConsumerGroupHeartbeatSeen> {
+        self.shared.cluster.lock().consumer_group_heartbeats.clone()
     }
 
     /// Offset the next record appended to a partition will receive, which for
@@ -711,7 +1091,7 @@ impl FakeBroker {
             .lock()
             .transactions
             .get(transactional_id)
-            .is_some_and(|t| t.open)
+            .is_some_and(BrokerTransaction::is_open)
     }
 
     /// Last stable offset of a partition: the first offset a `read_committed`
@@ -730,10 +1110,7 @@ impl FakeBroker {
     /// Every record on `topic` that a `read_committed` consumer would see.
     ///
     /// Reads the broker's own log directly: no consumer, no polling, no
-    /// timeout. A test asserting exactly-once behaviour previously had to build
-    /// a consumer with the right isolation level, subscribe, poll in a bounded
-    /// loop and collect — twenty-five lines whose iteration count is the sort
-    /// of thing that becomes flaky when someone tunes it.
+    /// timeout.
     ///
     /// Excludes records inside a transaction that aborted, and records inside a
     /// transaction that is still open (they sit at or past the last stable
@@ -826,18 +1203,14 @@ impl FakeBroker {
 
                 for record in batch.records {
                     out.push(ConsumerRecord {
-                        topic: topic.to_string(),
+                        topic: std::sync::Arc::from(topic),
                         partition: partition_id,
                         offset: base.saturating_add(i64::from(record.offset_delta)),
                         timestamp: batch.base_timestamp.saturating_add(record.timestamp_delta),
-                        timestamp_type: batch.attributes.timestamp_type as i8,
+                        timestamp_type: batch.attributes.timestamp_type,
                         key: record.key,
                         value: record.value,
-                        headers: record
-                            .headers
-                            .into_iter()
-                            .map(|h| (h.key, h.value))
-                            .collect(),
+                        headers: crate::consumer::headers_from_wire(record.headers),
                         leader_epoch: Some(batch.partition_leader_epoch),
                         delivery_count: None,
                     });
@@ -863,6 +1236,13 @@ impl FakeBroker {
     }
 }
 
+/// Seed the calling thread's random draws: backoff jitter, keyless partition
+/// choice, broker shuffles and generated member IDs. On a current-thread runtime every client task
+/// runs on the calling thread, so one seed fixes them all.
+pub fn seed_rng(seed: u64) {
+    crate::util::seed_rng(seed);
+}
+
 fn io_error(e: io::Error) -> KrafkaError {
     KrafkaError::network(e)
 }
@@ -872,12 +1252,7 @@ async fn accept_loop(listener: TcpListener, node_id: i32, shared: Arc<Shared>) {
         match listener.accept().await {
             Ok((stream, peer)) => {
                 debug!(node_id, %peer, "fake broker accepted a connection");
-                let shared = Arc::clone(&shared);
-                tokio::spawn(async move {
-                    if let Err(e) = serve(stream, node_id, shared).await {
-                        debug!(node_id, "fake broker connection ended: {e}");
-                    }
-                });
+                shared.accept(stream, node_id);
             }
             Err(e) => {
                 warn!(node_id, "fake broker accept failed: {e}");
@@ -892,7 +1267,11 @@ async fn accept_loop(listener: TcpListener, node_id: i32, shared: Arc<Shared>) {
 /// Requests are handled strictly in order: the response is written before the
 /// next frame is read. That matches Kafka's per-connection response ordering
 /// and is what makes a delayed response also delay everything behind it.
-async fn serve(mut stream: TcpStream, node_id: i32, shared: Arc<Shared>) -> Result<()> {
+async fn serve<S>(mut stream: S, node_id: i32, connection: u64, shared: Arc<Shared>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut authenticated = false;
     loop {
         let mut len_buf = [0u8; 4];
         match stream.read_exact(&mut len_buf).await {
@@ -955,75 +1334,192 @@ async fn serve(mut stream: TcpStream, node_id: i32, shared: Arc<Shared>) -> Resu
             client_id: header.client_id.clone(),
             node_id,
             sequence,
+            connection,
+            at: shared.started.elapsed(),
         });
 
+        let sasl_plain = shared.cluster.lock().sasl_plain.clone();
+        if let Some(credentials) = sasl_plain {
+            let mut body = BytesMut::new();
+            match api_key {
+                ApiKey::ApiVersions => {}
+                ApiKey::SaslHandshake => {
+                    handlers::sasl_handshake(&mut frame, &mut body)?;
+                    write_response(&mut stream, &header, &body).await?;
+                    continue;
+                }
+                ApiKey::SaslAuthenticate => {
+                    authenticated =
+                        handlers::sasl_authenticate(&mut frame, &credentials, &mut body)?;
+                    write_response(&mut stream, &header, &body).await?;
+                    continue;
+                }
+                // A real broker closes a connection that skips authentication.
+                _ if !authenticated => return Ok(()),
+                _ => {}
+            }
+        }
+
         let mut control = shared.hooks.lock().take(&info).unwrap_or(Control::Pass);
-
-        // Delays run outside every lock so other connections keep being served.
-        loop {
-            match control {
-                Control::Delay(d) => {
-                    tokio::time::sleep(d).await;
-                    control = Control::Pass;
-                }
-                Control::DelayThen(d, inner) => {
-                    tokio::time::sleep(d).await;
-                    control = *inner;
-                }
-                _ => break,
-            }
-        }
-
-        match control {
-            Control::Disconnect => return Ok(()),
-            Control::Silence => {
-                // Hold the connection open and answer nothing further. Kafka
-                // responses are ordered per connection, so nothing after this
-                // could be answered anyway.
-                std::future::pending::<()>().await;
-                return Ok(());
-            }
-            _ => {}
-        }
+        control = run_delays(control).await;
 
         let mut body = BytesMut::new();
-        let outcome = match control {
+        match control {
+            Control::Disconnect => return Ok(()),
+            Control::Silence => return silence().await,
             Control::Error(code) => {
-                handlers::dispatch_error(api_key, header.api_version, &mut frame, code, &mut body)
+                handlers::dispatch_error(api_key, header.api_version, &mut frame, code, &mut body)?;
             }
             Control::CorruptRecords => {
                 let mut cluster = shared.cluster.lock();
-                handlers::dispatch_corrupt(api_key, &mut frame, node_id, &mut cluster, &mut body)
+                handlers::dispatch_corrupt(api_key, &mut frame, node_id, &mut cluster, &mut body)?;
             }
-            _ => {
-                let mut cluster = shared.cluster.lock();
-                handlers::dispatch(
-                    api_key,
-                    header.api_version,
-                    &mut frame,
-                    node_id,
-                    header.client_id.as_deref(),
-                    &mut cluster,
-                    &mut body,
-                )
+            Control::ApplyThen(after) => {
+                serve_default(&shared, &header, &frame, node_id, true, &mut body).await?;
+                match run_delays(*after).await {
+                    Control::Pass => {}
+                    Control::Disconnect => return Ok(()),
+                    Control::Silence => return silence().await,
+                    Control::Error(code) => {
+                        body.clear();
+                        handlers::dispatch_error(
+                            api_key,
+                            header.api_version,
+                            &mut frame,
+                            code,
+                            &mut body,
+                        )?;
+                    }
+                    other => {
+                        return Err(KrafkaError::protocol_kind(
+                            crate::error::ProtocolErrorKind::InvalidValue,
+                            format!("fake broker: {other:?} cannot follow Control::ApplyThen"),
+                        ));
+                    }
+                }
             }
+            _ => serve_default(&shared, &header, &frame, node_id, false, &mut body).await?,
+        }
+
+        let throttle = shared.cluster.lock().throttle(api_key);
+        apply_throttle(api_key, header.api_version, throttle, &mut body);
+        write_response(&mut stream, &header, &body).await?;
+    }
+}
+
+/// Frame `body` behind the response header for `header` and write it.
+async fn write_response<S>(stream: &mut S, header: &ParsedHeader, body: &[u8]) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let mut out = BytesMut::with_capacity(body.len() + 8);
+    out.put_i32(0); // placeholder for the frame length
+    write_response_header(
+        &mut out,
+        header.api_key,
+        header.api_version,
+        header.correlation_id,
+    );
+    out.put_slice(body);
+    let frame_len = i32::try_from(out.len() - 4).map_err(|_| {
+        KrafkaError::protocol_kind(
+            crate::error::ProtocolErrorKind::Malformed,
+            "fake broker: response frame exceeds i32::MAX",
+        )
+    })?;
+    out[0..4].copy_from_slice(&frame_len.to_be_bytes());
+    stream.write_all(&out).await.map_err(io_error)?;
+    stream.flush().await.map_err(io_error)
+}
+
+/// Resolve `Delay` and `DelayThen` into the control that follows them,
+/// sleeping outside every lock so other connections keep being served.
+async fn run_delays(mut control: Control) -> Control {
+    loop {
+        match control {
+            Control::Delay(d) => {
+                tokio::time::sleep(d).await;
+                control = Control::Pass;
+            }
+            Control::DelayThen(d, inner) => {
+                tokio::time::sleep(d).await;
+                control = *inner;
+            }
+            other => return other,
+        }
+    }
+}
+
+/// Hold the connection open and answer nothing further. Kafka responses are
+/// ordered per connection, so nothing after this could be answered anyway.
+async fn silence() -> Result<()> {
+    std::future::pending::<()>().await;
+    Ok(())
+}
+
+/// Serve a request with the default handlers, holding a `Fetch` or
+/// `ShareFetch` that has nothing to return until data arrives or its wait
+/// runs out. `no_wait` answers at once.
+async fn serve_default(
+    shared: &Shared,
+    header: &ParsedHeader,
+    frame: &Bytes,
+    node_id: i32,
+    no_wait: bool,
+    body: &mut BytesMut,
+) -> Result<()> {
+    let mut poll = handlers::LongPoll {
+        expired: no_wait,
+        ..handlers::LongPoll::default()
+    };
+    let mut deadline: Option<tokio::time::Instant> = None;
+    loop {
+        // Registered before the state is read, so a change that lands between
+        // the read and the wait still wakes it.
+        let changed = shared.changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+
+        body.clear();
+        let mut request = frame.clone();
+        let served = {
+            let mut cluster = shared.cluster.lock();
+            handlers::dispatch(
+                header.api_key,
+                header.api_version,
+                &mut request,
+                node_id,
+                header.client_id.as_deref(),
+                &mut cluster,
+                &mut poll,
+                body,
+            )?
         };
-        outcome?;
+        match served {
+            handlers::Served::Done => break,
+            handlers::Served::Wait(max_wait) => {
+                let until = *deadline.get_or_insert_with(|| tokio::time::Instant::now() + max_wait);
+                tokio::select! {
+                    () = &mut changed => {}
+                    () = tokio::time::sleep_until(until) => poll.expired = true,
+                }
+            }
+        }
+    }
+    if !matches!(header.api_key, ApiKey::Fetch | ApiKey::ShareFetch) {
+        shared.changed.notify_waiters();
+    }
+    Ok(())
+}
 
-        let mut out = BytesMut::with_capacity(body.len() + 8);
-        out.put_i32(0); // placeholder for the frame length
-        write_response_header(&mut out, api_key, header.api_version, header.correlation_id);
-        out.put_slice(&body);
-        let frame_len = i32::try_from(out.len() - 4).map_err(|_| {
-            KrafkaError::protocol_kind(
-                crate::error::ProtocolErrorKind::Malformed,
-                "fake broker: response frame exceeds i32::MAX",
-            )
-        })?;
-        out[0..4].copy_from_slice(&frame_len.to_be_bytes());
-
-        stream.write_all(&out).await.map_err(io_error)?;
-        stream.flush().await.map_err(io_error)?;
+/// Overwrite the leading `throttle_time_ms` of a response body, for the APIs
+/// whose body starts with it.
+fn apply_throttle(api_key: ApiKey, api_version: i16, throttle_time_ms: i32, body: &mut BytesMut) {
+    let leads = api_key
+        .leading_throttle_time_min_version()
+        .is_some_and(|min| api_version >= min);
+    if throttle_time_ms > 0 && leads && body.len() >= 4 {
+        body[..4].copy_from_slice(&throttle_time_ms.to_be_bytes());
     }
 }
 

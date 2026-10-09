@@ -11,6 +11,9 @@ use crate::error::{KrafkaError, ProtocolErrorKind, Result};
 /// Maximum message size (default 100MB, configurable).
 pub const MAX_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
 
+/// Bytes requested per socket read while no frame length is known yet.
+const READ_CHUNK: usize = 64 * 1024;
+
 /// Encoder for Kafka protocol messages.
 #[derive(Debug, Default)]
 pub struct Encoder {
@@ -117,6 +120,56 @@ impl Decoder {
     /// Add data to the decoder buffer.
     pub fn extend(&mut self, data: &[u8]) {
         self.buffer.extend_from_slice(data);
+    }
+
+    /// Read the next complete frame from `reader`.
+    ///
+    /// Socket data is read straight into the frame buffer. Once a frame's
+    /// length prefix is known, the whole frame is reserved at once, so a large
+    /// response costs one allocation and one copy (kernel to buffer) rather
+    /// than a growing series of reallocations.
+    ///
+    /// Returns `Ok(None)` on a clean end of stream between frames; an end of
+    /// stream inside a frame is an error.
+    pub async fn read_frame<R>(&mut self, reader: &mut R) -> Result<Option<Bytes>>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        use tokio::io::AsyncReadExt;
+        loop {
+            if let Some(frame) = self.decode()? {
+                return Ok(Some(frame));
+            }
+            let want = match self.declared_frame_len() {
+                Some(frame_len) => frame_len - self.buffer.len(),
+                None => READ_CHUNK,
+            };
+            self.buffer.reserve(want);
+            let n = reader
+                .read_buf(&mut self.buffer)
+                .await
+                .map_err(KrafkaError::network)?;
+            if n == 0 {
+                if self.buffer.is_empty() {
+                    return Ok(None);
+                }
+                return Err(KrafkaError::network(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "connection closed inside a frame ({} bytes buffered)",
+                        self.buffer.len()
+                    ),
+                )));
+            }
+        }
+    }
+
+    /// Length of the frame being assembled, prefix included, once the prefix
+    /// has arrived and is within bounds.
+    fn declared_frame_len(&self) -> Option<usize> {
+        let prefix: [u8; 4] = self.buffer.get(..4)?.try_into().ok()?;
+        let size = usize::try_from(i32::from_be_bytes(prefix)).ok()?;
+        (size <= self.max_size).then_some(4 + size)
     }
 
     /// Try to decode the next message.

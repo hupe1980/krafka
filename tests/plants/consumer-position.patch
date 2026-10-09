@@ -1,0 +1,11 @@
+diff -ruN a/src/consumer/mod.rs b/src/consumer/mod.rs
+--- a/src/consumer/mod.rs
++++ b/src/consumer/mod.rs
+@@ -542,6 +542,7 @@
+         loop {
+             let records = self.deliver(max)?;
+             if !records.is_empty() {
++                tokio::task::yield_now().await;
+                 return Ok(records);
+             }
+ 

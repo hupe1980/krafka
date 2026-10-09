@@ -4,62 +4,9 @@
 //! Each request/response type implements [`VersionedEncode`] and/or
 //! [`VersionedDecode`] for version-dispatched encoding and decoding.
 //!
-//! Types are organized by API category:
-//! - [`metadata`] — Metadata request/response
-//! - [`produce`] — Produce request/response
-//! - [`fetch`] — Fetch request/response
-//! - [`coordinator`] — FindCoordinator request/response
-//! - [`join_group`] — JoinGroup
-//! - [`sync_group`] — SyncGroup
-//! - [`heartbeat`] — Heartbeat
-//! - [`leave_group`] — LeaveGroup
-//! - [`offset_commit`] — OffsetCommit
-//! - [`list_offsets`] — ListOffsets
-//! - [`offset_fetch`] — OffsetFetch
-//! - [`offset_for_leader_epoch`] — OffsetForLeaderEpoch
-//! - [`create_topics`] — CreateTopics
-//! - [`delete_topics`] — DeleteTopics
-//! - [`create_partitions`] — CreatePartitions
-//! - [`describe_topic_partitions`] — DescribeTopicPartitions
-//! - [`describe_configs`] — DescribeConfigs
-//! - [`incremental_alter_configs`] — IncrementalAlterConfigs
-//! - [`consumer_group_describe`] — ConsumerGroupDescribe (Key 69, KIP-848)
-//! - [`consumer_protocol`] — the embedded `ConsumerProtocolAssignment` blob
-//!   carried by classic groups
-//! - [`delete_groups`] — DeleteGroups (Key 42)
-//! - [`describe_cluster`] — DescribeCluster (Key 60)
-//! - [`describe_groups`] — DescribeGroups (Key 15)
-//! - [`list_config_resources`] — ListConfigResources (Key 74, KIP-1142)
-//! - [`list_groups`] — ListGroups (Key 16)
-//! - [`update_features`] — UpdateFeatures (Key 57, KIP-584)
-//! - [`sasl`] — SaslHandshake, SaslAuthenticate
-//! - [`acl`] — ACL management (DescribeAcls, CreateAcls, DeleteAcls)
-//! - [`init_producer_id`] — InitProducerId
-//! - [`add_partitions_to_txn`] — AddPartitionsToTxn
-//! - [`add_offsets_to_txn`] — AddOffsetsToTxn
-//! - [`end_txn`] — EndTxn, TransactionResult
-//! - [`txn_offset_commit`] — TxnOffsetCommit
-//! - [`delete_records`] — DeleteRecords
-//! - [`delegation_token`] — Delegation token management
-//! - [`describe_client_quotas`] — DescribeClientQuotas
-//! - [`alter_client_quotas`] — AlterClientQuotas
-//! - [`consumer_group_heartbeat`] — KIP-848 consumer group heartbeat
-//! - [`alter_partition_reassignments`] — AlterPartitionReassignments
-//! - [`alter_replica_log_dirs`] — AlterReplicaLogDirs
-//! - [`describe_log_dirs`] — DescribeLogDirs
-//! - [`describe_producers`] — DescribeProducers
-//! - [`describe_transactions`] — DescribeTransactions
-//! - [`describe_quorum`] — DescribeQuorum
-//! - [`elect_leaders`] — ElectLeaders
-//! - [`list_partition_reassignments`] — ListPartitionReassignments
-//! - [`list_transactions`] — ListTransactions
-//! - [`offset_delete`] — OffsetDelete
-//! - [`describe_user_scram_credentials`] — DescribeUserScramCredentials
-//! - [`alter_user_scram_credentials`] — AlterUserScramCredentials
-//! - [`write_txn_markers`] — WriteTxnMarkers
-//! - [`telemetry`] — KIP-714 telemetry (feature-gated)
-//! - [`share`] — KIP-932 share groups (feature-gated)
-//! - [`share_group_offsets`] — Share-group offset admin (Keys 90–92, KIP-932/KIP-1226)
+//! One submodule per API, named after it in snake case (`fetch`,
+//! `join_group`, …). [`consumer_protocol`] holds the `ConsumerProtocol`
+//! subscription and assignment blobs that classic groups carry.
 
 use bytes::{Buf, BufMut, Bytes};
 
@@ -263,10 +210,7 @@ pub use share_group_offsets::*;
 mod streams_group_describe;
 pub use streams_group_describe::*;
 
-#[cfg(feature = "telemetry")]
 mod telemetry;
-#[cfg(feature = "telemetry")]
-#[cfg_attr(docsrs, doc(cfg(feature = "telemetry")))]
 pub use telemetry::*;
 
 mod create_topics;

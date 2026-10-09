@@ -5,12 +5,10 @@
 //! as `sasl.oauthbearer.method=oidc` — plus the RFC 7523 **client assertion**
 //! variant that Kafka 4.3 added in KIP-1258.
 //!
-//! # Why this exists
-//!
-//! [`OAuthBearerTokenProvider`] has always let an application supply tokens,
-//! but that made every krafka user write their own OAuth client: an HTTPS POST,
-//! form encoding, JSON parsing, `expires_in` arithmetic and a retry policy.
-//! Every other major Kafka client ships that flow. This is it.
+//! [`OidcTokenProvider`] is a [`CredentialProvider`]
+//! of OAUTHBEARER tokens: an HTTPS POST, form encoding, JSON parsing and
+//! `expires_in` arithmetic, so an application does not write its own OAuth
+//! client.
 //!
 //! # Two ways to authenticate to the token endpoint
 //!
@@ -19,25 +17,19 @@
 //! | Client secret (KIP-768) | [`ClientCredentials::secret`] | HTTP Basic `client_id:client_secret` |
 //! | Client assertion (KIP-1258, RFC 7523) | [`ClientCredentials::assertion`] | `client_assertion_type` + a signed JWT |
 //!
-//! Client assertion is the stronger of the two: the credential on the wire is a
-//! short-lived signature rather than a long-lived shared secret, and the
-//! private key never leaves the workload. It is also what makes krafka usable
-//! with identity providers that refuse `client_secret_basic` outright.
+//! With a client assertion the credential on the wire is a short-lived
+//! signature, and the private key never leaves the workload.
 //!
 //! # No cryptography dependency
 //!
-//! krafka does **not** sign the assertion for you, and deliberately so. Signing
-//! needs RSA or ECDSA, and pinning a specific implementation on every user of a
-//! Kafka client is a supply-chain decision that belongs to the application.
+//! krafka does **not** sign the assertion; the choice of RSA/ECDSA
+//! implementation stays with the application. The signed JWT is *sourced*:
 //!
-//! Instead the signed JWT is *sourced*:
-//!
-//! - [`AssertionSource::File`] — read from disk on every token request. This is
-//!   the cloud-native path: a SPIFFE agent, a Vault sidecar or a projected
-//!   Kubernetes service-account token writes the file and rotates it, and
-//!   krafka picks up each new value without a restart. It is also exactly what
-//!   Kafka's own `sasl.oauthbearer.assertion.file` does.
-//! - [`AssertionSource::Callback`] — you produce the JWT, signing it with
+//! - [`AssertionSource::file`] — read from disk on every token request, so a
+//!   SPIFFE agent, a Vault sidecar or a projected Kubernetes service-account
+//!   token can rotate it without a restart. Same as Kafka's
+//!   `sasl.oauthbearer.assertion.file`.
+//! - [`AssertionSource::provider`] — you produce the JWT, signing it with
 //!   whatever library you already depend on.
 //!
 //! # Example
@@ -56,7 +48,7 @@
 //! // Or a sidecar-issued assertion (KIP-1258).
 //! let provider = OidcTokenProvider::builder("https://idp.example.com/oauth2/token")
 //!     .credentials(ClientCredentials::assertion(
-//!         AssertionSource::File("/var/run/secrets/oauth/assertion.jwt".into()),
+//!         AssertionSource::file("/var/run/secrets/oauth/assertion.jwt"),
 //!     ))
 //!     .client_id("my-client-id")
 //!     .request_timeout(Duration::from_secs(10))
@@ -68,9 +60,7 @@
 //! # }
 //! ```
 
-use std::future::Future;
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -80,7 +70,9 @@ use zeroize::Zeroizing;
 use crate::error::{KrafkaError, Result};
 use crate::http::{HttpClient, base64_encode};
 
-use super::oauthbearer::{OAuthBearerToken, OAuthBearerTokenProvider};
+use super::TlsConfig;
+use super::oauthbearer::OAuthBearerToken;
+use super::{CredentialProvider, ErasedCredentialProvider};
 
 /// RFC 7523 §2.2 client-assertion type, sent verbatim as a form parameter.
 const JWT_BEARER_ASSERTION_TYPE: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
@@ -88,9 +80,9 @@ const JWT_BEARER_ASSERTION_TYPE: &str = "urn:ietf:params:oauth:client-assertion-
 /// Largest token-endpoint response body accepted, in bytes.
 ///
 /// A token response is a small JSON object; real ones run to a few kilobytes
-/// even with a large JWT. The cap stops a hostile or misconfigured endpoint —
-/// or an HTML error page from a captive portal — from being buffered without
-/// bound on every reconnect.
+/// even with a large JWT. The HTTP client enforces the cap while reading, so a
+/// hostile or misconfigured endpoint — or an HTML error page from a captive
+/// portal — cannot make it buffer more on every reconnect.
 const MAX_TOKEN_RESPONSE_BYTES: usize = 1024 * 1024;
 
 /// Largest assertion file accepted, in bytes.
@@ -105,50 +97,53 @@ const MAX_ASSERTION_FILE_BYTES: u64 = 64 * 1024;
 /// krafka never signs the assertion itself — see the [module docs](self) for
 /// why.
 #[derive(Clone)]
-pub enum AssertionSource {
-    /// Read the JWT from a file, on **every** token request.
-    ///
-    /// Re-reading rather than caching is the point: a SPIFFE agent, Vault
-    /// sidecar or projected Kubernetes service-account token rewrites the file
-    /// as the assertion rotates, and a cached value would keep presenting a
-    /// dead credential until the process restarted.
-    ///
-    /// Surrounding whitespace (a trailing newline from `echo`, say) is
-    /// trimmed.
+pub struct AssertionSource(Source);
+
+#[derive(Clone)]
+enum Source {
     File(PathBuf),
-
-    /// A fixed, pre-signed JWT.
-    ///
-    /// Only useful for tests and short-lived jobs: assertions are meant to be
-    /// short-lived, so a static one becomes a permanent authentication failure
-    /// the moment it expires.
     Static(Zeroizing<String>),
-
-    /// Produce the JWT on demand, signing it however you like.
-    ///
-    /// Called on every token request, so it must be cheap or do its own
-    /// caching.
-    #[allow(clippy::type_complexity)]
-    Callback(Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<String>> + Send>> + Send + Sync>),
+    Provider(Arc<dyn ErasedCredentialProvider<String>>),
 }
 
 impl std::fmt::Debug for AssertionSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::File(path) => f.debug_tuple("File").field(path).finish(),
-            Self::Static(_) => f.debug_tuple("Static").field(&"[REDACTED]").finish(),
-            Self::Callback(_) => f.write_str("Callback(<fn>)"),
+        match &self.0 {
+            Source::File(path) => f.debug_tuple("File").field(path).finish(),
+            Source::Static(_) => f.debug_tuple("Static").field(&"[REDACTED]").finish(),
+            Source::Provider(_) => f.write_str("Provider(<fn>)"),
         }
     }
 }
 
 impl AssertionSource {
+    /// Read the JWT from a file, on **every** token request.
+    ///
+    /// A SPIFFE agent, Vault sidecar or projected Kubernetes service-account
+    /// token rewrites the file as the assertion rotates; re-reading picks up
+    /// each new value. Surrounding whitespace is trimmed.
+    pub fn file(path: impl Into<PathBuf>) -> Self {
+        Self(Source::File(path.into()))
+    }
+
+    /// A fixed, pre-signed JWT. Only useful for tests and short-lived jobs:
+    /// a static assertion fails authentication once it expires.
+    pub fn fixed(jwt: impl Into<String>) -> Self {
+        Self(Source::Static(Zeroizing::new(jwt.into())))
+    }
+
+    /// Produce the JWT on demand, signing it however you like. Called on
+    /// every token request, so it must be cheap or cache.
+    pub fn provider(provider: impl CredentialProvider<String> + 'static) -> Self {
+        Self(Source::Provider(Arc::new(provider)))
+    }
+
     /// Resolve the current signed JWT.
     async fn resolve(&self) -> Result<Zeroizing<String>> {
-        match self {
-            Self::Static(jwt) => Ok(jwt.clone()),
-            Self::Callback(f) => Ok(Zeroizing::new(f().await?)),
-            Self::File(path) => {
+        match &self.0 {
+            Source::Static(jwt) => Ok(jwt.clone()),
+            Source::Provider(provider) => Ok(Zeroizing::new(provider.credentials_erased().await?)),
+            Source::File(path) => {
                 let metadata = tokio::fs::metadata(path).await.map_err(|e| {
                     KrafkaError::auth(format!(
                         "cannot stat client-assertion file {}: {e}",
@@ -244,7 +239,7 @@ impl ClientCredentials {
     }
 }
 
-/// An [`OAuthBearerTokenProvider`] that fetches access tokens from an OIDC
+/// A [`CredentialProvider`] of OAUTHBEARER tokens, fetched from an OIDC
 /// token endpoint using the `client_credentials` grant.
 ///
 /// Build with [`OidcTokenProvider::builder`]. Caching and proactive refresh are
@@ -285,14 +280,20 @@ impl OidcTokenProvider {
             form_parameters: Vec::new(),
             sasl_extensions: Vec::new(),
             request_timeout: None,
+            trust: TlsConfig::new(),
         }
     }
 
     /// Build the `application/x-www-form-urlencoded` request body and the
     /// optional `Authorization` header for one token request.
+    ///
+    /// Every buffer that holds the client secret or the assertion is sized
+    /// exactly before it is written, so no reallocation frees a copy, and is
+    /// zeroized on drop.
     async fn build_request(&self) -> Result<(Zeroizing<String>, Option<Zeroizing<String>>)> {
-        let mut form = String::from("grant_type=client_credentials");
+        let mut pairs: Vec<(&str, &str)> = vec![("grant_type", "client_credentials")];
 
+        let jwt;
         let auth_header = match &self.credentials {
             ClientCredentials::Secret {
                 client_id,
@@ -301,22 +302,23 @@ impl OidcTokenProvider {
                 // RFC 6749 §2.3.1: the client id and secret are form-urlencoded
                 // *before* being joined and base64'd, so a secret containing
                 // `:` cannot be misread as a field separator.
-                let raw = format!(
-                    "{}:{}",
-                    form_urlencode(client_id),
-                    form_urlencode(client_secret)
-                );
-                Some(Zeroizing::new(format!(
-                    "Basic {}",
-                    base64_encode(raw.as_bytes())
-                )))
+                let mut raw = Zeroizing::new(String::with_capacity(
+                    form_urlencoded_len(client_id) + 1 + form_urlencoded_len(client_secret),
+                ));
+                form_urlencode_into(&mut raw, client_id);
+                raw.push(':');
+                form_urlencode_into(&mut raw, client_secret);
+                // `base64_encode` allocates its output at its exact length.
+                let encoded = Zeroizing::new(base64_encode(raw.as_bytes()));
+                let mut header = Zeroizing::new(String::with_capacity(6 + encoded.len()));
+                header.push_str("Basic ");
+                header.push_str(&encoded);
+                Some(header)
             }
             ClientCredentials::Assertion { source } => {
-                let jwt = source.resolve().await?;
-                form.push_str("&client_assertion_type=");
-                form.push_str(&form_urlencode(JWT_BEARER_ASSERTION_TYPE));
-                form.push_str("&client_assertion=");
-                form.push_str(&form_urlencode(&jwt));
+                jwt = source.resolve().await?;
+                pairs.push(("client_assertion_type", JWT_BEARER_ASSERTION_TYPE));
+                pairs.push(("client_assertion", &jwt));
                 None
             }
         };
@@ -325,21 +327,16 @@ impl OidcTokenProvider {
         // claims usually carry it) and redundant alongside Basic auth, but some
         // providers require it in the body either way.
         if let Some(client_id) = &self.client_id {
-            form.push_str("&client_id=");
-            form.push_str(&form_urlencode(client_id));
+            pairs.push(("client_id", client_id));
         }
         if let Some(scope) = &self.scope {
-            form.push_str("&scope=");
-            form.push_str(&form_urlencode(scope));
+            pairs.push(("scope", scope));
         }
         for (key, value) in &self.form_parameters {
-            form.push('&');
-            form.push_str(&form_urlencode(key));
-            form.push('=');
-            form.push_str(&form_urlencode(value));
+            pairs.push((key, value));
         }
 
-        Ok((Zeroizing::new(form), auth_header))
+        Ok((encode_form(&pairs), auth_header))
     }
 
     async fn fetch_token(&self) -> Result<OAuthBearerToken> {
@@ -347,24 +344,13 @@ impl OidcTokenProvider {
 
         let response = self
             .http
-            .request(
-                "POST",
+            .post_form(
                 &self.token_endpoint,
-                &[
-                    ("Content-Type", "application/x-www-form-urlencoded"),
-                    ("Accept", "application/json"),
-                ],
-                Some(form.as_bytes()),
+                form.as_bytes(),
                 auth_header.as_ref().map(|h| h.as_str()),
             )
-            .await?;
-
-        if response.body.len() > MAX_TOKEN_RESPONSE_BYTES {
-            return Err(KrafkaError::auth(format!(
-                "token endpoint returned {} bytes, above the {MAX_TOKEN_RESPONSE_BYTES} byte limit",
-                response.body.len()
-            )));
-        }
+            .await
+            .map_err(|e| self.endpoint_error(e))?;
 
         if !(200..300).contains(&response.status) {
             // RFC 6749 §5.2 error bodies are small JSON objects naming the
@@ -378,7 +364,7 @@ impl OidcTokenProvider {
             )));
         }
 
-        let parsed: TokenResponse = serde_json::from_slice(&response.body).map_err(|e| {
+        let mut parsed: TokenResponse = serde_json::from_slice(&response.body).map_err(|e| {
             KrafkaError::auth(format!(
                 "token endpoint {} returned a body that is not a valid OAuth token \
                  response: {e}",
@@ -393,7 +379,8 @@ impl OidcTokenProvider {
             )));
         }
 
-        let mut token = OAuthBearerToken::new(parsed.access_token);
+        // Moves the buffer out without copying; the token zeroizes it on drop.
+        let mut token = OAuthBearerToken::new(std::mem::take(&mut *parsed.access_token));
 
         match parsed.expires_in {
             Some(seconds) if seconds > 0 => {
@@ -437,9 +424,23 @@ impl OidcTokenProvider {
     }
 }
 
-impl OAuthBearerTokenProvider for OidcTokenProvider {
-    fn provide_token(&self) -> Pin<Box<dyn Future<Output = Result<OAuthBearerToken>> + Send + '_>> {
-        Box::pin(self.fetch_token())
+impl OidcTokenProvider {
+    /// Name the endpoint in a transport or TLS failure; the HTTP client's own
+    /// message names only the host.
+    fn endpoint_error(&self, error: KrafkaError) -> KrafkaError {
+        match error {
+            KrafkaError::Auth { message, source } => KrafkaError::Auth {
+                message: format!("token endpoint {}: {message}", self.token_endpoint),
+                source,
+            },
+            other => other,
+        }
+    }
+}
+
+impl CredentialProvider<OAuthBearerToken> for OidcTokenProvider {
+    async fn credentials(&self) -> Result<OAuthBearerToken> {
+        self.fetch_token().await
     }
 }
 
@@ -454,6 +455,9 @@ pub struct OidcTokenProviderBuilder {
     form_parameters: Vec<(String, String)>,
     sasl_extensions: Vec<(String, String)>,
     request_timeout: Option<Duration>,
+    /// Trust store for the token endpoint; only its CA and native-roots
+    /// settings are set.
+    trust: TlsConfig,
 }
 
 impl OidcTokenProviderBuilder {
@@ -521,12 +525,46 @@ impl OidcTokenProviderBuilder {
         self
     }
 
+    /// Trust only the PEM CA bundle at `path` for the token endpoint
+    /// (pinning), instead of the default WebPKI roots.
+    ///
+    /// Independent of the Kafka TLS settings: an identity provider and the
+    /// brokers usually have different issuers. The rule is the same as
+    /// [`TlsConfig::with_ca_cert`]: the bundle replaces the defaults, and
+    /// combined with [`native_roots`](Self::native_roots) the two add up.
+    ///
+    /// ```rust,no_run
+    /// # use krafka::auth::oidc::{ClientCredentials, OidcTokenProvider};
+    /// # fn f() -> Result<(), krafka::error::KrafkaError> {
+    /// OidcTokenProvider::builder("https://keycloak.internal/realms/kafka/protocol/openid-connect/token")
+    ///     .credentials(ClientCredentials::secret("id", "secret"))
+    ///     .ca_cert("/etc/pki/internal-ca.pem")
+    ///     .build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn ca_cert(mut self, path: impl Into<String>) -> Self {
+        self.trust.ca_cert_path = Some(path.into());
+        self
+    }
+
+    /// Trust the platform's root store for the token endpoint, instead of the
+    /// default WebPKI roots. With [`ca_cert`](Self::ca_cert), both are trusted.
+    #[cfg(feature = "native-tls-roots")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "native-tls-roots")))]
+    pub fn native_roots(mut self) -> Self {
+        self.trust.use_native_roots = true;
+        self
+    }
+
     /// Validate and build the provider.
     ///
     /// # Errors
     ///
     /// Returns [`KrafkaError::Config`] if the endpoint is empty, is not an
-    /// absolute `http`/`https` URL, or if no credentials were supplied.
+    /// absolute `http`/`https` URL, if no credentials were supplied, or if the
+    /// trust store cannot be loaded (an unreadable [`ca_cert`](Self::ca_cert)
+    /// bundle, or no usable native roots).
     ///
     /// A plain-`http` endpoint is **rejected**: the request carries either a
     /// client secret or a signed assertion, and the response carries an access
@@ -563,7 +601,11 @@ impl OidcTokenProviderBuilder {
             scope: self.scope,
             form_parameters: self.form_parameters,
             sasl_extensions: self.sasl_extensions,
-            http: HttpClient::with_webpki_roots(self.request_timeout)?,
+            http: HttpClient::new(
+                Arc::new(super::tls::build_tls_config_sync(&self.trust)?),
+                self.request_timeout,
+                MAX_TOKEN_RESPONSE_BYTES,
+            ),
         })
     }
 }
@@ -571,9 +613,16 @@ impl OidcTokenProviderBuilder {
 /// A successful RFC 6749 §5.1 token response.
 #[derive(serde::Deserialize)]
 struct TokenResponse {
-    access_token: String,
+    #[serde(deserialize_with = "zeroizing_string")]
+    access_token: Zeroizing<String>,
     #[serde(default)]
     expires_in: Option<i64>,
+}
+
+fn zeroizing_string<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Zeroizing<String>, D::Error> {
+    <String as serde::Deserialize>::deserialize(deserializer).map(Zeroizing::new)
 }
 
 /// Extract the RFC 6749 §5.2 `error` / `error_description` from a failure body.
@@ -598,37 +647,59 @@ fn describe_oauth_error(body: &[u8]) -> String {
     }
 }
 
-/// Percent-encode a value for `application/x-www-form-urlencoded`.
+/// Encode `pairs` as an `application/x-www-form-urlencoded` body, in a buffer
+/// allocated once at its final length and zeroized on drop.
+fn encode_form(pairs: &[(&str, &str)]) -> Zeroizing<String> {
+    let len = pairs
+        .iter()
+        .map(|(k, v)| form_urlencoded_len(k) + 1 + form_urlencoded_len(v))
+        .sum::<usize>()
+        + pairs.len().saturating_sub(1);
+    let mut form = Zeroizing::new(String::with_capacity(len));
+    for (i, (key, value)) in pairs.iter().enumerate() {
+        if i > 0 {
+            form.push('&');
+        }
+        form_urlencode_into(&mut form, key);
+        form.push('=');
+        form_urlencode_into(&mut form, value);
+    }
+    form
+}
+
+fn is_unreserved(byte: u8) -> bool {
+    matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~')
+}
+
+/// Length of `value` once [`form_urlencode_into`] has encoded it.
+fn form_urlencoded_len(value: &str) -> usize {
+    value
+        .bytes()
+        .map(|b| if is_unreserved(b) || b == b' ' { 1 } else { 3 })
+        .sum()
+}
+
+/// Percent-encode a value for `application/x-www-form-urlencoded`, appending
+/// to `out`.
 ///
 /// Anything outside the RFC 3986 unreserved set is escaped, and a space becomes
 /// `+` per the HTML form encoding Kafka's own OAuth clients use. Encoding by
 /// allow-list rather than by escaping a deny-list means a JWT's `.` separators,
 /// a secret's `&`, and any non-ASCII byte are all handled without a special
 /// case — and a value can never terminate its own field.
-fn form_urlencode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.as_bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(*byte as char);
-            }
-            b' ' => out.push('+'),
-            other => {
-                out.push('%');
-                out.push(
-                    char::from_digit((other >> 4) as u32, 16)
-                        .unwrap_or('0')
-                        .to_ascii_uppercase(),
-                );
-                out.push(
-                    char::from_digit((other & 0x0F) as u32, 16)
-                        .unwrap_or('0')
-                        .to_ascii_uppercase(),
-                );
-            }
+fn form_urlencode_into(out: &mut String, value: &str) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for byte in value.bytes() {
+        if is_unreserved(byte) {
+            out.push(char::from(byte));
+        } else if byte == b' ' {
+            out.push('+');
+        } else {
+            out.push('%');
+            out.push(char::from(HEX[usize::from(byte >> 4)]));
+            out.push(char::from(HEX[usize::from(byte & 0x0F)]));
         }
     }
-    out
 }
 
 #[cfg(test)]
@@ -637,6 +708,26 @@ mod tests {
     use super::*;
 
     // ── form encoding ────────────────────────────────────────────────────
+
+    fn form_urlencode(value: &str) -> String {
+        let mut out = String::new();
+        form_urlencode_into(&mut out, value);
+        assert_eq!(
+            out.len(),
+            form_urlencoded_len(value),
+            "pre-sizing for {value:?}"
+        );
+        out
+    }
+
+    /// The buffer is allocated once: a reallocation would free a copy of
+    /// the secret without zeroizing it.
+    #[test]
+    fn the_form_is_allocated_at_its_final_length() {
+        let form = encode_form(&[("a b", "x&y"), ("client_assertion", "h.p.s"), ("k", "ü")]);
+        assert_eq!(&*form, "a+b=x%26y&client_assertion=h.p.s&k=%C3%BC");
+        assert_eq!(form.capacity(), form.len());
+    }
 
     /// Every byte outside the unreserved set must be escaped. A secret
     /// containing `&` or `=` that escaped unencoded would inject extra form
@@ -698,9 +789,7 @@ mod tests {
     #[tokio::test]
     async fn assertion_credentials_use_the_jwt_bearer_type() {
         let jwt = "header.payload.signature";
-        let p = provider(ClientCredentials::assertion(AssertionSource::Static(
-            Zeroizing::new(jwt.to_string()),
-        )));
+        let p = provider(ClientCredentials::assertion(AssertionSource::fixed(jwt)));
         let (form, auth) = p.build_request().await.unwrap();
 
         assert!(auth.is_none(), "assertion flow sends no Basic header");
@@ -725,8 +814,8 @@ mod tests {
     #[tokio::test]
     async fn scope_and_client_id_are_appended() {
         let p = OidcTokenProvider::builder("https://idp.example.com/token")
-            .credentials(ClientCredentials::assertion(AssertionSource::Static(
-                Zeroizing::new("a.b.c".into()),
+            .credentials(ClientCredentials::assertion(AssertionSource::fixed(
+                "a.b.c",
             )))
             .client_id("my client")
             .scope("kafka:write kafka:read")
@@ -752,7 +841,7 @@ mod tests {
         let path = dir.join("assertion.jwt");
         std::fs::write(&path, "  a.b.c\n").unwrap();
 
-        let source = AssertionSource::File(path.clone());
+        let source = AssertionSource::file(path.clone());
         assert_eq!(&*source.resolve().await.unwrap(), "a.b.c");
 
         std::fs::remove_file(&path).ok();
@@ -768,7 +857,7 @@ mod tests {
         let path = dir.join("assertion.jwt");
         std::fs::write(&path, "\n  \n").unwrap();
 
-        let err = AssertionSource::File(path.clone())
+        let err = AssertionSource::file(path.clone())
             .resolve()
             .await
             .expect_err("empty file must error");
@@ -780,7 +869,7 @@ mod tests {
     #[tokio::test]
     async fn missing_assertion_file_names_the_path() {
         let path = PathBuf::from("/nonexistent/krafka/assertion.jwt");
-        let err = AssertionSource::File(path)
+        let err = AssertionSource::file(path)
             .resolve()
             .await
             .expect_err("missing file must error");
@@ -792,13 +881,13 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = calls.clone();
-        let source = AssertionSource::Callback(Arc::new(move || {
+        let source = AssertionSource::provider(move || {
             let counter = counter.clone();
-            Box::pin(async move {
+            async move {
                 let n = counter.fetch_add(1, Ordering::SeqCst);
                 Ok(format!("jwt-{n}"))
-            })
-        }));
+            }
+        });
 
         assert_eq!(&*source.resolve().await.unwrap(), "jwt-0");
         assert_eq!(&*source.resolve().await.unwrap(), "jwt-1");
@@ -853,10 +942,7 @@ mod tests {
         );
         assert!(!secret.contains("super-secret"), "got: {secret}");
 
-        let assertion = format!(
-            "{:?}",
-            AssertionSource::Static(Zeroizing::new("a.b.c".into()))
-        );
+        let assertion = format!("{:?}", AssertionSource::fixed("a.b.c"));
         assert!(!assertion.contains("a.b.c"), "got: {assertion}");
         assert!(assertion.contains("REDACTED"), "got: {assertion}");
     }
@@ -913,7 +999,7 @@ mod tests {
     fn token_response_expires_in_is_optional() {
         let with: TokenResponse =
             serde_json::from_slice(br#"{"access_token":"t","expires_in":3600}"#).unwrap();
-        assert_eq!(with.access_token, "t");
+        assert_eq!(*with.access_token, "t");
         assert_eq!(with.expires_in, Some(3600));
 
         let without: TokenResponse =
@@ -927,5 +1013,130 @@ mod tests {
             .decode(input)
             .expect("valid base64");
         String::from_utf8(bytes).expect("valid utf8")
+    }
+
+    // ── the token endpoint over HTTPS ────────────────────────────────────
+
+    fn testdata(name: &str) -> String {
+        format!("{}/src/auth/testdata/{name}", env!("CARGO_MANIFEST_DIR"))
+    }
+
+    /// Serve one HTTPS request on 127.0.0.1 with `server.pem` (issued by the
+    /// test CA `ca.pem`), answering with `response`. Returns the endpoint URL.
+    async fn token_endpoint(response: Vec<u8>) -> String {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let certs = CertificateDer::pem_file_iter(testdata("server.pem"))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        let key = PrivateKeyDer::from_pem_file(testdata("server.key")).unwrap();
+        let config = rustls::ServerConfig::builder_with_provider(
+            crate::auth::tls::resolve_crypto_provider(),
+        )
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let Ok(mut tls) = acceptor.accept(tcp).await else {
+                return;
+            };
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                match tls.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => request.extend_from_slice(&buf[..n]),
+                }
+            }
+            let _ = tls.write_all(&response).await;
+            let _ = tls.shutdown().await;
+        });
+        format!("https://127.0.0.1:{port}/token")
+    }
+
+    fn ok_response(body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_behind_a_private_ca_is_reachable_with_that_ca() {
+        let endpoint =
+            token_endpoint(ok_response(r#"{"access_token":"tok-1","expires_in":60}"#)).await;
+        let token = OidcTokenProvider::builder(&endpoint)
+            .credentials(ClientCredentials::secret("id", "secret"))
+            .ca_cert(testdata("ca.pem"))
+            .build()
+            .unwrap()
+            .fetch_token()
+            .await
+            .expect("the pinned CA must verify the endpoint");
+        let initial = token.to_gs2_initial_response();
+        assert!(
+            initial.windows(17).any(|w| w == b"auth=Bearer tok-1"),
+            "the fetched token must be the endpoint's"
+        );
+    }
+
+    /// Negative control: the default WebPKI roots do not know the test CA.
+    #[tokio::test]
+    async fn without_its_ca_the_endpoint_fails_verification() {
+        let endpoint = token_endpoint(ok_response(r#"{"access_token":"tok-1"}"#)).await;
+        let err = OidcTokenProvider::builder(&endpoint)
+            .credentials(ClientCredentials::secret("id", "secret"))
+            .build()
+            .unwrap()
+            .fetch_token()
+            .await
+            .expect_err("an unknown issuer must be rejected")
+            .to_string();
+        assert!(err.contains(&endpoint), "got: {err}");
+        assert!(err.contains("UnknownIssuer"), "got: {err}");
+    }
+
+    #[test]
+    fn an_unreadable_ca_bundle_fails_the_build() {
+        let err = OidcTokenProvider::builder("https://idp.example.com/token")
+            .credentials(ClientCredentials::secret("id", "secret"))
+            .ca_cert("/nonexistent/krafka/ca.pem")
+            .build()
+            .expect_err("a missing CA bundle must not fall back to other roots")
+            .to_string();
+        assert!(err.contains("/nonexistent/krafka/ca.pem"), "got: {err}");
+    }
+
+    /// The token cap reaches the HTTP client: a 2 MiB body fails at the
+    /// 1 MiB limit instead of being buffered and rejected afterwards.
+    #[tokio::test]
+    async fn an_oversized_token_response_stops_at_the_token_cap() {
+        let mut response = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec();
+        response.extend(std::iter::repeat_n(b' ', 2 * MAX_TOKEN_RESPONSE_BYTES));
+        let endpoint = token_endpoint(response).await;
+        let err = OidcTokenProvider::builder(&endpoint)
+            .credentials(ClientCredentials::secret("id", "secret"))
+            .ca_cert(testdata("ca.pem"))
+            .build()
+            .unwrap()
+            .fetch_token()
+            .await
+            .expect_err("a 2 MiB token response must be refused")
+            .to_string();
+        assert!(
+            err.contains(&format!("exceeds {MAX_TOKEN_RESPONSE_BYTES}-byte limit")),
+            "got: {err}"
+        );
     }
 }
