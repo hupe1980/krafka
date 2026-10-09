@@ -43,7 +43,7 @@ zstd = { version = "0.13", optional = true }          # zstd encode (requires C 
 crc32c = "0.6"
 
 # Random number generation
-rand = "0.9"
+rand = "0.10"
 
 # Synchronization (non-poisoning RwLock)
 parking_lot = "0.12"
