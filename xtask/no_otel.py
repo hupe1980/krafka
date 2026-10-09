@@ -38,7 +38,7 @@ def violations(lines: list[str]) -> list[str]:
 
 def graph(features: list[str]) -> list[str]:
     out = subprocess.run(
-        ["cargo", "tree", "--offline", "--locked", "-e", "normal,build",
+        ["cargo", "tree", "--offline", "--locked", "--color", "never", "-e", "normal,build",
          "--prefix", "none", "--format", "{p}", *features],
         cwd=ROOT, check=True, capture_output=True, text=True,
     ).stdout

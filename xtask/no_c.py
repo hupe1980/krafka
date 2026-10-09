@@ -164,7 +164,7 @@ def node_id(content: str) -> str:
 
 def cargo_tree(target: str, features: str | None, manifest: Path) -> Graph:
     cmd = [
-        "cargo", "tree", "--offline", "--locked", "--charset", "ascii",
+        "cargo", "tree", "--offline", "--locked", "--charset", "ascii", "--color", "never",
         "-e", "normal,build", "--target", target,
         "--manifest-path", str(manifest),
     ]

@@ -613,7 +613,10 @@ fuzz target time="60":
     mkdir -p "$corpus"
     seeds=()
     [ -d "fuzz/seeds/{{target}}" ] && seeds=("fuzz/seeds/{{target}}")
-    cargo +nightly fuzz run {{target}} "$corpus" ${seeds[@]+"${seeds[@]}"} -- \
+    # A prebuilt cargo-fuzz defaults to the target it was built for (musl from
+    # install-action), where ASan cannot run; build for the toolchain's host.
+    host="$(rustc +nightly -vV | sed -n 's/^host: //p')"
+    cargo +nightly fuzz run --target "$host" {{target}} "$corpus" ${seeds[@]+"${seeds[@]}"} -- \
         -max_total_time={{time}} -timeout=10 -rss_limit_mb=2048
 
 # List the available fuzz targets.

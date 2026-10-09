@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 def tree_packages(target: str) -> set[tuple[str, str]]:
     out = subprocess.run(
-        ["cargo", "tree", "--locked", "-e", "normal,build", "--target", target,
+        ["cargo", "tree", "--locked", "--color", "never", "-e", "normal,build", "--target", target,
          "--prefix", "none", "--format", "{p}"],
         cwd=ROOT, capture_output=True, text=True, check=True,
     ).stdout
@@ -37,7 +37,7 @@ def tree_packages(target: str) -> set[tuple[str, str]]:
 
 def direct_dependencies(target: str) -> set[str]:
     out = subprocess.run(
-        ["cargo", "tree", "--locked", "-e", "normal", "--target", target, "--depth", "1",
+        ["cargo", "tree", "--locked", "--color", "never", "-e", "normal", "--target", target, "--depth", "1",
          "--prefix", "none", "--format", "{p}"],
         cwd=ROOT, capture_output=True, text=True, check=True,
     ).stdout
