@@ -56,7 +56,7 @@ socket2 = "0.5"
 
 # Cryptography for SASL/SCRAM
 sha2 = "0.10.2"
-hmac = "0.12"
+hmac = "0.13"
 pbkdf2 = { version = "0.12.1", default-features = false, features = ["hmac"] }
 base64 = "0.22"
 zeroize = { version = "1.8", features = ["derive"] }
