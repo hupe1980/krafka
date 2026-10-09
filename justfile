@@ -467,7 +467,7 @@ sasl-matrix:
 
 # Integration tests against a real Redpanda in Docker.
 #
-# Runs the release pinned in tests/redpanda/Dockerfile (moved by Dependabot);
+# Runs the release pinned in tests/redpanda/Dockerfile;
 # `REDPANDA_VERSION=latest` runs the current release instead. The image is
 # pulled first and its digest printed, so a log names what was tested.
 #
