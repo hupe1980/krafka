@@ -566,32 +566,6 @@ jobs:
           path: fuzz/artifacts/
           if-no-files-found: ignore
 
-  # Non-blocking (declared in xtask/ci_job_parity.py): mutation-tests the
-  # mutants a pull request's diff touches and reports survivors in the job
-  # summary. It is absent from `ci-success`'s needs, so it cannot fail `CI`.
-  mutants:
-    name: Mutants in diff (report)
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
-        with:
-          just-version: "1.58.0"
-      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
-        with:
-          tool: cargo-mutants@27.1.0
-      - run: just mutants-diff "origin/$BASE_REF"
-        env:
-          BASE_REF: ${{ github.base_ref }}
-
   integration:
     name: Integration Tests (Kafka ${{ matrix.kafka-version }})
     runs-on: ubuntu-latest

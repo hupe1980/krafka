@@ -44,12 +44,7 @@ ALLOWED_WITHOUT_JOB: dict[str, dict[str, str]] = {}
 
 # ci.yml jobs that report without gating `CI`. Wiring: absent from
 # `ci-success`'s needs; GitHub shows their result on the pull request.
-NON_BLOCKING_JOBS = {
-    "mutants": (
-        "reports the surviving mutants in a pull request's diff; equivalent "
-        "mutants would make a gate a false-positive generator"
-    ),
-}
+NON_BLOCKING_JOBS: dict[str, str] = {}
 
 # Jobs that must gate `CI`: a red result in them is a krafka regression.
 MUST_BLOCK = {
@@ -250,19 +245,19 @@ def self_test() -> int:
             lambda y: _drop_need(y, "clippy"), None, None, "`clippy` is not in",
         ),
         "declared non-blocking job absent": (
-            None, None, {"mutants": "x", "ghost-job": "x"}, "`ghost-job`, which is not a job",
+            None, None, {"ghost-job": "x"}, "`ghost-job`, which is not a job",
         ),
         "declared non-blocking job gates CI": (
-            lambda y: y.replace("      - msrv\n", "      - msrv\n      - mutants\n", 1), None, None,
-            "`mutants` is declared non-blocking but is in",
+            None, None, {"clippy": "x"},
+            "`clippy` is declared non-blocking but is in",
         ),
         "gated job wired not to block": (
             lambda y: y.replace("  msrv:\n    name: MSRV (1.95)\n", "  msrv:\n    name: MSRV (1.95)\n    continue-on-error: true\n", 1),
             None, None, "`msrv` is gated but has `continue-on-error: true`",
         ),
         "non-blocking job needed by a gated job": (
-            lambda y: y.replace("  msrv:\n    name: MSRV (1.95)\n", "  msrv:\n    name: MSRV (1.95)\n    needs: mutants\n", 1),
-            None, None, "needed by gated job `msrv`",
+            lambda y: _drop_need(y, "clippy").replace("  msrv:\n    name: MSRV (1.95)\n", "  msrv:\n    name: MSRV (1.95)\n    needs: clippy\n", 1),
+            None, {"clippy": "x"}, "needed by gated job `msrv`",
         ),
         "pinned Redpanda job dropped from needs": (
             lambda y: _drop_need(y, "integration-redpanda"), None, {**NON_BLOCKING_JOBS, "integration-redpanda": "x"},

@@ -344,7 +344,7 @@ site-check:
 
 # Mutation-test the scoped files (`mutants_files`) and print the survivor
 # count. Not part of `ci`: the full set takes hours; CI runs it weekly
-# (mutants-weekly.yml) and `mutants-diff` on every pull request.
+# (mutants-weekly.yml). `mutants-diff` is for local runs on a branch.
 [doc("Mutation-test the invariant-dense modules")]
 mutants *ARGS:
     #!/usr/bin/env bash

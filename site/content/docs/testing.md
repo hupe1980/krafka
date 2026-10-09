@@ -611,6 +611,6 @@ For contributors. `just ci` is the local gate; each of its recipes is a job in
 | `just integration`, `just integration-matrix` | Apache Kafka in Docker (`apache/kafka-native:3.9.0` by default), every supported minor 3.9 → 4.3 | yes |
 | `just integration-sasl`, `just integration-sasl-matrix` | PLAIN, SCRAM-SHA-256/512 and OAUTHBEARER over `SASL_PLAINTEXT` and `SASL_SSL`, Kafka 3.9.0 and 4.3.1. AWS MSK IAM is covered by unit tests only | yes |
 | `just integration-redpanda` | The Redpanda release pinned in `tests/redpanda/Dockerfile`; `REDPANDA_VERSION=latest` runs the current one weekly | pinned: yes; `latest`: no |
-| `just mutants`, `just mutants-diff origin/main` | cargo-mutants over sequence arithmetic, the in-flight barrier, varint codecs and fetch sessions; per pull request only the mutants its diff touches. `--re <fn>` scopes a run to one function | no |
+| `just mutants`, `just mutants-diff origin/main` | cargo-mutants over sequence arithmetic, the in-flight barrier, varint codecs and fetch sessions; weekly in CI, `mutants-diff` locally for a branch's changes. `--re <fn>` scopes a run to one function | no |
 | `just bench-check` | Send- and consume-path regression against a saved baseline | local only |
 | `just ci-job-parity` | Every workflow job is inside `CI` or declared non-blocking | yes |
