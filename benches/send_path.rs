@@ -41,9 +41,12 @@ fn runtime() -> tokio::runtime::Runtime {
 async fn producer_for(linger: Duration, batch_size: usize) -> (FakeBroker, Producer) {
     let broker = FakeBroker::start().await.expect("fake broker");
     broker.create_topic("bench", 4);
-    let producer = Producer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
+    let producer = krafka::Kafka::builder(broker.bootstrap_servers())
         .client_id("bench")
+        .connect()
+        .await
+        .expect("producer")
+        .producer()
         .linger(linger)
         .batch_size(batch_size)
         .build()
@@ -73,7 +76,7 @@ fn bench_send_single(c: &mut Criterion) {
                 let producer = &producer;
                 b.to_async(&rt).iter(|| async move {
                     let md = producer
-                        .send("bench", Some(b"k"), Some(b"v"))
+                        .send(krafka::Record::new("bench", "v").key("k"))
                         .await
                         .expect("send");
                     let _ = black_box(md);
@@ -104,7 +107,7 @@ fn bench_send_concurrent(c: &mut Criterion) {
                     for _ in 0..n {
                         let p = producer.clone();
                         handles.push(tokio::spawn(async move {
-                            p.send("bench", Some(b"k"), Some(b"value")).await
+                            p.send(krafka::Record::new("bench", "value").key("k")).await
                         }));
                     }
                     for h in handles {
@@ -140,9 +143,12 @@ fn bench_send_batched(c: &mut Criterion) {
                 // awaiting a Vec of them one at a time measures N *sequential*
                 // sends, each paying a full `linger`, and reports `n * linger`
                 // — which looks like a batching collapse and proves nothing.
-                let sends = keys
-                    .iter()
-                    .map(|key| producer.send("bench", Some(key), Some(b"payload")));
+                let sends = keys.iter().map(|key| {
+                    producer.send(
+                        krafka::Record::new("bench", "payload")
+                            .key(bytes::Bytes::copy_from_slice(key)),
+                    )
+                });
                 let results = futures::future::join_all(sends).await;
                 for r in results {
                     let _ = black_box(r.expect("send"));

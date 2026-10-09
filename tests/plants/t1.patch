@@ -1,0 +1,24 @@
+diff -ruN a/src/producer/transaction.rs b/src/producer/transaction.rs
+--- a/src/producer/transaction.rs
++++ b/src/producer/transaction.rs
+@@ -1728,7 +1728,7 @@
+         let generation = self.producer.barrier.snapshot();
+         self.producer.accumulator.flush(generation);
+         self.gate.drained().await;
+-        self.gate.failure("commit")
++        None
+     }
+ 
+     /// Prepare the open transaction and hand back its identity (KIP-939).
+@@ -1885,11 +1885,6 @@
+     /// completes it (`abort` is refused there). Dropped after the coordinator
+     /// answered, the transaction is committed.
+     pub async fn commit(&self) -> Result<()> {
+-        if self.state() == TransactionState::Open
+-            && let Some(error) = self.gate.failure("commit")
+-        {
+-            return Err(error);
+-        }
+         let entered = self
+             .gate
+             .transition(

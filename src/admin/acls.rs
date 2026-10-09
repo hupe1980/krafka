@@ -1,286 +1,319 @@
-//! AdminClient operation group: acls.
+//! ACLs: describe, create, delete.
 
-use tracing::{info, warn};
-
-use crate::error::{KrafkaError, ProtocolErrorKind, Result};
+use crate::error::{KrafkaError, Result};
 use crate::protocol::{
-    AclBinding, AclBindingFilter, ApiKey, CreateAclsRequest, CreateAclsResponse, DeleteAclsRequest,
-    DeleteAclsResponse, DescribeAclsRequest, DescribeAclsResponse, VersionedDecode,
-    VersionedEncode, versions,
+    AclBinding, AclBindingFilter, AclOperation, AclPatternType, AclPermissionType, AclResourceType,
+    ApiKey, CreateAclsRequest, CreateAclsResponse, DeleteAclsRequest, DeleteAclsResponse,
+    DescribeAclsRequest, DescribeAclsResponse, versions,
 };
 
-#[allow(clippy::wildcard_imports)]
-use super::*;
+use super::AdminClient;
+use super::driver::{Mode, Target, answer, exchange, negotiate};
+
+/// A filter over ACL bindings, for [`AdminClient::describe_acls`] and
+/// [`AdminClient::delete_acls`]. Unset fields match anything.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AclFilter {
+    /// Resource type to match.
+    pub resource_type: AclResourceType,
+    /// Resource name to match (`None` for any).
+    pub resource_name: Option<String>,
+    /// Pattern type for matching.
+    pub pattern_type: AclPatternType,
+    /// Principal to match (`None` for any).
+    pub principal: Option<String>,
+    /// Host to match (`None` for any).
+    pub host: Option<String>,
+    /// Operation to match.
+    pub operation: AclOperation,
+    /// Permission type to match.
+    pub permission_type: AclPermissionType,
+}
+
+impl AclFilter {
+    /// A filter that matches every ACL.
+    pub fn all() -> Self {
+        Self::default()
+    }
+
+    /// A filter for one resource.
+    pub fn for_resource(resource_type: AclResourceType, resource_name: impl Into<String>) -> Self {
+        Self {
+            resource_type,
+            resource_name: Some(resource_name.into()),
+            ..Default::default()
+        }
+    }
+
+    /// A filter for one principal.
+    pub fn for_principal(principal: impl Into<String>) -> Self {
+        Self {
+            principal: Some(principal.into()),
+            ..Default::default()
+        }
+    }
+
+    /// Set the resource type.
+    #[must_use]
+    pub fn resource_type(mut self, resource_type: AclResourceType) -> Self {
+        self.resource_type = resource_type;
+        self
+    }
+
+    /// Set the resource name.
+    #[must_use]
+    pub fn resource_name(mut self, name: impl Into<String>) -> Self {
+        self.resource_name = Some(name.into());
+        self
+    }
+
+    /// Set the pattern type.
+    #[must_use]
+    pub fn pattern_type(mut self, pattern_type: AclPatternType) -> Self {
+        self.pattern_type = pattern_type;
+        self
+    }
+
+    /// Set the principal.
+    #[must_use]
+    pub fn principal(mut self, principal: impl Into<String>) -> Self {
+        self.principal = Some(principal.into());
+        self
+    }
+
+    /// Set the host.
+    #[must_use]
+    pub fn host(mut self, host: impl Into<String>) -> Self {
+        self.host = Some(host.into());
+        self
+    }
+
+    /// Set the operation.
+    #[must_use]
+    pub fn operation(mut self, operation: AclOperation) -> Self {
+        self.operation = operation;
+        self
+    }
+
+    /// Set the permission type.
+    #[must_use]
+    pub fn permission_type(mut self, permission_type: AclPermissionType) -> Self {
+        self.permission_type = permission_type;
+        self
+    }
+
+    fn to_wire(&self) -> AclBindingFilter {
+        AclBindingFilter {
+            resource_type: self.resource_type,
+            resource_name: self.resource_name.clone(),
+            pattern_type: self.pattern_type,
+            principal: self.principal.clone(),
+            host: self.host.clone(),
+            operation: self.operation,
+            permission_type: self.permission_type,
+        }
+    }
+}
+
+/// What one filter of [`AdminClient::delete_acls`] removed.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct DeleteAclsResult {
+    /// Bindings deleted.
+    pub deleted: Vec<AclBinding>,
+    /// Bindings that matched but were not deleted, with the reason.
+    pub failed: Vec<(AclBinding, KrafkaError)>,
+}
+
+admin_options! {
+    /// Options for [`AdminClient::describe_acls`].
+    DescribeAclsOptions {}
+}
+
+admin_options! {
+    /// Options for [`AdminClient::create_acls`].
+    CreateAclsOptions {}
+}
+
+admin_options! {
+    /// Options for [`AdminClient::delete_acls`].
+    DeleteAclsOptions {}
+}
 
 impl AdminClient {
-    /// Describe ACLs matching a filter.
+    /// List the ACL bindings matching `filter` (any broker).
     ///
-    /// # Example
-    /// ```ignore
-    /// // Describe all ACLs for a specific topic
-    /// let filter = AclFilter::for_resource(AclResourceType::Topic, "my-topic");
-    /// let result = admin.describe_acls(filter).await?;
-    /// ```
-    pub async fn describe_acls(&self, filter: AclFilter) -> Result<DescribeAclsResult> {
-        self.check_not_closed()?;
-        let conn = self.get_any_broker_connection().await?;
-
-        let request = DescribeAclsRequest {
-            resource_type: filter.resource_type,
-            resource_name: filter.resource_name,
-            pattern_type: filter.pattern_type,
-            principal: filter.principal,
-            host: filter.host,
-            operation: filter.operation,
-            permission_type: filter.permission_type,
-        };
-
-        let version = conn
-            .negotiate_api_version(
+    /// # Errors
+    ///
+    /// The broker's error (for example `CLUSTER_AUTHORIZATION_FAILED`), a
+    /// closed client, or the deadline.
+    pub async fn describe_acls(
+        &self,
+        filter: AclFilter,
+        options: DescribeAclsOptions,
+    ) -> Result<Vec<AclBinding>> {
+        let call = self.call("DescribeAcls", Mode::Read, options.timeout)?;
+        let filter = &filter;
+        call.single(Target::AnyBroker, |conn| async move {
+            let request = DescribeAclsRequest {
+                resource_type: filter.resource_type,
+                resource_name: filter.resource_name.clone(),
+                pattern_type: filter.pattern_type,
+                principal: filter.principal.clone(),
+                host: filter.host.clone(),
+                operation: filter.operation,
+                permission_type: filter.permission_type,
+            };
+            let version = negotiate(
+                &conn,
                 ApiKey::DescribeAcls,
-                versions::DESCRIBE_ACLS_MAX,
                 versions::DESCRIBE_ACLS_MIN,
-            )
-            .ok_or_else(|| {
-                KrafkaError::protocol_kind(
-                    ProtocolErrorKind::UnknownApiVersion,
-                    "no mutually supported DescribeAcls API version",
-                )
-            })?;
-
-        let response_bytes = conn
-            .send_request(ApiKey::DescribeAcls, version, |buf| {
-                request.encode_versioned(version, buf)
-            })
-            .await?;
-
-        let mut buf = response_bytes;
-        let response = DescribeAclsResponse::decode_versioned(version, &mut buf)?;
-
-        let bindings = response
-            .resources
-            .into_iter()
-            .flat_map(|res| {
-                res.acls.into_iter().map(move |acl| AclBinding {
-                    resource_type: res.resource_type,
-                    resource_name: res.resource_name.clone(),
-                    pattern_type: res.pattern_type,
-                    principal: acl.principal,
-                    host: acl.host,
-                    operation: acl.operation,
-                    permission_type: acl.permission_type,
+                versions::DESCRIBE_ACLS_MAX,
+            )?;
+            let response: DescribeAclsResponse =
+                exchange(&conn, ApiKey::DescribeAcls, version, &request).await?;
+            answer(response.error_code, response.error_message)?;
+            Ok(response
+                .resources
+                .into_iter()
+                .flat_map(|res| {
+                    res.acls.into_iter().map(move |acl| AclBinding {
+                        resource_type: res.resource_type,
+                        resource_name: res.resource_name.clone(),
+                        pattern_type: res.pattern_type,
+                        principal: acl.principal,
+                        host: acl.host,
+                        operation: acl.operation,
+                        permission_type: acl.permission_type,
+                    })
                 })
-            })
-            .collect();
-
-        Ok(DescribeAclsResult {
-            error: if response.error_code.is_ok() {
-                None
-            } else {
-                Some(
-                    response
-                        .error_message
-                        .unwrap_or_else(|| format!("{:?}", response.error_code)),
-                )
-            },
-            bindings,
+                .collect())
         })
+        .await
     }
 
-    /// Create ACLs.
+    /// Create ACL bindings (controller). Returns each binding with its result,
+    /// in the order given.
     ///
-    /// Returns `Ok(result)` when the RPC succeeds.  **An `Ok` return does not
-    /// mean every ACL was created** — inspect each element of
-    /// [`CreateAclsResult::results`] for per-ACL failures.
+    /// # Errors
     ///
-    /// # Arguments
-    /// * `acls` - List of ACL bindings to create
-    ///
-    /// # Example
-    /// ```ignore
-    /// let acl = AclBinding::allow_read_topic("my-topic", "User:alice");
-    /// admin.create_acls(vec![acl]).await?;
-    /// ```
-    pub async fn create_acls(&self, acls: Vec<AclBinding>) -> Result<CreateAclsResult> {
-        self.check_not_closed()?;
-
-        // `CreateAcls` is controller-only: route to the controller and retry on
-        // NOT_CONTROLLER so a controller failover cannot report success while
-        // creating nothing.
-        let responses = self
-            .with_controller("CreateAcls", |conn| {
-                let acls = &acls;
-                async move {
+    /// The call fails for a closed client.
+    pub async fn create_acls(
+        &self,
+        acls: Vec<AclBinding>,
+        options: CreateAclsOptions,
+    ) -> Result<Vec<(AclBinding, Result<()>)>> {
+        let call = self.call("CreateAcls", Mode::Write, options.timeout)?;
+        let acls_ref = &acls;
+        let mut results = call
+            .fan_out(
+                (0..acls.len()).collect(),
+                |_| Target::Controller,
+                |conn, indexes| async move {
                     let request = CreateAclsRequest {
-                        creations: acls.clone(),
+                        creations: indexes.iter().map(|&i| acls_ref[i].clone()).collect(),
                     };
-
-                    let version = conn
-                        .negotiate_api_version(
-                            ApiKey::CreateAcls,
-                            versions::CREATE_ACLS_MAX,
-                            versions::CREATE_ACLS_MIN,
-                        )
-                        .ok_or_else(|| {
-                            KrafkaError::protocol_kind(
-                                ProtocolErrorKind::UnknownApiVersion,
-                                "no mutually supported CreateAcls API version",
-                            )
-                        })?;
-
-                    let response_bytes = conn
-                        .send_request(ApiKey::CreateAcls, version, |buf| {
-                            request.encode_versioned(version, buf)
-                        })
-                        .await?;
-
-                    let mut buf = response_bytes;
-                    let response = CreateAclsResponse::decode_versioned(version, &mut buf)?;
-
-                    if let Some(r) = response
-                        .results
-                        .iter()
-                        .find(|r| super::is_controller_moved(r.error_code))
-                    {
-                        return Ok(ControllerAttempt::NotController(r.error_code));
-                    }
-
-                    Ok(ControllerAttempt::Done(response.results))
-                }
-            })
-            .await?;
-
-        let results: Vec<CreateAclResult> = responses
-            .into_iter()
-            .map(|r| CreateAclResult {
-                error: if r.error_code.is_ok() {
-                    None
-                } else {
-                    Some(
-                        r.error_message
-                            .unwrap_or_else(|| format!("{:?}", r.error_code)),
-                    )
+                    let version = negotiate(
+                        &conn,
+                        ApiKey::CreateAcls,
+                        versions::CREATE_ACLS_MIN,
+                        versions::CREATE_ACLS_MAX,
+                    )?;
+                    let response: CreateAclsResponse =
+                        exchange(&conn, ApiKey::CreateAcls, version, &request).await?;
+                    // Results come back in request order.
+                    Ok(indexes
+                        .into_iter()
+                        .zip(response.results)
+                        .map(|(i, r)| (i, answer(r.error_code, r.error_message)))
+                        .collect())
                 },
+            )
+            .await;
+        Ok(acls
+            .into_iter()
+            .enumerate()
+            .map(|(i, acl)| {
+                let result = results
+                    .remove(&i)
+                    .unwrap_or_else(|| Err(KrafkaError::timeout("CreateAcls")));
+                (acl, result)
             })
-            .collect();
-
-        let failed = results.iter().filter(|r| r.error.is_some()).count();
-        info!(
-            "Created {}/{} ACL(s) ({failed} failed)",
-            results.len() - failed,
-            results.len()
-        );
-        Ok(CreateAclsResult { results })
+            .collect())
     }
 
-    /// Delete ACLs matching the specified filters.
+    /// Delete the ACL bindings matching each filter (controller). Returns
+    /// each filter with what it deleted, in the order given.
     ///
-    /// Returns `Ok(result)` when the RPC succeeds.  **An `Ok` return does not
-    /// mean every filter matched or every ACL was deleted** — inspect each
-    /// element of [`DeleteAclsResult`] for per-filter failures.
+    /// # Errors
     ///
-    /// # Arguments
-    /// * `filters` - List of ACL binding filters to match for deletion
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Delete all ACLs for a specific topic
-    /// let filter = AclBindingFilter {
-    ///     resource_type: AclResourceType::Topic,
-    ///     resource_name: Some("my-topic".to_string()),
-    ///     pattern_type: AclPatternType::Literal,
-    ///     principal: None,
-    ///     host: None,
-    ///     operation: AclOperation::Any,
-    ///     permission_type: AclPermissionType::Any,
-    /// };
-    /// admin.delete_acls(vec![filter]).await?;
-    /// ```
-    pub async fn delete_acls(&self, filters: Vec<AclBindingFilter>) -> Result<DeleteAclsResult> {
-        self.check_not_closed()?;
-
-        // `DeleteAcls` is controller-only; see `create_acls`.
-        let responses = self
-            .with_controller("DeleteAcls", |conn| {
-                let filters = &filters;
-                async move {
+    /// The call fails for a closed client.
+    pub async fn delete_acls(
+        &self,
+        filters: Vec<AclFilter>,
+        options: DeleteAclsOptions,
+    ) -> Result<Vec<(AclFilter, Result<DeleteAclsResult>)>> {
+        let call = self.call("DeleteAcls", Mode::Write, options.timeout)?;
+        let filters_ref = &filters;
+        let mut results = call
+            .fan_out(
+                (0..filters.len()).collect(),
+                |_| Target::Controller,
+                |conn, indexes| async move {
                     let request = DeleteAclsRequest {
-                        filters: filters.clone(),
+                        filters: indexes.iter().map(|&i| filters_ref[i].to_wire()).collect(),
                     };
-
-                    let version = conn
-                        .negotiate_api_version(
-                            ApiKey::DeleteAcls,
-                            versions::DELETE_ACLS_MAX,
-                            versions::DELETE_ACLS_MIN,
-                        )
-                        .ok_or_else(|| {
-                            KrafkaError::protocol_kind(
-                                ProtocolErrorKind::UnknownApiVersion,
-                                "no mutually supported DeleteAcls API version",
-                            )
-                        })?;
-
-                    let response_bytes = conn
-                        .send_request(ApiKey::DeleteAcls, version, |buf| {
-                            request.encode_versioned(version, buf)
+                    let version = negotiate(
+                        &conn,
+                        ApiKey::DeleteAcls,
+                        versions::DELETE_ACLS_MIN,
+                        versions::DELETE_ACLS_MAX,
+                    )?;
+                    let response: DeleteAclsResponse =
+                        exchange(&conn, ApiKey::DeleteAcls, version, &request).await?;
+                    Ok(indexes
+                        .into_iter()
+                        .zip(response.filter_results)
+                        .map(|(i, r)| {
+                            let result = answer(r.error_code, r.error_message).map(|()| {
+                                let mut outcome = DeleteAclsResult {
+                                    deleted: Vec::new(),
+                                    failed: Vec::new(),
+                                };
+                                for acl in r.matching_acls {
+                                    let binding = AclBinding {
+                                        resource_type: acl.resource_type,
+                                        resource_name: acl.resource_name,
+                                        pattern_type: acl.pattern_type,
+                                        principal: acl.principal,
+                                        host: acl.host,
+                                        operation: acl.operation,
+                                        permission_type: acl.permission_type,
+                                    };
+                                    match answer(acl.error_code, acl.error_message) {
+                                        Ok(()) => outcome.deleted.push(binding),
+                                        Err(e) => outcome.failed.push((binding, e)),
+                                    }
+                                }
+                                outcome
+                            });
+                            (i, result)
                         })
-                        .await?;
-
-                    let mut buf = response_bytes;
-                    let response = DeleteAclsResponse::decode_versioned(version, &mut buf)?;
-
-                    if let Some(fr) = response
-                        .filter_results
-                        .iter()
-                        .find(|fr| super::is_controller_moved(fr.error_code))
-                    {
-                        return Ok(ControllerAttempt::NotController(fr.error_code));
-                    }
-
-                    Ok(ControllerAttempt::Done(response.filter_results))
-                }
-            })
-            .await?;
-
-        let filter_results: Vec<DeleteAclFilterResult> = responses
+                        .collect())
+                },
+            )
+            .await;
+        Ok(filters
             .into_iter()
-            .map(|fr| {
-                // Count only the ACLs the broker actually deleted. A matching
-                // ACL that carries its own error code was *not* removed;
-                // counting it inflates `deleted_count` and makes a partially
-                // failed deletion look complete.
-                let deleted_count = fr
-                    .matching_acls
-                    .iter()
-                    .filter(|acl| acl.error_code.is_ok())
-                    .count();
-                let unmatched = fr.matching_acls.len() - deleted_count;
-                if unmatched > 0 {
-                    warn!(
-                        "DeleteAcls: {unmatched} matched ACL(s) reported an error and were not deleted"
-                    );
-                }
-                DeleteAclFilterResult {
-                    error: if fr.error_code.is_ok() {
-                        None
-                    } else {
-                        Some(
-                            fr.error_message
-                                .unwrap_or_else(|| format!("{:?}", fr.error_code)),
-                        )
-                    },
-                    deleted_count,
-                }
+            .enumerate()
+            .map(|(i, filter)| {
+                let result = results
+                    .remove(&i)
+                    .unwrap_or_else(|| Err(KrafkaError::timeout("DeleteAcls")));
+                (filter, result)
             })
-            .collect();
-
-        let total: usize = filter_results.iter().map(|r| r.deleted_count).sum();
-        info!(
-            "Deleted {total} ACL(s) across {} filter(s)",
-            filter_results.len()
-        );
-        Ok(DeleteAclsResult { filter_results })
+            .collect())
     }
 }
 
@@ -288,10 +321,10 @@ impl AdminClient {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::protocol::{AclOperation, AclPatternType, AclPermissionType, AclResourceType};
+    use crate::protocol::VersionedEncode;
 
     #[test]
-    fn test_describe_acls_request_round_trips_filter_fields() {
+    fn test_acl_filter_builder() {
         let filter = AclFilter::all()
             .resource_type(AclResourceType::Topic)
             .resource_name("orders")
@@ -300,62 +333,14 @@ mod tests {
             .host("10.0.0.1")
             .operation(AclOperation::Read)
             .permission_type(AclPermissionType::Allow);
+        let wire = filter.to_wire();
+        assert_eq!(wire.resource_type, AclResourceType::Topic);
+        assert_eq!(wire.resource_name.as_deref(), Some("orders"));
+        assert_eq!(wire.principal.as_deref(), Some("User:alice"));
 
-        let request = DescribeAclsRequest {
-            resource_type: filter.resource_type,
-            resource_name: filter.resource_name.clone(),
-            pattern_type: filter.pattern_type,
-            principal: filter.principal.clone(),
-            host: filter.host.clone(),
-            operation: filter.operation,
-            permission_type: filter.permission_type,
-        };
-
-        assert_eq!(request.resource_type, AclResourceType::Topic);
-        assert_eq!(request.resource_name.as_deref(), Some("orders"));
-        assert_eq!(request.pattern_type, AclPatternType::Prefixed);
-        assert_eq!(request.principal.as_deref(), Some("User:alice"));
-        assert_eq!(request.host.as_deref(), Some("10.0.0.1"));
-
-        let mut buf = Vec::new();
-        request
-            .encode_versioned(versions::DESCRIBE_ACLS_MAX, &mut buf)
-            .expect("DescribeAcls must encode");
-        assert!(!buf.is_empty());
-    }
-
-    #[test]
-    fn test_create_acls_request_encodes_every_binding() {
-        let request = CreateAclsRequest {
-            creations: vec![
-                AclBinding::allow_read_topic("orders", "User:alice"),
-                AclBinding::allow_write_topic("orders", "User:bob"),
-            ],
-        };
-        assert_eq!(request.creations.len(), 2);
-
-        let mut buf = Vec::new();
-        request
-            .encode_versioned(versions::CREATE_ACLS_MAX, &mut buf)
-            .expect("CreateAcls must encode");
-        assert!(!buf.is_empty());
-    }
-
-    #[test]
-    fn test_delete_acls_request_encodes_filters() {
         let request = DeleteAclsRequest {
-            filters: vec![AclBindingFilter {
-                resource_type: AclResourceType::Topic,
-                resource_name: Some("orders".to_string()),
-                pattern_type: AclPatternType::Literal,
-                principal: None,
-                host: None,
-                operation: AclOperation::Any,
-                permission_type: AclPermissionType::Any,
-            }],
+            filters: vec![wire],
         };
-        assert_eq!(request.filters.len(), 1);
-
         let mut buf = Vec::new();
         request
             .encode_versioned(versions::DELETE_ACLS_MAX, &mut buf)
@@ -363,38 +348,11 @@ mod tests {
         assert!(!buf.is_empty());
     }
 
-    /// `deleted_count` must count only ACLs the broker actually removed.
-    /// Counting every matched ACL regardless of its individual error code
-    /// over-reports deletions and makes a partial failure look complete.
     #[test]
-    fn test_deleted_count_excludes_matched_acls_that_errored() {
-        // Simulate the filtering the production path performs on
-        // `fr.matching_acls`.
-        let matching: Vec<crate::error::ErrorCode> = vec![
-            crate::error::ErrorCode::None,
-            crate::error::ErrorCode::SecurityDisabled,
-            crate::error::ErrorCode::None,
-        ];
-
-        let deleted = matching.iter().filter(|c| c.is_ok()).count();
-        assert_eq!(
-            deleted, 2,
-            "only ACLs with an OK error code were actually deleted"
-        );
-        assert_ne!(
-            deleted,
-            matching.len(),
-            "counting all matched ACLs would over-report the deletion"
-        );
-    }
-
-    #[test]
-    fn test_delete_acl_filter_result_reports_zero_when_nothing_matched() {
-        let r = DeleteAclFilterResult {
-            error: None,
-            deleted_count: 0,
-        };
-        assert!(r.error.is_none());
-        assert_eq!(r.deleted_count, 0);
+    fn test_acl_filter_constructors() {
+        let f = AclFilter::for_resource(AclResourceType::Group, "g");
+        assert_eq!(f.resource_name.as_deref(), Some("g"));
+        let f = AclFilter::for_principal("User:bob");
+        assert_eq!(f.principal.as_deref(), Some("User:bob"));
     }
 }

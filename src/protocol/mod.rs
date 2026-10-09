@@ -27,7 +27,7 @@
 //! ## Example
 //!
 //! ```rust,ignore
-//! use krafka::protocol::ApiKey;
+//! use crate::protocol::ApiKey;
 //!
 //! // Negotiate the best version for Fetch
 //! // Prefer Fetch v7..=v11; fall back to v4 if the broker doesn't support v7+.
@@ -55,11 +55,16 @@ pub use api::{
 pub use codec::{Decoder, Encoder, MAX_MESSAGE_SIZE};
 pub use header::{RequestHeader, ResponseHeader};
 pub use messages::*;
+// For `__private`, benches and fuzz targets.
+#[cfg_attr(not(feature = "internal"), allow(unused_imports))]
 pub use primitives::*;
+#[cfg(test)]
+pub(crate) use record::DECOMPRESSIONS;
 pub use record::{
-    Compression, LazyRecordBatch, LazyRecordIterator, Record, RecordBatch, RecordBatchBuilder,
-    RecordHeader,
+    Compression, Record, RecordBatch, RecordBatchHeader, RecordHeader, TimestampType,
 };
+#[cfg_attr(not(feature = "internal"), allow(unused_imports))]
+pub use record::{RecordBatchAttributes, RecordBatchBuilder};
 
 use crate::error::{KrafkaError, ProtocolErrorKind, Result};
 
@@ -89,9 +94,7 @@ use crate::error::{KrafkaError, ProtocolErrorKind, Result};
 /// want anyway — fetch metadata for the topics in use
 /// (`ClusterMetadata::refresh_for_topics`) rather than the whole cluster.
 ///
-/// If you have a workload that legitimately needs a higher ceiling, that is a
-/// bug report worth filing: the fix is to thread a limit through
-/// `ConnectionConfig`, not to raise a global constant.
+/// The limit is not configurable.
 pub const MAX_DECODE_ARRAY_LEN: usize = 100_000;
 
 /// Maximum number of headers allowed on a single producer record.
@@ -103,12 +106,10 @@ pub const MAX_RECORD_HEADERS: usize = 10_000;
 
 /// Validate a topic name against the Kafka wire-format limit.
 ///
-/// Fix for H6: the infallible [`Encode`] impl on [`KafkaString`] panics when
-/// a value exceeds `i16::MAX` bytes. Rather than refactoring every call site
-/// through the fallible [`TryEncode`] path, we validate at the public API
-/// boundary so the panic path is structurally unreachable in production —
-/// matching Kafka's Java client and `librdkafka`, which reject oversize
-/// inputs at ingress with `InvalidTopicException` / `RD_KAFKA_RESP_ERR__INVALID_ARG`.
+/// The infallible [`Encode`] impl on [`KafkaString`] panics when a value
+/// exceeds `i16::MAX` bytes (the fallible path is [`TryEncode`]). Validating
+/// at the public API boundary makes that panic unreachable, and matches the
+/// Java client and `librdkafka`, which reject oversize inputs at ingress.
 ///
 /// This helper is **not** a full broker-side topic-name validator (Kafka's
 /// broker limit is 249 chars of a restricted charset); it enforces only the
@@ -126,7 +127,7 @@ pub const MAX_RECORD_HEADERS: usize = 10_000;
 ///
 /// Use at every public ingress where a user-supplied topic name reaches a
 /// request encoder (see call sites in [`crate::admin`] and
-/// [`crate::producer::ProducerRecord::validate`]).
+/// [`crate::producer::Record::validate`]).
 #[inline]
 pub fn validate_topic_name(name: &str) -> Result<()> {
     const MAX_TOPIC_NAME_LEN: usize = 249;
@@ -164,9 +165,7 @@ pub fn validate_topic_name(name: &str) -> Result<()> {
 /// Short-circuits on the first invalid name encountered in iteration order.
 /// For inputs with deterministic iteration order (e.g. slices or `Vec`s) the
 /// surfaced error is also deterministic and matches the single-name helper's
-/// message exactly. Preferred over `for name in names { validate_topic_name(name)? }`
-/// sprinkled across call sites, because the shared implementation keeps
-/// the H6 coverage surface easy to audit.
+/// message exactly.
 #[inline]
 pub fn validate_topic_names<'a, I>(names: I) -> Result<()>
 where
@@ -656,11 +655,11 @@ api_versions! {
     "ConsumerGroupDescribe" [69] => CONSUMER_GROUP_DESCRIBE_MIN = 0 ..= CONSUMER_GROUP_DESCRIBE_MAX = 1,
         "v0 KIP-848 (includes per-member rack ID), v1 member_type (KIP-1099)";
 
-    "GetTelemetrySubscriptions" [71] cfg(feature = "telemetry") => GET_TELEMETRY_SUBSCRIPTIONS_MIN = 0 ..= GET_TELEMETRY_SUBSCRIPTIONS_MAX = 0,
-        "v0 only, flexible from v0 (KIP-714); requires the `telemetry` feature";
+    "GetTelemetrySubscriptions" [71] => GET_TELEMETRY_SUBSCRIPTIONS_MIN = 0 ..= GET_TELEMETRY_SUBSCRIPTIONS_MAX = 0,
+        "v0 only, flexible from v0 (KIP-714)";
 
-    "PushTelemetry" [72] cfg(feature = "telemetry") => PUSH_TELEMETRY_MIN = 0 ..= PUSH_TELEMETRY_MAX = 0,
-        "v0 only, flexible from v0 (KIP-714); requires the `telemetry` feature";
+    "PushTelemetry" [72] => PUSH_TELEMETRY_MIN = 0 ..= PUSH_TELEMETRY_MAX = 0,
+        "v0 only, flexible from v0 (KIP-714)";
 
     "ListConfigResources" [74] => LIST_CONFIG_RESOURCES_MIN = 0 ..= LIST_CONFIG_RESOURCES_MAX = 1,
         "v0 client-metrics-only (KIP-714), v1 arbitrary resource types (KIP-1142)",
@@ -957,7 +956,7 @@ mod tests {
         );
     }
 
-    // ── Regression: allocation amplification ───────────────────────────
+    // ── Allocation amplification ───────────────────────────────────────
 
     /// A declared count is clamped to the bytes that could possibly hold it.
     #[test]
@@ -979,7 +978,7 @@ mod tests {
         assert_eq!(decode_capacity(64, 64), 64);
     }
 
-    /// The bound that makes the fix sound: every array element occupies at
+    /// The bound that makes the clamp sound: every array element occupies at
     /// least one wire byte, so `remaining` is an upper bound on the count and
     /// each individual pre-allocation is bounded by the response size.
     #[test]

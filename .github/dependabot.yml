@@ -1,0 +1,28 @@
+# Dependabot proposes updates as pull requests, which run the whole CI gate.
+version: 2
+updates:
+  # Workflow actions, pinned by commit SHA with the version in a comment.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ['*']
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: cargo
+    directory: /fuzz
+    schedule:
+      interval: weekly
+
+  # The pinned Redpanda release (tests/redpanda/Dockerfile). A pin move is a
+  # one-line pull request whose `integration-redpanda` job runs the new tag.
+  - package-ecosystem: docker
+    directory: /tests/redpanda
+    schedule:
+      interval: weekly

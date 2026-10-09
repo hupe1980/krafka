@@ -10,7 +10,8 @@
 use std::cell::RefCell;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -24,11 +25,29 @@ thread_local! {
     static JITTER_RNG: RefCell<SmallRng> = RefCell::new(SmallRng::from_os_rng());
 }
 
-/// Shared exponential-backoff parameters used by both [`RetryPolicy`] and
-/// [`ConnectionRetryConfig`].
-///
-/// [`RetryPolicy`]: crate::producer::RetryPolicy
-/// [`ConnectionRetryConfig`]: crate::network::ConnectionRetryConfig
+#[cfg(feature = "test-broker")]
+thread_local! {
+    /// Whether [`seed_rng`] seeded this thread: UUIDs then draw from the
+    /// seeded RNG too, so a simulation's member IDs follow its seed.
+    static SEEDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with this thread's non-cryptographic RNG: every random choice
+/// that shapes client behaviour (jitter, partition and broker choice) draws
+/// from it.
+pub(crate) fn with_rng<T>(f: impl FnOnce(&mut SmallRng) -> T) -> T {
+    JITTER_RNG.with(|rng| f(&mut rng.borrow_mut()))
+}
+
+/// Reseed this thread's non-cryptographic RNG.
+#[cfg(feature = "test-broker")]
+pub(crate) fn seed_rng(seed: u64) {
+    JITTER_RNG.with(|rng| *rng.borrow_mut() = SmallRng::seed_from_u64(seed));
+    SEEDED.with(|seeded| seeded.set(true));
+}
+
+/// Shared exponential-backoff parameters used by the producer's retry policy
+/// and the connection pool's reconnect loop.
 #[derive(Debug, Clone)]
 pub struct BackoffPolicy {
     /// Initial backoff duration (first retry delay).
@@ -115,15 +134,9 @@ impl BackoffPolicy {
         // * a non-finite multiplier makes the product `NaN`, and `f64::min`
         //   returns the non-`NaN` operand rather than propagating it.
         //
-        // A previous version short-circuited to the ceiling whenever
-        // `multiplier > 1.0 && exponent >= 1024`, to avoid "evaluating powi with
-        // a large exponent". That guard was both unnecessary and wrong:
-        // `powi` is repeated squaring, so even `i32::MAX` costs ~31
-        // multiplications, and for a multiplier just above 1.0 the exponential
-        // is nowhere near the ceiling at attempt 1025 — `multiplier = 1.0000001`
-        // jumped from 100 ms straight to `max_backoff` instead of the 100.01 ms
-        // it had actually reached. Mutation testing surfaced it: negating the
-        // `||` changed nothing any test could see.
+        // No large-exponent short-circuit: `powi` is repeated squaring (even
+        // `i32::MAX` costs ~31 multiplications), and a multiplier just above
+        // 1.0 is nowhere near the ceiling at attempt 1025.
         let base_backoff = if initial_secs >= effective_max_secs {
             effective_max_secs
         } else {
@@ -153,7 +166,7 @@ impl BackoffPolicy {
         let jitter_factor = self.jitter_factor();
         let jitter_range = base_backoff * jitter_factor;
         let jitter = if jitter_factor > 0.0 && jitter_range > 0.0 {
-            JITTER_RNG.with(|rng| rng.borrow_mut().random_range(-jitter_range..=jitter_range))
+            with_rng(|rng| rng.random_range(-jitter_range..=jitter_range))
         } else {
             0.0
         };
@@ -334,12 +347,21 @@ fn stamp_uuid_v4_bits(bytes: &mut [u8; 16]) {
 /// Format: `xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx` where `y` is one of
 /// `{8, 9, a, b}`. Uses `rand::ThreadRng` (ChaCha12, OS-seeded CSPRNG) for the
 /// 122 random bits. Suitable for both uniqueness (member IDs, client IDs)
-/// and non-predictability — UUIDs generated here are not guessable.
+/// and non-predictability — UUIDs generated here are not guessable. On a
+/// thread a simulation seeded (`test-broker`), they draw from the seeded RNG.
 ///
 /// A single heap allocation of exactly 36 bytes is made.
 pub fn random_uuid_v4() -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut bytes: [u8; 16] = rand::random();
+    #[cfg(feature = "test-broker")]
+    let seeded = SEEDED.with(std::cell::Cell::get);
+    #[cfg(not(feature = "test-broker"))]
+    let seeded = false;
+    let mut bytes: [u8; 16] = if seeded {
+        with_rng(|rng| rng.random())
+    } else {
+        rand::random()
+    };
     stamp_uuid_v4_bits(&mut bytes);
 
     // Encode into a 36-byte UUID string (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).
@@ -498,8 +520,7 @@ pub mod varint {
     /// [`ProtocolErrorKind::InvalidLength`] rather than silently truncated —
     /// matching the Java client's `readUnsignedVarint`, which throws. This
     /// keeps `FF FF FF FF 7F` (non-canonical) distinguishable from
-    /// `FF FF FF FF 0F` (canonical `u32::MAX`); previously both decoded to
-    /// `u32::MAX`.
+    /// `FF FF FF FF 0F` (canonical `u32::MAX`).
     #[inline]
     pub fn decode_unsigned_varint(buf: &mut impl Buf) -> Result<u32> {
         let mut result: u32 = 0;
@@ -774,8 +795,8 @@ mod tests {
 
     #[test]
     fn test_calculate_backoff_does_not_panic_on_negative_jitter_factor() {
-        // A negative jitter_factor previously produced an empty sampling range
-        // (`random_range(0.05..=-0.05)`), which panics. It must now behave
+        // A negative jitter_factor would give an empty sampling range
+        // (`random_range(0.05..=-0.05)`), which panics. It must behave
         // exactly like jitter_factor == 0.0.
         let policy = BackoffPolicy {
             initial_backoff: Duration::from_millis(100),
@@ -947,10 +968,8 @@ mod tests {
 
     /// The version and variant bits, checked against every possible input.
     ///
-    /// This replaces asserting the nibbles of one random UUID, which caught a
-    /// corrupted variant mask only half the time — the surviving mutant
-    /// (`& 0x3F` → `| 0x3F`) leaves bit 6 random, so the old test passed on a
-    /// coin flip.
+    /// Exhaustive, because the mutant `& 0x3F` → `| 0x3F` leaves bit 6
+    /// random: a check over one random UUID would catch it half the time.
     #[test]
     fn stamp_uuid_v4_bits_is_correct_for_every_input() {
         for byte in 0u8..=255 {
@@ -986,11 +1005,9 @@ mod tests {
 
     /// A multiplier just above 1.0 must keep growing, not jump to the ceiling.
     ///
-    /// The previous implementation short-circuited to `max_backoff` whenever
-    /// `multiplier > 1.0 && exponent >= 1024`, on the theory that such an
-    /// exponent would overflow. It does not for a multiplier this close to 1:
-    /// at attempt 1025 the series has reached ~100.01 ms, and the old code
-    /// returned the full 10 s ceiling — a 100× jump.
+    /// At attempt 1025 a multiplier this close to 1 has reached ~100.01 ms;
+    /// short-circuiting large exponents to `max_backoff` would return the
+    /// full 10 s ceiling.
     #[test]
     fn calculate_backoff_does_not_jump_to_the_ceiling_for_slow_growth() {
         let policy = BackoffPolicy {

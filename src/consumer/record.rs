@@ -1,50 +1,47 @@
 //! Consumer record types.
 
-use std::collections::HashSet;
+use std::sync::Arc;
 
 use bytes::Bytes;
 
-use crate::{Offset, PartitionId, Timestamp};
+pub use crate::protocol::TimestampType;
+use crate::{Headers, Offset, PartitionId, Timestamp};
 
 /// A record consumed from Kafka.
 #[non_exhaustive]
 #[must_use = "contains data consumed from Kafka"]
 #[derive(Debug, Clone)]
 pub struct ConsumerRecord {
-    /// Topic name.
-    pub topic: String,
+    /// Topic name, shared by every record of the topic in one fetch.
+    pub topic: Arc<str>,
     /// Partition.
     pub partition: PartitionId,
     /// Offset within the partition.
     pub offset: Offset,
-    /// Timestamp.
+    /// Timestamp (milliseconds since the epoch).
     pub timestamp: Timestamp,
-    /// Timestamp type (0 = CreateTime, 1 = LogAppendTime).
-    pub timestamp_type: i8,
+    /// Whether `timestamp` is the producer's create time or the broker's
+    /// log-append time.
+    pub timestamp_type: TimestampType,
     /// Record key.
     pub key: Option<Bytes>,
     /// Record value.
     pub value: Option<Bytes>,
-    /// Headers (preserves duplicate keys and null values, matching the Kafka protocol).
-    ///
-    /// Keys are raw bytes — Kafka does not mandate UTF-8 for header keys.
-    /// Use [`header`](Self::header) with a `&[u8]` key, or compare
-    /// via [`std::str::from_utf8`] when you know the key is text.
-    pub headers: Vec<(Bytes, Option<Bytes>)>,
+    /// Headers in wire order, duplicates and null values kept — the same type
+    /// a produced [`Record`](crate::Record) carries. A key that is not valid
+    /// UTF-8 is decoded lossily (U+FFFD), as Java's `Header.key()` does.
+    pub headers: Headers,
     /// Leader epoch.
     pub leader_epoch: Option<i32>,
-    /// Delivery count for share group records (KIP-932).
-    ///
-    /// The number of times this record has been delivered to consumers.
-    /// `None` for records consumed via regular consumer groups.
-    /// A value of 1 means the record is being delivered for the first time.
+    /// How many times a share group delivered this record (KIP-932); `None`
+    /// for records from a [`Consumer`](super::Consumer).
     pub delivery_count: Option<i16>,
 }
 
 impl ConsumerRecord {
     /// Create a new consumer record.
     pub fn new(
-        topic: impl Into<String>,
+        topic: impl Into<Arc<str>>,
         partition: PartitionId,
         offset: Offset,
         key: Option<Bytes>,
@@ -55,21 +52,17 @@ impl ConsumerRecord {
             partition,
             offset,
             timestamp: 0,
-            timestamp_type: 0,
+            timestamp_type: TimestampType::CreateTime,
             key,
             value,
-            headers: Vec::new(),
+            headers: Headers::new(),
             leader_epoch: None,
             delivery_count: None,
         }
     }
 
-    /// Returns `true` if this record is a tombstone (delete marker).
-    ///
-    /// In log-compacted topics, a record with a key but no value marks the
-    /// key for deletion. Compaction removes older records for that key, while
-    /// the tombstone itself may remain until the topic's delete retention
-    /// period expires.
+    /// Returns `true` if this record is a tombstone (delete marker): a key
+    /// and no value. Log compaction removes older records for that key.
     #[inline]
     pub fn is_tombstone(&self) -> bool {
         self.key.is_some() && self.value.is_none()
@@ -101,45 +94,47 @@ impl ConsumerRecord {
             .and_then(|v| std::str::from_utf8(v).ok())
     }
 
-    /// Get the first header value matching the given key.
-    /// Returns `Some(Some(bytes))` if a header with a value is found,
-    /// `Some(None)` if a header with a null value is found,
-    /// or `None` if no header with that key exists.
+    /// The first header named `key`: `Some(Some(value))`, `Some(None)` for a
+    /// null value, `None` when there is no such header.
     #[inline]
-    pub fn header(&self, key: &[u8]) -> Option<Option<&Bytes>> {
+    pub fn header(&self, key: &str) -> Option<Option<&Bytes>> {
         self.headers
             .iter()
-            .find(|(k, _)| k.as_ref() == key)
+            .find(|(k, _)| k == key)
             .map(|(_, v)| v.as_ref())
     }
 
-    /// Get the first header value as a string.
-    /// Returns `None` for missing headers and headers with null values.
+    /// The first header named `key` as a string; `None` when it is missing,
+    /// null or not UTF-8.
     #[inline]
-    pub fn header_str(&self, key: &[u8]) -> Option<&str> {
+    pub fn header_str(&self, key: &str) -> Option<&str> {
         self.header(key)
             .flatten()
             .and_then(|v| std::str::from_utf8(v).ok())
     }
 
-    /// Get the first non-null header value matching the given key.
+    /// Every value of the headers named `key`, nulls included, in order.
     #[inline]
-    pub fn header_value(&self, key: &[u8]) -> Option<&Bytes> {
+    pub fn headers_by_key(&self, key: &str) -> Vec<Option<&Bytes>> {
         self.headers
             .iter()
-            .find(|(k, v)| k.as_ref() == key && v.is_some())
-            .and_then(|(_, v)| v.as_ref())
-    }
-
-    /// Get all header values matching the given key (including nulls).
-    #[inline]
-    pub fn headers_by_key(&self, key: &[u8]) -> Vec<Option<&Bytes>> {
-        self.headers
-            .iter()
-            .filter(|(k, _)| k.as_ref() == key)
+            .filter(|(k, _)| k == key)
             .map(|(_, v)| v.as_ref())
             .collect()
     }
+}
+
+/// Decode a wire header key: lossily when it is not UTF-8.
+pub(crate) fn header_key(key: &[u8]) -> String {
+    String::from_utf8_lossy(key).into_owned()
+}
+
+/// Convert decoded wire headers to [`Headers`].
+pub(crate) fn headers_from_wire(headers: Vec<crate::protocol::RecordHeader>) -> Headers {
+    headers
+        .into_iter()
+        .map(|h| (header_key(&h.key), h.value))
+        .collect()
 }
 
 /// Represents a topic-partition pair.
@@ -174,99 +169,6 @@ impl TopicPartition {
     }
 }
 
-/// A collection of consumer records from a poll.
-#[derive(Debug, Default)]
-pub struct ConsumerRecords {
-    records: Vec<ConsumerRecord>,
-    partitions: Vec<(String, PartitionId)>,
-}
-
-impl ConsumerRecords {
-    /// Create an empty record collection.
-    pub fn empty() -> Self {
-        Self::default()
-    }
-
-    /// Create from a vector of records.
-    pub fn from_records(records: Vec<ConsumerRecord>) -> Self {
-        let mut seen = HashSet::new();
-        let mut partitions = Vec::new();
-        for record in &records {
-            let tp = (record.topic.clone(), record.partition);
-            if seen.insert(tp.clone()) {
-                partitions.push(tp);
-            }
-        }
-        Self {
-            records,
-            partitions,
-        }
-    }
-
-    /// Check if empty.
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.records.is_empty()
-    }
-
-    /// Get the number of records.
-    #[inline]
-    pub fn count(&self) -> usize {
-        self.records.len()
-    }
-
-    /// Get records for a specific topic.
-    pub fn records_for_topic(&self, topic: &str) -> impl Iterator<Item = &ConsumerRecord> {
-        self.records.iter().filter(move |r| r.topic == topic)
-    }
-
-    /// Get records for a specific partition.
-    pub fn records_for_partition(
-        &self,
-        topic: &str,
-        partition: PartitionId,
-    ) -> impl Iterator<Item = &ConsumerRecord> {
-        self.records
-            .iter()
-            .filter(move |r| r.topic == topic && r.partition == partition)
-    }
-
-    /// Get all partitions in this record set.
-    #[inline]
-    pub fn partitions(&self) -> &[(String, PartitionId)] {
-        &self.partitions
-    }
-
-    /// Iterate over all records.
-    #[inline]
-    pub fn iter(&self) -> impl Iterator<Item = &ConsumerRecord> {
-        self.records.iter()
-    }
-
-    /// Convert to a vector.
-    pub fn into_vec(self) -> Vec<ConsumerRecord> {
-        self.records
-    }
-}
-
-impl IntoIterator for ConsumerRecords {
-    type Item = ConsumerRecord;
-    type IntoIter = std::vec::IntoIter<ConsumerRecord>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.records.into_iter()
-    }
-}
-
-impl<'a> IntoIterator for &'a ConsumerRecords {
-    type Item = &'a ConsumerRecord;
-    type IntoIter = std::slice::Iter<'a, ConsumerRecord>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.records.iter()
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -282,7 +184,7 @@ mod tests {
             Some(Bytes::from("value")),
         );
 
-        assert_eq!(record.topic, "test-topic");
+        assert_eq!(&*record.topic, "test-topic");
         assert_eq!(record.partition, 0);
         assert_eq!(record.offset, 42);
         assert_eq!(record.key_str(), Some("key"));
@@ -324,49 +226,18 @@ mod tests {
     }
 
     #[test]
-    fn test_consumer_records_iteration() {
-        let records = vec![
-            ConsumerRecord::new("topic1", 0, 0, None, Some(Bytes::from("a"))),
-            ConsumerRecord::new("topic1", 0, 1, None, Some(Bytes::from("b"))),
-            ConsumerRecord::new("topic1", 1, 0, None, Some(Bytes::from("c"))),
-        ];
-
-        let consumer_records = ConsumerRecords::from_records(records);
-        assert_eq!(consumer_records.count(), 3);
-        assert!(!consumer_records.is_empty());
-
-        let p0_records: Vec<_> = consumer_records
-            .records_for_partition("topic1", 0)
-            .collect();
-        assert_eq!(p0_records.len(), 2);
-    }
-
-    #[test]
-    fn test_consumer_records_partitions() {
-        let records = vec![
-            ConsumerRecord::new("topic1", 0, 0, None, None),
-            ConsumerRecord::new("topic1", 1, 0, None, None),
-            ConsumerRecord::new("topic2", 0, 0, None, None),
-        ];
-
-        let consumer_records = ConsumerRecords::from_records(records);
-        assert_eq!(consumer_records.partitions().len(), 3);
-    }
-
-    #[test]
     fn test_consumer_record_duplicate_headers_preserved() {
         let mut record = ConsumerRecord::new("test-topic", 0, 0, None, Some(Bytes::from("value")));
 
-        // Add duplicate header keys
         record
             .headers
-            .push((Bytes::from("trace-id"), Some(Bytes::from("abc"))));
+            .push(("trace-id".to_string(), Some(Bytes::from("abc"))));
         record
             .headers
-            .push((Bytes::from("trace-id"), Some(Bytes::from("def"))));
+            .push(("trace-id".to_string(), Some(Bytes::from("def"))));
         record
             .headers
-            .push((Bytes::from("other"), Some(Bytes::from("xyz"))));
+            .push(("other".to_string(), Some(Bytes::from("xyz"))));
 
         // Both duplicates should be preserved
         assert_eq!(
@@ -377,7 +248,7 @@ mod tests {
 
         // header() returns the first match
         assert_eq!(
-            record.header(b"trace-id"),
+            record.header("trace-id"),
             Some(Some(&Bytes::from("abc"))),
             "header() should return the first matching header value"
         );
@@ -389,18 +260,18 @@ mod tests {
 
         record
             .headers
-            .push((Bytes::from("trace-id"), Some(Bytes::from("first"))));
+            .push(("trace-id".to_string(), Some(Bytes::from("first"))));
         record
             .headers
-            .push((Bytes::from("trace-id"), Some(Bytes::from("second"))));
+            .push(("trace-id".to_string(), Some(Bytes::from("second"))));
         record
             .headers
-            .push((Bytes::from("trace-id"), Some(Bytes::from("third"))));
+            .push(("trace-id".to_string(), Some(Bytes::from("third"))));
         record
             .headers
-            .push((Bytes::from("other-key"), Some(Bytes::from("other"))));
+            .push(("other-key".to_string(), Some(Bytes::from("other"))));
 
-        let trace_values = record.headers_by_key(b"trace-id");
+        let trace_values = record.headers_by_key("trace-id");
         assert_eq!(
             trace_values.len(),
             3,
@@ -410,67 +281,46 @@ mod tests {
         assert_eq!(trace_values[1], Some(&Bytes::from("second")));
         assert_eq!(trace_values[2], Some(&Bytes::from("third")));
 
-        let other_values = record.headers_by_key(b"other-key");
+        let other_values = record.headers_by_key("other-key");
         assert_eq!(other_values.len(), 1);
 
-        let missing_values = record.headers_by_key(b"nonexistent");
+        let missing_values = record.headers_by_key("nonexistent");
         assert!(
             missing_values.is_empty(),
             "headers_by_key for missing key should return empty vec"
         );
     }
 
-    // ── R9.7: null header values ──
+    // ── null header values ──
 
     #[test]
     fn test_consumer_record_header_with_null_value() {
         let mut record = ConsumerRecord::new("t", 0, 0, None, Some(Bytes::from("v")));
-        record.headers.push((Bytes::from("x-null"), None));
+        record.headers.push(("x-null".to_string(), None));
         record
             .headers
-            .push((Bytes::from("x-present"), Some(Bytes::from("data"))));
+            .push(("x-present".to_string(), Some(Bytes::from("data"))));
 
         // header() returns Some(None) for a null-valued header
-        assert_eq!(record.header(b"x-null"), Some(None));
+        assert_eq!(record.header("x-null"), Some(None));
         // header() returns Some(Some(&bytes)) for a present-valued header
-        assert_eq!(
-            record.header(b"x-present"),
-            Some(Some(&Bytes::from("data")))
-        );
+        assert_eq!(record.header("x-present"), Some(Some(&Bytes::from("data"))));
         // header() returns None for a missing key
-        assert_eq!(record.header(b"missing"), None);
-    }
-
-    #[test]
-    fn test_consumer_record_header_value_skips_null() {
-        let mut record = ConsumerRecord::new("t", 0, 0, None, Some(Bytes::from("v")));
-        // First entry is null, second is non-null
-        record.headers.push((Bytes::from("key"), None));
-        record
-            .headers
-            .push((Bytes::from("key"), Some(Bytes::from("real"))));
-
-        // header_value() should skip the null and return the first non-null
-        assert_eq!(record.header_value(b"key"), Some(&Bytes::from("real")));
-
-        // If all values for a key are null, header_value() returns None
-        let mut record2 = ConsumerRecord::new("t", 0, 0, None, None);
-        record2.headers.push((Bytes::from("all-null"), None));
-        assert_eq!(record2.header_value(b"all-null"), None);
+        assert_eq!(record.header("missing"), None);
     }
 
     #[test]
     fn test_consumer_record_header_str_returns_none_for_null() {
         let mut record = ConsumerRecord::new("t", 0, 0, None, None);
-        record.headers.push((Bytes::from("h"), None));
+        record.headers.push(("h".to_string(), None));
         record
             .headers
-            .push((Bytes::from("h2"), Some(Bytes::from("text"))));
+            .push(("h2".to_string(), Some(Bytes::from("text"))));
 
         // null header → None
-        assert_eq!(record.header_str(b"h"), None);
+        assert_eq!(record.header_str("h"), None);
         // present header with valid UTF-8 → Some(str)
-        assert_eq!(record.header_str(b"h2"), Some("text"));
+        assert_eq!(record.header_str("h2"), Some("text"));
     }
 
     #[test]
@@ -478,16 +328,29 @@ mod tests {
         let mut record = ConsumerRecord::new("t", 0, 0, None, None);
         record
             .headers
-            .push((Bytes::from("k"), Some(Bytes::from("a"))));
-        record.headers.push((Bytes::from("k"), None));
+            .push(("k".to_string(), Some(Bytes::from("a"))));
+        record.headers.push(("k".to_string(), None));
         record
             .headers
-            .push((Bytes::from("k"), Some(Bytes::from("b"))));
+            .push(("k".to_string(), Some(Bytes::from("b"))));
 
-        let vals = record.headers_by_key(b"k");
+        let vals = record.headers_by_key("k");
         assert_eq!(vals.len(), 3);
         assert_eq!(vals[0], Some(&Bytes::from("a")));
         assert_eq!(vals[1], None);
         assert_eq!(vals[2], Some(&Bytes::from("b")));
+    }
+
+    /// Header keys are `String`s; a key that is not UTF-8 is decoded lossily
+    /// and the record is still delivered. Negative control: a strict
+    /// `String::from_utf8(..).unwrap()` in `header_key` panics here.
+    #[test]
+    fn a_non_utf8_header_key_is_decoded_lossily() {
+        let headers = headers_from_wire(vec![crate::protocol::RecordHeader::new(
+            Bytes::from_static(b"tr\xffce"),
+            Bytes::from_static(b"v"),
+        )]);
+        assert_eq!(headers[0].0, "tr\u{fffd}ce");
+        assert_eq!(headers[0].1.as_deref(), Some(&b"v"[..]));
     }
 }

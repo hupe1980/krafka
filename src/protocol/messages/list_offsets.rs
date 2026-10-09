@@ -375,7 +375,7 @@ mod tests {
     use crate::util::varint;
     use bytes::BytesMut;
 
-    // ── R14: ListOffsetsResponse decode safety ──
+    // ── ListOffsetsResponse decode safety ──
 
     #[test]
     fn test_list_offsets_response_decode_v1_empty() {
@@ -489,7 +489,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ── R14: ListOffsetsRequest encode_v2 with isolation_level ──
+    // ── ListOffsetsRequest encode_v2 with isolation_level ──
 
     #[test]
     fn test_list_offsets_request_encode_v2_includes_isolation_level() {

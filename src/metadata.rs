@@ -5,6 +5,18 @@
 //! - Topic and partition information
 //! - Broker discovery
 //! - Leader election tracking
+//!
+//! # One writer
+//!
+//! Every [`ClusterMetadata`](crate::metadata::ClusterMetadata) has one writer task. Callers never fetch
+//! metadata themselves: they ask the writer for topics (optionally forcing a
+//! fetch the cache-age check would skip) and wait for the answer. The writer
+//! unions everything requested since its last fetch into one `Metadata`
+//! request, applies the retry backoff between fetches, and is the only code
+//! that builds a new snapshot from a response. Leader hints and rebootstraps
+//! go through the same serialized write path, so no update can overwrite
+//! another one it did not see. Readers load the current snapshot without
+//! locking.
 
 // `AHashMap` is used throughout this module for all internal maps (broker IDs,
 // topic names, partition IDs). `ahash` is a non-cryptographic hash function.
@@ -15,14 +27,14 @@
 // Key lengths are also bounded by Kafka's own validation (topic names ≤ 249
 // characters, broker IDs are i32).
 use ahash::{AHashMap, AHashSet};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+use tokio::time::Instant;
 
 use arc_swap::ArcSwap;
-use parking_lot::{Mutex as SyncMutex, RwLock as SyncRwLock};
-use tokio::sync::oneshot;
-use tokio::time::timeout;
+use parking_lot::Mutex as SyncMutex;
+use tokio::sync::{Notify, oneshot};
 use tracing::{debug, info, warn};
 
 use crate::error::{ErrorCode, KrafkaError, Result};
@@ -33,23 +45,21 @@ use crate::protocol::{
 use crate::util::BackoffPolicy;
 use crate::{BrokerId, PartitionId};
 
-/// Strategy for recovering when metadata refresh fails for too long.
+/// Strategy for recovering when the client loses the cluster, i.e. Java's
+/// `metadata.recovery.strategy` (KIP-899, KIP-1102).
 ///
-/// Mirrors Java's `metadata.recovery.strategy`, introduced by KIP-899 (Kafka
-/// 3.8) with the two values below. KIP-899's own trigger is "no broker in the
-/// current metadata is reachable"; the time-based
-/// [`ClusterMetadata::with_rebootstrap_trigger`] that also drives it here comes
-/// from KIP-1102 (Kafka 4.0), which additionally made `rebootstrap` the default
-/// upstream.
+/// With [`Rebootstrap`](Self::Rebootstrap) the client drops its view of the
+/// cluster and rediscovers it from the bootstrap servers when every known
+/// broker is unreachable, when no metadata request has succeeded within
+/// [`ClusterMetadata::with_rebootstrap_trigger`], or when a broker answers
+/// `REBOOTSTRAP_REQUIRED`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum MetadataRecoveryStrategy {
-    /// No automatic recovery — behave like pre-KIP-899 clients. This is
-    /// `metadata.recovery.strategy=none`.
-    #[default]
+    /// No automatic recovery: `metadata.recovery.strategy=none`.
     None,
-    /// Reset to bootstrap servers and re-discover the cluster when metadata
-    /// refresh has not succeeded within the configured trigger duration.
+    /// Rediscover the cluster from the bootstrap servers. The default.
+    #[default]
     Rebootstrap,
 }
 
@@ -148,11 +158,11 @@ pub(crate) fn broker_info_for_node(
 /// rolling restart, for example). Such an entry has `leader == -1`,
 /// `leader_epoch == -1`, and a non-OK [`error_code`](Self::error_code).
 ///
-/// Retaining the entry is deliberate: dropping it would shrink
-/// [`TopicInfo::partition_count`], and a key-hash partitioner computing
-/// `hash % partition_count` would then route keys to different partitions for
-/// the duration of the outage, silently violating per-key ordering. Routing is
-/// instead expected to fail for the individual affected partitions.
+/// Retaining the entry keeps [`TopicInfo::partition_count`] stable, so a
+/// key-hash partitioner computing `hash % partition_count` keeps routing each
+/// key to the same partition during the outage. Routing fails for the
+/// individual affected partitions instead, with a retriable
+/// `LEADER_NOT_AVAILABLE`.
 #[non_exhaustive]
 #[must_use]
 #[derive(Debug, Clone)]
@@ -195,10 +205,12 @@ impl PartitionInfo {
 pub struct TopicInfo {
     /// Topic name.
     pub name: String,
+    /// Topic ID (Metadata v10+). All zeros when the broker did not report one.
+    pub topic_id: [u8; 16],
     /// Whether the topic is internal.
     pub is_internal: bool,
     /// Partition information, keyed by partition ID for O(1) lookup.
-    pub partitions: AHashMap<PartitionId, PartitionInfo>,
+    pub partitions: std::collections::HashMap<PartitionId, PartitionInfo>,
 }
 
 impl TopicInfo {
@@ -250,136 +262,6 @@ impl TopicInfo {
     }
 }
 
-/// What a metadata refresh call actually did.
-///
-/// Returned by [`ClusterMetadata::refresh_for_topics_outcome`]. The distinction
-/// matters for retry loops: a caller that reacted to a stale-leader error and
-/// then re-issued its request against *identical* metadata would spin forever.
-/// [`RefreshOutcome::RateLimited`] tells the caller that **no** broker
-/// round-trip happened and how long to wait before a refresh can succeed.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RefreshOutcome {
-    /// A metadata request was sent to a broker and the cache was updated.
-    Refreshed,
-    /// Every requested topic was already present in the cache and younger than
-    /// `metadata.max.age.ms`; no request was sent because none was needed.
-    AlreadyFresh,
-    /// The refresh was suppressed by the `retry.backoff.ms` rate limiter and
-    /// **the cache was not updated**. The payload is how long remains before
-    /// another attempt is permitted.
-    RateLimited(Duration),
-}
-
-impl RefreshOutcome {
-    /// Returns `true` when the caller can rely on the cache reflecting a
-    /// genuine, recent broker response — i.e. anything but
-    /// [`RefreshOutcome::RateLimited`].
-    #[inline]
-    #[must_use]
-    pub fn is_current(self) -> bool {
-        !matches!(self, Self::RateLimited(_))
-    }
-
-    /// How long to wait before re-issuing, or `None` if no wait is needed.
-    #[inline]
-    #[must_use]
-    pub fn retry_after(self) -> Option<Duration> {
-        match self {
-            Self::RateLimited(d) => Some(d),
-            _ => None,
-        }
-    }
-}
-
-/// Coalescing state for concurrent metadata refresh calls.
-///
-/// Replaces `tokio::sync::Mutex<()>` (which was held across the entire
-/// refresh network round-trip) with a subscriber list:
-///
-/// - `Idle`: no refresh in flight; the first caller becomes the refresher.
-/// - `InFlight`: a refresh is in progress; subsequent callers may subscribe via
-///   a oneshot and are woken when the refresh completes.
-///
-/// A caller may only subscribe when the in-flight refresh actually covers the
-/// topics it needs — see [`InFlightTopics::covers`]. Otherwise it would receive
-/// the refresher's `Ok(())` for a topic set that was never requested from the
-/// broker, and then fail with `no leader for <topic>-<partition>` having
-/// apparently just refreshed.
-///
-/// The `parking_lot::Mutex` wrapping this state is held for at most a few
-/// microseconds (just long enough to push/drain the subscriber list) and is
-/// **never** held across an `.await` point.
-enum RefreshCoalescingState {
-    Idle,
-    InFlight {
-        /// Topics the in-flight refresh asked the broker for. `All` means a
-        /// full refresh, which covers every topic.
-        topics: InFlightTopics,
-        /// Callers waiting on this refresh.
-        senders: Vec<oneshot::Sender<Result<RefreshOutcome>>>,
-    },
-}
-
-/// The topic set an in-flight refresh covers.
-#[derive(Debug, Clone)]
-enum InFlightTopics {
-    /// A full refresh — covers every topic in the cluster.
-    All,
-    /// A partial refresh limited to these topic names.
-    Some(Vec<String>),
-}
-
-impl InFlightTopics {
-    fn from_request(topics: Option<&[&str]>) -> Self {
-        match topics {
-            None => Self::All,
-            Some(names) => Self::Some(names.iter().map(|n| (*n).to_string()).collect()),
-        }
-    }
-
-    /// Whether a refresh for `requested` can be satisfied by this in-flight
-    /// refresh — i.e. `requested` is a subset of what is already being fetched.
-    fn covers(&self, requested: Option<&[&str]>) -> bool {
-        match (self, requested) {
-            // A full refresh covers anything, including another full refresh.
-            (Self::All, _) => true,
-            // A partial refresh can never satisfy a full refresh.
-            (Self::Some(_), None) => false,
-            (Self::Some(in_flight), Some(names)) => names
-                .iter()
-                .all(|n| in_flight.iter().any(|f| f.as_str() == *n)),
-        }
-    }
-}
-
-/// RAII guard that resets the coalescing state to `Idle` and notifies all
-/// waiting subscribers when the refresher completes or is cancelled.
-struct RefreshGuard<'a> {
-    state: &'a SyncMutex<RefreshCoalescingState>,
-    result: Option<Result<RefreshOutcome>>,
-}
-
-impl Drop for RefreshGuard<'_> {
-    fn drop(&mut self) {
-        let result = self.result.take().unwrap_or_else(|| {
-            Err(KrafkaError::invalid_state(
-                "metadata refresh was cancelled or panicked",
-            ))
-        });
-        let mut st = self.state.lock();
-        if let RefreshCoalescingState::InFlight {
-            ref mut senders, ..
-        } = *st
-        {
-            for tx in senders.drain(..) {
-                let _ = tx.send(result.clone());
-            }
-        }
-        *st = RefreshCoalescingState::Idle;
-    }
-}
-
 /// Default ceiling for the metadata retry backoff, mirroring Java's
 /// `retry.backoff.max.ms`.
 const DEFAULT_RETRY_BACKOFF_MAX: Duration = Duration::from_millis(1000);
@@ -394,35 +276,29 @@ const DEFAULT_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 /// without materially changing the average retry rate of any single client.
 const RETRY_BACKOFF_JITTER: f64 = 0.2;
 
-/// Fraction of [`ClusterMetadata::rebootstrap_trigger`] used as random extra
-/// delay before a rebootstrap is allowed to fire.
+/// Fraction of the rebootstrap trigger used as random extra delay before a
+/// time-triggered rebootstrap is allowed to fire.
 ///
 /// Without it, a fleet whose clients all lost the cluster at the same instant
 /// would rebootstrap in lockstep and hit the seed brokers as one wave.
 const REBOOTSTRAP_TRIGGER_JITTER: f64 = 0.2;
 
+/// How many candidate addresses one connection attempt races concurrently.
+const CONNECT_FANOUT: usize = 3;
+
 /// State of the metadata-refresh rate limiter (KIP-580).
 ///
-/// The delay between refresh *attempts* grows exponentially while refreshes
-/// keep failing and resets as soon as one succeeds. A flat delay means every
-/// failing partition on every client retries at the same fixed interval, so a
-/// cluster that is already struggling receives a steady synchronised drumbeat
-/// of metadata requests exactly when it can least afford it.
+/// The delay between fetches grows exponentially while they keep failing and
+/// resets to the base delay as soon as one succeeds.
 #[derive(Debug)]
 struct RefreshBackoffState {
-    /// When the last refresh attempt completed (success or failure).
-    /// `None` means no attempt has completed yet, so the next one is free.
+    /// When the last fetch completed (success or failure). `None` means no
+    /// fetch has completed yet, so the next one is free.
     last_attempt_completed: Option<Instant>,
-    /// Number of consecutive failed refresh attempts. Reset to zero on
-    /// success. Drives the exponent of the backoff curve.
+    /// Number of consecutive failed fetches. Reset to zero on success.
     consecutive_failures: u32,
-    /// Delay that must elapse after `last_attempt_completed` before another
-    /// attempt is permitted.
-    ///
-    /// It is computed once, when the attempt completes, rather than on every
-    /// rate-limit check. Recomputing it per check would re-sample the jitter
-    /// and make [`RefreshOutcome::RateLimited`]'s reported remaining time jump
-    /// around between two consecutive calls that observe the same state.
+    /// Delay that must elapse after `last_attempt_completed` before the next
+    /// fetch. Computed once per completed fetch, so the jitter is sampled once.
     current_delay: Duration,
 }
 
@@ -435,7 +311,7 @@ impl RefreshBackoffState {
         }
     }
 
-    /// How much of `current_delay` is left, or `None` if an attempt is allowed.
+    /// How much of `current_delay` is left, or `None` if a fetch is allowed.
     fn remaining(&self) -> Option<Duration> {
         let last = self.last_attempt_completed?;
         let elapsed = last.elapsed();
@@ -446,18 +322,14 @@ impl RefreshBackoffState {
         }
     }
 
-    /// Record a successful refresh: drop back to the base delay.
-    ///
-    /// The base delay is still applied (and still jittered) so that a caller
-    /// looping on a genuinely changing cluster cannot turn every response into
-    /// an immediate follow-up request.
+    /// Record a successful fetch: drop back to the base delay.
     fn record_success(&mut self, policy: &BackoffPolicy) {
         self.consecutive_failures = 0;
         self.current_delay = policy.calculate_backoff(1);
         self.last_attempt_completed = Some(Instant::now());
     }
 
-    /// Record a failed refresh: advance one step along the exponential curve.
+    /// Record a failed fetch: advance one step along the exponential curve.
     fn record_failure(&mut self, policy: &BackoffPolicy) {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         self.current_delay = policy.calculate_backoff(self.consecutive_failures);
@@ -465,182 +337,88 @@ impl RefreshBackoffState {
     }
 }
 
-/// Upper bound on the number of topics whose usage is tracked.
+/// Milliseconds since a process-wide reference instant, never zero.
 ///
-/// The map is pruned on every metadata refresh, so it is normally bounded by
-/// "topics touched within the TTL". The cap only matters for a client that
-/// addresses a very large number of distinct topics between two refreshes; it
-/// keeps a pathological workload from turning the tracker itself into the leak
-/// the TTL exists to prevent.
-const MAX_TRACKED_TOPIC_USAGE: usize = 10_000;
+/// Zero is reserved as "never used" in [`TopicStamp::last_used_ms`].
+fn now_millis() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    let epoch = EPOCH.get_or_init(Instant::now);
+    u64::try_from(epoch.elapsed().as_millis())
+        .unwrap_or(u64::MAX)
+        .saturating_add(1)
+}
 
-/// Records when each topic was last *used* by this client.
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// When a cached topic was last fetched and last used.
 ///
-/// TTL eviction is an idleness rule, mirroring `metadata.max.idle.ms`: every
-/// `send()` resets the timer, as `ProducerMetadata.add` does in Java. Keying it
-/// off the last *refresh* instead would evict a topic being written to every
-/// second, because a partial refresh stamps only the topic it names — leaving
-/// every other topic in active use to age out.
+/// The one per-topic expiry record. `refreshed` decides whether the entry is
+/// current (`metadata.max.age.ms`); `last_used_ms` decides whether it is idle
+/// (`metadata.max.idle.ms`). A partial refresh evicts a topic only when it is
+/// neither used nor fetched within the idle TTL.
 ///
-/// Timestamps are milliseconds since a fixed epoch so that a touch on the send
-/// path is a shared-lock lookup plus one relaxed atomic store: no allocation,
-/// and no writer contention between topics once an entry exists.
+/// The stamp is shared by `Arc` between snapshots, so a use recorded on the
+/// read path is one relaxed atomic store with no lock.
 #[derive(Debug)]
-struct TopicUsageTracker {
-    /// Reference point for the stored millisecond timestamps.
-    epoch: Instant,
-    /// Topic name → milliseconds since `epoch` at which it was last used.
-    entries: SyncRwLock<AHashMap<String, AtomicU64>>,
+struct TopicStamp {
+    /// When a metadata response last included this topic.
+    refreshed: Instant,
+    /// [`now_millis`] at the last use; `0` when never used.
+    last_used_ms: AtomicU64,
 }
 
-impl TopicUsageTracker {
-    fn new() -> Self {
-        Self {
-            epoch: Instant::now(),
-            entries: SyncRwLock::new(AHashMap::new()),
-        }
+impl TopicStamp {
+    fn fetched_now(last_used_ms: u64) -> Arc<Self> {
+        Arc::new(Self {
+            refreshed: Instant::now(),
+            last_used_ms: AtomicU64::new(last_used_ms),
+        })
     }
 
-    /// Milliseconds since `epoch`. Saturates rather than wrapping; a client
-    /// would have to run for ~584 million years to reach the ceiling.
-    fn now_millis(&self) -> u64 {
-        u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
-    }
-
-    fn millis(duration: Duration) -> u64 {
-        u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-    }
-
-    /// Mark `topic` as used now.
-    fn touch(&self, topic: &str, ttl: Duration) {
-        let now = self.now_millis();
-
-        // Fast path: the entry exists, so a shared lock and a relaxed store are
-        // enough. Concurrent touches of different topics never serialise.
-        if let Some(slot) = self.entries.read().get(topic) {
-            slot.store(now, Ordering::Relaxed);
-            return;
-        }
-
-        let mut entries = self.entries.write();
-        // Re-check: another task may have inserted between the two locks.
-        if let Some(slot) = entries.get(topic) {
-            slot.store(now, Ordering::Relaxed);
-            return;
-        }
-        if entries.len() >= MAX_TRACKED_TOPIC_USAGE {
-            // Drop everything already past the TTL first: one O(n) pass
-            // reclaims many slots, so the scan amortises to nothing across the
-            // inserts that follow. Evicting one entry per insert instead would
-            // make every new topic pay a full scan once the cap is reached.
-            let ttl_ms = Self::millis(ttl);
-            entries.retain(|_, ts| now.saturating_sub(ts.load(Ordering::Relaxed)) <= ttl_ms);
-
-            // Everything is still live: give up the least recently used one.
-            // At worst that makes a nearly-idle topic evictable slightly early,
-            // and it is refetched on its next use.
-            if entries.len() >= MAX_TRACKED_TOPIC_USAGE
-                && let Some(oldest) = entries
-                    .iter()
-                    .min_by_key(|(_, ts)| ts.load(Ordering::Relaxed))
-                    .map(|(name, _)| name.clone())
-            {
-                entries.remove(&oldest);
-            }
-        }
-        entries.insert(topic.to_owned(), AtomicU64::new(now));
-    }
-
-    /// Of `names`, those used within `ttl`.
-    ///
-    /// Borrows the names from the caller's map so the filter costs one shared
-    /// lock and no per-topic allocation.
-    fn active_among<'a, I>(&self, ttl: Duration, names: I) -> AHashSet<&'a str>
-    where
-        I: Iterator<Item = &'a str>,
-    {
-        let now = self.now_millis();
-        let ttl_ms = Self::millis(ttl);
-        let entries = self.entries.read();
-        names
-            .filter(|name| {
-                entries
-                    .get(*name)
-                    .is_some_and(|ts| now.saturating_sub(ts.load(Ordering::Relaxed)) <= ttl_ms)
-            })
-            .collect()
-    }
-
-    /// Drop entries idle for longer than `ttl`, bounding the map.
-    fn prune(&self, ttl: Duration) {
-        let now = self.now_millis();
-        let ttl_ms = Self::millis(ttl);
-        let mut entries = self.entries.write();
-        entries.retain(|_, ts| now.saturating_sub(ts.load(Ordering::Relaxed)) <= ttl_ms);
-    }
-
-    /// How long ago `topic` was last used, or `None` if it was never used.
-    #[cfg(test)]
-    fn idle_for(&self, topic: &str) -> Option<Duration> {
-        let now = self.now_millis();
-        self.entries
-            .read()
-            .get(topic)
-            .map(|ts| Duration::from_millis(now.saturating_sub(ts.load(Ordering::Relaxed))))
-    }
-
-    #[cfg(test)]
-    fn tracked_len(&self) -> usize {
-        self.entries.read().len()
+    /// Whether the topic was fetched or used within `ttl`.
+    fn is_live(&self, now: Instant, now_ms: u64, ttl: Duration) -> bool {
+        let used = self.last_used_ms.load(Ordering::Relaxed);
+        now.duration_since(self.refreshed) <= ttl
+            || (used != 0 && now_ms.saturating_sub(used) <= millis(ttl))
     }
 }
 
-/// Cached cluster metadata.
+/// One immutable snapshot of cluster metadata.
 #[derive(Debug, Clone)]
 struct MetadataCache {
     /// Cluster ID.
     cluster_id: Option<String>,
     /// Controller broker ID.
     controller_id: BrokerId,
-    /// Brokers by ID.
+    /// Brokers by ID: exactly the brokers of the last metadata response, plus
+    /// endpoints registered by leader hints since.
     brokers: AHashMap<BrokerId, BrokerInfo>,
-    /// Topics by name. Wrapped in `Arc` so that partial-refresh clones of
-    /// the map are O(n) ref-count bumps instead of O(n) deep copies.
+    /// Topics by name, `Arc`-wrapped so a new snapshot shares unchanged
+    /// entries with the previous one.
     topics: AHashMap<String, Arc<TopicInfo>>,
-    /// Topic UUID → topic name map. Topic names are wrapped in `Arc` so that
-    /// partial-refresh clones of the map are O(n) ref-count bumps instead of
-    /// O(n) deep copies. Populated from metadata v10+ responses where each
-    /// topic includes a 16-byte topic_id. Used by the KIP-848 consumer
-    /// protocol to resolve topic UUIDs in assignments.
+    /// Topic UUID → topic name (Metadata v10+). Used by the KIP-848 consumer
+    /// and the share consumer to resolve topic IDs.
     topic_ids: AHashMap<[u8; 16], Arc<String>>,
-    /// Reverse index: topic name → topic UUID. Kept in sync with `topic_ids`
-    /// for O(1) lookups.
-    ///
-    /// # TOCTOU note
-    ///
-    /// `topic_ids` and `name_to_topic_id` are updated atomically under the
-    /// cache write lock. Callers must not assume consistency between a read
-    /// from one map and a subsequent independent read from the other without
-    /// re-acquiring the lock.
+    /// Topic name → topic UUID, kept in step with `topic_ids`.
     name_to_topic_id: AHashMap<String, [u8; 16]>,
-    /// Per-topic timestamp of the last refresh that included this topic.
-    /// Used for TTL-based eviction during partial refreshes and to decide
-    /// whether an individual entry is stale (see [`MetadataCache::topic_is_fresh`]).
-    topic_last_refreshed: AHashMap<String, Instant>,
+    /// Fetch and use stamps for every topic in `topics`.
+    topic_stamps: AHashMap<String, Arc<TopicStamp>>,
     /// The topic-level error the broker last reported for a topic, if any.
     ///
-    /// A topic that errors is absent from `topics` (permanent errors) or
-    /// present but stale (retriable ones), and in both cases the *reason* is
-    /// what a caller needs: `TOPIC_AUTHORIZATION_FAILED` and
-    /// `UNKNOWN_TOPIC_OR_PARTITION` call for completely different handling,
-    /// and reporting both as "unknown topic" sends operators hunting for a
-    /// topic that exists and they simply cannot read. Mirrors
-    /// `Metadata.getError(topic)` in the Java client.
-    ///
-    /// Cleared for a topic as soon as it comes back without an error.
+    /// `TOPIC_AUTHORIZATION_FAILED` and `UNKNOWN_TOPIC_OR_PARTITION` call for
+    /// different handling, so the reason a topic is missing is kept. Mirrors
+    /// `Metadata.getError(topic)` in the Java client. Cleared for a topic as
+    /// soon as it comes back without an error.
     topic_errors: AHashMap<String, ErrorCode>,
-    /// When the metadata was last updated.
+    /// When the snapshot was built.
     last_updated: Instant,
+    /// Incremented by every write to the snapshot.
+    generation: u64,
+    /// Incremented by every rebootstrap. A fetch that started before a
+    /// rebootstrap is discarded when it completes after it.
+    reset_epoch: u64,
 }
 
 impl MetadataCache {
@@ -652,9 +430,11 @@ impl MetadataCache {
             topics: AHashMap::new(),
             topic_ids: AHashMap::new(),
             name_to_topic_id: AHashMap::new(),
-            topic_last_refreshed: AHashMap::new(),
+            topic_stamps: AHashMap::new(),
             topic_errors: AHashMap::new(),
             last_updated: Instant::now(),
+            generation: 0,
+            reset_epoch: 0,
         }
     }
 
@@ -662,773 +442,540 @@ impl MetadataCache {
         self.last_updated.elapsed() > max_age
     }
 
-    /// Whether `topic` is present **and** was itself refreshed within
-    /// `max_age`.
+    /// Whether `topic` is present **and** was itself fetched within `max_age`.
     ///
     /// `last_updated` advances on every refresh, including a partial one for a
-    /// completely different topic, so it says nothing about the age of any
-    /// individual entry. A client that keeps refreshing topic A would otherwise
-    /// serve an hours-old leader map for topic B forever, because the cache as
-    /// a whole never looks stale and the entry is present.
+    /// different topic, so it says nothing about the age of one entry.
     fn topic_is_fresh(&self, topic: &str, max_age: Duration) -> bool {
         self.topics.contains_key(topic)
             && self
-                .topic_last_refreshed
+                .topic_stamps
                 .get(topic)
-                .is_some_and(|ts| ts.elapsed() <= max_age)
+                .is_some_and(|stamp| stamp.refreshed.elapsed() <= max_age)
+    }
+
+    /// Build the next snapshot from a metadata response.
+    ///
+    /// A full refresh is authoritative for topics; a partial one merges into
+    /// the current topics, evicting those idle beyond `topic_ttl`. Either way
+    /// the broker map becomes the response's brokers.
+    ///
+    /// Within one topic ID a partition's cached leader epoch is never replaced
+    /// by an older one (KIP-320). When the topic ID changed — the topic was
+    /// deleted and re-created — the incoming partitions replace the cached
+    /// ones regardless of epoch.
+    fn merge(
+        &self,
+        response: MetadataResponse,
+        full_refresh: bool,
+        topic_ttl: Option<Duration>,
+    ) -> Self {
+        let now = Instant::now();
+        let now_ms = now_millis();
+
+        let brokers: AHashMap<BrokerId, BrokerInfo> = response
+            .brokers
+            .into_iter()
+            .map(|b| {
+                (
+                    b.node_id,
+                    BrokerInfo::new(b.node_id, b.host, b.port, b.rack),
+                )
+            })
+            .collect();
+
+        let retained = |name: &String| -> bool {
+            match topic_ttl {
+                None => true,
+                Some(ttl) => self
+                    .topic_stamps
+                    .get(name)
+                    .is_some_and(|stamp| stamp.is_live(now, now_ms, ttl)),
+            }
+        };
+
+        let mut topics: AHashMap<String, Arc<TopicInfo>> = if full_refresh {
+            AHashMap::new()
+        } else {
+            let kept: AHashMap<_, _> = self
+                .topics
+                .iter()
+                .filter(|(name, _)| retained(name))
+                .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                .collect();
+            let evicted = self.topics.len() - kept.len();
+            if evicted > 0 {
+                debug!(evicted, "evicted idle topics from metadata cache");
+            }
+            kept
+        };
+        let mut topic_errors: AHashMap<String, ErrorCode> = if full_refresh {
+            AHashMap::new()
+        } else {
+            self.topic_errors
+                .iter()
+                .filter(|(name, _)| match topic_ttl {
+                    None => true,
+                    Some(_) => topics.contains_key(name.as_str()),
+                })
+                .map(|(k, v)| (k.clone(), *v))
+                .collect()
+        };
+        // Topics this response fetched; their stamps are renewed below.
+        let mut fetched: Vec<String> = Vec::new();
+
+        for topic in response.topics {
+            let Some(name) = topic.name else {
+                continue;
+            };
+
+            if !topic.error_code.is_ok() {
+                topic_errors.insert(name.clone(), topic.error_code);
+                // An unknown topic was deleted (or never existed) and leaves
+                // the cache; other retriable errors are transient.
+                let gone = matches!(
+                    topic.error_code,
+                    ErrorCode::UnknownTopicOrPartition | ErrorCode::UnknownTopicId
+                );
+                if topic.error_code.is_retriable() && !gone {
+                    // The broker knows the topic but cannot describe it right
+                    // now (LEADER_NOT_AVAILABLE while it is created, for
+                    // example). Keep the previous entry, restoring it if the
+                    // idle TTL just evicted it.
+                    debug!(topic = %name, error = ?topic.error_code, "transient topic error; keeping cached entry");
+                    if !topics.contains_key(&name)
+                        && let Some(previous) = self.topics.get(&name)
+                    {
+                        topics.insert(name.clone(), Arc::clone(previous));
+                    }
+                    if topics.contains_key(&name) {
+                        fetched.push(name);
+                    }
+                } else {
+                    warn!(topic = %name, error = ?topic.error_code, "topic metadata error");
+                    topics.remove(&name);
+                }
+                continue;
+            }
+
+            let topic_id = topic.topic_id.unwrap_or([0; 16]);
+            let cached = self.topics.get(&name).filter(|cached| {
+                // A different non-zero ID is a different topic: its epochs
+                // start again from zero and must not be compared with the
+                // deleted topic's.
+                let recreated = topic_id != [0; 16]
+                    && cached.topic_id != [0; 16]
+                    && cached.topic_id != topic_id;
+                if recreated {
+                    info!(topic = %name, "topic ID changed; the topic was re-created");
+                }
+                !recreated
+            });
+
+            // Every partition the broker reported is retained, including
+            // errored ones, so `partition_count()` stays stable.
+            let partitions: std::collections::HashMap<PartitionId, PartitionInfo> = topic
+                .partitions
+                .into_iter()
+                .map(|p| {
+                    let healthy = p.error_code.is_ok();
+                    if !healthy {
+                        debug!(
+                            topic = %name,
+                            partition = p.partition_index,
+                            error = ?p.error_code,
+                            "partition reported an error; retaining entry with no leader"
+                        );
+                    }
+                    let incoming = PartitionInfo {
+                        topic: name.clone(),
+                        partition: p.partition_index,
+                        leader: if healthy { p.leader_id } else { -1 },
+                        leader_epoch: if healthy { p.leader_epoch } else { -1 },
+                        replicas: p.replica_nodes,
+                        isr: p.isr_nodes,
+                        offline_replicas: p.offline_replicas,
+                        error_code: p.error_code,
+                    };
+
+                    // KIP-320: a lagging broker can answer with an older epoch
+                    // than the cached one; keep the newer entry. An epoch of -1
+                    // is unknown and never takes part in the comparison.
+                    let merged = match cached.and_then(|t| t.partitions.get(&p.partition_index)) {
+                        Some(previous)
+                            if previous.leader_epoch >= 0
+                                && incoming.leader_epoch >= 0
+                                && incoming.leader_epoch < previous.leader_epoch =>
+                        {
+                            debug!(
+                                topic = %name,
+                                partition = p.partition_index,
+                                cached_epoch = previous.leader_epoch,
+                                response_epoch = incoming.leader_epoch,
+                                "ignoring stale leader epoch from metadata response (KIP-320)"
+                            );
+                            previous.clone()
+                        }
+                        _ => incoming,
+                    };
+                    (p.partition_index, merged)
+                })
+                .collect();
+
+            topic_errors.remove(&name);
+            fetched.push(name.clone());
+            topics.insert(
+                name.clone(),
+                Arc::new(TopicInfo {
+                    name,
+                    topic_id,
+                    is_internal: topic.is_internal,
+                    partitions,
+                }),
+            );
+        }
+
+        let mut topic_stamps: AHashMap<String, Arc<TopicStamp>> = self
+            .topic_stamps
+            .iter()
+            .filter(|(name, _)| topics.contains_key(name.as_str()))
+            .map(|(k, v)| (k.clone(), Arc::clone(v)))
+            .collect();
+        for name in fetched {
+            let last_used = topic_stamps
+                .get(&name)
+                .map_or(0, |stamp| stamp.last_used_ms.load(Ordering::Relaxed));
+            topic_stamps.insert(name, TopicStamp::fetched_now(last_used));
+        }
+
+        let mut topic_ids: AHashMap<[u8; 16], Arc<String>> = AHashMap::new();
+        let mut name_to_topic_id: AHashMap<String, [u8; 16]> = AHashMap::new();
+        for (name, info) in &topics {
+            if info.topic_id != [0; 16] {
+                topic_ids.insert(info.topic_id, Arc::new(name.clone()));
+                name_to_topic_id.insert(name.clone(), info.topic_id);
+            }
+        }
+
+        Self {
+            cluster_id: response.cluster_id,
+            controller_id: response.controller_id,
+            brokers,
+            topics,
+            topic_ids,
+            name_to_topic_id,
+            topic_stamps,
+            topic_errors,
+            last_updated: now,
+            generation: self.generation + 1,
+            reset_epoch: self.reset_epoch,
+        }
     }
 }
 
-/// Cluster metadata manager.
-pub struct ClusterMetadata {
-    /// Bootstrap servers (lock-free reads via `ArcSwap` for KIP-899 `update_seed_brokers`).
+/// Topics requested from the writer since its last fetch.
+#[derive(Default)]
+struct PendingFetch {
+    /// Somebody asked for every topic.
+    full: bool,
+    /// Topics asked for by name.
+    topics: AHashSet<String>,
+    /// Callers waiting for the fetch that covers their request.
+    waiters: Vec<oneshot::Sender<Result<()>>>,
+    /// A rebootstrap was requested.
+    rebootstrap: bool,
+}
+
+impl PendingFetch {
+    fn is_empty(&self) -> bool {
+        !self.full && !self.rebootstrap && self.waiters.is_empty()
+    }
+}
+
+/// State shared by a [`ClusterMetadata`] handle and its writer task.
+struct Inner {
+    /// Bootstrap servers; replaceable at runtime (KIP-899).
     bootstrap_servers: ArcSwap<Vec<String>>,
     /// Connection pool.
     pool: Arc<ConnectionPool>,
-    /// Cached metadata (lock-free reads via `ArcSwap`).
+    /// The current snapshot. Loaded lock-free; stored only under `write_lock`.
     cache: ArcSwap<MetadataCache>,
-    /// Metadata max age before refresh.
+    /// Serializes every store to `cache`. Held for the in-memory merge only,
+    /// never across an `.await`.
+    write_lock: SyncMutex<()>,
+    /// Metadata max age before a topic entry counts as stale.
     max_age: Duration,
-    /// Upper bound on how long a *subscriber* waits for an in-flight refresh
-    /// driven by another task.
-    ///
-    /// This is deliberately **not** `max_age`: bounding the wait by the
-    /// metadata max-age (300 s by default) means a nominally "bounded" wait can
-    /// block a caller for five minutes behind one stalled refresher. Mirrors
-    /// `request.timeout.ms` in the Java client. Default: 30 s.
-    request_timeout: Duration,
-    /// Coalescing state for concurrent metadata refresh calls.
-    ///
-    /// The `parking_lot::Mutex` is held only for microseconds (to push/drain
-    /// the subscriber list). The actual network I/O happens outside the lock,
-    /// preventing slow brokers from serialising all metadata callers.
-    refresh_state: SyncMutex<RefreshCoalescingState>,
-    /// Exponential-with-jitter backoff between successive refresh *attempts*
-    /// (KIP-580). Mirrors `retry.backoff.ms` / `retry.backoff.max.ms` in the
-    /// Java client: `initial_backoff` is the base delay after a success or a
-    /// first failure, doubling per consecutive failure up to `max_backoff`.
-    /// `None` disables rate limiting entirely.
+    /// Backoff between fetches (KIP-580). `None` disables it.
     retry_backoff: Option<BackoffPolicy>,
-    /// Rate-limiter state: when the last attempt completed, how many
-    /// consecutive failures preceded it, and the delay currently in force.
+    /// Rate-limiter state, owned by the writer.
     refresh_backoff: SyncMutex<RefreshBackoffState>,
-    /// Recovery strategy when metadata refresh fails for too long, i.e.
     /// `metadata.recovery.strategy` (KIP-899).
     recovery_strategy: MetadataRecoveryStrategy,
-    /// Duration after which a failing metadata refresh triggers a rebootstrap
-    /// (only when `recovery_strategy` is [`MetadataRecoveryStrategy::Rebootstrap`]).
-    /// The time-based trigger itself is KIP-1102.
-    /// Default: 300 s (5 minutes), matching the Java client.
+    /// How long fetches may keep failing before a rebootstrap (KIP-1102).
     rebootstrap_trigger: Duration,
-    /// Upper bound on the random delay inserted before a rebootstrap tears
-    /// down connections and re-dials the seed brokers.
-    ///
-    /// A fleet that loses the cluster simultaneously (a rack outage, a rolling
-    /// restart that goes wrong) would otherwise all rebootstrap at the same
-    /// instant and arrive at one seed broker as a single wave, which is exactly
-    /// the load spike the seed broker cannot absorb while recovering.
-    /// Default: 500 ms. `Duration::ZERO` disables the delay.
+    /// Upper bound on the random delay before a rebootstrap.
     rebootstrap_jitter: Duration,
-    /// Instant when the current streak of metadata-refresh failures started.
-    /// Reset to `None` on every successful refresh. After a rebootstrap
-    /// it is set to the *current* instant (matching Java) so the next cycle
-    /// starts timing immediately.
+    /// Start of the current streak of failed fetches. Cleared by a successful
+    /// fetch; set to *now* by a rebootstrap so the next one needs another full
+    /// trigger period.
     metadata_attempt_start: SyncMutex<Option<Instant>>,
-    /// Maximum age of a cached topic entry before it is evicted during partial
-    /// refresh. Defaults to 5 minutes, matching the Java client's
-    /// `metadata.max.idle.ms`. `None` disables TTL eviction. When set, topics
-    /// not refreshed within this duration are pruned on the next partial
-    /// refresh, preventing unbounded cache growth from topic churn.
+    /// Idle TTL for topic entries (`metadata.max.idle.ms`). `None` disables
+    /// eviction.
     topic_cache_ttl: Option<Duration>,
-    /// When each topic was last *used* by this client. Drives TTL eviction,
-    /// which is an idleness rule (Java's `metadata.max.idle.ms`) rather than a
-    /// refresh-recency one. See [`TopicUsageTracker`].
-    topic_usage: TopicUsageTracker,
-    /// Whether a topic-specific metadata request may ask the broker to create
-    /// topics it does not have, i.e. `allow.auto.create.topics`.
-    ///
-    /// Only ever set on requests that name topics; an all-topics refresh has
-    /// nothing to create. The broker must also have
-    /// `auto.create.topics.enable=true` for the flag to do anything.
+    /// `allow.auto.create.topics` on topic-specific requests.
     auto_create_topics: bool,
+    /// Requests waiting for the writer.
+    pending: SyncMutex<PendingFetch>,
+    /// Wakes the writer.
+    wake: Notify,
+    /// Whether the writer task has been spawned.
+    writer_started: AtomicBool,
+    /// Set when the owning handle is dropped; stops the writer.
+    closed: AtomicBool,
+}
+
+/// Cluster metadata manager.
+///
+/// Reads are lock-free snapshot loads. Fetches go through the writer task;
+/// see the module documentation.
+pub struct ClusterMetadata {
+    inner: Arc<Inner>,
+}
+
+impl Drop for ClusterMetadata {
+    fn drop(&mut self) {
+        self.inner.closed.store(true, Ordering::Release);
+        self.inner.wake.notify_one();
+    }
 }
 
 impl ClusterMetadata {
     /// Create a new cluster metadata manager.
+    ///
+    /// The `with_*` methods configure it; they take effect only before the
+    /// first fetch.
     pub fn new(
         bootstrap_servers: Vec<String>,
         pool: Arc<ConnectionPool>,
         max_age: Duration,
     ) -> Self {
         Self {
-            bootstrap_servers: ArcSwap::from_pointee(bootstrap_servers),
-            pool,
-            cache: ArcSwap::from_pointee(MetadataCache::new()),
-            max_age,
-            request_timeout: Duration::from_secs(30),
-            refresh_state: SyncMutex::new(RefreshCoalescingState::Idle),
-            retry_backoff: Some(Self::default_retry_backoff_policy()),
-            refresh_backoff: SyncMutex::new(RefreshBackoffState::new()),
-            recovery_strategy: MetadataRecoveryStrategy::None,
-            rebootstrap_trigger: Duration::from_secs(300),
-            rebootstrap_jitter: Duration::from_millis(500),
-            metadata_attempt_start: SyncMutex::new(None),
-            // Default to 5 minutes, matching Java's `metadata.max.idle.ms`.
-            // Prevents unbounded cache growth on topic churn; callers that
-            // want the old unbounded behaviour can opt out via
-            // `with_topic_cache_ttl_disabled()`.
-            topic_cache_ttl: Some(Duration::from_secs(300)),
-            topic_usage: TopicUsageTracker::new(),
-            // Off by default. Creating cluster state as a side effect of a
-            // typo'd topic name is not a default worth having; see
-            // `with_auto_create_topics` for the full reasoning.
-            auto_create_topics: false,
+            inner: Arc::new(Inner {
+                bootstrap_servers: ArcSwap::from_pointee(bootstrap_servers),
+                pool,
+                cache: ArcSwap::from_pointee(MetadataCache::new()),
+                write_lock: SyncMutex::new(()),
+                max_age,
+                retry_backoff: Some(Inner::default_retry_backoff_policy()),
+                refresh_backoff: SyncMutex::new(RefreshBackoffState::new()),
+                recovery_strategy: MetadataRecoveryStrategy::default(),
+                rebootstrap_trigger: Duration::from_secs(300),
+                rebootstrap_jitter: Duration::from_millis(500),
+                metadata_attempt_start: SyncMutex::new(None),
+                topic_cache_ttl: Some(Duration::from_secs(300)),
+                auto_create_topics: false,
+                pending: SyncMutex::new(PendingFetch::default()),
+                wake: Notify::new(),
+                writer_started: AtomicBool::new(false),
+                closed: AtomicBool::new(false),
+            }),
         }
     }
 
+    /// Apply a configuration change. Configuration is fixed once the writer
+    /// task has started, which happens on the first fetch.
+    fn configure(mut self, apply: impl FnOnce(&mut Inner)) -> Self {
+        match Arc::get_mut(&mut self.inner) {
+            Some(inner) => apply(inner),
+            None => warn!("ClusterMetadata is already in use; configuration change ignored"),
+        }
+        self
+    }
+
     /// Set the metadata recovery strategy, i.e. `metadata.recovery.strategy`
-    /// (KIP-899).
-    ///
-    /// When set to [`MetadataRecoveryStrategy::Rebootstrap`], the client will
-    /// automatically close all connections and fall back to bootstrap servers
-    /// when metadata refresh has not succeeded within
-    /// [`rebootstrap_trigger`](Self::with_rebootstrap_trigger) (that timeout
-    /// trigger is KIP-1102).
+    /// (KIP-899). Default: [`MetadataRecoveryStrategy::Rebootstrap`].
     #[must_use]
-    pub fn with_recovery_strategy(mut self, strategy: MetadataRecoveryStrategy) -> Self {
-        self.recovery_strategy = strategy;
-        self
+    pub fn with_recovery_strategy(self, strategy: MetadataRecoveryStrategy) -> Self {
+        self.configure(|inner| inner.recovery_strategy = strategy)
     }
 
-    /// Set the duration after which failed metadata refreshes trigger a
-    /// rebootstrap (`metadata.recovery.rebootstrap.trigger.ms`, KIP-1102).
-    /// Only effective when the recovery strategy is
-    /// [`MetadataRecoveryStrategy::Rebootstrap`] (KIP-899). Default: 300 s.
+    /// Set how long metadata fetches may keep failing before the client
+    /// rebootstraps (`metadata.recovery.rebootstrap.trigger.ms`, KIP-1102).
+    /// Only effective with [`MetadataRecoveryStrategy::Rebootstrap`].
+    /// Default: 300 s.
     #[must_use]
-    pub fn with_rebootstrap_trigger(mut self, duration: Duration) -> Self {
-        self.rebootstrap_trigger = duration;
-        self
-    }
-
-    /// Set the upper bound on how long a caller waits for a metadata refresh
-    /// that another task is already driving.
-    ///
-    /// Mirrors `request.timeout.ms` in the Java client. Default: 30 s.
-    #[must_use]
-    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
-        self.request_timeout = timeout;
-        self
+    pub fn with_rebootstrap_trigger(self, duration: Duration) -> Self {
+        self.configure(|inner| inner.rebootstrap_trigger = duration)
     }
 
     /// Set the topic cache TTL for partial refreshes, i.e.
     /// `metadata.max.idle.ms`.
     ///
-    /// During partial refreshes, cached topics that have been **idle** for
-    /// longer than this duration are evicted to prevent unbounded cache
-    /// growth. A topic is idle when nothing has addressed it: producing to it,
-    /// resolving its leader, asking for its partition count, or naming it in a
-    /// metadata refresh all reset the timer, exactly as `ProducerMetadata.add`
-    /// does in the Java client. A topic that is still being *refreshed* also
-    /// survives, so an entry can never be dropped while its metadata is
-    /// current.
+    /// During a partial refresh, cached topics neither used nor fetched within
+    /// this duration are evicted. Producing to a topic, resolving its leader,
+    /// asking for its partition count, or naming it in a refresh all count as
+    /// use, as `ProducerMetadata.add` does in the Java client.
     ///
-    /// Full refreshes always rebuild from scratch regardless of this setting.
+    /// Full refreshes always rebuild the topic set from the response.
     ///
     /// Default: 5 minutes (matching Java's `metadata.max.idle.ms`).
     #[must_use]
-    pub fn with_topic_cache_ttl(mut self, ttl: Duration) -> Self {
-        self.topic_cache_ttl = Some(ttl);
-        self
+    pub fn with_topic_cache_ttl(self, ttl: Duration) -> Self {
+        self.configure(|inner| inner.topic_cache_ttl = Some(ttl))
     }
 
-    /// Disable topic cache TTL eviction.
-    ///
-    /// Partial refreshes will retain cached topic entries indefinitely.
-    /// Prefer the default TTL for long-lived clients that discover topics
-    /// dynamically (CDC, multi-tenant gateways); disabling TTL eviction can
-    /// cause unbounded cache growth on topic churn.
+    /// Disable topic cache TTL eviction: partial refreshes keep every cached
+    /// topic indefinitely.
     #[must_use]
-    pub fn with_topic_cache_ttl_disabled(mut self) -> Self {
-        self.topic_cache_ttl = None;
-        self
+    pub fn with_topic_cache_ttl_disabled(self) -> Self {
+        self.configure(|inner| inner.topic_cache_ttl = None)
     }
 
     /// Allow the broker to create a topic this client asks about but the
     /// cluster does not have, i.e. `allow.auto.create.topics`.
     ///
-    /// The flag rides on topic-specific metadata requests only; an all-topics
-    /// refresh has nothing to create. The broker must additionally be
-    /// configured with `auto.create.topics.enable=true`, which is where the
-    /// decision ultimately sits.
+    /// The flag rides on topic-specific metadata requests only. The broker
+    /// must additionally be configured with `auto.create.topics.enable=true`.
     ///
-    /// Defaults to `false`, unlike the Java client, which asks for
-    /// auto-creation on the producer and defaults the consumer to `true`. A
-    /// typo'd topic name that silently materialises a real topic reports
-    /// nothing until the traffic is found missing from the topic it was meant
-    /// for. Turn it on for development and test clusters.
+    /// Defaults to `false`: a typo'd topic name that silently materialises a
+    /// real topic reports nothing until the traffic is found missing. Turn it
+    /// on for development and test clusters.
     #[must_use]
-    pub fn with_auto_create_topics(mut self, allow: bool) -> Self {
-        self.auto_create_topics = allow;
-        self
+    pub fn with_auto_create_topics(self, allow: bool) -> Self {
+        self.configure(|inner| inner.auto_create_topics = allow)
     }
 
-    /// The default metadata retry backoff: 100 ms base, doubling to a 1 s
-    /// ceiling, with ±20% jitter.
-    fn default_retry_backoff_policy() -> BackoffPolicy {
-        BackoffPolicy {
-            initial_backoff: DEFAULT_RETRY_BACKOFF,
-            max_backoff: DEFAULT_RETRY_BACKOFF_MAX,
-            backoff_multiplier: 2.0,
-            jitter_factor: RETRY_BACKOFF_JITTER,
-        }
-    }
-
-    /// Set the **base** delay between successive metadata refresh attempts.
+    /// Set the **base** delay between metadata fetches.
     ///
-    /// This is the first step of the exponential curve described in
-    /// [`with_retry_backoff_max`](Self::with_retry_backoff_max), not a flat
-    /// interval: after `n` consecutive failed refreshes the delay is
-    /// `backoff × 2^(n-1)`, capped and jittered. A successful refresh resets it
-    /// back to `backoff`.
+    /// After `n` consecutive failed fetches the delay is `backoff × 2^(n-1)`,
+    /// capped by [`with_retry_backoff_max`](Self::with_retry_backoff_max) and
+    /// jittered; a successful fetch resets it to `backoff`. Mirrors
+    /// `retry.backoff.ms`. Default: 100 ms.
     ///
-    /// Mirrors `retry.backoff.ms` in the Java client. Default: 100 ms.
-    ///
-    /// Passing `None` disables rate limiting entirely — every caller that asks
-    /// for a refresh gets a broker round-trip. That is almost never what you
-    /// want outside tests: it is the configuration that lets one unavailable
-    /// partition turn a tight poll loop into a metadata-request storm.
+    /// `None` disables the backoff: every request the writer receives is
+    /// fetched immediately. Useful in tests only.
     ///
     /// If `backoff` exceeds the configured maximum, the maximum is raised to
-    /// match so the curve stays well-formed.
+    /// match.
     #[must_use]
-    pub fn with_retry_backoff(mut self, backoff: impl Into<Option<Duration>>) -> Self {
-        self.retry_backoff = backoff.into().map(|base| {
-            let mut policy = self
-                .retry_backoff
-                .take()
-                .unwrap_or_else(Self::default_retry_backoff_policy);
-            policy.initial_backoff = base;
-            policy.max_backoff = policy.max_backoff.max(base);
-            policy
-        });
-        self
+    pub fn with_retry_backoff(self, backoff: impl Into<Option<Duration>>) -> Self {
+        let backoff = backoff.into();
+        self.configure(|inner| {
+            inner.retry_backoff = backoff.map(|base| {
+                let mut policy = inner
+                    .retry_backoff
+                    .take()
+                    .unwrap_or_else(Inner::default_retry_backoff_policy);
+                policy.initial_backoff = base;
+                policy.max_backoff = policy.max_backoff.max(base);
+                policy
+            });
+        })
     }
 
-    /// Set the ceiling for the exponential metadata retry backoff (KIP-580).
-    ///
-    /// Consecutive refresh failures double the delay — 100 ms, 200 ms, 400 ms,
-    /// … — until it reaches this ceiling, where it stays until a refresh
-    /// succeeds. Mirrors `retry.backoff.max.ms` in the Java client.
-    /// Default: 1 s.
-    ///
-    /// Values below the base delay are raised to it, so the curve is never
-    /// inverted. Has no effect when rate limiting is disabled via
-    /// [`with_retry_backoff(None)`](Self::with_retry_backoff).
+    /// Set the ceiling of the exponential metadata backoff, i.e.
+    /// `retry.backoff.max.ms`. Default: 1 s. Values below the base delay are
+    /// raised to it. No effect when the backoff is disabled.
     #[must_use]
-    pub fn with_retry_backoff_max(mut self, max_backoff: Duration) -> Self {
-        if let Some(policy) = self.retry_backoff.as_mut() {
-            policy.max_backoff = max_backoff.max(policy.initial_backoff);
-        }
-        self
+    pub fn with_retry_backoff_max(self, max_backoff: Duration) -> Self {
+        self.configure(|inner| {
+            if let Some(policy) = inner.retry_backoff.as_mut() {
+                policy.max_backoff = max_backoff.max(policy.initial_backoff);
+            }
+        })
     }
 
-    /// Replace the whole metadata retry backoff policy.
-    ///
-    /// Use this to control the multiplier or jitter factor as well as the
-    /// bounds. The policy's jitter factor is clamped into `0.0..=1.0` when it
-    /// is read, so an out-of-range value degrades to "no jitter" rather than
-    /// misbehaving.
+    /// Replace the whole metadata backoff policy.
     #[must_use]
-    pub fn with_retry_backoff_policy(mut self, policy: BackoffPolicy) -> Self {
-        self.retry_backoff = Some(policy);
-        self
+    pub fn with_retry_backoff_policy(self, policy: BackoffPolicy) -> Self {
+        self.configure(|inner| inner.retry_backoff = Some(policy))
     }
 
-    /// Set the upper bound on the random delay applied before a rebootstrap
-    /// closes connections and re-dials the seed brokers (KIP-899/KIP-1102).
+    /// Set the upper bound on the random delay applied before a rebootstrap.
     ///
-    /// The delay is sampled uniformly from `[0, jitter)` on each rebootstrap so
-    /// that a fleet which lost the cluster at the same instant does not arrive
-    /// at one seed broker as a single synchronised wave. Default: 500 ms;
-    /// `Duration::ZERO` rebootstraps immediately.
+    /// The delay is sampled uniformly from `[0, jitter)` so that a fleet which
+    /// lost the cluster at the same instant does not arrive at one seed broker
+    /// as a single wave. Default: 500 ms; `Duration::ZERO` rebootstraps
+    /// immediately.
     #[must_use]
-    pub fn with_rebootstrap_jitter(mut self, jitter: Duration) -> Self {
-        self.rebootstrap_jitter = jitter;
-        self
+    pub fn with_rebootstrap_jitter(self, jitter: Duration) -> Self {
+        self.configure(|inner| inner.rebootstrap_jitter = jitter)
     }
 
     /// Get the bootstrap servers.
     pub fn bootstrap_servers(&self) -> Vec<String> {
-        (**self.bootstrap_servers.load()).clone()
+        (**self.inner.bootstrap_servers.load()).clone()
     }
 
-    /// Refresh metadata from the cluster.
+    /// How long cached metadata may be used before a refresh.
+    pub(crate) fn max_age(&self) -> Duration {
+        self.inner.max_age
+    }
+
+    /// Fetch metadata for every topic in the cluster.
     pub async fn refresh(&self) -> Result<()> {
-        self.refresh_for_topics(None).await
+        self.request(None, true).await
     }
 
-    /// Refresh metadata for specific topics.
+    /// Make sure metadata for `topics` is current, fetching it when a topic is
+    /// missing or older than the metadata max age. `None` fetches every topic.
     ///
-    /// This is the convenience wrapper around
-    /// [`refresh_for_topics_outcome`](Self::refresh_for_topics_outcome): when
-    /// the rate limiter suppresses an attempt, this method **waits out the
-    /// remaining backoff and re-issues** rather than returning a success the
-    /// caller never received. A plain `Ok(())` from this method therefore
-    /// always means the cache reflects a genuine broker response (or was
-    /// already fresh).
-    ///
-    /// Callers that want to make their own scheduling decision — for example a
-    /// bounded retry loop that has other work to do while it waits — should
-    /// call [`refresh_for_topics_outcome`](Self::refresh_for_topics_outcome)
-    /// and inspect [`RefreshOutcome`].
-    ///
-    /// # Errors
-    ///
-    /// Besides the underlying refresh errors, returns
-    /// [`KrafkaError::Timeout`] if the rate limiter suppresses every attempt
-    /// within [`MAX_RATE_LIMIT_WAITS`](Self::MAX_RATE_LIMIT_WAITS) rounds. That
-    /// only happens when other tasks keep winning the race for the same
-    /// refresh slot; reporting it is better than returning `Ok(())` for a
-    /// refresh that never touched a broker.
+    /// Returns when the writer has applied a response that covers the
+    /// request, or with the error of the fetch that tried.
     pub async fn refresh_for_topics(&self, topics: Option<&[&str]>) -> Result<()> {
-        let mut last_remaining = Duration::ZERO;
-
-        for _ in 0..Self::MAX_RATE_LIMIT_WAITS {
-            match self.refresh_for_topics_outcome(topics).await? {
-                RefreshOutcome::Refreshed | RefreshOutcome::AlreadyFresh => return Ok(()),
-                RefreshOutcome::RateLimited(remaining) => {
-                    // The previous attempt completed less than the current
-                    // backoff ago. Returning Ok here would hand the caller a
-                    // success it never received and leave it retrying against
-                    // byte-identical stale metadata. Wait out the backoff, then
-                    // really refresh. The backoff grows while the cluster keeps
-                    // failing, so this loop cannot become a hot spin.
-                    debug!(
-                        remaining_ms = remaining.as_millis(),
-                        "metadata refresh rate-limited; awaiting backoff before re-issuing"
-                    );
-                    last_remaining = remaining;
-                    tokio::time::sleep(remaining).await;
-                }
-            }
-        }
-
-        Err(KrafkaError::timeout(format!(
-            "metadata refresh was rate-limited {} times in a row (last wait {} ms); \
-             another task is monopolising the refresh slot",
-            Self::MAX_RATE_LIMIT_WAITS,
-            last_remaining.as_millis(),
-        )))
+        self.request(topics, false).await
     }
 
-    /// How many times [`refresh_for_topics`](Self::refresh_for_topics) will
-    /// wait out a rate-limit before giving up.
+    /// Fetch metadata for `topics` even when the cached entries are current.
     ///
-    /// Each round sleeps for exactly the reported remaining backoff, so under
-    /// normal contention the first or second round succeeds. The bound exists
-    /// so a caller can never be pinned in the loop indefinitely.
-    const MAX_RATE_LIMIT_WAITS: usize = 3;
-
-    /// Refresh metadata for specific topics, reporting what actually happened.
-    ///
-    /// Concurrent callers are coalesced: the first caller claims the refresher
-    /// role while subsequent callers subscribe to the in-flight result via a
-    /// oneshot channel. The `parking_lot::Mutex` used for coalescing is held
-    /// only for microseconds to read/update the subscriber list and is **never**
-    /// held across any `.await` point.
-    ///
-    /// A caller only joins an in-flight refresh when that refresh covers the
-    /// topics it asked for (a full refresh covers everything; a partial refresh
-    /// covers a superset of the requested names). A caller asking for topics the
-    /// in-flight refresh will not fetch starts its own refresh instead —
-    /// otherwise it would be handed an `Ok` for a topic the broker was never
-    /// asked about and then fail to find a leader for it.
-    ///
-    /// Subscriber waits are bounded by
-    /// [`request_timeout`](Self::with_request_timeout) (30 s by default). If the
-    /// in-flight refresh does not complete within that window, a
-    /// [`KrafkaError::Timeout`] is returned so the caller is never blocked
-    /// indefinitely behind a stalled refresher (dead broker, network partition,
-    /// repeated reconnection retries).
-    ///
-    /// The Metadata API version is negotiated with the broker (v1–v13).
-    /// Versions are cumulative: rack v1, cluster_id v2, offline replicas v5,
-    /// leader_epoch v7, authorized-ops v8, flexible encoding v9, topic UUIDs v10,
-    /// cluster_authorized_operations removed v11, topic_id works v12,
-    /// top-level error_code v13.
-    /// Falls back to METADATA_MIN (v1) if the broker doesn't advertise higher
-    /// Metadata support.
-    ///
-    /// When [`MetadataRecoveryStrategy::Rebootstrap`] is configured (KIP-899)
-    /// and no broker is reachable for longer than
-    /// [`rebootstrap_trigger`](Self::with_rebootstrap_trigger) (KIP-1102), all
-    /// connections are closed and the client falls back to bootstrap servers.
-    pub async fn refresh_for_topics_outcome(
-        &self,
-        topics: Option<&[&str]>,
-    ) -> Result<RefreshOutcome> {
-        self.refresh_for_topics_outcome_inner(topics, false).await
+    /// Use this when a broker has said the cache is wrong rather than old —
+    /// `NOT_LEADER_OR_FOLLOWER`, `FENCED_LEADER_EPOCH`, an unknown leader. The
+    /// writer's backoff still applies, so a burst of such errors becomes one
+    /// fetch per backoff interval. Mirrors `Metadata.requestUpdate()`.
+    pub async fn force_refresh(&self, topics: Option<&[&str]>) -> Result<()> {
+        self.request(topics, true).await
     }
 
-    /// Refresh metadata for `topics`, ignoring the cache-age check.
-    ///
-    /// Use this when a broker has told us the cache is *wrong* rather than
-    /// merely old — `NOT_LEADER_FOR_PARTITION`, `FENCED_LEADER_EPOCH`,
-    /// `UNKNOWN_TOPIC_OR_PARTITION` on a topic we believe exists. A leader move
-    /// does not age the cached entry, so the ordinary age gate would report
-    /// `AlreadyFresh` and the caller would keep retrying against the stale
-    /// leader until its delivery timeout expired without ever asking a broker.
-    ///
-    /// The `retry.backoff.ms` rate limiter still applies, so this cannot be
-    /// used to storm the cluster: a burst of leader-move errors collapses into
-    /// one request per backoff interval.
-    ///
-    /// This mirrors `Metadata.requestUpdate()` in the Java client, which sets an
-    /// explicit update flag that the age check does not override.
-    pub async fn refresh_for_topics_forced(&self, topics: Option<&[&str]>) -> Result<()> {
-        let mut last_remaining = Duration::ZERO;
-
-        for _ in 0..Self::MAX_RATE_LIMIT_WAITS {
-            match self.refresh_for_topics_outcome_inner(topics, true).await? {
-                RefreshOutcome::Refreshed | RefreshOutcome::AlreadyFresh => return Ok(()),
-                RefreshOutcome::RateLimited(remaining) => {
-                    last_remaining = remaining;
-                    tokio::time::sleep(remaining).await;
-                }
-            }
-        }
-
-        Err(KrafkaError::timeout(format!(
-            "metadata refresh remained rate-limited after {} attempts ({:?} remaining)",
-            Self::MAX_RATE_LIMIT_WAITS,
-            last_remaining
-        )))
-    }
-
-    async fn refresh_for_topics_outcome_inner(
-        &self,
-        topics: Option<&[&str]>,
-        force: bool,
-    ) -> Result<RefreshOutcome> {
-        // Asking for a topic *is* using it. Registering the interest here — the
-        // single funnel every refresh entry point passes through — is what
-        // keeps a topic that is only ever reached via an explicit refresh
-        // (consumer assignment, leader lookup) from being evicted as idle.
+    /// Hand a request to the writer and wait for the fetch that covers it.
+    async fn request(&self, topics: Option<&[&str]>, force: bool) -> Result<()> {
         if let Some(names) = topics {
             self.touch_topics(names);
-        }
-
-        // Coalesce concurrent calls without holding a mutex across network I/O.
-        //
-        // First, we atomically claim the "refresher" role, subscribe to a
-        // compatible in-flight refresh, or decide to run a second concurrent
-        // refresh. The parking_lot lock is released before any await.
-        let role = {
-            let mut state = self.refresh_state.lock();
-            match *state {
-                RefreshCoalescingState::Idle => {
-                    // We are the refresher; claim the in-flight slot and record
-                    // which topics this refresh will cover.
-                    *state = RefreshCoalescingState::InFlight {
-                        topics: InFlightTopics::from_request(topics),
-                        senders: Vec::new(),
-                    };
-                    Some(None)
-                }
-                RefreshCoalescingState::InFlight {
-                    topics: ref in_flight,
-                    ref mut senders,
-                } => {
-                    if in_flight.covers(topics) {
-                        // A compatible refresh is already in progress —
-                        // subscribe to be woken when it completes. The lock is
-                        // released before the await.
-                        //
-                        // Prune senders whose receivers have already been
-                        // dropped (timed-out or cancelled callers) to prevent
-                        // unbounded memory growth during a prolonged stall.
-                        senders.retain(|tx| !tx.is_closed());
-                        let (tx, rx) = oneshot::channel();
-                        senders.push(tx);
-                        Some(Some(rx))
-                    } else {
-                        // The in-flight refresh will not fetch what we need.
-                        // Run a second, independent refresh. Cache updates are
-                        // atomic `ArcSwap` merges, so concurrent refreshes are
-                        // safe.
-                        debug!(
-                            "in-flight metadata refresh does not cover the requested topics; \
-                             starting an independent refresh"
-                        );
-                        None
-                    }
-                }
+            if !force && self.inner.all_fresh(names) {
+                return Ok(());
             }
-        }; // ← parking_lot lock released here, before any .await
-
-        let Some(role) = role else {
-            // Independent refresh: we did not claim the coalescing slot, so
-            // there is no guard to drop and no subscribers to notify.
-            return self.refresh_for_topics_inner_forced(topics, force).await;
-        };
-
-        if let Some(rx) = role {
-            // Bound the wait by `request_timeout` so that a stalled refresher
-            // (dead broker + long reconnection retries) cannot block
-            // subscribers for the full metadata max-age.
-            return match timeout(self.request_timeout, rx).await {
-                Ok(Ok(result)) => result,
-                Ok(Err(_)) => {
-                    // The refresher task was cancelled or panicked.
-                    // `RefreshGuard::drop` resets state to `Idle` and notifies
-                    // all subscribers before dropping, so `rx` returning
-                    // `Err(RecvError)` is the signal that the state is already
-                    // `Idle`.  However, the refresher's result was not
-                    // propagated (it errored/panicked), so we return an error
-                    // here.  Recursing would retry with no bound; instead we
-                    // propagate the failure and let the caller decide.
-                    warn!("in-flight metadata refresh was cancelled or panicked");
-                    Err(KrafkaError::invalid_state(
-                        "metadata refresh was cancelled or panicked",
-                    ))
-                }
-                Err(_elapsed) => {
-                    // The original refresher is still running (state is still
-                    // `InFlight`).  Recursing here would re-subscribe and time
-                    // out again — unbounded recursion.  Return an error
-                    // directly; the caller decides whether to retry.
-                    warn!(
-                        timeout_ms = self.request_timeout.as_millis(),
-                        "timed out waiting for in-flight metadata refresh"
-                    );
-                    Err(KrafkaError::timeout(
-                        "metadata refresh timed out waiting for in-flight refresh",
-                    ))
-                }
-            };
         }
 
-        // We are the refresher. The `RefreshGuard` ensures that all subscribers
-        // are notified and the state is reset to `Idle` even if this task is
-        // cancelled or the inner function panics.
-        let mut guard = RefreshGuard {
-            state: &self.refresh_state,
-            result: None,
+        let receiver = {
+            let mut pending = self.inner.pending.lock();
+            match topics {
+                None => pending.full = true,
+                Some(names) => pending
+                    .topics
+                    .extend(names.iter().map(|name| (*name).to_string())),
+            }
+            let (sender, receiver) = oneshot::channel();
+            pending.waiters.push(sender);
+            receiver
         };
+        self.wake_writer();
 
-        let result = self.refresh_for_topics_inner_forced(topics, force).await;
-        guard.result = Some(result.clone());
-        drop(guard); // drain subscribers and reset to Idle
-        result
+        receiver
+            .await
+            .unwrap_or_else(|_| Err(KrafkaError::closed("the metadata writer has stopped")))
     }
 
-    /// Core metadata refresh logic.  Called once the caller has resolved its
-    /// coalescing role; never called directly by users.
-    /// Core refresh. `force` skips the cache-age check but not the rate limiter.
-    async fn refresh_for_topics_inner_forced(
-        &self,
-        topics: Option<&[&str]>,
-        force: bool,
-    ) -> Result<RefreshOutcome> {
-        // Check if the requested data is already fresh.
-        //
-        // This is checked *before* the rate limiter: when the cache already
-        // satisfies the request there is nothing to wait for.
-        //
-        // For partial refreshes: skip if every requested topic is present in the
-        // cache and was refreshed within `max_age`. This deduplicates work when
-        // multiple callers ask for overlapping topic sets — the second caller
-        // finds the first caller's result still fresh and returns immediately.
-        //
-        // Full refreshes (`topics=None`) are never skipped: a recent partial
-        // refresh does not guarantee a full-cluster snapshot.
-        let cache = self.cache.load();
-        if !cache.brokers.is_empty() && !force {
-            let all_fresh = match topics {
-                None => false,
-                Some(names) => names.iter().all(|name| {
-                    cache.topics.contains_key(*name)
-                        && cache
-                            .topic_last_refreshed
-                            .get(*name)
-                            .is_some_and(|ts| ts.elapsed() <= self.max_age)
-                }),
-            };
-            if all_fresh {
-                debug!("All requested topics are fresh in cache, skipping redundant request");
-                return Ok(RefreshOutcome::AlreadyFresh);
-            }
+    /// Spawn the writer on first use and wake it.
+    fn wake_writer(&self) {
+        if !self.inner.writer_started.swap(true, Ordering::AcqRel) {
+            tokio::spawn(run_writer(Arc::clone(&self.inner)));
         }
-        drop(cache);
-
-        // Enforce the exponential inter-refresh backoff (KIP-580, mirroring
-        // `retry.backoff.ms` / `retry.backoff.max.ms` in the Java client) so
-        // that a tight poll loop on LEADER_NOT_AVAILABLE cannot create a
-        // metadata-refresh storm — and so that the storm decays instead of
-        // holding a constant rate while the cluster is unhealthy.
-        //
-        // Crucially this reports `RateLimited` rather than `Ok(())`: the cache
-        // was *not* updated, and a caller told "refreshed" here would re-issue
-        // its request against byte-identical stale metadata and make no
-        // progress.
-        if self.retry_backoff.is_some()
-            && let Some(remaining) = self.refresh_backoff.lock().remaining()
-        {
-            debug!(
-                remaining_ms = remaining.as_millis(),
-                "metadata refresh rate-limited; no request sent"
-            );
-            return Ok(RefreshOutcome::RateLimited(remaining));
-        }
-
-        // Record the start of this refresh attempt so the KIP-1102 rebootstrap
-        // trigger can measure how long refreshes have been failing.
-        // If there is already a recorded start (from a previous failing attempt),
-        // keep it — we only care about how long the *streak* has lasted.
-        {
-            let mut start = self.metadata_attempt_start.lock();
-            start.get_or_insert_with(Instant::now);
-        }
-
-        // Every exit path from the attempt — connection failure, request
-        // failure, decode failure, broker error, success — must feed the rate
-        // limiter. An attempt that fails before it reaches the broker is the
-        // one that most needs to back off: it is the signature of a cluster
-        // that is down, and leaving it unrecorded meant those attempts ran
-        // completely ungoverned.
-        let result = self.refresh_attempt(topics).await;
-        if let Some(policy) = self.retry_backoff.as_ref() {
-            let mut backoff = self.refresh_backoff.lock();
-            match &result {
-                Ok(_) => backoff.record_success(policy),
-                Err(_) => backoff.record_failure(policy),
-            }
-        }
-        result
-    }
-
-    /// Perform a single metadata refresh attempt against some reachable
-    /// broker, updating the cache on success.
-    ///
-    /// Rate limiting and freshness checks are the caller's responsibility; this
-    /// function always talks to a broker. It returns
-    /// [`RefreshOutcome::Refreshed`] or an error — never `AlreadyFresh` or
-    /// `RateLimited`.
-    async fn refresh_attempt(&self, topics: Option<&[&str]>) -> Result<RefreshOutcome> {
-        // Allow at most one rebootstrap retry per refresh call.
-        let mut rebootstrapped = false;
-
-        loop {
-            // Get a connection — on failure, check if rebootstrap is needed.
-            let conn = match self.get_any_connection().await {
-                Ok(conn) => conn,
-                Err(e) => {
-                    if !rebootstrapped && self.needs_rebootstrap() {
-                        self.rebootstrap().await;
-                        rebootstrapped = true;
-                        // Retry once after rebootstrap.
-                        self.get_any_connection().await?
-                    } else {
-                        return Err(e);
-                    }
-                }
-            };
-
-            // Negotiate the highest mutually supported Metadata version up to the
-            // client's supported maximum (`METADATA_MAX`).
-            // v1+ required, up to v13 (top-level error_code).
-            let metadata_version = conn
-                .negotiate_api_version(
-                    ApiKey::Metadata,
-                    crate::protocol::versions::METADATA_MAX,
-                    crate::protocol::versions::METADATA_MIN,
-                )
-                .unwrap_or_else(|| {
-                    debug!("Metadata API version negotiation unavailable; falling back to MIN");
-                    crate::protocol::versions::METADATA_MIN
-                });
-
-            // Build and send metadata request.
-            //
-            // `allow_auto_topic_creation` rides only on the topic-specific
-            // form: an all-topics request names nothing the broker could
-            // create, and setting the flag there would be meaningless at best.
-            let request = match topics {
-                Some(t) => {
-                    let mut request = MetadataRequest::for_topics(t.to_vec());
-                    request.allow_auto_topic_creation = self.auto_create_topics;
-                    request
-                }
-                None => MetadataRequest::all_topics(),
-            };
-
-            let response = conn
-                .send_request(ApiKey::Metadata, metadata_version, |buf| {
-                    request.encode_versioned(metadata_version, buf)
-                })
-                .await?;
-
-            // Decode response
-            let mut buf = response;
-            let metadata = MetadataResponse::decode_versioned(metadata_version, &mut buf)?;
-
-            // v13+ includes a top-level error code. Check it before processing
-            // topics. Per-topic errors are still handled individually in update_cache.
-            if metadata.error_code == ErrorCode::RebootstrapRequired {
-                if rebootstrapped {
-                    // Already retried once — don't loop forever.
-                    return Err(KrafkaError::broker(
-                        metadata.error_code,
-                        "server requested rebootstrap but retry also returned REBOOTSTRAP_REQUIRED",
-                    ));
-                }
-                // Server-initiated rebootstrap (KIP-1102): `REBOOTSTRAP_REQUIRED`
-                // (error code 129) in the Metadata v13 top-level error field is
-                // the cluster telling us to re-discover via bootstrap servers,
-                // without waiting for the client-side failure timer.
-                info!("Server requested rebootstrap (REBOOTSTRAP_REQUIRED)");
-                self.rebootstrap().await;
-                rebootstrapped = true;
-                continue;
-            }
-            if !metadata.error_code.is_ok() {
-                return Err(KrafkaError::broker(
-                    metadata.error_code,
-                    "metadata request failed",
-                ));
-            }
-
-            // Success — clear the failure-tracking timestamp on every successful
-            // response, including partial refreshes.
-            //
-            // The Java client resets the failure timer on any successful metadata
-            // response (partial or full). A previous krafka comment argued that a
-            // partial refresh doesn't prove all brokers are reachable — but
-            // `metadata_attempt_start` tracks whether the client can reach *any*
-            // broker, which a successful partial refresh confirms. Keeping the
-            // timer running after a successful partial refresh would trigger a
-            // spurious rebootstrap for consumers that never issue full refreshes.
-            {
-                let mut start = self.metadata_attempt_start.lock();
-                *start = None;
-            }
-
-            // Update cache. A full refresh (topics=None) is authoritative — the
-            // response contains every topic currently in the cluster, so we rebuild
-            // from scratch. A partial refresh delta-merges into the existing cache.
-            let full_refresh = topics.is_none();
-
-            self.update_cache(metadata, full_refresh);
-
-            return Ok(RefreshOutcome::Refreshed);
-        }
+        self.inner.wake.notify_one();
     }
 
     /// Replace the bootstrap server list at runtime (KIP-899).
     ///
-    /// This does **not** trigger a rebootstrap or close existing connections.
-    /// The new addresses are used on the next metadata refresh that falls back
-    /// to bootstrap servers (e.g. after all cached brokers become unreachable).
+    /// Takes effect on the next connection attempt that falls back to the
+    /// bootstrap servers; existing connections stay open.
     ///
     /// # Errors
     ///
@@ -1440,586 +987,44 @@ impl ClusterMetadata {
             ));
         }
         info!(count = servers.len(), "Updating seed brokers (KIP-899)");
-        self.bootstrap_servers.store(Arc::new(servers));
+        self.inner.bootstrap_servers.store(Arc::new(servers));
         Ok(())
     }
 
-    /// Force a rebootstrap: close all connections, clear the metadata cache,
-    /// and fall back to bootstrap servers — the recovery action KIP-899 defines
-    /// as `metadata.recovery.strategy=rebootstrap`.
-    ///
-    /// The next call to [`refresh`](Self::refresh) or
-    /// [`refresh_for_topics`](Self::refresh_for_topics) will re-discover the
-    /// cluster from the bootstrap addresses.
-    ///
-    /// After rebootstrap, the failure-tracking timer is set to **now** (not
-    /// cleared) so that the next refresh cycle starts timing immediately —
-    /// matching the Java client's `metadataAttemptStartMs = Optional.of(now)`.
-    ///
-    /// # Warning: In-Flight Requests Are Cancelled
-    ///
-    /// `close_all()` closes every broker connection immediately. Any `Produce`,
-    /// `Fetch`, or `OffsetCommit` requests that are in flight at the time of
-    /// rebootstrap will be cancelled and return errors to their callers. Callers
-    /// that perform retries will retry after the pool reconnects; callers with
-    /// `acks=0` (fire-and-forget) or non-retryable errors may lose data.
-    ///
-    /// This is an inherent limitation of the connection-drop recovery strategy.
-    /// For zero-data-loss recovery, use `acks=all` with retries and a
-    /// [`TransactionalProducer`](crate::producer::TransactionalProducer).
-    /// # Seed-broker DNS
-    ///
-    /// Seed brokers are held as `host:port` strings and resolved at dial time,
-    /// never as cached `SocketAddr`s. Because the rebootstrap empties the
-    /// metadata cache and `ConnectionPool::close_all` drains the connection
-    /// maps, the next dial is a fresh resolution of the seed hostnames. A
-    /// client whose brokers moved to new IPs behind a load balancer therefore
-    /// recovers, instead of retrying addresses that no longer answer.
-    ///
-    /// # Jitter
+    /// Rebootstrap now: drop the cluster view and rediscover the cluster from
+    /// the bootstrap servers on the next fetch (KIP-899).
     ///
     /// A random delay of up to
-    /// [`rebootstrap_jitter`](Self::with_rebootstrap_jitter) (500 ms by
-    /// default) precedes the teardown so a fleet that lost the cluster at the
-    /// same moment does not hit the seed brokers as one synchronised wave.
+    /// [`with_rebootstrap_jitter`](Self::with_rebootstrap_jitter) precedes the
+    /// reset. In-flight requests are not aborted, and connections stay open;
+    /// a fetch that was in flight when the reset happened is discarded rather
+    /// than applied. Seed addresses are `host:port` strings resolved at dial
+    /// time, so brokers that moved to new IPs behind the same name are found.
     pub async fn rebootstrap(&self) {
-        // Spread the fleet out before doing anything observable. Sampling in a
-        // block keeps the (non-Send) thread-local RNG out of the future.
-        let delay = if self.rebootstrap_jitter.is_zero() {
-            Duration::ZERO
-        } else {
-            use rand::Rng as _;
-            let nanos = rand::rng().random_range(0..self.rebootstrap_jitter.as_nanos().max(1));
-            Duration::from_nanos(nanos.min(u64::MAX as u128) as u64)
-        };
-        if !delay.is_zero() {
-            debug!(
-                delay_ms = delay.as_millis(),
-                "delaying rebootstrap by a random interval to avoid a seed-broker stampede"
-            );
-            tokio::time::sleep(delay).await;
-        }
-
-        warn!(
-            "Rebootstrapping: closing all connections and cancelling in-flight requests (KIP-899). \
-             In-flight Produce/Fetch/Commit requests will return errors; retries will recover."
-        );
-
-        // Close all pooled connections — this cancels all in-flight requests
-        // and drops every cached socket, so the next dial re-resolves DNS.
-        self.pool.close_all().await;
-
-        // Reset metadata cache to empty so `get_any_connection` goes straight
-        // to bootstrap servers, re-resolving their hostnames.
-        self.cache.store(Arc::new(MetadataCache::new()));
-
-        // Set the failure tracker to *now* (not None) so the next cycle starts
-        // timing immediately — if the rebootstrap itself doesn't help, we'll
-        // know how long it's been since we last rebootstrapped.
-        {
-            let mut start = self.metadata_attempt_start.lock();
-            *start = Some(Instant::now());
-        }
+        self.inner.rebootstrap("requested").await;
     }
 
-    /// Check whether the rebootstrap trigger duration has elapsed.
+    /// Ask the writer to rebootstrap before its next fetch, without waiting.
     ///
-    /// This is a pure predicate — it does **not** perform the rebootstrap.
-    /// The caller is responsible for calling [`rebootstrap`](Self::rebootstrap)
-    /// if this returns `true`.
-    ///
-    /// # Why this cannot fire in a tight loop
-    ///
-    /// The timer it reads, `metadata_attempt_start`, is set to *now* by
-    /// [`rebootstrap`](Self::rebootstrap) rather than cleared. A second
-    /// rebootstrap therefore requires another full trigger period of continuous
-    /// failure, even when the whole cluster is down and every refresh fails
-    /// immediately. Refresh attempts themselves are separately governed by the
-    /// exponential retry backoff.
-    ///
-    /// The trigger is compared against a randomly extended deadline (up to 20%
-    /// beyond the configured value) so clients that started failing together do
-    /// not all cross the threshold on the same tick.
-    fn needs_rebootstrap(&self) -> bool {
-        if self.recovery_strategy != MetadataRecoveryStrategy::Rebootstrap {
-            return false;
-        }
-
-        let start = self.metadata_attempt_start.lock();
-        let Some(attempt_start) = *start else {
-            return false;
-        };
-        let elapsed = attempt_start.elapsed();
-        drop(start);
-
-        let effective_trigger = {
-            use rand::Rng as _;
-            let spread = self.rebootstrap_trigger.mul_f64(REBOOTSTRAP_TRIGGER_JITTER);
-            if spread.is_zero() {
-                self.rebootstrap_trigger
-            } else {
-                self.rebootstrap_trigger
-                    + Duration::from_nanos(
-                        rand::rng()
-                            .random_range(0..spread.as_nanos().max(1))
-                            .min(u64::MAX as u128) as u64,
-                    )
-            }
-        };
-
-        if elapsed < effective_trigger {
-            return false;
-        }
-
-        warn!(
-            elapsed_ms = elapsed.as_millis(),
-            trigger_ms = self.rebootstrap_trigger.as_millis(),
-            "Metadata refresh failing too long, rebootstrap needed (KIP-1102)"
-        );
-
-        true
-    }
-
-    /// Get a connection to any available broker.
-    ///
-    /// Candidates are the cached brokers plus any bootstrap servers not already
-    /// among them. Rather than racing *every* candidate — which on a 100-broker
-    /// cluster means up to 100 concurrent TCP + TLS + SASL handshakes on each
-    /// refresh — the list is shuffled and a bounded subset is raced. Shuffling
-    /// keeps load spread across the cluster instead of hammering whichever
-    /// broker happens to hash first.
-    ///
-    /// If a whole batch fails, the next batch is tried, so a partially
-    /// unreachable cluster still converges on a live broker.
-    async fn get_any_connection(&self) -> Result<Arc<BrokerConnection>> {
-        /// How many connection attempts to race concurrently.
-        const CONNECT_FANOUT: usize = 3;
-
-        let mut addrs = self.connection_candidates();
-
-        if addrs.is_empty() {
-            return Err(KrafkaError::invalid_state(
-                "no available brokers to connect to",
-            ));
-        }
-
-        // Shuffle so repeated refreshes do not all stampede the same broker.
-        {
-            use rand::seq::SliceRandom as _;
-            let mut rng = rand::rng();
-            addrs.shuffle(&mut rng);
-        }
-
-        for chunk in addrs.chunks(CONNECT_FANOUT) {
-            // Race this bounded batch; the first successful connection wins.
-            let futs: Vec<_> = chunk
-                .iter()
-                .map(|addr| {
-                    let pool = Arc::clone(&self.pool);
-                    let addr = addr.clone();
-                    Box::pin(async move { pool.get_connection(&addr).await })
-                })
-                .collect();
-
-            if let Ok((conn, _rest)) = futures::future::select_ok(futs).await {
-                return Ok(conn);
-            }
-        }
-
-        Err(KrafkaError::invalid_state(
-            "no available brokers to connect to",
-        ))
-    }
-
-    /// Build the candidate address list for [`get_any_connection`]: every
-    /// cached broker, followed by any seed broker not already among them.
-    ///
-    /// Addresses are `host:port` strings, never pre-resolved `SocketAddr`s —
-    /// the connection layer resolves them on each dial. That is what lets a
-    /// client recover when brokers move to new IPs behind a load balancer:
-    /// after a rebootstrap the cache is empty, so the only candidates are the
-    /// seed hostnames and they are resolved afresh.
-    ///
-    /// Deduplication uses a set rather than a linear scan; on a large cluster
-    /// the scan was quadratic in the broker count on every refresh.
-    fn connection_candidates(&self) -> Vec<String> {
-        let cache = self.cache.load();
-        let servers = self.bootstrap_servers.load();
-
-        let mut addrs: Vec<String> = Vec::with_capacity(cache.brokers.len() + servers.len());
-        let mut seen: ahash::AHashSet<&str> = ahash::AHashSet::with_capacity(cache.brokers.len());
-
-        for broker in cache.brokers.values() {
-            if seen.insert(broker.address()) {
-                addrs.push(broker.address().to_string());
-            }
-        }
-        for s in servers.iter() {
-            if seen.insert(s.as_str()) {
-                addrs.push(s.clone());
-            }
-        }
-        addrs
-    }
-
-    /// Update the metadata cache from a response.
-    ///
-    /// Builds a new snapshot and swaps it in atomically via `ArcSwap`.
-    ///
-    /// When `full_refresh` is true the response is authoritative (all topics in
-    /// the cluster), so the broker and topic maps are rebuilt from scratch.
-    /// When false (partial/topic-specific refresh), the response is delta-merged
-    /// into the existing cache so that topics not in the request are preserved
-    /// and broker entries referenced by preserved topics remain available.
-    fn update_cache(&self, response: MetadataResponse, full_refresh: bool) {
-        let old = self.cache.load();
-        let now = Instant::now();
-
-        // Full refresh: response is authoritative — start empty.
-        // Partial refresh: merge into the existing broker map so preserved
-        // topics cannot end up referencing brokers missing from the cache.
-        let mut brokers = if full_refresh {
-            AHashMap::new()
-        } else {
-            old.brokers.clone()
-        };
-        for broker in response.brokers {
-            brokers.insert(
-                broker.node_id,
-                BrokerInfo::new(broker.node_id, broker.host, broker.port, broker.rack),
-            );
-        }
-
-        // Full refresh: response is authoritative — start empty.
-        // Partial refresh: delta-merge into existing topics and topic_ids,
-        // evicting entries that have gone idle for longer than
-        // `topic_cache_ttl`.
-        //
-        // Idleness, not refresh recency, is the eviction rule (Java's
-        // `metadata.max.idle.ms`). A partial refresh names one topic, so
-        // evicting on the stamp it leaves would drop every *other* topic the
-        // client is actively producing to.
-        //
-        // An entry also survives while its metadata is still current
-        // (`topic_last_refreshed` within the TTL), so it can never be evicted
-        // inside the window it was fetched in — covering any caller that
-        // reaches the cache without going through a usage-tracking accessor.
-        let mut topics = if full_refresh {
-            AHashMap::new()
-        } else if let Some(ttl) = self.topic_cache_ttl {
-            let active = self
-                .topic_usage
-                .active_among(ttl, old.topics.keys().map(String::as_str));
-            let retained: AHashMap<_, _> = old
-                .topics
-                .iter()
-                .filter(|(name, _)| {
-                    active.contains(name.as_str())
-                        || old
-                            .topic_last_refreshed
-                            .get(*name)
-                            .is_some_and(|ts| now.duration_since(*ts) <= ttl)
-                })
-                .map(|(k, v)| (k.clone(), Arc::clone(v)))
-                .collect();
-            let evicted = old.topics.len().saturating_sub(retained.len());
-            if evicted > 0 {
-                debug!(
-                    evicted,
-                    ttl_secs = ttl.as_secs(),
-                    "evicted idle topics from metadata cache"
-                );
-            }
-            retained
-        } else {
-            old.topics.clone()
-        };
-        // Keep only topic_ids whose names survived eviction. Filtering
-        // unconditionally (rather than only when a TTL is set) is what stops
-        // the UUID map outliving the topic map it indexes.
-        let mut topic_ids: AHashMap<[u8; 16], Arc<String>> = if full_refresh {
-            AHashMap::new()
-        } else {
-            old.topic_ids
-                .iter()
-                .filter(|(_, name)| topics.contains_key(name.as_str()))
-                .map(|(k, v)| (*k, Arc::clone(v)))
-                .collect()
-        };
-
-        // Topic-level errors the broker reported, so a caller can be told *why*
-        // a topic is missing instead of a flat "unknown topic". A full refresh
-        // is authoritative and starts empty; a partial refresh carries forward
-        // what it did not ask about, bounded by the same idleness rule that
-        // bounds the topic map itself.
-        let mut topic_errors: AHashMap<String, ErrorCode> = if full_refresh {
-            AHashMap::new()
-        } else if let Some(ttl) = self.topic_cache_ttl {
-            let active = self
-                .topic_usage
-                .active_among(ttl, old.topic_errors.keys().map(String::as_str));
-            old.topic_errors
-                .iter()
-                .filter(|(name, _)| active.contains(name.as_str()))
-                .map(|(k, v)| (k.clone(), *v))
-                .collect()
-        } else {
-            old.topic_errors.clone()
-        };
-
-        // Build a reverse index (name → UUID) so we can remove the old UUID
-        // for a topic name in O(1) instead of scanning the entire map.
-        let mut name_to_uuid: AHashMap<String, [u8; 16]> = topic_ids
-            .iter()
-            .map(|(uuid, name)| (name.as_ref().clone(), *uuid))
-            .collect();
-
-        // Track which topic names are actually provided by this response so
-        // that only those entries get their `topic_last_refreshed` timestamp
-        // advanced to `now`.  Retained-from-cache topics must keep their
-        // original timestamps; resetting them would make them perpetually
-        // "fresh" and defeat TTL eviction.
-        let mut response_topic_names: Vec<String> = Vec::new();
-
-        for topic in response.topics {
-            let Some(topic_name) = topic.name else {
-                continue;
-            };
-
-            if !topic.error_code.is_ok() {
-                // Remember the reason regardless of retriability: a caller
-                // blocked on this topic needs to distinguish "does not exist
-                // yet" from "you are not allowed to see it".
-                topic_errors.insert(topic_name.clone(), topic.error_code);
-
-                if topic.error_code.is_retriable() {
-                    // Transient errors (LeaderNotAvailable, RequestTimedOut, etc.)
-                    // — keep the stale cache entry so callers don't see the topic
-                    // as "unknown" until the next successful refresh.
-                    //
-                    // Also treat the transient response as a TTL refresh signal:
-                    // the broker knows about this topic, so we stamp it with `now`
-                    // to prevent premature TTL eviction.  Two sub-cases:
-                    //
-                    // 1. Topic survived TTL eviction above (still in `topics`):
-                    //    no entry change needed, just reset the timestamp.
-                    // 2. Topic was already TTL-evicted before the loop:
-                    //    restore it from `old.topics` so it is not silently lost.
-                    debug!(
-                        "Topic {} has transient error: {:?}, keeping stale cache entry",
-                        topic_name, topic.error_code
-                    );
-                    if !topics.contains_key(&topic_name)
-                        && let Some(old_info) = old.topics.get(&topic_name)
-                    {
-                        // Restore the stale entry: the topic was TTL-evicted
-                        // before the response loop, but the broker still
-                        // acknowledges it (even transiently).
-                        topics.insert(topic_name.clone(), Arc::clone(old_info));
-                        // Also restore the UUID mapping so that
-                        // `topic_id_for_name()` keeps working (e.g. for
-                        // ShareConsumer fetch routing that requires topic IDs).
-                        if let Some(&old_uuid) = old.name_to_topic_id.get(&topic_name)
-                            && let Some(name_arc) = old.topic_ids.get(&old_uuid)
-                        {
-                            topic_ids.insert(old_uuid, Arc::clone(name_arc));
-                            name_to_uuid.insert(topic_name.clone(), old_uuid);
-                        }
-                    }
-                    // Only stamp TTL for topics that are actually in the cache
-                    // (survived eviction or just restored from old).  Topics
-                    // with a transient error but no prior cache entry are
-                    // skipped, preventing orphaned entries in
-                    // `topic_last_refreshed` with no corresponding `topics` key.
-                    if topics.contains_key(&topic_name) {
-                        response_topic_names.push(topic_name);
-                    }
-                } else {
-                    // Permanent errors (UnknownTopicOrPartition, TopicAuthorizationFailed,
-                    // InvalidTopic, etc.) — remove from cache.
-                    warn!("Topic {} has error: {:?}", topic_name, topic.error_code);
-                    if let Some(tid) = topic.topic_id {
-                        topic_ids.remove(&tid);
-                    }
-                    // Also remove any stale UUID → name mapping by name, in case
-                    // the error response omitted topic_id or it was an all-zero UUID.
-                    if let Some(old_uuid) = name_to_uuid.remove(&topic_name) {
-                        topic_ids.remove(&old_uuid);
-                    }
-                    topics.remove(&topic_name);
-                    // No TTL timestamp is removed here: `topic_last_refreshed`
-                    // is rebuilt below by filtering against the final `topics`
-                    // map, so a topic dropped here cannot leave an orphaned
-                    // timestamp behind. That filter is what bounds the map
-                    // under high topic churn.
-                }
-                continue;
-            }
-
-            // Track topic UUID → name mapping (v10+).
-            // Remove any old UUID that previously mapped to this name first —
-            // the topic may have been recreated with a new UUID.
-            if let Some(tid) = topic.topic_id {
-                if let Some(old_uuid) = name_to_uuid.remove(&topic_name) {
-                    topic_ids.remove(&old_uuid);
-                }
-                let topic_arc = Arc::new(topic_name.clone());
-                topic_ids.insert(tid, topic_arc);
-                name_to_uuid.insert(topic_name.clone(), tid);
-            }
-
-            // Previous view of this topic, used for the KIP-320 leader-epoch
-            // merge below.
-            let cached_topic = old.topics.get(&topic_name);
-
-            // Every partition the broker reported is retained, including those
-            // in an error state. Dropping errored partitions would shrink
-            // `partition_count()` mid-outage and silently re-map a key-hash
-            // partitioner's `hash % partition_count`, breaking per-key ordering
-            // for as long as the partitions stay unavailable.
-            let partitions: AHashMap<PartitionId, PartitionInfo> = topic
-                .partitions
-                .into_iter()
-                .map(|p| {
-                    if !p.offline_replicas.is_empty() {
-                        debug!(
-                            topic = %topic_name,
-                            partition = p.partition_index,
-                            offline_replicas = ?p.offline_replicas,
-                            "partition has offline replicas; routing may be impaired if the leader is unavailable"
-                        );
-                    }
-
-                    let healthy = p.error_code.is_ok();
-                    if !healthy {
-                        debug!(
-                            topic = %topic_name,
-                            partition = p.partition_index,
-                            error = ?p.error_code,
-                            "partition reported an error; retaining entry with no leader"
-                        );
-                    }
-
-                    let incoming = PartitionInfo {
-                        topic: topic_name.clone(),
-                        partition: p.partition_index,
-                        // An errored partition has no trustworthy leader; mark
-                        // it unroutable rather than dialling a stale broker.
-                        leader: if healthy { p.leader_id } else { -1 },
-                        leader_epoch: if healthy { p.leader_epoch } else { -1 },
-                        replicas: p.replica_nodes,
-                        isr: p.isr_nodes,
-                        offline_replicas: p.offline_replicas,
-                        error_code: p.error_code,
-                    };
-
-                    // KIP-320 leader-epoch fencing (mirrors Java's
-                    // `Metadata.updatePartitionMetadata`): a lagging broker can
-                    // answer with an older epoch than we already hold. Applying
-                    // it would revert the client to the *previous* leader until
-                    // the next refresh — precisely the silent wrong-leader
-                    // window KIP-320 exists to close. Keep the newer entry.
-                    //
-                    // Epochs of -1 mean "unknown" (Metadata < v7, or an error
-                    // state) and never participate in the comparison.
-                    let merged = match cached_topic.and_then(|t| t.partitions.get(&p.partition_index)) {
-                        Some(cached)
-                            if cached.leader_epoch >= 0
-                                && incoming.leader_epoch >= 0
-                                && incoming.leader_epoch < cached.leader_epoch =>
-                        {
-                            debug!(
-                                topic = %topic_name,
-                                partition = p.partition_index,
-                                cached_epoch = cached.leader_epoch,
-                                response_epoch = incoming.leader_epoch,
-                                "ignoring stale leader epoch from metadata response (KIP-320)"
-                            );
-                            cached.clone()
-                        }
-                        _ => incoming,
-                    };
-
-                    (p.partition_index, merged)
-                })
-                .collect();
-
-            // The topic came back healthy: any recorded error is history.
-            topic_errors.remove(&topic_name);
-
-            response_topic_names.push(topic_name.clone());
-            topics.insert(
-                topic_name.clone(),
-                Arc::new(TopicInfo {
-                    name: topic_name,
-                    is_internal: topic.is_internal,
-                    partitions,
-                }),
-            );
-        }
-
-        // Build topic_last_refreshed:
-        // - Full refresh: start empty; every topic comes from this response.
-        // - Partial refresh: carry forward the entries whose topic is still in
-        //   the cache, with their *original* timestamps so their age is
-        //   preserved; retained topics must NOT have their clock reset.
-        //   Filtering against `topics` is what keeps the map bounded — an
-        //   evicted or permanently-errored topic cannot leave an orphaned
-        //   timestamp behind.
-        // In all cases, only topics that appear in the current response are
-        // stamped with `now`; retained-from-cache topics keep their existing
-        // timestamps so per-topic staleness stays meaningful.
-        let mut topic_last_refreshed = if full_refresh {
-            AHashMap::with_capacity(response_topic_names.len())
-        } else {
-            old.topic_last_refreshed
-                .iter()
-                .filter(|(name, _)| topics.contains_key(name.as_str()))
-                .map(|(k, v)| (k.clone(), *v))
-                .collect()
-        };
-        // Stamp only topics included in this response with `now`.
-        // For a full refresh `response_topic_names` covers all topics (the map
-        // started empty).  For a partial refresh this correctly skips
-        // retained-only entries, preserving their original timestamps.
-        for name in response_topic_names {
-            topic_last_refreshed.insert(name, now);
-        }
-
-        let new_cache = MetadataCache {
-            cluster_id: response.cluster_id,
-            controller_id: response.controller_id,
-            brokers,
-            topics,
-            topic_ids,
-            name_to_topic_id: name_to_uuid,
-            topic_last_refreshed,
-            topic_errors,
-            last_updated: now,
-        };
-
-        debug!(
-            "Updated metadata: {} brokers, {} topics",
-            new_cache.brokers.len(),
-            new_cache.topics.len()
-        );
-
-        self.cache.store(Arc::new(new_cache));
-
-        // Bound the usage tracker on the same schedule as the cache it feeds.
-        if let Some(ttl) = self.topic_cache_ttl {
-            self.topic_usage.prune(ttl);
-        }
+    /// For protocol paths that learn the cluster changed outside a Metadata
+    /// response, such as `REBOOTSTRAP_REQUIRED` in `ApiVersions` (KIP-1242).
+    #[allow(dead_code)]
+    pub(crate) fn request_rebootstrap(&self) {
+        self.inner.pending.lock().rebootstrap = true;
+        self.wake_writer();
     }
 
     /// Get broker info by ID.
     pub fn broker(&self, broker_id: BrokerId) -> Option<BrokerInfo> {
-        self.cache.load().brokers.get(&broker_id).cloned()
+        self.inner.cache.load().brokers.get(&broker_id).cloned()
     }
 
     /// Get all brokers.
     pub fn brokers(&self) -> Vec<BrokerInfo> {
-        self.cache.load().brokers.values().cloned().collect()
+        let mut brokers: Vec<BrokerInfo> =
+            self.inner.cache.load().brokers.values().cloned().collect();
+        brokers.sort_by_key(BrokerInfo::id);
+        brokers
     }
 
     /// Get topic info by name, deep-cloning the entry.
@@ -2031,21 +1036,18 @@ impl ClusterMetadata {
     }
 
     /// Get topic info by name without copying the partition map.
-    ///
-    /// The cache stores each [`TopicInfo`] behind an `Arc`, so this is a
-    /// ref-count bump regardless of how many partitions the topic has.
     pub fn topic_arc(&self, name: &str) -> Option<Arc<TopicInfo>> {
         self.touch_topic(name);
-        self.cache.load().topics.get(name).map(Arc::clone)
+        self.inner.cache.load().topics.get(name).map(Arc::clone)
     }
 
     /// Resolve a 16-byte topic UUID to a topic name.
     ///
-    /// The mapping is populated from metadata v10+ responses where each topic
-    /// includes a `topic_id`. Returns `None` if the UUID is unknown — the
-    /// caller should trigger a metadata refresh and retry.
+    /// Returns `None` if the UUID is unknown — the caller should refresh and
+    /// retry.
     pub fn topic_name_for_id(&self, topic_id: &[u8; 16]) -> Option<String> {
         let name = self
+            .inner
             .cache
             .load()
             .topic_ids
@@ -2059,12 +1061,11 @@ impl ClusterMetadata {
 
     /// Resolve a topic name to its 16-byte UUID.
     ///
-    /// The mapping is populated from metadata v10+ responses. Returns `None`
-    /// if the topic is unknown or the broker did not return a topic ID — the
-    /// caller should trigger a metadata refresh and retry.
+    /// Returns `None` if the topic is unknown or the broker did not report a
+    /// topic ID — the caller should refresh and retry.
     pub fn topic_id_for_name(&self, name: &str) -> Option<[u8; 16]> {
         self.touch_topic(name);
-        self.cache.load().name_to_topic_id.get(name).copied()
+        self.inner.cache.load().name_to_topic_id.get(name).copied()
     }
 
     /// Get all topics, deep-cloning every entry.
@@ -2072,7 +1073,8 @@ impl ClusterMetadata {
     /// Prefer [`topics_arc`](Self::topics_arc), which avoids copying every
     /// topic's partition map.
     pub fn topics(&self) -> Vec<TopicInfo> {
-        self.cache
+        self.inner
+            .cache
             .load()
             .topics
             .values()
@@ -2082,13 +1084,20 @@ impl ClusterMetadata {
 
     /// Get all topics without copying their partition maps.
     pub fn topics_arc(&self) -> Vec<Arc<TopicInfo>> {
-        self.cache.load().topics.values().map(Arc::clone).collect()
+        self.inner
+            .cache
+            .load()
+            .topics
+            .values()
+            .map(Arc::clone)
+            .collect()
     }
 
     /// Get the leader for a topic partition.
     pub fn leader(&self, topic: &str, partition: PartitionId) -> Option<BrokerId> {
         self.touch_topic(topic);
-        self.cache
+        self.inner
+            .cache
             .load()
             .topics
             .get(topic)
@@ -2097,11 +1106,12 @@ impl ClusterMetadata {
 
     /// Get the leader epoch for a topic partition.
     ///
-    /// The leader epoch is used for fencing stale reads after leadership changes.
-    /// Returns None if the topic/partition is not found in metadata.
+    /// Returns `None` if the topic/partition is not found in metadata or the
+    /// epoch is unknown.
     pub fn leader_epoch(&self, topic: &str, partition: PartitionId) -> Option<i32> {
         self.touch_topic(topic);
-        self.cache
+        self.inner
+            .cache
             .load()
             .topics
             .get(topic)
@@ -2111,38 +1121,27 @@ impl ClusterMetadata {
     /// Apply a leader reported by a broker in a Fetch/Produce response (KIP-951).
     ///
     /// When leadership moves, the broker that rejected the request with
-    /// `NOT_LEADER_OR_FOLLOWER` / `FENCED_LEADER_EPOCH` also names the node that
-    /// should have received it, and advertises that node's endpoint. Folding
-    /// that report straight into the cache lets the very next attempt go to the
-    /// right broker; without it every failover costs a full metadata round trip
-    /// on top of the failed request.
-    ///
-    /// The hint lands in the shared cache rather than in per-client state so
-    /// that a leader learned by one code path (a consumer fetch, say) is also
-    /// used by every other user of the same [`ClusterMetadata`].
+    /// `NOT_LEADER_OR_FOLLOWER` / `FENCED_LEADER_EPOCH` names the node that
+    /// should have received it and advertises its endpoint. Folding that into
+    /// the cache lets the next attempt go to the right broker without a
+    /// metadata round trip, for every user of this [`ClusterMetadata`].
     ///
     /// # Epoch rule
     ///
     /// The hint is ignored unless `leader_epoch` is strictly newer than the
-    /// cached epoch, mirroring the KIP-320 fencing already applied on the
-    /// metadata merge path: a lagging broker must never be able to drag the
-    /// cache back to a previous leader. A cached epoch of `-1` means "unknown"
-    /// (Metadata < v7, or a partition in an error state) and is always
-    /// superseded. A hint whose own epoch is `-1` carries no ordering
-    /// information and is never applied to the partition.
+    /// cached epoch (KIP-320). A cached epoch of `-1` is always superseded; a
+    /// hint whose own epoch is `-1` never updates the partition.
     ///
     /// # Reachability
     ///
-    /// `endpoint` is the address the broker advertised for `leader_id`. It is
-    /// registered in the broker map, so a node the cache has never seen becomes
-    /// routable immediately. When `endpoint` is `None` and `leader_id` is also
-    /// absent from the broker map the hint is unusable — pointing the partition
-    /// at a broker with no address would only turn a retriable error into a
-    /// routing failure — so it is dropped and `false` is returned.
+    /// `endpoint` is registered in the broker map, so a node the cache has
+    /// never seen becomes routable immediately. When `endpoint` is `None` and
+    /// `leader_id` is unknown the hint is dropped and `false` is returned.
     ///
-    /// This never stamps the topic as freshly refreshed: the report covers one
-    /// partition, and suppressing the periodic refresh on the strength of it
-    /// would leave the rest of the topic's leader map to rot.
+    /// The hint never marks the topic as freshly fetched.
+    ///
+    /// The update goes through the same serialized write path as a fetch, so
+    /// a fetch completing later with an older epoch keeps the hint.
     ///
     /// Returns `true` if the cache changed.
     pub fn apply_leader_hint(
@@ -2156,24 +1155,15 @@ impl ClusterMetadata {
         if leader_id < 0 {
             return false;
         }
-        // A leader report is a live routing decision for this topic.
         self.touch_topic(topic);
 
-        let mut changed = false;
-        self.cache.rcu(|current| {
-            // `rcu` may run this closure more than once under contention, so
-            // every iteration has to start from the current snapshot's verdict.
-            changed = false;
-
-            // Registering the endpoint is worthwhile on its own: it makes the
-            // node dialable even when the partition update below is skipped.
+        self.inner.write(|current| {
             let endpoint_is_new = endpoint.as_ref().is_some_and(|info| {
                 current
                     .brokers
                     .get(&info.id())
                     .is_none_or(|known| known.address() != info.address())
             });
-
             let reachable = endpoint.is_some() || current.brokers.contains_key(&leader_id);
             let partition_is_new = reachable
                 && leader_epoch >= 0
@@ -2184,12 +1174,11 @@ impl ClusterMetadata {
                     .is_some_and(|p| p.leader_epoch < 0 || leader_epoch > p.leader_epoch);
 
             if !endpoint_is_new && !partition_is_new {
-                return Arc::clone(current);
+                return None;
             }
-            changed = true;
 
-            let mut next = MetadataCache::clone(current);
-
+            let mut next = current.clone();
+            next.generation += 1;
             if endpoint_is_new && let Some(info) = endpoint.clone() {
                 debug!(
                     node_id = info.id(),
@@ -2198,7 +1187,6 @@ impl ClusterMetadata {
                 );
                 next.brokers.insert(info.id(), info);
             }
-
             if partition_is_new && let Some(cached_topic) = next.topics.get(topic) {
                 let mut updated = TopicInfo::clone(cached_topic);
                 if let Some(p) = updated.partitions.get_mut(&partition) {
@@ -2213,28 +1201,27 @@ impl ClusterMetadata {
                     );
                     p.leader = leader_id;
                     p.leader_epoch = leader_epoch;
-                    // The broker just named a live leader for this partition,
-                    // so a stale per-partition error must not keep
-                    // `is_routable()` false and strand it until the next
-                    // refresh.
+                    // The broker just named a live leader, so a stale
+                    // partition error must not keep it unroutable.
                     p.error_code = ErrorCode::None;
                 }
                 next.topics.insert(topic.to_string(), Arc::new(updated));
             }
-
-            Arc::new(next)
-        });
-
-        changed
+            Some(next)
+        })
     }
 
     /// Get a connection to the leader of a partition.
     ///
-    /// Refreshes first when *this topic's* entry is missing or older than
-    /// `metadata.max.age.ms`. Per-topic age is what matters: the cache-wide
-    /// `last_updated` stamp advances on every partial refresh, including one
-    /// for an unrelated topic, so a client that keeps refreshing topic A would
-    /// otherwise route topic B from an arbitrarily old leader map.
+    /// Fetches this topic's metadata first when the entry is stale, and forces
+    /// a fetch when the cache cannot route the partition.
+    ///
+    /// # Errors
+    ///
+    /// A partition with no leader, or a leader missing from the broker map,
+    /// is a retriable [`KrafkaError::Broker`] with
+    /// [`ErrorCode::LeaderNotAvailable`]. A topic the broker reported an error
+    /// for carries that code instead.
     pub async fn get_leader_connection(
         &self,
         topic: &str,
@@ -2242,146 +1229,116 @@ impl ClusterMetadata {
     ) -> Result<Arc<BrokerConnection>> {
         self.touch_topic(topic);
 
-        // Resolve the leader address, refreshing at most once if this topic's
-        // entry is missing or stale. Everything needed for the dial is copied
-        // out so no `ArcSwap` guard is held across an `.await`.
         let resolve = |cache: &MetadataCache| -> Option<(BrokerId, String)> {
             let leader_id = cache.topics.get(topic).and_then(|t| t.leader(partition))?;
             let address = cache.brokers.get(&leader_id)?.address().to_string();
             Some((leader_id, address))
         };
 
-        let resolved = {
-            let cache = self.cache.load();
-            if cache.topic_is_fresh(topic, self.max_age) {
-                resolve(&cache)
-            } else {
-                None
-            }
+        let (resolved, fresh) = {
+            let cache = self.inner.cache.load();
+            (
+                resolve(&cache),
+                cache.topic_is_fresh(topic, self.inner.max_age),
+            )
         };
 
         let (leader_id, address) = match resolved {
-            Some(found) => found,
-            None => {
-                self.refresh_for_topics(Some(&[topic])).await?;
-                let cache = self.cache.load();
-                // Distinguish the two failure modes so the error names the
-                // actual problem: an unroutable partition versus a leader that
-                // is not in the broker set.
-                let leader_id = cache
-                    .topics
-                    .get(topic)
-                    .and_then(|t| t.leader(partition))
-                    .ok_or_else(|| {
-                        KrafkaError::invalid_state(format!("no leader for {topic}-{partition}"))
-                    })?;
-                let address = cache
-                    .brokers
-                    .get(&leader_id)
-                    .ok_or_else(|| {
-                        KrafkaError::invalid_state(format!("broker {leader_id} not found"))
-                    })?
-                    .address()
-                    .to_string();
-                (leader_id, address)
+            Some(found) if fresh => found,
+            stale => {
+                // An unroutable partition forces a fetch: its entry may be
+                // fresh by age and still wrong.
+                self.request(Some(&[topic]), stale.is_none()).await?;
+                let cache = self.inner.cache.load();
+                match resolve(&cache) {
+                    Some(found) => found,
+                    None => {
+                        let code = cache
+                            .topic_errors
+                            .get(topic)
+                            .copied()
+                            .unwrap_or(ErrorCode::LeaderNotAvailable);
+                        return Err(KrafkaError::broker(
+                            code,
+                            format!("no routable leader for {topic}-{partition}"),
+                        ));
+                    }
+                }
             }
         };
 
-        self.pool.get_connection_by_id(leader_id, &address).await
+        self.inner
+            .pool
+            .get_connection_by_id(leader_id, &address)
+            .await
     }
 
     /// Get a connection to a specific broker by ID.
+    ///
+    /// Fetches the broker list once when the ID is unknown.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorCode::BrokerNotAvailable`] when the broker is not in the cluster
+    /// metadata after that fetch.
     pub async fn get_broker_connection(
         &self,
         broker_id: BrokerId,
     ) -> Result<Arc<BrokerConnection>> {
-        // Copy the address out before awaiting: holding an `ArcSwap` guard
-        // across the dial keeps the reader slot occupied for the duration of a
-        // TCP/TLS handshake and forces concurrent cache writers onto the
-        // fallback lock path.
-        let address = {
-            let cache = self.cache.load();
-            cache
-                .brokers
-                .get(&broker_id)
-                .ok_or_else(|| KrafkaError::invalid_state(format!("broker {broker_id} not found")))?
-                .address()
-                .to_string()
+        let address = match self.broker(broker_id) {
+            Some(broker) => broker.address().to_string(),
+            None => {
+                self.force_refresh(Some(&[])).await?;
+                self.broker(broker_id)
+                    .ok_or_else(|| {
+                        KrafkaError::broker(
+                            ErrorCode::BrokerNotAvailable,
+                            format!("broker {broker_id} is not in the cluster metadata"),
+                        )
+                    })?
+                    .address()
+                    .to_string()
+            }
         };
 
-        self.pool.get_connection_by_id(broker_id, &address).await
+        self.inner
+            .pool
+            .get_connection_by_id(broker_id, &address)
+            .await
     }
 
     /// Get the controller broker.
     ///
     /// Returns `None` when the cluster has not reported a controller yet, when
-    /// the controller ID is negative (no controller elected — normal briefly
-    /// during failover), or when the reported ID is not among the known brokers.
-    ///
-    /// Controller-only APIs (CreateTopics, DeleteTopics, CreatePartitions,
-    /// IncrementalAlterConfigs, CreateAcls/DeleteAcls, AlterClientQuotas,
-    /// AlterUserScramCredentials, CreateDelegationToken, ElectLeaders,
-    /// AlterPartitionReassignments, UpdateFeatures) must be routed here. A
-    /// non-controller broker forwards them, but during a controller failover
-    /// the forwarding broker answers `NOT_CONTROLLER` (41) instead, which
-    /// surfaces only as a per-item error string.
+    /// the controller ID is negative (none elected, briefly normal during
+    /// failover), or when the reported ID is not among the known brokers.
     pub fn controller(&self) -> Option<BrokerInfo> {
-        let cache = self.cache.load();
+        let cache = self.inner.cache.load();
         if cache.controller_id < 0 {
             return None;
         }
         cache.brokers.get(&cache.controller_id).cloned()
     }
 
-    /// Get a connection to the cluster controller.
-    ///
-    /// Refreshes metadata once if the controller is currently unknown, so that
-    /// a caller retrying after `NOT_CONTROLLER` picks up the newly elected
-    /// controller.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ErrorCode::UnknownControllerId`] if no controller can be
-    /// resolved even after a refresh.
-    pub async fn get_controller_connection(&self) -> Result<Arc<BrokerConnection>> {
-        let controller = match self.controller() {
-            Some(c) => c,
-            None => {
-                debug!("controller unknown; refreshing metadata to resolve it");
-                self.refresh().await?;
-                self.controller().ok_or_else(|| {
-                    KrafkaError::broker(
-                        ErrorCode::UnknownControllerId,
-                        "cluster reported no active controller",
-                    )
-                })?
-            }
-        };
-
-        self.pool
-            .get_connection_by_id(controller.id(), controller.address())
-            .await
-    }
-
     /// Get the cluster ID.
     pub fn cluster_id(&self) -> Option<String> {
-        self.cache.load().cluster_id.clone()
+        self.inner.cache.load().cluster_id.clone()
     }
 
     /// Check if metadata needs refresh.
     pub fn needs_refresh(&self) -> bool {
-        self.cache.load().is_stale(self.max_age)
+        self.inner.cache.load().is_stale(self.inner.max_age)
     }
 
     /// Get partition count for a topic from the cache, without fetching.
     ///
     /// Returns `None` when the topic is not cached. Callers that need the
     /// count in order to make progress should use
-    /// [`ensure_partition_count`](Self::ensure_partition_count), which fetches
-    /// on a miss instead of reporting the topic as unknown.
+    /// [`ensure_partition_count`](Self::ensure_partition_count).
     pub fn partition_count(&self, topic: &str) -> Option<usize> {
         self.touch_topic(topic);
-        self.cache
+        self.inner
+            .cache
             .load()
             .topics
             .get(topic)
@@ -2396,79 +1353,43 @@ impl ClusterMetadata {
     /// fetched, it may have been evicted as idle, or it may be in the middle of
     /// being created.
     ///
-    /// The call retries until `max_wait` elapses, so a topic that is still
-    /// being created (`UNKNOWN_TOPIC_OR_PARTITION`, `LEADER_NOT_AVAILABLE`)
-    /// resolves as soon as the cluster settles. Fatal topic errors —
-    /// `TOPIC_AUTHORIZATION_FAILED`, `INVALID_TOPIC_EXCEPTION` — are returned
-    /// immediately rather than retried into a timeout, matching
-    /// `Metadata.maybeThrowExceptionForTopic`.
+    /// The call keeps fetching until `max_wait` elapses, so a topic that is
+    /// still being created resolves as soon as the cluster settles. Fatal
+    /// topic errors — `TOPIC_AUTHORIZATION_FAILED`, `INVALID_TOPIC_EXCEPTION` —
+    /// are returned immediately, matching `Metadata.maybeThrowExceptionForTopic`.
     ///
     /// # Errors
     ///
     /// - [`KrafkaError::Broker`] with the code the broker reported for the
     ///   topic, when the broker gave a reason.
     /// - [`KrafkaError::Timeout`] when `max_wait` elapses with no answer.
-    /// - The underlying refresh error when it is not retriable.
+    /// - The underlying fetch error when it is not retriable.
     pub async fn ensure_partition_count(&self, topic: &str, max_wait: Duration) -> Result<usize> {
-        // A topic with zero partitions is not usable and not final either: it
-        // is what a topic mid-creation looks like. Treat it exactly like a
-        // miss and keep waiting rather than handing a partitioner a modulus of
-        // zero.
-        //
-        // `partition_count` records the usage, which is what keeps this topic
-        // from being evicted again while the fetch is in flight.
+        // A topic with zero partitions is what a topic mid-creation looks
+        // like; keep waiting rather than hand a partitioner a modulus of zero.
         if let Some(count) = self.partition_count(topic).filter(|count| *count > 0) {
             return Ok(count);
         }
 
         let deadline = Instant::now() + max_wait;
-        // Between attempts, wait at least as long as the metadata rate limiter
-        // would: with rate limiting disabled there is otherwise nothing to stop
-        // a missing topic from turning into a refresh storm.
-        let attempt_spacing = self
-            .retry_backoff
-            .as_ref()
-            .map_or(DEFAULT_RETRY_BACKOFF, |policy| policy.initial_backoff);
-
         loop {
-            // Forced: the ordinary age gate reports `AlreadyFresh` for a topic
-            // that is cached but unusable (present with no partitions, as a
-            // topic mid-creation is), and this loop exists precisely to make
-            // progress on such a topic. The rate limiter still governs it, so
-            // a burst of sends to one missing topic collapses into one request
-            // per backoff interval.
-            match self
-                .refresh_for_topics_outcome_inner(Some(&[topic]), true)
-                .await
-            {
-                Ok(RefreshOutcome::RateLimited(remaining)) => {
-                    // Another caller refreshed very recently. Wait out its
-                    // backoff rather than counting this as an attempt.
-                    let wait = remaining.min(deadline.saturating_duration_since(Instant::now()));
-                    if wait.is_zero() {
-                        break;
-                    }
-                    tokio::time::sleep(wait).await;
-                    continue;
-                }
-                Ok(_) => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, self.force_refresh(Some(&[topic]))).await {
+                Err(_) => break,
+                Ok(Ok(())) => {
                     if let Some(count) = self.partition_count(topic).filter(|count| *count > 0) {
                         return Ok(count);
                     }
                 }
-                Err(e) => {
-                    if !e.is_retriable() {
-                        return Err(e);
-                    }
-                    debug!(
-                        topic,
-                        error = %e,
-                        "metadata refresh for unknown topic failed; retrying within max_wait"
-                    );
+                Ok(Err(e)) if !e.is_retriable() => return Err(e),
+                Ok(Err(e)) => {
+                    debug!(topic, error = %e, "metadata fetch for an unknown topic failed; retrying within max_wait");
                 }
             }
 
-            // A fatal topic error will not resolve by waiting.
             if let Some(code) = self.topic_error(topic)
                 && !code.is_retriable()
             {
@@ -2478,11 +1399,12 @@ impl ClusterMetadata {
                 ));
             }
 
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                break;
+            // The writer spaces forced fetches by its backoff; with the
+            // backoff disabled, space them here.
+            if self.inner.retry_backoff.is_none() {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                tokio::time::sleep(DEFAULT_RETRY_BACKOFF.min(remaining)).await;
             }
-            tokio::time::sleep(attempt_spacing.min(remaining)).await;
         }
 
         Err(match self.topic_error(topic) {
@@ -2505,35 +1427,447 @@ impl ClusterMetadata {
     /// Mirrors `Metadata.getError(topic)` in the Java client. Cleared as soon
     /// as the topic comes back healthy.
     pub fn topic_error(&self, topic: &str) -> Option<ErrorCode> {
-        self.cache.load().topic_errors.get(topic).copied()
+        self.inner.cache.load().topic_errors.get(topic).copied()
     }
 
     /// Mark `topic` as in use, resetting its idle timer.
     ///
-    /// Every accessor that resolves a topic does this already; call it
-    /// directly only to keep a topic warm that is addressed through some other
-    /// route. No-op when TTL eviction is disabled, since nothing then consults
-    /// the idle timer.
+    /// Every accessor that resolves a topic does this already. A topic that
+    /// is not cached has no timer; asking for it in a refresh stamps it. No-op
+    /// when TTL eviction is disabled.
     pub fn touch_topic(&self, topic: &str) {
-        if let Some(ttl) = self.topic_cache_ttl {
-            self.topic_usage.touch(topic, ttl);
+        if self.inner.topic_cache_ttl.is_none() {
+            return;
+        }
+        if let Some(stamp) = self.inner.cache.load().topic_stamps.get(topic) {
+            stamp.last_used_ms.store(now_millis(), Ordering::Relaxed);
         }
     }
 
     /// Mark several topics as in use. See [`touch_topic`](Self::touch_topic).
     pub fn touch_topics(&self, topics: &[&str]) {
-        if let Some(ttl) = self.topic_cache_ttl {
-            for topic in topics {
-                self.topic_usage.touch(topic, ttl);
+        if self.inner.topic_cache_ttl.is_none() {
+            return;
+        }
+        let cache = self.inner.cache.load();
+        let now = now_millis();
+        for topic in topics {
+            if let Some(stamp) = cache.topic_stamps.get(*topic) {
+                stamp.last_used_ms.store(now, Ordering::Relaxed);
             }
         }
     }
 }
 
+impl Inner {
+    /// The default metadata backoff: 100 ms base, doubling to a 1 s ceiling,
+    /// with ±20% jitter.
+    fn default_retry_backoff_policy() -> BackoffPolicy {
+        BackoffPolicy {
+            initial_backoff: DEFAULT_RETRY_BACKOFF,
+            max_backoff: DEFAULT_RETRY_BACKOFF_MAX,
+            backoff_multiplier: 2.0,
+            jitter_factor: RETRY_BACKOFF_JITTER,
+        }
+    }
+
+    /// Whether every name is cached and fetched within the max age.
+    fn all_fresh(&self, names: &[&str]) -> bool {
+        let cache = self.cache.load();
+        !cache.brokers.is_empty()
+            && names
+                .iter()
+                .all(|name| cache.topic_is_fresh(name, self.max_age))
+    }
+
+    /// Store a new snapshot computed from the current one. `update` returns
+    /// `None` to leave the snapshot unchanged. Returns whether it changed.
+    fn write(&self, update: impl FnOnce(&MetadataCache) -> Option<MetadataCache>) -> bool {
+        let _serialized = self.write_lock.lock();
+        let current = self.cache.load_full();
+        match update(&current) {
+            Some(next) => {
+                self.cache.store(Arc::new(next));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Apply a metadata response unless a rebootstrap happened since the fetch
+    /// started (`reset_epoch` changed). Returns whether it was applied.
+    fn apply(&self, response: MetadataResponse, full_refresh: bool, reset_epoch: u64) -> bool {
+        let ttl = self.topic_cache_ttl;
+        self.write(|current| {
+            if current.reset_epoch != reset_epoch {
+                debug!("discarding a metadata response fetched before a rebootstrap");
+                return None;
+            }
+            let next = current.merge(response, full_refresh, ttl);
+            debug!(
+                brokers = next.brokers.len(),
+                topics = next.topics.len(),
+                "updated metadata"
+            );
+            Some(next)
+        })
+    }
+
+    /// Time until the backoff permits the next fetch.
+    fn backoff_remaining(&self) -> Option<Duration> {
+        self.retry_backoff.as_ref()?;
+        self.refresh_backoff.lock().remaining()
+    }
+
+    /// One fetch, as the writer runs it: count it toward the failure streak
+    /// and the backoff.
+    async fn refresh(&self, topics: Option<&[String]>) -> Result<()> {
+        self.metadata_attempt_start
+            .lock()
+            .get_or_insert_with(Instant::now);
+        let result = self.refresh_attempt(topics).await;
+        if let Some(policy) = self.retry_backoff.as_ref() {
+            let mut backoff = self.refresh_backoff.lock();
+            match &result {
+                Ok(()) => backoff.record_success(policy),
+                Err(_) => backoff.record_failure(policy),
+            }
+        }
+        result
+    }
+
+    /// Fetch metadata from some reachable broker and apply it.
+    ///
+    /// Rebootstraps (with [`MetadataRecoveryStrategy::Rebootstrap`]) when the
+    /// failure streak exceeds the trigger, when no known broker is reachable,
+    /// and on `REBOOTSTRAP_REQUIRED` — at most once per fetch.
+    async fn refresh_attempt(&self, topics: Option<&[String]>) -> Result<()> {
+        let rebootstrap_enabled = self.recovery_strategy == MetadataRecoveryStrategy::Rebootstrap;
+        let mut rebootstrapped = false;
+        if self.needs_rebootstrap() {
+            self.rebootstrap("no successful metadata response within the rebootstrap trigger")
+                .await;
+            rebootstrapped = true;
+        }
+
+        // Bounded: each pass either returns or consumes the one rebootstrap,
+        // and a response discarded by a concurrent rebootstrap is re-fetched
+        // once against the new view.
+        for _ in 0..3 {
+            let reset_epoch = self.cache.load().reset_epoch;
+            let conn = match self.get_any_connection().await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    if rebootstrap_enabled
+                        && !rebootstrapped
+                        && !self.cache.load().brokers.is_empty()
+                    {
+                        self.rebootstrap("no known broker is reachable").await;
+                        rebootstrapped = true;
+                        continue;
+                    }
+                    return Err(e);
+                }
+            };
+
+            let version = conn
+                .negotiate_api_version(
+                    ApiKey::Metadata,
+                    crate::protocol::versions::METADATA_MAX,
+                    crate::protocol::versions::METADATA_MIN,
+                )
+                .unwrap_or(crate::protocol::versions::METADATA_MIN);
+
+            // `allow_auto_topic_creation` rides only on the topic-specific
+            // form; an all-topics request names nothing to create.
+            let request = match topics {
+                Some(names) => {
+                    let mut request =
+                        MetadataRequest::for_topics(names.iter().map(String::as_str).collect());
+                    request.allow_auto_topic_creation = self.auto_create_topics;
+                    request
+                }
+                None => MetadataRequest::all_topics(),
+            };
+
+            let mut response = conn
+                .send_request(ApiKey::Metadata, version, |buf| {
+                    request.encode_versioned(version, buf)
+                })
+                .await?;
+            let metadata = MetadataResponse::decode_versioned(version, &mut response)?;
+
+            if metadata.error_code == ErrorCode::RebootstrapRequired
+                && rebootstrap_enabled
+                && !rebootstrapped
+            {
+                info!("broker requested a rebootstrap (REBOOTSTRAP_REQUIRED)");
+                self.rebootstrap("REBOOTSTRAP_REQUIRED").await;
+                rebootstrapped = true;
+                continue;
+            }
+            if !metadata.error_code.is_ok() {
+                return Err(KrafkaError::broker(
+                    metadata.error_code,
+                    "metadata request failed",
+                ));
+            }
+
+            // Any successful response proves a broker is reachable.
+            *self.metadata_attempt_start.lock() = None;
+
+            if self.apply(metadata, topics.is_none(), reset_epoch) {
+                return Ok(());
+            }
+        }
+
+        Err(KrafkaError::unavailable(
+            "metadata was reset while the fetch was in flight",
+        ))
+    }
+
+    /// Drop the cluster view after a random delay of up to
+    /// `rebootstrap_jitter`, so the next connection goes to the seeds.
+    async fn rebootstrap(&self, reason: &str) {
+        let delay = if self.rebootstrap_jitter.is_zero() {
+            Duration::ZERO
+        } else {
+            use rand::Rng as _;
+            let nanos = crate::util::with_rng(|rng| {
+                rng.random_range(0..self.rebootstrap_jitter.as_nanos().max(1))
+            });
+            Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+        };
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        warn!(
+            reason,
+            "rebootstrapping: rediscovering the cluster from the bootstrap servers (KIP-899)"
+        );
+        self.reset_to_seeds();
+    }
+
+    /// Replace the snapshot with an empty one and restart the failure timer.
+    fn reset_to_seeds(&self) {
+        self.write(|current| {
+            let mut next = MetadataCache::new();
+            next.generation = current.generation + 1;
+            next.reset_epoch = current.reset_epoch + 1;
+            Some(next)
+        });
+        // Set to now, not cleared: another rebootstrap needs another full
+        // trigger period of failure.
+        *self.metadata_attempt_start.lock() = Some(Instant::now());
+    }
+
+    /// Whether the failure streak has outlasted the rebootstrap trigger.
+    ///
+    /// The trigger is extended by a random amount (up to 20%) so that clients
+    /// that started failing together do not cross it on the same tick.
+    fn needs_rebootstrap(&self) -> bool {
+        if self.recovery_strategy != MetadataRecoveryStrategy::Rebootstrap {
+            return false;
+        }
+        let Some(attempt_start) = *self.metadata_attempt_start.lock() else {
+            return false;
+        };
+        let elapsed = attempt_start.elapsed();
+
+        let effective_trigger = {
+            use rand::Rng as _;
+            let spread = self.rebootstrap_trigger.mul_f64(REBOOTSTRAP_TRIGGER_JITTER);
+            if spread.is_zero() {
+                self.rebootstrap_trigger
+            } else {
+                let nanos =
+                    crate::util::with_rng(|rng| rng.random_range(0..spread.as_nanos().max(1)));
+                self.rebootstrap_trigger
+                    + Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+            }
+        };
+
+        elapsed >= effective_trigger
+    }
+
+    /// Get a connection to any available broker.
+    ///
+    /// Candidates are the cached brokers plus the bootstrap servers not
+    /// already among them, shuffled and raced a few at a time.
+    ///
+    /// # Errors
+    ///
+    /// When no candidate connects, the error names every address tried and
+    /// carries a failure as its source: an authentication failure on any
+    /// address makes the whole error [`KrafkaError::Auth`]; otherwise it is a
+    /// retriable network error with the last failure.
+    async fn get_any_connection(&self) -> Result<Arc<BrokerConnection>> {
+        let mut addrs = self.connection_candidates();
+        if addrs.is_empty() {
+            return Err(KrafkaError::unavailable(
+                "no bootstrap servers or brokers to connect to",
+            ));
+        }
+        {
+            use rand::seq::SliceRandom as _;
+            crate::util::with_rng(|rng| addrs.shuffle(rng));
+        }
+
+        use futures::StreamExt as _;
+
+        // The most telling failure: an authentication failure wins over any
+        // network one, because retrying will not fix it.
+        let mut cause: Option<KrafkaError> = None;
+        for chunk in addrs.chunks(CONNECT_FANOUT) {
+            let mut attempts: futures::stream::FuturesUnordered<_> = chunk
+                .iter()
+                .map(|addr| {
+                    let pool = Arc::clone(&self.pool);
+                    let addr = addr.clone();
+                    async move { pool.get_connection(&addr).await }
+                })
+                .collect();
+            while let Some(attempt) = attempts.next().await {
+                match attempt {
+                    Ok(conn) => return Ok(conn),
+                    Err(e) => {
+                        if !matches!(cause, Some(KrafkaError::Auth { .. })) {
+                            cause = Some(e);
+                        }
+                    }
+                }
+            }
+        }
+
+        Err(no_broker_reachable(&addrs, cause))
+    }
+
+    /// Every cached broker address, followed by each bootstrap server not
+    /// already among them. Addresses are `host:port` strings resolved at dial
+    /// time.
+    fn connection_candidates(&self) -> Vec<String> {
+        let cache = self.cache.load();
+        let servers = self.bootstrap_servers.load();
+
+        let mut addrs: Vec<String> = Vec::with_capacity(cache.brokers.len() + servers.len());
+        let mut seen: AHashSet<&str> = AHashSet::with_capacity(cache.brokers.len());
+        let mut brokers: Vec<&BrokerInfo> = cache.brokers.values().collect();
+        brokers.sort_by_key(|b| b.id());
+        for broker in brokers {
+            if seen.insert(broker.address()) {
+                addrs.push(broker.address().to_string());
+            }
+        }
+        for s in servers.iter() {
+            if seen.insert(s.as_str()) {
+                addrs.push(s.clone());
+            }
+        }
+        addrs
+    }
+
+    /// Fail every waiting request: the handle is gone.
+    fn fail_pending(&self) {
+        let pending = std::mem::take(&mut *self.pending.lock());
+        for waiter in pending.waiters {
+            let _ = waiter.send(Err(KrafkaError::closed("cluster metadata was dropped")));
+        }
+    }
+}
+
+/// The error for "no candidate address connected".
+fn no_broker_reachable(addrs: &[String], last: Option<KrafkaError>) -> KrafkaError {
+    let tried = addrs.join(", ");
+    match last {
+        Some(KrafkaError::Auth { message, source }) => KrafkaError::Auth {
+            message: format!("could not connect to any of [{tried}]: {message}"),
+            source,
+        },
+        Some(last) => KrafkaError::network(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            NoBrokerReachable { tried, last },
+        )),
+        None => KrafkaError::unavailable(format!("could not connect to any of [{tried}]")),
+    }
+}
+
+/// Every candidate address failed; `last` is the final failure.
+#[derive(Debug)]
+struct NoBrokerReachable {
+    tried: String,
+    last: KrafkaError,
+}
+
+impl std::fmt::Display for NoBrokerReachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "could not connect to any of [{}]; last error: {}",
+            self.tried, self.last
+        )
+    }
+}
+
+impl std::error::Error for NoBrokerReachable {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.last)
+    }
+}
+
+/// The writer task: the only code that fetches metadata and applies it.
+///
+/// Waits for requests, waits out the backoff (requests arriving meanwhile join
+/// the same fetch), fetches the union of everything requested, and answers
+/// every waiter with the outcome.
+async fn run_writer(inner: Arc<Inner>) {
+    loop {
+        if inner.closed.load(Ordering::Acquire) {
+            inner.fail_pending();
+            return;
+        }
+        if inner.pending.lock().is_empty() {
+            inner.wake.notified().await;
+            continue;
+        }
+
+        if let Some(wait) = inner.backoff_remaining() {
+            tokio::time::sleep(wait).await;
+        }
+
+        let batch = std::mem::take(&mut *inner.pending.lock());
+        if batch.rebootstrap {
+            inner.rebootstrap("requested by the protocol").await;
+        }
+        if batch.waiters.iter().all(oneshot::Sender::is_closed) {
+            continue;
+        }
+
+        let topics: Option<Vec<String>> = if batch.full {
+            None
+        } else {
+            Some(batch.topics.into_iter().collect())
+        };
+        let result = inner.refresh(topics.as_deref()).await;
+        if let Err(e) = &result {
+            debug!(error = %e, "metadata fetch failed");
+        }
+        for waiter in batch.waiters {
+            let _ = waiter.send(result.clone());
+        }
+    }
+}
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    impl ClusterMetadata {
+        /// Apply a response through the serialized write path.
+        fn update_cache(&self, response: MetadataResponse, full_refresh: bool) {
+            let epoch = self.inner.cache.load().reset_epoch;
+            assert!(self.inner.apply(response, full_refresh, epoch));
+        }
+    }
 
     #[test]
     fn test_broker_info_address() {
@@ -2545,6 +1879,7 @@ mod tests {
     fn test_topic_info() {
         let topic = TopicInfo {
             name: "test".to_string(),
+            topic_id: [0; 16],
             is_internal: false,
             partitions: [
                 (
@@ -2638,7 +1973,8 @@ mod tests {
     fn test_metadata_recovery_strategy_default() {
         assert_eq!(
             MetadataRecoveryStrategy::default(),
-            MetadataRecoveryStrategy::None,
+            MetadataRecoveryStrategy::Rebootstrap,
+            "KIP-1102 made rebootstrap the default"
         );
     }
 
@@ -2656,10 +1992,10 @@ mod tests {
         .with_rebootstrap_trigger(Duration::from_secs(60));
 
         assert_eq!(
-            meta.recovery_strategy,
+            meta.inner.recovery_strategy,
             MetadataRecoveryStrategy::Rebootstrap
         );
-        assert_eq!(meta.rebootstrap_trigger, Duration::from_secs(60));
+        assert_eq!(meta.inner.rebootstrap_trigger, Duration::from_secs(60));
     }
 
     #[test]
@@ -2701,7 +2037,7 @@ mod tests {
     }
 
     #[test]
-    fn test_needs_rebootstrap_disabled_by_default() {
+    fn test_needs_rebootstrap_never_fires_with_strategy_none() {
         let pool = Arc::new(ConnectionPool::new(
             crate::network::ConnectionConfig::default(),
         ));
@@ -2709,10 +2045,12 @@ mod tests {
             vec!["localhost:9092".to_string()],
             pool,
             Duration::from_secs(300),
-        );
+        )
+        .with_recovery_strategy(MetadataRecoveryStrategy::None)
+        .with_rebootstrap_trigger(Duration::ZERO);
+        *meta.inner.metadata_attempt_start.lock() = Some(Instant::now() - Duration::from_secs(1));
 
-        // Default strategy is None — should never trigger rebootstrap.
-        assert!(!meta.needs_rebootstrap());
+        assert!(!meta.inner.needs_rebootstrap());
     }
 
     #[test]
@@ -2729,18 +2067,18 @@ mod tests {
         .with_rebootstrap_trigger(Duration::from_secs(300));
 
         // No attempt recorded yet — needs_rebootstrap should return false.
-        assert!(!meta.needs_rebootstrap());
+        assert!(!meta.inner.needs_rebootstrap());
 
         // Simulate that a refresh attempt has started.
         {
-            let mut start = meta.metadata_attempt_start.lock();
+            let mut start = meta.inner.metadata_attempt_start.lock();
             *start = Some(Instant::now());
         }
 
         // Still shouldn't trigger — trigger is 300s, elapsed is ~0.
-        assert!(!meta.needs_rebootstrap());
+        assert!(!meta.inner.needs_rebootstrap());
         // Timestamp should still be recorded.
-        assert!(meta.metadata_attempt_start.lock().is_some());
+        assert!(meta.inner.metadata_attempt_start.lock().is_some());
     }
 
     #[tokio::test]
@@ -2759,20 +2097,20 @@ mod tests {
 
         // Simulate that a refresh attempt has started.
         {
-            let mut start = meta.metadata_attempt_start.lock();
+            let mut start = meta.inner.metadata_attempt_start.lock();
             *start = Some(Instant::now());
         }
 
         // With a zero trigger, needs_rebootstrap should return true.
-        assert!(meta.needs_rebootstrap());
+        assert!(meta.inner.needs_rebootstrap());
 
         // Perform the actual rebootstrap.
         meta.rebootstrap().await;
 
         // After rebootstrap, the attempt start should be set to Some(now) — not None.
-        assert!(meta.metadata_attempt_start.lock().is_some());
+        assert!(meta.inner.metadata_attempt_start.lock().is_some());
         // Cache should be reset.
-        assert!(meta.cache.load().brokers.is_empty());
+        assert!(meta.inner.cache.load().brokers.is_empty());
     }
 
     #[tokio::test]
@@ -2792,14 +2130,14 @@ mod tests {
         cache
             .brokers
             .insert(1, BrokerInfo::new(1, "host".to_string(), 9092, None));
-        meta.cache.store(Arc::new(cache));
-        assert!(!meta.cache.load().brokers.is_empty());
+        meta.inner.cache.store(Arc::new(cache));
+        assert!(!meta.inner.cache.load().brokers.is_empty());
 
         meta.rebootstrap().await;
 
-        assert!(meta.cache.load().brokers.is_empty());
+        assert!(meta.inner.cache.load().brokers.is_empty());
         // After rebootstrap, timer is set to Some(now) — not cleared.
-        assert!(meta.metadata_attempt_start.lock().is_some());
+        assert!(meta.inner.metadata_attempt_start.lock().is_some());
     }
 
     #[test]
@@ -2815,7 +2153,7 @@ mod tests {
             pool,
             Duration::from_secs(300),
         );
-        assert_eq!(meta.topic_cache_ttl, Some(Duration::from_secs(300)));
+        assert_eq!(meta.inner.topic_cache_ttl, Some(Duration::from_secs(300)));
     }
 
     #[test]
@@ -2829,7 +2167,7 @@ mod tests {
             Duration::from_secs(300),
         )
         .with_topic_cache_ttl_disabled();
-        assert_eq!(meta.topic_cache_ttl, None);
+        assert_eq!(meta.inner.topic_cache_ttl, None);
     }
 
     /// A metadata response listing `topic_names`, each with one healthy
@@ -2883,7 +2221,7 @@ mod tests {
     /// The bug this whole mechanism exists to fix.
     ///
     /// A partial refresh names one topic, so only that topic gets a fresh
-    /// `topic_last_refreshed` stamp. Evicting on that stamp threw away a topic
+    /// fetch stamp. Evicting on that stamp threw away a topic
     /// that the client was actively producing to, purely because some *other*
     /// topic happened to be the one that needed refreshing — and the next send
     /// to it then failed as `unknown topic` for a topic that plainly exists.
@@ -2902,7 +2240,7 @@ mod tests {
         meta.touch_topic("topic-b");
         meta.update_cache(ok_topics_response(&["topic-a"]), false);
 
-        let cache = meta.cache.load();
+        let cache = meta.inner.cache.load();
         assert!(
             cache.topics.contains_key("topic-a"),
             "topic-a was in the response and must be cached"
@@ -2925,7 +2263,7 @@ mod tests {
 
         meta.update_cache(ok_topics_response(&["topic-a"]), false);
 
-        let cache = meta.cache.load();
+        let cache = meta.inner.cache.load();
         assert!(cache.topics.contains_key("topic-a"));
         assert!(
             !cache.topics.contains_key("topic-b"),
@@ -2945,33 +2283,57 @@ mod tests {
         meta.update_cache(ok_topics_response(&["topic-a"]), false);
 
         assert!(
-            meta.cache.load().topics.contains_key("topic-b"),
+            meta.inner.cache.load().topics.contains_key("topic-b"),
             "a topic refreshed within the TTL must survive even with no recorded use"
         );
     }
 
+    /// When `topic` was last used, or `None` when never.
+    fn last_used(meta: &ClusterMetadata, topic: &str) -> Option<u64> {
+        meta.inner
+            .cache
+            .load()
+            .topic_stamps
+            .get(topic)
+            .map(|stamp| stamp.last_used_ms.load(Ordering::Relaxed))
+            .filter(|ms| *ms != 0)
+    }
+
     /// Usage is recorded by the ordinary read accessors, so a caller that only
-    /// ever asks for partition counts or leaders keeps its topics warm without
-    /// knowing the tracker exists.
+    /// ever asks for partition counts or leaders keeps its topics warm.
     #[test]
     fn test_read_accessors_record_topic_usage() {
         let meta = ttl_metadata(Duration::from_secs(60));
         meta.update_cache(ok_topics_response(&["topic-a", "topic-b"]), true);
 
         assert!(
-            meta.topic_usage.idle_for("topic-a").is_none(),
+            last_used(&meta, "topic-a").is_none(),
             "a refresh alone is not a use"
         );
 
         assert_eq!(meta.partition_count("topic-a"), Some(1));
-        assert!(meta.topic_usage.idle_for("topic-a").is_some());
+        assert!(last_used(&meta, "topic-a").is_some());
 
         assert!(meta.leader("topic-b", 0).is_some());
-        assert!(meta.topic_usage.idle_for("topic-b").is_some());
+        assert!(last_used(&meta, "topic-b").is_some());
     }
 
-    /// With TTL eviction disabled there is nothing to feed, so nothing is
-    /// tracked and the tracker cannot itself become the leak.
+    /// A use survives the topic being fetched again: the stamp's use time is
+    /// carried into the new snapshot.
+    #[test]
+    fn test_a_refetch_keeps_the_last_use() {
+        let meta = ttl_metadata(Duration::from_secs(60));
+        meta.update_cache(ok_topics_response(&["topic-a"]), true);
+        meta.touch_topic("topic-a");
+        let used = last_used(&meta, "topic-a");
+        assert!(used.is_some());
+
+        meta.update_cache(ok_topics_response(&["topic-a"]), false);
+        assert_eq!(last_used(&meta, "topic-a"), used);
+    }
+
+    /// With TTL eviction disabled nothing consults the use time, so nothing
+    /// records it.
     #[test]
     fn test_usage_is_not_tracked_when_ttl_eviction_is_disabled() {
         let pool = Arc::new(ConnectionPool::new(
@@ -2983,33 +2345,31 @@ mod tests {
             Duration::from_secs(300),
         )
         .with_topic_cache_ttl_disabled();
+        meta.update_cache(ok_topics_response(&["topic-a"]), true);
 
         meta.touch_topic("topic-a");
-        assert_eq!(meta.topic_usage.tracked_len(), 0);
+        assert!(last_used(&meta, "topic-a").is_none());
     }
 
-    /// The usage map is pruned on every refresh and hard-capped, so a client
-    /// that addresses an unbounded stream of distinct topics cannot grow it
-    /// without limit.
+    /// The expiry map holds exactly the cached topics: touching a topic the
+    /// cache does not hold adds nothing, and an evicted topic takes its stamp
+    /// with it.
     #[test]
-    fn test_usage_tracking_is_bounded() {
+    fn test_topic_stamps_track_exactly_the_cached_topics() {
         let meta = ttl_metadata(Duration::from_millis(10));
-
-        for i in 0..(MAX_TRACKED_TOPIC_USAGE + 50) {
-            meta.touch_topic(&format!("topic-{i}"));
+        for i in 0..50 {
+            meta.touch_topic(&format!("never-fetched-{i}"));
         }
-        assert!(
-            meta.topic_usage.tracked_len() <= MAX_TRACKED_TOPIC_USAGE,
-            "the usage map must respect its hard cap"
-        );
+        assert!(meta.inner.cache.load().topic_stamps.is_empty());
 
+        meta.update_cache(ok_topics_response(&["topic-a", "topic-b"]), true);
         std::thread::sleep(Duration::from_millis(30));
         meta.update_cache(ok_topics_response(&["topic-a"]), false);
-        assert_eq!(
-            meta.topic_usage.tracked_len(),
-            0,
-            "entries idle beyond the TTL are pruned on refresh"
-        );
+
+        let cache = meta.inner.cache.load();
+        let mut stamped: Vec<&String> = cache.topic_stamps.keys().collect();
+        stamped.sort();
+        assert_eq!(stamped, vec!["topic-a"]);
     }
 
     /// A topic error is remembered with its code, so a caller learns *why* a
@@ -3070,7 +2430,7 @@ mod tests {
         );
     }
 
-    /// Regression test: a partial refresh must not reset `topic_last_refreshed`
+    /// A partial refresh must not reset the fetch stamp
     /// for topics that were only retained from the cache (not present in the
     /// response).  Resetting retained timestamps makes them perpetually "fresh"
     /// so TTL eviction never fires.
@@ -3124,17 +2484,18 @@ mod tests {
         // First partial update: populate cache with "topic-a".
         meta.update_cache(make_response(&["topic-a"]), false);
         let ts_a = meta
+            .inner
             .cache
             .load()
-            .topic_last_refreshed
+            .topic_stamps
             .get("topic-a")
-            .copied()
+            .map(|s| s.refreshed)
             .unwrap();
 
         // Second partial update: only "topic-b" is in the response.
         // "topic-a" is retained from the cache but must keep its original timestamp.
         meta.update_cache(make_response(&["topic-b"]), false);
-        let cache = meta.cache.load();
+        let cache = meta.inner.cache.load();
 
         assert!(
             cache.topics.contains_key("topic-a"),
@@ -3145,18 +2506,22 @@ mod tests {
             "topic-b should appear after the second update"
         );
 
-        let ts_a_after = cache.topic_last_refreshed.get("topic-a").copied().unwrap();
+        let ts_a_after = cache
+            .topic_stamps
+            .get("topic-a")
+            .map(|s| s.refreshed)
+            .unwrap();
         assert_eq!(
             ts_a, ts_a_after,
             "retained topic-a's timestamp must not be advanced by a partial refresh"
         );
         assert!(
-            cache.topic_last_refreshed.contains_key("topic-b"),
+            cache.topic_stamps.contains_key("topic-b"),
             "freshly refreshed topic-b must have a timestamp"
         );
     }
 
-    /// Regression test: a partial refresh where a topic comes back with a
+    /// A partial refresh where a topic comes back with a
     /// transient error must reset its TTL timestamp so it is not evicted on
     /// the next refresh, and the stale cache entry must be preserved.
     #[test]
@@ -3231,23 +2596,28 @@ mod tests {
         // Populate the cache with a successful refresh for "topic-a".
         meta.update_cache(make_ok_response(&["topic-a"]), false);
         let ts_before = meta
+            .inner
             .cache
             .load()
-            .topic_last_refreshed
+            .topic_stamps
             .get("topic-a")
-            .copied()
+            .map(|s| s.refreshed)
             .unwrap();
 
         // A subsequent partial refresh returns a transient error for "topic-a".
         // The stale entry must be preserved AND the timestamp must advance.
         meta.update_cache(make_transient_error_response("topic-a"), false);
-        let cache = meta.cache.load();
+        let cache = meta.inner.cache.load();
 
         assert!(
             cache.topics.contains_key("topic-a"),
             "topic-a must be retained when the response has a transient error"
         );
-        let ts_after = cache.topic_last_refreshed.get("topic-a").copied().unwrap();
+        let ts_after = cache
+            .topic_stamps
+            .get("topic-a")
+            .map(|s| s.refreshed)
+            .unwrap();
         assert!(
             ts_after >= ts_before,
             "transient-error response must advance the TTL timestamp so the topic \
@@ -3255,7 +2625,7 @@ mod tests {
         );
     }
 
-    /// Regression test: if a topic has already been TTL-evicted before the
+    /// If a topic has already been TTL-evicted before the
     /// response loop runs, a transient error in the response must restore the
     /// stale entry rather than silently losing it.
     #[test]
@@ -3307,7 +2677,7 @@ mod tests {
             false,
         );
         assert!(
-            meta.cache.load().topics.contains_key("topic-a"),
+            meta.inner.cache.load().topics.contains_key("topic-a"),
             "pre-condition: topic-a seeded"
         );
 
@@ -3341,14 +2711,14 @@ mod tests {
         );
 
         assert!(
-            meta.cache.load().topics.contains_key("topic-a"),
+            meta.inner.cache.load().topics.contains_key("topic-a"),
             "topic-a must be restored from old cache after TTL eviction + transient error"
         );
     }
 
-    /// Regression test: a brand-new topic that appears in a partial refresh
+    /// A brand-new topic that appears in a partial refresh
     /// only with a transient error (and has no prior cache entry) must NOT
-    /// create an orphaned entry in `topic_last_refreshed` with no corresponding
+    /// create an orphaned stamp with no corresponding
     /// key in `topics`.
     #[test]
     fn test_transient_error_never_cached_topic_not_stamped() {
@@ -3388,25 +2758,22 @@ mod tests {
             false,
         );
 
-        let cache = meta.cache.load();
+        let cache = meta.inner.cache.load();
         assert!(
             !cache.topics.contains_key("unknown-topic"),
             "unknown-topic must not appear in topics when only a transient error was received \
              and there is no prior cache entry"
         );
         assert!(
-            !cache.topic_last_refreshed.contains_key("unknown-topic"),
-            "unknown-topic must not be stamped in topic_last_refreshed when it is not in topics"
+            !cache.topic_stamps.contains_key("unknown-topic"),
+            "unknown-topic must not be stamped when it is not in topics"
         );
     }
 
-    /// Regression test: when a TTL-evicted topic is restored via the
-    /// transient-error path, its UUID mapping must also be restored so that
-    /// `topic_id_for_name()` continues to return `Some(uuid)`.
-    ///
-    /// Without the fix, `topic_ids` / `name_to_topic_id` were pruned during
-    /// TTL eviction and never repopulated in the transient-error branch,
-    /// causing ShareConsumer fetch routing to break.
+    /// When a TTL-evicted topic is restored via the transient-error path, its
+    /// UUID mapping must also be restored so that `topic_id_for_name()`
+    /// continues to return `Some(uuid)`; share-consumer fetch routing
+    /// depends on it.
     #[test]
     fn test_transient_error_restores_uuid_mapping_for_evicted_topic() {
         use crate::protocol::{MetadataBroker, MetadataPartitionResponse, MetadataTopicResponse};
@@ -3459,7 +2826,11 @@ mod tests {
             false,
         );
         assert!(
-            meta.cache.load().name_to_topic_id.contains_key("topic-b"),
+            meta.inner
+                .cache
+                .load()
+                .name_to_topic_id
+                .contains_key("topic-b"),
             "pre-condition: UUID mapping seeded"
         );
 
@@ -3494,7 +2865,7 @@ mod tests {
             false,
         );
 
-        let cache = meta.cache.load();
+        let cache = meta.inner.cache.load();
         assert!(
             cache.topics.contains_key("topic-b"),
             "topic-b must be restored in topics"
@@ -3508,167 +2879,6 @@ mod tests {
             cache.topic_ids.contains_key(&uuid),
             "UUID must be present in topic_ids"
         );
-    }
-
-    // ══════════════════════════════════════════════════════════════════
-    // Refresh coalescing must respect the requested topic set
-    // ══════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn test_in_flight_full_refresh_covers_everything() {
-        let all = InFlightTopics::All;
-        assert!(
-            all.covers(None),
-            "a full refresh covers another full refresh"
-        );
-        assert!(all.covers(Some(&["a"])));
-        assert!(all.covers(Some(&["a", "b", "c"])));
-    }
-
-    #[test]
-    fn test_in_flight_partial_never_covers_full_refresh() {
-        let partial = InFlightTopics::Some(vec!["a".into(), "b".into()]);
-        assert!(
-            !partial.covers(None),
-            "a partial refresh cannot satisfy a caller asking for all topics"
-        );
-    }
-
-    /// A caller asking for ["b"] must NOT be allowed to
-    /// join an in-flight refresh for ["a"]. Joining it hands the caller an
-    /// Ok(()) for a topic the broker was never asked about, after which
-    /// `get_leader_connection` fails with "no leader for b-0" despite having
-    /// just "refreshed".
-    #[test]
-    fn test_in_flight_partial_only_covers_subsets() {
-        let in_flight = InFlightTopics::Some(vec!["a".into()]);
-
-        assert!(in_flight.covers(Some(&["a"])), "exact match must join");
-        assert!(
-            !in_flight.covers(Some(&["b"])),
-            "disjoint topic set must NOT join an unrelated refresh"
-        );
-        assert!(
-            !in_flight.covers(Some(&["a", "b"])),
-            "a superset must NOT join: 'b' would never be fetched"
-        );
-
-        let wider = InFlightTopics::Some(vec!["a".into(), "b".into(), "c".into()]);
-        assert!(wider.covers(Some(&["a", "c"])), "a subset may join");
-        assert!(!wider.covers(Some(&["a", "d"])));
-    }
-
-    #[test]
-    fn test_in_flight_empty_request_is_covered() {
-        let in_flight = InFlightTopics::Some(vec!["a".into()]);
-        assert!(in_flight.covers(Some(&[])));
-    }
-
-    #[test]
-    fn test_in_flight_from_request() {
-        assert!(matches!(
-            InFlightTopics::from_request(None),
-            InFlightTopics::All
-        ));
-        match InFlightTopics::from_request(Some(&["x", "y"])) {
-            InFlightTopics::Some(v) => assert_eq!(v, vec!["x".to_string(), "y".to_string()]),
-            InFlightTopics::All => panic!("expected a partial refresh"),
-        }
-    }
-
-    // ══════════════════════════════════════════════════════════════════
-    // A rate-limited refresh must be distinguishable from a real one
-    // ══════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn test_refresh_outcome_rate_limited_is_not_current() {
-        let limited = RefreshOutcome::RateLimited(Duration::from_millis(100));
-        assert!(
-            !limited.is_current(),
-            "a rate-limited refresh did not contact a broker and must not read as current"
-        );
-        assert_eq!(limited.retry_after(), Some(Duration::from_millis(100)));
-
-        assert!(RefreshOutcome::Refreshed.is_current());
-        assert_eq!(RefreshOutcome::Refreshed.retry_after(), None);
-        assert!(RefreshOutcome::AlreadyFresh.is_current());
-        assert_eq!(RefreshOutcome::AlreadyFresh.retry_after(), None);
-    }
-
-    /// A refresh within `retry_backoff` of the previous one must report
-    /// `RateLimited` — not `Ok(())`. Returning success there is what made the
-    /// admin retry loops re-issue against byte-identical stale metadata.
-    #[tokio::test]
-    async fn test_refresh_reports_rate_limited_instead_of_false_success() {
-        let pool = Arc::new(ConnectionPool::new(
-            crate::network::ConnectionConfig::default(),
-        ));
-        let meta = ClusterMetadata::new(
-            vec!["localhost:1".to_string()],
-            pool,
-            Duration::from_secs(300),
-        )
-        .with_retry_backoff(Duration::from_secs(60))
-        .with_retry_backoff_max(Duration::from_secs(60));
-
-        // Pretend a refresh just completed successfully, arming the backoff.
-        meta.refresh_backoff
-            .lock()
-            .record_success(meta.retry_backoff.as_ref().unwrap());
-
-        let outcome = meta
-            .refresh_for_topics_inner_forced(Some(&["some-topic"]), false)
-            .await
-            .expect("rate limiting is not an error");
-
-        match outcome {
-            RefreshOutcome::RateLimited(remaining) => {
-                assert!(remaining <= Duration::from_secs(72));
-                assert!(!outcome.is_current());
-            }
-            other => panic!("expected RateLimited, got {other:?}"),
-        }
-    }
-
-    /// The freshness check runs before the rate limiter: data already in cache
-    /// is returned without waiting out a backoff it does not need.
-    #[tokio::test]
-    async fn test_already_fresh_wins_over_rate_limiting() {
-        let pool = Arc::new(ConnectionPool::new(
-            crate::network::ConnectionConfig::default(),
-        ));
-        let meta = ClusterMetadata::new(
-            vec!["localhost:1".to_string()],
-            pool,
-            Duration::from_secs(300),
-        )
-        .with_retry_backoff(Duration::from_secs(60));
-
-        let mut cache = MetadataCache::new();
-        cache
-            .brokers
-            .insert(1, BrokerInfo::new(1, "h".into(), 9092, None));
-        cache.topics.insert(
-            "t".into(),
-            Arc::new(TopicInfo {
-                name: "t".into(),
-                is_internal: false,
-                partitions: AHashMap::new(),
-            }),
-        );
-        cache
-            .topic_last_refreshed
-            .insert("t".into(), Instant::now());
-        meta.cache.store(Arc::new(cache));
-        meta.refresh_backoff
-            .lock()
-            .record_success(meta.retry_backoff.as_ref().unwrap());
-
-        let outcome = meta
-            .refresh_for_topics_inner_forced(Some(&["t"]), false)
-            .await
-            .unwrap();
-        assert_eq!(outcome, RefreshOutcome::AlreadyFresh);
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -3887,7 +3097,7 @@ mod tests {
         cache
             .brokers
             .insert(1, BrokerInfo::new(1, "h".into(), 9092, None));
-        meta.cache.store(Arc::new(cache));
+        meta.inner.cache.store(Arc::new(cache));
 
         assert!(meta.controller().is_none());
     }
@@ -3928,19 +3138,6 @@ mod tests {
         assert_eq!(meta.topic("t").unwrap().name, a.name);
     }
 
-    #[test]
-    fn test_request_timeout_default_and_override() {
-        let meta = test_metadata();
-        assert_eq!(
-            meta.request_timeout,
-            Duration::from_secs(30),
-            "subscriber waits must be bounded by request timeout, not the 300s max-age"
-        );
-
-        let meta = test_metadata().with_request_timeout(Duration::from_secs(5));
-        assert_eq!(meta.request_timeout, Duration::from_secs(5));
-    }
-
     // ══════════════════════════════════════════════════════════════════
     // Exponential metadata retry backoff with jitter (KIP-580)
     // ══════════════════════════════════════════════════════════════════
@@ -3948,7 +3145,11 @@ mod tests {
     #[test]
     fn test_default_retry_backoff_is_exponential_and_capped() {
         let meta = test_metadata();
-        let policy = meta.retry_backoff.as_ref().expect("enabled by default");
+        let policy = meta
+            .inner
+            .retry_backoff
+            .as_ref()
+            .expect("enabled by default");
 
         assert_eq!(policy.initial_backoff, DEFAULT_RETRY_BACKOFF);
         assert_eq!(policy.max_backoff, DEFAULT_RETRY_BACKOFF_MAX);
@@ -3964,7 +3165,7 @@ mod tests {
     #[test]
     fn test_refresh_backoff_grows_with_consecutive_failures() {
         let meta = test_metadata();
-        let policy = meta.retry_backoff.clone().unwrap();
+        let policy = meta.inner.retry_backoff.clone().unwrap();
         let mut state = RefreshBackoffState::new();
 
         // Base 100 ms, ×2 per failure, ±20% jitter, ceiling 1000 ms.
@@ -3999,7 +3200,7 @@ mod tests {
     #[test]
     fn test_refresh_backoff_is_jittered_across_clients() {
         let meta = test_metadata();
-        let policy = meta.retry_backoff.clone().unwrap();
+        let policy = meta.inner.retry_backoff.clone().unwrap();
 
         // Simulate many clients that have all failed four times in a row. If
         // the delays were identical they would retry in lockstep — the storm
@@ -4023,7 +3224,7 @@ mod tests {
     #[test]
     fn test_refresh_backoff_resets_on_success() {
         let meta = test_metadata();
-        let policy = meta.retry_backoff.clone().unwrap();
+        let policy = meta.inner.retry_backoff.clone().unwrap();
         let mut state = RefreshBackoffState::new();
 
         for _ in 0..8 {
@@ -4074,7 +3275,7 @@ mod tests {
     #[test]
     fn test_with_retry_backoff_sets_base_and_raises_max() {
         let meta = test_metadata().with_retry_backoff(Duration::from_millis(250));
-        let policy = meta.retry_backoff.as_ref().unwrap();
+        let policy = meta.inner.retry_backoff.as_ref().unwrap();
         assert_eq!(policy.initial_backoff, Duration::from_millis(250));
         assert_eq!(
             policy.max_backoff, DEFAULT_RETRY_BACKOFF_MAX,
@@ -4083,7 +3284,7 @@ mod tests {
 
         // A base above the ceiling raises the ceiling rather than inverting it.
         let meta = test_metadata().with_retry_backoff(Duration::from_secs(5));
-        let policy = meta.retry_backoff.as_ref().unwrap();
+        let policy = meta.inner.retry_backoff.as_ref().unwrap();
         assert_eq!(policy.initial_backoff, Duration::from_secs(5));
         assert_eq!(policy.max_backoff, Duration::from_secs(5));
     }
@@ -4093,38 +3294,17 @@ mod tests {
         let meta = test_metadata()
             .with_retry_backoff(Duration::from_millis(500))
             .with_retry_backoff_max(Duration::from_millis(10));
-        let policy = meta.retry_backoff.as_ref().unwrap();
+        let policy = meta.inner.retry_backoff.as_ref().unwrap();
         assert_eq!(policy.max_backoff, Duration::from_millis(500));
     }
 
     #[test]
     fn test_with_retry_backoff_none_disables_rate_limiting() {
         let meta = test_metadata().with_retry_backoff(None);
-        assert!(meta.retry_backoff.is_none());
+        assert!(meta.inner.retry_backoff.is_none());
         // A max on a disabled limiter is a no-op rather than a re-enable.
         let meta = meta.with_retry_backoff_max(Duration::from_secs(1));
-        assert!(meta.retry_backoff.is_none());
-    }
-
-    /// With rate limiting disabled, a rate-limited outcome is impossible even
-    /// immediately after another attempt.
-    #[tokio::test]
-    async fn test_disabled_backoff_never_rate_limits() {
-        let meta = ClusterMetadata::new(
-            vec!["localhost:1".to_string()],
-            Arc::new(ConnectionPool::new(
-                crate::network::ConnectionConfig::default(),
-            )),
-            Duration::from_secs(300),
-        )
-        .with_retry_backoff(None);
-
-        // No broker is listening on port 1, so this fails — but it must fail
-        // with a connection error rather than being suppressed.
-        let outcome = meta
-            .refresh_for_topics_inner_forced(Some(&["t"]), false)
-            .await;
-        assert!(outcome.is_err(), "expected a connection failure");
+        assert!(meta.inner.retry_backoff.is_none());
     }
 
     /// A refresh that never reaches a broker must still arm the rate limiter.
@@ -4141,14 +3321,10 @@ mod tests {
             Duration::from_secs(300),
         );
 
-        assert!(
-            meta.refresh_for_topics_inner_forced(Some(&["t"]), false)
-                .await
-                .is_err()
-        );
+        assert!(meta.refresh_for_topics(Some(&["t"])).await.is_err());
 
         {
-            let state = meta.refresh_backoff.lock();
+            let state = meta.inner.refresh_backoff.lock();
             assert_eq!(
                 state.consecutive_failures, 1,
                 "a connection failure is a refresh failure and must count"
@@ -4156,16 +3332,16 @@ mod tests {
             assert!(state.remaining().is_some(), "the limiter must now be armed");
         }
 
-        // The immediately following attempt is suppressed rather than
-        // re-dialling the dead broker.
-        let outcome = meta
-            .refresh_for_topics_inner_forced(Some(&["t"]), false)
-            .await
-            .expect("rate limiting is not an error");
-        assert!(matches!(outcome, RefreshOutcome::RateLimited(_)));
-
-        // ...and the failure count did not advance: no attempt was made.
-        assert_eq!(meta.refresh_backoff.lock().consecutive_failures, 1);
+        // The next request waits out the backoff instead of re-dialling the
+        // dead broker at once.
+        let started = Instant::now();
+        assert!(meta.refresh_for_topics(Some(&["t"])).await.is_err());
+        assert!(
+            started.elapsed() >= Duration::from_millis(50),
+            "the second fetch went out after {:?}, inside the backoff",
+            started.elapsed()
+        );
+        assert_eq!(meta.inner.refresh_backoff.lock().consecutive_failures, 2);
     }
 
     /// Consecutive real failures must escalate the delay, not hold it flat.
@@ -4184,20 +3360,11 @@ mod tests {
 
         let mut delays = Vec::new();
         for _ in 0..4 {
-            assert!(
-                meta.refresh_for_topics_inner_forced(None, false)
-                    .await
-                    .is_err()
-            );
-            delays.push(meta.refresh_backoff.lock().current_delay);
-            // Wait out the backoff so the next call is a real attempt.
-            let remaining = meta.refresh_backoff.lock().remaining();
-            if let Some(r) = remaining {
-                tokio::time::sleep(r).await;
-            }
+            assert!(meta.refresh().await.is_err());
+            delays.push(meta.inner.refresh_backoff.lock().current_delay);
         }
 
-        assert_eq!(meta.refresh_backoff.lock().consecutive_failures, 4);
+        assert_eq!(meta.inner.refresh_backoff.lock().consecutive_failures, 4);
         assert!(
             delays[3] > delays[0],
             "backoff must grow across consecutive failures: {delays:?}"
@@ -4212,13 +3379,13 @@ mod tests {
     fn test_rebootstrap_jitter_default_and_override() {
         let meta = test_metadata();
         assert_eq!(
-            meta.rebootstrap_jitter,
+            meta.inner.rebootstrap_jitter,
             Duration::from_millis(500),
             "a restarted fleet must not converge on one seed broker"
         );
 
         let meta = test_metadata().with_rebootstrap_jitter(Duration::ZERO);
-        assert_eq!(meta.rebootstrap_jitter, Duration::ZERO);
+        assert_eq!(meta.inner.rebootstrap_jitter, Duration::ZERO);
     }
 
     /// A rebootstrap must not be able to fire again immediately: it restarts
@@ -4232,19 +3399,19 @@ mod tests {
             .with_rebootstrap_jitter(Duration::ZERO);
 
         // A long-running failure streak crosses the trigger.
-        *meta.metadata_attempt_start.lock() = Some(Instant::now() - Duration::from_secs(600));
-        assert!(meta.needs_rebootstrap());
+        *meta.inner.metadata_attempt_start.lock() = Some(Instant::now() - Duration::from_secs(600));
+        assert!(meta.inner.needs_rebootstrap());
 
         meta.rebootstrap().await;
 
         // Immediately afterwards the cluster is still down — but the trigger
         // must not be satisfied again until another 300 s of failure.
         assert!(
-            !meta.needs_rebootstrap(),
+            !meta.inner.needs_rebootstrap(),
             "back-to-back rebootstraps would turn a cluster outage into a \
              connection-churn storm against the seed brokers"
         );
-        assert!(meta.metadata_attempt_start.lock().is_some());
+        assert!(meta.inner.metadata_attempt_start.lock().is_some());
     }
 
     /// The jittered deadline must never fire *before* the configured trigger.
@@ -4255,15 +3422,15 @@ mod tests {
             .with_rebootstrap_trigger(Duration::from_secs(10));
 
         // Just under the trigger: must never fire, however the jitter lands.
-        *meta.metadata_attempt_start.lock() = Some(Instant::now() - Duration::from_secs(9));
+        *meta.inner.metadata_attempt_start.lock() = Some(Instant::now() - Duration::from_secs(9));
         for _ in 0..64 {
-            assert!(!meta.needs_rebootstrap());
+            assert!(!meta.inner.needs_rebootstrap());
         }
 
         // Comfortably past trigger + max jitter (10 s + 20%): always fires.
-        *meta.metadata_attempt_start.lock() = Some(Instant::now() - Duration::from_secs(30));
+        *meta.inner.metadata_attempt_start.lock() = Some(Instant::now() - Duration::from_secs(30));
         for _ in 0..64 {
-            assert!(meta.needs_rebootstrap());
+            assert!(meta.inner.needs_rebootstrap());
         }
     }
 
@@ -4291,15 +3458,15 @@ mod tests {
         cache
             .brokers
             .insert(2, BrokerInfo::new(2, "old-broker-2".into(), 9092, None));
-        meta.cache.store(Arc::new(cache));
+        meta.inner.cache.store(Arc::new(cache));
 
-        let before = meta.connection_candidates();
+        let before = meta.inner.connection_candidates();
         assert!(before.iter().any(|a| a == "old-broker-1:9092"));
         assert!(before.iter().any(|a| a == "seed.example.com:9092"));
 
         meta.rebootstrap().await;
 
-        let after = meta.connection_candidates();
+        let after = meta.inner.connection_candidates();
         assert_eq!(
             after,
             vec!["seed.example.com:9092".to_string()],
@@ -4315,13 +3482,14 @@ mod tests {
     fn test_updated_seed_brokers_appear_in_connection_candidates() {
         let meta = test_metadata();
         assert!(
-            meta.connection_candidates()
+            meta.inner
+                .connection_candidates()
                 .contains(&"localhost:9092".to_string())
         );
 
         meta.update_seed_brokers(vec!["new-seed:9092".to_string()])
             .unwrap();
-        assert_eq!(meta.connection_candidates(), vec!["new-seed:9092"]);
+        assert_eq!(meta.inner.connection_candidates(), vec!["new-seed:9092"]);
     }
 
     #[test]
@@ -4332,10 +3500,10 @@ mod tests {
         cache
             .brokers
             .insert(1, BrokerInfo::new(1, "localhost".into(), 9092, None));
-        meta.cache.store(Arc::new(cache));
+        meta.inner.cache.store(Arc::new(cache));
 
         assert_eq!(
-            meta.connection_candidates(),
+            meta.inner.connection_candidates(),
             vec!["localhost:9092".to_string()],
             "a seed that is also a known broker must not be dialled twice"
         );
@@ -4359,29 +3527,35 @@ mod tests {
             "stale".into(),
             Arc::new(TopicInfo {
                 name: "stale".into(),
+                topic_id: [0; 16],
                 is_internal: false,
-                partitions: AHashMap::new(),
+                partitions: std::collections::HashMap::new(),
             }),
         );
         cache.topics.insert(
             "fresh".into(),
             Arc::new(TopicInfo {
                 name: "fresh".into(),
+                topic_id: [0; 16],
                 is_internal: false,
-                partitions: AHashMap::new(),
+                partitions: std::collections::HashMap::new(),
+            }),
+        );
+        cache.topic_stamps.insert(
+            "stale".into(),
+            Arc::new(TopicStamp {
+                refreshed: Instant::now() - Duration::from_secs(600),
+                last_used_ms: AtomicU64::new(0),
             }),
         );
         cache
-            .topic_last_refreshed
-            .insert("stale".into(), Instant::now() - Duration::from_secs(600));
-        cache
-            .topic_last_refreshed
-            .insert("fresh".into(), Instant::now());
+            .topic_stamps
+            .insert("fresh".into(), TopicStamp::fetched_now(0));
         // The cache as a whole was just written by the "fresh" refresh.
         cache.last_updated = Instant::now();
-        meta.cache.store(Arc::new(cache));
+        meta.inner.cache.store(Arc::new(cache));
 
-        let cache = meta.cache.load();
+        let cache = meta.inner.cache.load();
         assert!(
             !cache.is_stale(max_age),
             "pre-condition: the cache as a whole looks current"
@@ -4400,15 +3574,16 @@ mod tests {
 
     #[test]
     fn test_topic_without_timestamp_is_not_fresh() {
-        // A topic present in `topics` but with no `topic_last_refreshed` entry
+        // A topic present in `topics` but with no stamp
         // has unknown age and must be treated as stale rather than trusted.
         let mut cache = MetadataCache::new();
         cache.topics.insert(
             "t".into(),
             Arc::new(TopicInfo {
                 name: "t".into(),
+                topic_id: [0; 16],
                 is_internal: false,
-                partitions: AHashMap::new(),
+                partitions: std::collections::HashMap::new(),
             }),
         );
         assert!(!cache.topic_is_fresh("t", Duration::from_secs(60)));
@@ -4428,11 +3603,11 @@ mod tests {
         );
         // `metadata_response` only advertises broker 1; add 2 so hints that
         // omit an endpoint still have a reachable target.
-        let mut cache = MetadataCache::clone(&meta.cache.load());
+        let mut cache = MetadataCache::clone(&meta.inner.cache.load());
         cache
             .brokers
             .insert(2, BrokerInfo::new(2, "h2".into(), 9092, None));
-        meta.cache.store(Arc::new(cache));
+        meta.inner.cache.store(Arc::new(cache));
         meta
     }
 
@@ -4583,11 +3758,11 @@ mod tests {
         // The report covers one partition; treating it as a refresh would let
         // the rest of the topic's leader map go stale unnoticed.
         let meta = metadata_with_leader(5);
-        let before = meta.cache.load().topic_last_refreshed["t"];
+        let before = meta.inner.cache.load().topic_stamps["t"].refreshed;
 
         assert!(meta.apply_leader_hint("t", 0, 2, 6, endpoint(2)));
 
-        assert_eq!(meta.cache.load().topic_last_refreshed["t"], before);
+        assert_eq!(meta.inner.cache.load().topic_stamps["t"].refreshed, before);
     }
 
     #[test]
@@ -4629,5 +3804,114 @@ mod tests {
         assert_eq!(found.address(), "b:2");
         assert_eq!(found.rack(), Some("r"));
         assert!(broker_info_for_node(&endpoints, 6).is_none());
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // One writer: topic IDs, hints and rebootstraps on the write path
+    // ══════════════════════════════════════════════════════════════════
+
+    fn response_with_id(
+        id: [u8; 16],
+        partitions: Vec<crate::protocol::MetadataPartitionResponse>,
+    ) -> MetadataResponse {
+        let mut response = metadata_response(partitions);
+        response.topics[0].topic_id = Some(id);
+        response
+    }
+
+    /// A re-created topic (new ID) restarts its epochs: the incoming
+    /// partitions replace the cached ones even with a lower epoch.
+    #[test]
+    fn test_a_changed_topic_id_resets_the_leader_epochs() {
+        let meta = test_metadata();
+        meta.update_cache(
+            response_with_id([1; 16], vec![partition_response(0, 1, 5, ErrorCode::None)]),
+            true,
+        );
+        meta.update_cache(
+            response_with_id([2; 16], vec![partition_response(0, 2, 0, ErrorCode::None)]),
+            true,
+        );
+        assert_eq!(meta.leader("t", 0), Some(2));
+        assert_eq!(meta.leader_epoch("t", 0), Some(0));
+        assert_eq!(meta.topic_id_for_name("t"), Some([2; 16]));
+    }
+
+    /// Control: within one topic ID a lower epoch is still ignored (KIP-320).
+    #[test]
+    fn test_the_same_topic_id_keeps_the_newer_epoch() {
+        let meta = test_metadata();
+        meta.update_cache(
+            response_with_id([1; 16], vec![partition_response(0, 1, 5, ErrorCode::None)]),
+            true,
+        );
+        meta.update_cache(
+            response_with_id([1; 16], vec![partition_response(0, 2, 4, ErrorCode::None)]),
+            true,
+        );
+        assert_eq!(meta.leader("t", 0), Some(1));
+        assert_eq!(meta.leader_epoch("t", 0), Some(5));
+    }
+
+    /// A leader hint applied while a fetch is in flight survives the fetch's
+    /// older epoch: both go through the serialized write path.
+    #[test]
+    fn test_a_leader_hint_survives_a_later_response_with_an_older_epoch() {
+        let meta = metadata_with_leader(5);
+        assert!(meta.apply_leader_hint("t", 0, 2, 6, endpoint(2)));
+        meta.update_cache(
+            metadata_response(vec![partition_response(0, 1, 5, ErrorCode::None)]),
+            false,
+        );
+        assert_eq!(meta.leader("t", 0), Some(2));
+        assert_eq!(meta.leader_epoch("t", 0), Some(6));
+    }
+
+    /// A response fetched before a rebootstrap is discarded, so the brokers
+    /// the rebootstrap dropped do not come back.
+    #[test]
+    fn test_a_response_fetched_before_a_rebootstrap_is_discarded() {
+        let meta = test_metadata();
+        let epoch_at_fetch = meta.inner.cache.load().reset_epoch;
+        meta.inner.reset_to_seeds();
+        let applied = meta.inner.apply(
+            metadata_response(vec![partition_response(0, 1, 0, ErrorCode::None)]),
+            true,
+            epoch_at_fetch,
+        );
+        assert!(!applied);
+        assert!(meta.brokers().is_empty());
+        assert!(meta.topic("t").is_none());
+    }
+
+    /// Every successful response replaces the broker map, partial or not.
+    #[test]
+    fn test_a_partial_response_replaces_the_broker_map() {
+        let meta = metadata_with_leader(1);
+        assert!(meta.broker(2).is_some());
+        meta.update_cache(ok_topics_response(&["other"]), false);
+        assert!(
+            meta.broker(2).is_none(),
+            "a broker absent from the response leaves the map"
+        );
+        assert!(meta.broker(1).is_some());
+    }
+
+    /// A topic the broker reports unknown leaves the cache.
+    #[test]
+    fn test_an_unknown_topic_leaves_the_cache() {
+        let meta = test_metadata();
+        meta.update_cache(
+            metadata_response(vec![partition_response(0, 1, 0, ErrorCode::None)]),
+            true,
+        );
+        let mut gone = metadata_response(vec![]);
+        gone.topics[0].error_code = ErrorCode::UnknownTopicOrPartition;
+        meta.update_cache(gone, false);
+        assert!(meta.topic("t").is_none());
+        assert_eq!(
+            meta.topic_error("t"),
+            Some(ErrorCode::UnknownTopicOrPartition)
+        );
     }
 }

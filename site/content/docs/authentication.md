@@ -18,21 +18,8 @@ krafka supports multiple security protocols:
 | `SASL_PLAINTEXT` | No | Yes (SASL) |
 | `SASL_SSL` | Yes (TLS) | Yes (SASL) |
 
-### Not supported: GSSAPI / Kerberos
-
-krafka implements PLAIN, SCRAM-SHA-256/512, OAUTHBEARER and AWS MSK IAM. It does
-**not** implement GSSAPI, and this is a deliberate position rather than an
-oversight.
-
-There is no mature pure-Rust GSSAPI implementation. Supporting it would mean
-linking `libgssapi` (and MIT Kerberos or Heimdal), which would break the crate's
-central promise — no C dependencies by default — for every user, in exchange for
-a mechanism most deployments do not use. Kerberos-integrated environments are
-therefore not served by this client today.
-
-If you need Kerberos, `rust-rdkafka` supports it through librdkafka. If your
-broker offers OAUTHBEARER alongside Kerberos, that path works here and is the
-usual migration route.
+GSSAPI (Kerberos) is not implemented; the reason is on the
+[protocol page](@/docs/protocol.md#not-implemented).
 
 ### Supported SASL Mechanisms
 
@@ -69,17 +56,10 @@ Every mechanism composes with TLS through one method, `with_tls`:
 ```rust,compile
 use krafka::auth::{AuthConfig, TlsConfig};
 
-// SASL_SSL + SCRAM-SHA-512 — the default secured listener on Redpanda Cloud,
-// Aiven, Instaclustr and most Strimzi installs.
+// SASL_SSL + SCRAM-SHA-512 with a private CA.
 let tls = TlsConfig::new().with_ca_cert("/etc/kafka/ca.pem");
 let config = AuthConfig::sasl_scram_sha512("username", "password").with_tls(tls);
 ```
-
-Prefer this to the per-mechanism `_ssl` constructors when you build the TLS
-configuration separately — it is the same thing, and it cannot be missing for
-the mechanism you happen to need. `tests/builder_surface.rs` asserts that every
-`SaslMechanism` is constructible under both `SASL_PLAINTEXT` and `SASL_SSL`
-from the public API alone.
 
 ## SASL Authentication
 
@@ -91,16 +71,16 @@ Simple username/password authentication. **Always use with TLS in production!**
 use krafka::auth::AuthConfig;
 
 // Without TLS (development only!)
-let config = AuthConfig::sasl_plain("username", "password")?;
+let config = AuthConfig::sasl_plain("username", "password");
 
 // With TLS (recommended for production)
 use krafka::auth::TlsConfig;
-let config = AuthConfig::sasl_plain_ssl("username", "password", TlsConfig::new())?;
+let config = AuthConfig::sasl_plain("username", "password").with_tls(TlsConfig::new());
 ```
 
 ### SASL/SCRAM-SHA-256
 
-Challenge-response authentication with SHA-256 hashing. More secure than PLAIN.
+Challenge-response authentication with SHA-256; the password itself is never sent.
 
 ```rust,compile
 use krafka::auth::{AuthConfig, TlsConfig};
@@ -109,12 +89,12 @@ use krafka::auth::{AuthConfig, TlsConfig};
 let config = AuthConfig::sasl_scram_sha256("username", "password");
 
 // With TLS (recommended for production)
-let config = AuthConfig::sasl_scram_sha256_ssl("username", "password", TlsConfig::new());
+let config = AuthConfig::sasl_scram_sha256("username", "password").with_tls(TlsConfig::new());
 ```
 
 ### SASL/SCRAM-SHA-512
 
-Maximum security SCRAM authentication with SHA-512 hashing.
+Challenge-response authentication with SHA-512.
 
 ```rust,compile
 use krafka::auth::{AuthConfig, TlsConfig};
@@ -122,13 +102,12 @@ use krafka::auth::{AuthConfig, TlsConfig};
 // Without TLS (development only!)
 let config = AuthConfig::sasl_scram_sha512("username", "password");
 
-// With TLS — this is what a managed Kafka offering almost always wants
-let config = AuthConfig::sasl_scram_sha512_ssl("username", "password", TlsConfig::new());
+// With TLS
+let config = AuthConfig::sasl_scram_sha512("username", "password").with_tls(TlsConfig::new());
 ```
 
-Over TLS, SCRAM is additionally bound to the TLS session with
-`tls-server-end-point` channel binding (RFC 5929 §4.1) unless you turn it off
-with `with_scram_channel_binding(false)`.
+Every SCRAM exchange carries the `n,,` GS2 header, which is what Apache Kafka
+brokers accept. Over `SASL_SSL` the TLS layer authenticates the broker.
 
 ### SCRAM Protocol Details
 
@@ -137,36 +116,9 @@ The SCRAM client implements RFC 5802 with:
 - Salted Challenge-Response mechanism
 - PBKDF2 key derivation with iteration count validation (4,096–1,000,000 range)
 - HMAC signature verification
-- Constant-time comparison via the `subtle` crate (timing-attack resistant)
-- Automatic secret zeroization on drop (`password`, `salted_password`, `server_signature`)
+- Constant-time signature comparison (`subtle`)
+- Secret zeroization on drop (`password`, `salted_password`, `server_signature`)
 - Debug output redacts the password as `[REDACTED]`
-
-```rust
-use krafka::auth::{ChannelBinding, ScramClient, ScramMechanism, ScramState};
-
-// Create SCRAM client (no channel binding for SASL_PLAINTEXT)
-let mut scram = ScramClient::new("alice", "secret", ScramMechanism::Sha256, ChannelBinding::None);
-assert_eq!(scram.state(), ScramState::Initial);
-
-// Generate client-first message
-let client_first = scram.client_first_message();
-// -> "n,,n=alice,r=<nonce>"
-
-// When using SASL_SSL, pass channel binding data to tie SCRAM to the TLS session:
-// let cb_data = extract_tls_server_end_point(&tls_stream).unwrap();
-// let mut scram = ScramClient::new("alice", "secret", ScramMechanism::Sha256,
-//     ChannelBinding::TlsServerEndPoint(cb_data));
-// -> client-first: "p=tls-server-end-point,,n=alice,r=<nonce>"
-
-// Process server-first message
-// scram.process_server_first(server_response)?;
-
-// Generate client-final message
-// let client_final = scram.client_final_message()?;
-
-// Verify server-final
-// scram.process_server_final(server_response)?;
-```
 
 ### SASL/OAUTHBEARER
 
@@ -180,12 +132,13 @@ let config = AuthConfig::sasl_oauthbearer("your-jwt-token-here");
 
 // With TLS (recommended for production)
 use krafka::auth::TlsConfig;
-let config = AuthConfig::sasl_oauthbearer_ssl("your-jwt-token-here", TlsConfig::new());
+let config = AuthConfig::sasl_oauthbearer("your-jwt-token-here").with_tls(TlsConfig::new());
 ```
 
 #### With SASL Extensions
 
-For providers like Confluent Cloud that require additional SASL extensions:
+For brokers that read SASL extensions, such as Confluent Cloud's
+`logicalCluster` and `identityPoolId` (see [Cloud Platforms](@/docs/cloud.md#confluent-cloud)):
 
 ```rust,compile
 use krafka::auth::{AuthConfig, OAuthBearerToken};
@@ -199,109 +152,64 @@ let config = AuthConfig::sasl_oauthbearer_token(token);
 
 // Or with TLS
 use krafka::auth::TlsConfig;
-let config = AuthConfig::sasl_oauthbearer_token_ssl(
-    OAuthBearerToken::new("your-jwt-token")
-        .with_extension("logicalCluster", "lkc-abc123"),
-    TlsConfig::new(),
-);
-```
-
-#### Builder Convenience Methods
-
-All client builders support shorthand `.sasl_oauthbearer(token)` and
-`.sasl_oauthbearer_provider(provider)` methods:
-
-```rust
-use krafka::auth::OAuthBearerToken;
-use krafka::producer::Producer;
-use krafka::consumer::Consumer;
-
-// Static token
-let producer = Producer::builder()
-    .bootstrap_servers("broker:9093")
-    .sasl_oauthbearer("your-jwt-token")
-    .build()
-    .await?;
-
-// Token provider (recommended)
-let consumer = Consumer::builder()
-    .bootstrap_servers("broker:9093")
-    .group_id("my-group")
-    .sasl_oauthbearer_provider(|| async {
-        let token = fetch_token_from_oauth_server().await?;
-        Ok(OAuthBearerToken::new(token))
-    })
-    .build()
-    .await?;
+let config = AuthConfig::sasl_oauthbearer_token(OAuthBearerToken::new("your-jwt-token")
+        .with_extension("logicalCluster", "lkc-abc123")).with_tls(TlsConfig::new());
 ```
 
 #### Automatic Token Refresh via Provider
 
-For production use, implement the `OAuthBearerTokenProvider` trait so that
-krafka can fetch a fresh token on every new broker connection — including
-automatic reconnections. This eliminates the need to restart clients when
-tokens expire.
+A token provider is called for every new broker connection, reconnections
+included, so each connection gets a current token. A provider is anything that
+implements `CredentialProvider<OAuthBearerToken>`: an async closure, or your
+own type.
 
 **Closure provider (simplest)**
 
-```rust
+```rust,compile
 use krafka::auth::{AuthConfig, OAuthBearerToken};
+
+// Your OAuth client.
+async fn fetch_access_token() -> krafka::Result<String> {
+    Ok("jwt".to_string())
+}
 
 let config = AuthConfig::sasl_oauthbearer_provider(|| async {
     // Called on every new broker connection
-    let jwt = my_oauth_client.get_access_token().await?;
+    let jwt = fetch_access_token().await?;
     Ok(OAuthBearerToken::new(jwt))
 });
 ```
 
 **Struct provider (when you need shared state)**
 
-> **Security Note**: Wrap secrets like `client_secret` in `zeroize::Zeroizing<String>`
-> so they are erased from memory on drop. This does **not** by itself prevent the
-> secret from being exposed via `Debug`/`Display` if the containing struct is
-> logged or derives `Debug`. Callers must still avoid logging secrets and should
-> implement a redacted `Debug` for any struct that holds credentials (or
-> otherwise ensure secret fields are never formatted).
+> Wrap secrets such as `client_secret` in `zeroize::Zeroizing<String>` so they
+> are erased on drop. That does not redact them from `Debug`: give a struct that
+> holds credentials a redacted `Debug`, or do not derive one.
 
-```rust
-use krafka::auth::{OAuthBearerToken, OAuthBearerTokenProvider};
-use krafka::error::Result;
-use std::future::Future;
-use std::pin::Pin;
+```rust,compile
+use krafka::Kafka;
+use krafka::auth::{AuthConfig, CredentialProvider, OAuthBearerToken};
 use zeroize::Zeroizing;
 
 struct MyTokenProvider {
     client_id: String,
     client_secret: Zeroizing<String>,
-    token_url: String,
 }
 
-impl OAuthBearerTokenProvider for MyTokenProvider {
-    fn provide_token(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<OAuthBearerToken>> + Send + '_>> {
-        Box::pin(async move {
-            // Use your preferred HTTP client to fetch a token
-            let jwt = fetch_oauth_token(
-                &self.token_url,
-                &self.client_id,
-                &self.client_secret,
-            ).await?;
-            Ok(OAuthBearerToken::new(jwt))
-        })
+impl CredentialProvider<OAuthBearerToken> for MyTokenProvider {
+    async fn credentials(&self) -> krafka::Result<OAuthBearerToken> {
+        // Use your preferred HTTP client to fetch a token.
+        let jwt = format!("{}:{}", self.client_id, self.client_secret.len());
+        Ok(OAuthBearerToken::new(jwt))
     }
 }
 
-// Use with any client builder
-let consumer = Consumer::builder()
-    .bootstrap_servers("broker:9093")
-    .group_id("my-group")
-    .sasl_oauthbearer_provider(MyTokenProvider {
+let kafka = Kafka::builder("broker:9093")
+    .security(AuthConfig::sasl_oauthbearer_provider(MyTokenProvider {
         client_id: "my-app".into(),
         client_secret: Zeroizing::new("secret".into()),
-        token_url: "https://auth.example.com/oauth/token".into(),
-    })
-    .build()
+    }))
+    .connect()
     .await?;
 ```
 
@@ -310,25 +218,15 @@ let consumer = Consumer::builder()
 ```rust,compile
 use krafka::auth::{AuthConfig, OAuthBearerToken, TlsConfig};
 
-let config = AuthConfig::sasl_oauthbearer_provider_ssl(
-    || async { Ok(OAuthBearerToken::new("fresh-jwt")) },
-    TlsConfig::new(),
-);
+let config = AuthConfig::sasl_oauthbearer_provider(|| async { Ok(OAuthBearerToken::new("fresh-jwt")) }).with_tls(TlsConfig::new());
 ```
 
-**How it works:** The provider is called once per broker connection. When
-the connection pool detects a disconnection and reconnects, the provider
-is called again — delivering a fresh token without any client restart.
-Implementations may cache tokens internally and only refresh when
-approaching expiry. Provider resolution is bounded by the configured
-request timeout (default 30 s) to prevent hung providers from stalling
-reconnection loops.
+The provider is called once per broker connection and may cache tokens
+itself. Each call is bounded by the request timeout (default 30 s).
 
-If `OAuthBearerToken::with_lifetime_ms()` is set, krafka rejects tokens that
-are already expired or within 30 seconds of expiry before starting the SASL
-handshake. This avoids avoidable broker-side failures caused by client/broker
-clock skew. Provider implementations should return a token with comfortably
-more than 30 seconds of remaining lifetime.
+If `OAuthBearerToken::with_lifetime_ms()` is set, krafka rejects a token that
+is expired or within 30 seconds of expiry before the SASL handshake. Return
+tokens with more than 30 seconds of lifetime left.
 
 #### OAUTHBEARER Protocol Details
 
@@ -341,14 +239,9 @@ The implementation follows RFC 7628 GS2 framing:
 - **Debug safety**: Token redacted as `[REDACTED]` in Debug output
 - **Extensions**: Arbitrary key-value pairs appended to the GS2 frame
 
-> **Note**: GSSAPI/Kerberos is not supported. It requires system Kerberos libraries
-> via FFI, which is incompatible with krafka’s `#![deny(unsafe_code)]` policy. Use
-> OAUTHBEARER or SCRAM as alternatives.
-
 ### Built-in OIDC token provider (`oauth-oidc`)
 
-Enable the `oauth-oidc` feature and krafka fetches access tokens itself, instead
-of you writing the OAuth client:
+With the `oauth-oidc` feature, krafka fetches access tokens itself:
 
 ```sh
 cargo add krafka --features oauth-oidc
@@ -376,9 +269,8 @@ let provider = OidcTokenProvider::builder("https://idp.example.com/oauth2/token"
 let auth = AuthConfig::sasl_oauthbearer_provider(provider);
 ```
 
-**Client assertion (KIP-1258)** — stronger, because the credential on the wire
-is a short-lived signature rather than a long-lived shared secret, and the
-private key never leaves the workload:
+**Client assertion (KIP-1258)** — the credential on the wire is a short-lived
+signed JWT, and the private key stays with the workload:
 
 ```rust,compile
 use krafka::auth::oidc::{AssertionSource, ClientCredentials, OidcTokenProvider};
@@ -387,32 +279,32 @@ let provider = OidcTokenProvider::builder("https://idp.example.com/oauth2/token"
     .credentials(ClientCredentials::assertion(
         // Re-read on every token request, so a SPIFFE agent or Vault sidecar
         // can rotate the assertion without restarting the process.
-        AssertionSource::File("/var/run/secrets/oauth/assertion.jwt".into()),
+        AssertionSource::file("/var/run/secrets/oauth/assertion.jwt"),
     ))
     .client_id("my-client-id")
     .build()?;
 ```
 
-#### krafka does not sign the assertion
+#### Assertion sources
 
-Signing needs RSA or ECDSA, and pinning a specific implementation on every user
-of a Kafka client is a supply-chain decision that belongs to the application. So
-the JWT is *sourced*, not produced:
+krafka does not sign the assertion (it adds no RSA or ECDSA dependency); it
+reads a JWT from one of these sources:
 
 | Source | Use it when |
 |--------|-------------|
-| `AssertionSource::File(path)` | A sidecar writes and rotates the assertion — SPIFFE, Vault, a projected Kubernetes service-account token. Re-read on **every** token request, so rotation needs no restart. Mirrors Kafka's own `sasl.oauthbearer.assertion.file`. |
-| `AssertionSource::Callback(f)` | You sign it yourself with whatever JWT library you already depend on. |
-| `AssertionSource::Static(jwt)` | Tests and short-lived jobs only — assertions are meant to be short-lived, so a static one becomes a permanent auth failure once it expires. |
+| `AssertionSource::file(path)` | A sidecar writes and rotates the assertion — SPIFFE, Vault, a projected Kubernetes service-account token. Re-read on **every** token request, so rotation needs no restart. Mirrors Kafka's own `sasl.oauthbearer.assertion.file`. |
+| `AssertionSource::provider(p)` | You sign it yourself with whatever JWT library you already depend on; `p` is an async closure or a `CredentialProvider<String>`. |
+| `AssertionSource::fixed(jwt)` | Tests and short-lived jobs only — assertions are meant to be short-lived, so a static one becomes a permanent auth failure once it expires. |
 
-#### Confluent Cloud SASL extensions
+#### SASL extensions
 
-SASL extensions travel in the OAUTHBEARER exchange with **Kafka**, and are
-deliberately a different list from the token-request form parameters — the
-identity provider and the broker are different audiences:
+SASL extensions go to **Kafka** in the OAUTHBEARER exchange; form parameters go
+to the identity provider:
 
-```rust
-OidcTokenProvider::builder("https://idp.example.com/oauth2/token")
+```rust,compile
+use krafka::auth::oidc::{ClientCredentials, OidcTokenProvider};
+
+let provider = OidcTokenProvider::builder("https://idp.example.com/oauth2/token")
     .credentials(ClientCredentials::secret("id", "secret"))
     .sasl_extension("logicalCluster", "lkc-123")   // sent to Kafka
     .sasl_extension("identityPoolId", "pool-456")  // sent to Kafka
@@ -420,50 +312,99 @@ OidcTokenProvider::builder("https://idp.example.com/oauth2/token")
     .build()?;
 ```
 
-#### Behaviour worth knowing
+#### Behaviour
 
 - **`https` is required.** A plain-`http` token endpoint is rejected at build
-  time: the request carries a client credential and the response carries an
-  access token.
+  time.
 - **Errors name the cause.** RFC 6749 §5.2 bodies are parsed, so a failure reads
   `invalid_client: unknown client id` rather than `HTTP 400`.
 - **`expires_in` drives refresh.** The token store caches until the token nears
   expiry; a response without `expires_in` falls back to the bounded
   unknown-expiry schedule rather than being cached forever.
-- **Secrets are redacted in `Debug`** and zeroized on drop. That applies
-  throughout the stack, including the protocol layer: `SaslAuthenticateRequest`
-  and `SaslAuthenticateResponse` report a byte count rather than their
-  `auth_bytes`, which for SASL/PLAIN is `\0username\0password` in cleartext and
-  for OAUTHBEARER is the bearer token verbatim. `just secret-debug` fails CI if
-  a credential-bearing type ever derives `Debug` again.
+- **The response is capped at 1 MiB while it is read.** A larger body fails the
+  fetch after at most that much has been read.
+- **Secrets are redacted in `Debug`.** That includes the protocol layer:
+  `SaslAuthenticateRequest` and `SaslAuthenticateResponse` report a byte count
+  rather than their `auth_bytes`, which for SASL/PLAIN is
+  `\0username\0password` and for OAUTHBEARER is the bearer token.
+- **Secrets are zeroized on drop**, in krafka's buffers: the client secret,
+  the `client_id:secret` Basic credential and its encoding, the assertion, the
+  form body (sized once, so no reallocation leaves a copy), the HTTP request
+  buffer, the response body and the access token. Copies inside rustls, the
+  crypto backend and the socket's read buffer are not zeroized.
+
+#### Trusting the token endpoint
+
+The token endpoint is verified against the WebPKI (Mozilla) roots by default,
+independently of the Kafka TLS settings. An identity provider behind an
+internal CA, such as Keycloak or ADFS, needs that CA:
+
+```rust,compile
+use krafka::auth::oidc::{ClientCredentials, OidcTokenProvider};
+
+let provider = OidcTokenProvider::builder("https://keycloak.internal/realms/kafka/protocol/openid-connect/token")
+    .credentials(ClientCredentials::secret("my-client-id", "my-client-secret"))
+    .ca_cert("/etc/pki/internal-ca.pem")
+    .build()?;
+```
+
+The rule is the Kafka path's: `ca_cert` pins (only that bundle is trusted),
+`native_roots()` (with the `native-tls-roots` feature) uses the platform store,
+and the two together add up. The HTTPS client selects its crypto provider the
+same way as the Kafka connections.
 
 ## TLS/SSL Encryption
 
 ### Crypto backend
 
 krafka's TLS is `rustls`, which needs a crypto backend. `ring` is the default;
-`rustls-aws-lc-rs` selects aws-lc-rs, preferable on AWS Graviton and in
-FIPS-oriented deployments:
+`rustls-aws-lc-rs` selects aws-lc-rs, which adds post-quantum key exchange and
+compiles C (`aws-lc-sys`):
 
 ```sh
-cargo add krafka --no-default-features --features rustls-aws-lc-rs,compression
+cargo add krafka --no-default-features --features rustls-aws-lc-rs
 ```
 
-The two features are **additive**. Cargo features cannot be made mutually
-exclusive without breaking dependency graphs where two crates each pick a
-different backend, so enabling `rustls-aws-lc-rs` on top of the default `ring`
-(or building with `--all-features`) is a supported configuration: aws-lc-rs
-wins deterministically. krafka selects the provider explicitly on every path,
-including certificate verification, rather than letting `rustls` infer it from
-crate features — inference panics when the features are ambiguous.
+The two features are additive. With both enabled (for example with
+`--all-features`), aws-lc-rs is used. krafka passes the provider explicitly on
+every path, certificate verification included.
 
 To pick the backend for the whole process, including krafka, install one before
 opening any connection:
 
-```rust,ignore
+```rust,compile
 rustls::crypto::aws_lc_rs::default_provider()
     .install_default()
     .expect("crypto provider already installed");
+```
+
+### Key exchange and post-quantum
+
+The groups krafka offers in the TLS 1.3 ClientHello, in order (rustls 0.23.45,
+read 2026-10-08):
+
+| Backend | Groups offered | Post-quantum |
+|---|---|---|
+| `ring` (default) | X25519, secp256r1, secp384r1 | no |
+| `rustls-aws-lc-rs` | X25519MLKEM768, X25519, secp256r1, secp384r1 | yes, preferred |
+
+With aws-lc-rs the first ClientHello carries a hybrid X25519MLKEM768 share, so a
+broker that accepts it negotiates it without a retry; a broker that does not falls back to X25519. A ClientHello with the
+hybrid share is over 1 KB larger, and some middleboxes mishandle a ClientHello
+split across TCP segments.
+
+To opt out, or to choose other groups, install a process-default provider; krafka
+uses an installed provider before its own:
+
+```rust,compile
+use rustls::crypto::{CryptoProvider, aws_lc_rs};
+
+CryptoProvider {
+    kx_groups: vec![aws_lc_rs::kx_group::X25519],
+    ..aws_lc_rs::default_provider()
+}
+.install_default()
+.expect("crypto provider already installed");
 ```
 
 ### Basic TLS
@@ -487,7 +428,7 @@ let tls_config = TlsConfig::new()
     .with_ca_cert("/path/to/ca.pem");
 ```
 
-`with_ca_cert()` **pins** the trust store to the provided CA bundle — the default WebPKI (Mozilla) roots are **not** loaded. This matches the Java Kafka client (`ssl.truststore.location`) and librdkafka (`ssl.ca.location`).
+`with_ca_cert()` **pins** the trust store to the provided CA bundle: the default WebPKI (Mozilla) roots are not loaded, as with Java's `ssl.truststore.location` and librdkafka's `ssl.ca.location`.
 
 ### Native Platform Trust Stores
 
@@ -557,58 +498,59 @@ openssl pkcs8 -topk8 -v2 aes256 -in old.key -out client-key.pem
 The passphrase stays in memory for the life of the config, because
 [certificate rotation](#certificate-rotation-kip-1288) reads the key file again,
 and is zeroized when the config is dropped. A rotated key must use the same
-passphrase.
+passphrase. A passphrase with no client certificate and key configured is a
+configuration error.
+
+The PEM file contents and the decrypted key are zeroized in krafka's buffers.
+The decrypted key is then handed to rustls, which frees its copy, and the
+crypto backend's parsed key, without zeroizing; that is outside krafka's
+control.
 
 ### SNI Hostname
 
 For servers behind load balancers or proxies:
 
-```rust
+```rust,compile
 use krafka::auth::TlsConfig;
 
-let mut tls_config = TlsConfig::new();
-tls_config.sni_hostname = Some("kafka.example.com".to_string());
+let tls_config = TlsConfig::new().with_sni_hostname("kafka.example.com");
 ```
 
 ### Certificate rotation (KIP-1288)
 
 Certificates rotated on disk by cert-manager, Vault or an SDS sidecar are picked
-up without restarting the process. Apache Kafka added this to the Java client in
-4.2 (KIP-1288); krafka offers both an event-driven and an unattended path.
+up without restarting the process (KIP-1288), on demand or on a timer.
 
-**Event-driven** — call `refresh_tls()` when your watcher fires. Available on
-`Producer`, `Consumer`, `AdminClient` and `KrafkaClient`:
+**Event-driven** — call `refresh_tls()` on the `Kafka` handle when your
+watcher fires:
 
-```rust
+```rust,compile
 // inotify fired, the secret volume was remounted, the sidecar signalled …
-producer.refresh_tls().await?;
+kafka.refresh_tls().await?;
 ```
 
 **Unattended** — reload on a timer:
 
 ```rust,compile
-use krafka::network::TransportConfig;
+use krafka::Kafka;
 use std::time::Duration;
 
-let transport = TransportConfig::builder()
+let kafka = Kafka::builder("broker:9093")
     .tls_reload_interval(Some(Duration::from_secs(3600)))
-    .build()?;
+    .connect()
+    .await?;
 ```
 
 Both paths behave the same way:
 
-- **Existing TLS sessions are unaffected.** They keep the connector they
-  handshaked with and are replaced naturally as connections cycle. Only
-  connections opened *after* a successful reload use the new material.
-- **A failed reload keeps the old certificates.** Catching a half-written PEM
-  mid-rotation logs a warning and changes nothing, so a non-atomic rotation
-  converges on the next attempt rather than breaking every new connection in
-  between.
+- **Existing TLS sessions are unaffected.** Only connections opened after a
+  successful reload use the new material.
+- **A failed reload keeps the old certificates.** A half-written PEM logs a
+  warning and changes nothing; the next attempt picks up the finished file.
 - **No-op without TLS.** Nothing on disk to reload.
 
-Using a `KrafkaClient` shares one pool across all its producers, consumers and
-admin clients, so one `refresh_tls()` there rotates certificates for all of
-them.
+Every client built from the handle shares its pool, so one reload rotates
+certificates for all of them.
 
 ### Skip Verification (Development Only)
 
@@ -628,9 +570,7 @@ For AWS Managed Streaming for Apache Kafka using IAM authentication:
 > by approximately 2-3 MB (release build). If binary size is critical, use
 > `AwsMskIamCredentials::from_env()` which works without the `aws-msk` feature.
 
-### From Environment Variables (Recommended)
-
-The simplest approach is to load credentials from environment variables:
+### From Environment Variables
 
 ```rust,compile
 use krafka::auth::{AuthConfig, AwsMskIamCredentials};
@@ -652,26 +592,28 @@ If the keys live in the environment but the region comes from a config file or a
 secret manager, use `from_env_with_region`, which neither reads nor requires
 `AWS_REGION`:
 
-```rust
+```rust,compile
 use krafka::auth::{AuthConfig, AwsMskIamCredentials};
 
+let configured_region = "eu-central-1"; // from your configuration
 let creds = AwsMskIamCredentials::from_env_with_region(configured_region)?;
 let config = AuthConfig::aws_msk_iam_with_credentials(creds);
 ```
 
 To re-region a credential you already have, use `with_region`:
 
-```rust
+```rust,compile
+use krafka::auth::AwsMskIamCredentials;
+
 let creds = AwsMskIamCredentials::from_env()?.with_region("eu-central-1");
 ```
 
-Do **not** rebuild the credential through `new` to change one field:
-`secret_access_key` and `session_token` are deliberately unreadable, so
-rebuilding silently drops the session token. Every deployment using an assumed
-role, an EC2/ECS instance profile or an EKS web identity then fails SigV4
-verification at connect time, with an error that never mentions the token.
+Do not rebuild the credential through `new` to change one field:
+`secret_access_key` and `session_token` cannot be read back, so the rebuilt
+credential has no session token, and temporary credentials (assumed role,
+instance profile, EKS web identity) then fail SigV4 verification at connect.
 
-### From AWS SDK Default Chain (Recommended for Production)
+### From the AWS SDK Default Chain
 
 For production deployments on EC2, ECS, Lambda, or EKS, use the AWS SDK default chain:
 
@@ -715,20 +657,9 @@ let creds = AwsMskIamCredentials::new(
 .with_session_token("session-token-here");
 ```
 
-### Using SecureConnectionConfig with MSK IAM
+### Credential Refresh
 
-```rust,compile
-use krafka::network::SecureConnectionConfig;
-
-let config = SecureConnectionConfig::builder()
-    .client_id("msk-client")
-    .aws_msk_iam("AKID", "secret", "us-east-1")
-    .build();
-```
-
-### Automatic Credential Refresh (Recommended)
-
-For production workloads using temporary credentials (STS, IRSA, ECS task role, EC2 instance profile), use a credential provider so that credentials are automatically refreshed on every broker reconnection:
+With temporary credentials (STS, IRSA, ECS task role, EC2 instance profile), use a credential provider; it is called for every new broker connection:
 
 ```rust,compile
 use krafka::auth::{AuthConfig, AwsMskIamCredentials};
@@ -738,52 +669,21 @@ let config = AuthConfig::aws_msk_iam_provider(|| async {
     AwsMskIamCredentials::from_default_chain("us-east-1").await
 });
 
-// Or implement AwsMskIamCredentialProvider for custom logic
-use krafka::auth::AwsMskIamCredentialProvider;
+// Or implement CredentialProvider for custom logic
+use krafka::auth::CredentialProvider;
 
 struct MyCredentialProvider;
-impl AwsMskIamCredentialProvider for MyCredentialProvider {
-    fn provide_credentials(
-        &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = krafka::error::Result<AwsMskIamCredentials>> + Send + '_>> {
-        Box::pin(async {
-            // Custom credential loading logic
-            AwsMskIamCredentials::from_env()
-        })
+impl CredentialProvider<AwsMskIamCredentials> for MyCredentialProvider {
+    async fn credentials(&self) -> krafka::Result<AwsMskIamCredentials> {
+        // Custom credential loading logic
+        AwsMskIamCredentials::from_env()
     }
 }
 
 let config = AuthConfig::aws_msk_iam_provider(MyCredentialProvider);
 ```
 
-The provider pattern mirrors OAUTHBEARER's `sasl_oauthbearer_provider()`. The `SecureConnectionConfig` builder also supports it:
-
-```rust,compile
-use krafka::network::SecureConnectionConfig;
-use krafka::auth::AwsMskIamCredentials;
-
-let config = SecureConnectionConfig::builder()
-    .client_id("msk-client")
-    .aws_msk_iam_provider(|| async {
-        AwsMskIamCredentials::from_default_chain("us-east-1").await
-    })
-    .build();
-```
-
-### Direct MskIamAuthenticator Usage
-
-For low-level control over the authentication process:
-
-```rust,compile
-use krafka::auth::{AwsMskIamCredentials, MskIamAuthenticator};
-
-let creds = AwsMskIamCredentials::new("AKID", "secret", "us-east-1");
-let authenticator = MskIamAuthenticator::new(&creds, "broker.kafka.us-east-1.amazonaws.com")?;
-
-// Generate signed authentication payload
-let payload = authenticator.create_auth_payload();
-// -> JSON with AWS Signature v4 signed request
-```
+The provider shape is the one OAUTHBEARER's `sasl_oauthbearer_provider()` takes.
 
 ### MSK IAM Protocol Details
 
@@ -834,17 +734,11 @@ let tls = TlsConfig::new().with_alpn_protocols(vec![b"kafka".to_vec()]);
 | `plaintext()` | PLAINTEXT | None |
 | `ssl(TlsConfig)` | SSL | None (TLS-only) |
 | `sasl_plain(user, pass)` | SASL_PLAINTEXT | PLAIN |
-| `sasl_plain_ssl(user, pass, tls)` | SASL_SSL | PLAIN |
 | `sasl_scram_sha256(user, pass)` | SASL_PLAINTEXT | SCRAM-SHA-256 |
-| `sasl_scram_sha256_ssl(user, pass, tls)` | SASL_SSL | SCRAM-SHA-256 |
 | `sasl_scram_sha512(user, pass)` | SASL_PLAINTEXT | SCRAM-SHA-512 |
-| `sasl_scram_sha512_ssl(user, pass, tls)` | SASL_SSL | SCRAM-SHA-512 |
 | `sasl_oauthbearer(token)` | SASL_PLAINTEXT | OAUTHBEARER |
-| `sasl_oauthbearer_ssl(token, tls)` | SASL_SSL | OAUTHBEARER |
 | `sasl_oauthbearer_token(OAuthBearerToken)` | SASL_PLAINTEXT | OAUTHBEARER |
-| `sasl_oauthbearer_token_ssl(OAuthBearerToken, tls)` | SASL_SSL | OAUTHBEARER |
 | `sasl_oauthbearer_provider(provider)` | SASL_PLAINTEXT | OAUTHBEARER |
-| `sasl_oauthbearer_provider_ssl(provider, tls)` | SASL_SSL | OAUTHBEARER |
 | `aws_msk_iam(key, secret, region)` | SASL_SSL | AWS_MSK_IAM |
 | `aws_msk_iam_with_credentials(creds)` | SASL_SSL | AWS_MSK_IAM |
 | `aws_msk_iam_provider(provider)` | SASL_SSL | AWS_MSK_IAM |
@@ -855,16 +749,10 @@ Plus one method that applies to all of them:
 |--------|--------|
 | `with_tls(TlsConfig)` | `PLAINTEXT` → `SSL`, `SASL_PLAINTEXT` → `SASL_SSL`; already-encrypted configs keep their protocol and take the new TLS settings |
 
-The `_ssl` constructors are shorthand for `with_tls`. Reach for `with_tls` when
-you build the `TlsConfig` separately or when you want one code path that handles
-every mechanism.
-
 ### From environment variables
 
 `AuthConfig::from_env` builds any of the above from the standard Kafka
-environment variables. It is a convenience for applications whose configuration
-*is* the environment; a library embedder resolving credentials from a secret
-manager should build the `AuthConfig` directly.
+environment variables.
 
 | Variable | Values |
 |---|---|
@@ -880,296 +768,79 @@ manager should build the `AuthConfig` directly.
 
 `AWS_MSK_IAM` takes its credentials from `AwsMskIamCredentials::from_env()`.
 Setting only one half of the client-certificate pair, or a key passphrase
-without a key, is an error rather than a silently ignored setting. There is deliberately no environment variable that
-disables certificate verification — use `TlsConfig::insecure()` in code if you
-need that.
+without a key, is an error. No environment variable disables certificate
+verification; that takes `TlsConfig::insecure()` in code.
 
 ## Client Authentication
 
-All krafka clients — AdminClient, Producer, TransactionalProducer, and Consumer — support the same authentication
-methods through dedicated builder methods. Authentication is wired end-to-end: TLS upgrade
-and SASL handshake happen automatically during connection establishment.
+Security is a connection setting: it is set once on the `Kafka` handle, and
+every client built from that handle — producer, transactional producer,
+consumer, share consumer and admin client — connects with it. TLS upgrade and
+SASL handshake happen during connection establishment.
 
-### Admin Client
+```rust,compile
+use krafka::Kafka;
+use krafka::auth::{AuthConfig, TlsConfig};
 
-```rust
-use krafka::AdminClient;
+let kafka = Kafka::builder("broker:9093")
+    .security(AuthConfig::sasl_scram_sha512("username", "password").with_tls(TlsConfig::new()))
+    .connect()
+    .await?;
 
-// SASL/PLAIN
-let admin = AdminClient::builder()
-    .client_id("admin-client")
-    .bootstrap_servers("broker:9092")
-    .sasl_plain("username", "password")
-    .build();
-
-// SASL/SCRAM-SHA-256
-let admin = AdminClient::builder()
-    .bootstrap_servers("broker:9092")
-    .sasl_scram_sha256("username", "password")
-    .build();
-
-// SASL/SCRAM-SHA-512
-let admin = AdminClient::builder()
-    .bootstrap_servers("broker:9092")
-    .sasl_scram_sha512("username", "password")
-    .build();
+let producer = kafka.producer().build().await?;
+let txn = kafka.producer().build_transactional("my-txn-id").await?;
+let consumer = kafka.consumer("my-group").build().await?;
+let admin = kafka.admin();
 ```
 
-### Producer
-
-```rust
-use krafka::producer::Producer;
-
-// SASL/PLAIN
-let producer = Producer::builder()
-    .bootstrap_servers("broker:9092")
-    .sasl_plain("username", "password")
-    .build()
-    .await?;
-
-// SASL/SCRAM-SHA-256
-let producer = Producer::builder()
-    .bootstrap_servers("broker:9092")
-    .sasl_scram_sha256("username", "password")
-    .build()
-    .await?;
-
-// SASL/SCRAM-SHA-512
-let producer = Producer::builder()
-    .bootstrap_servers("broker:9092")
-    .sasl_scram_sha512("username", "password")
-    .build()
-    .await?;
-```
-
-### Consumer
-
-```rust
-use krafka::consumer::Consumer;
-
-// SASL/PLAIN
-let consumer = Consumer::builder()
-    .bootstrap_servers("broker:9092")
-    .group_id("my-group")
-    .sasl_plain("username", "password")
-    .build()
-    .await?;
-
-// SASL/SCRAM-SHA-256
-let consumer = Consumer::builder()
-    .bootstrap_servers("broker:9092")
-    .group_id("my-group")
-    .sasl_scram_sha256("username", "password")
-    .build()
-    .await?;
-
-// SASL/SCRAM-SHA-512
-let consumer = Consumer::builder()
-    .bootstrap_servers("broker:9092")
-    .group_id("my-group")
-    .sasl_scram_sha512("username", "password")
-    .build()
-    .await?;
-```
-
-### Transactional Producer
-
-```rust
-use krafka::producer::TransactionalProducer;
-
-// SASL/PLAIN
-let producer = TransactionalProducer::builder()
-    .bootstrap_servers("broker:9092")
-    .transactional_id("my-txn-id")
-    .sasl_plain("username", "password")
-    .build()
-    .await?;
-
-// SASL/SCRAM-SHA-256
-let producer = TransactionalProducer::builder()
-    .bootstrap_servers("broker:9092")
-    .transactional_id("my-txn-id")
-    .sasl_scram_sha256("username", "password")
-    .build()
-    .await?;
-
-// SASL/SCRAM-SHA-512
-let producer = TransactionalProducer::builder()
-    .bootstrap_servers("broker:9092")
-    .transactional_id("my-txn-id")
-    .sasl_scram_sha512("username", "password")
-    .build()
-    .await?;
-```
-
-### Generic AuthConfig
-
-For advanced configurations or AWS MSK IAM, use `.auth()` on any builder:
-
-```rust
-use krafka::AdminClient;
-use krafka::producer::{Producer, TransactionalProducer};
-use krafka::consumer::Consumer;
-use krafka::auth::AuthConfig;
-
-let auth = AuthConfig::aws_msk_iam("access_key", "secret_key", "us-east-1");
-
-// Works on all client types
-let admin = AdminClient::builder()
-    .bootstrap_servers("broker:9092")
-    .auth(auth.clone())
-    .build();
-
-let producer = Producer::builder()
-    .bootstrap_servers("broker:9092")
-    .auth(auth.clone())
-    .build()
-    .await?;
-
-let txn_producer = TransactionalProducer::builder()
-    .bootstrap_servers("broker:9092")
-    .transactional_id("my-txn-id")
-    .auth(auth.clone())
-    .build()
-    .await?;
-
-let consumer = Consumer::builder()
-    .bootstrap_servers("broker:9092")
-    .group_id("my-group")
-    .auth(auth)
-    .build()
-    .await?;
-```
+Clients that need different credentials use different handles.
 
 ## Session Reauthentication (KIP-368)
 
-krafka supports [KIP-368](https://cwiki.apache.org/confluence/display/KAFKA/KIP-368%3A+Allow+SASL+Connections+to+Periodically+Re-Authenticate) session lifetime tracking. When a broker reports a session lifetime via `SaslAuthenticateResponse` v1, krafka tracks the expiry and proactively replaces the connection before the session expires.
-
-### How It Works
-
-1. During SASL handshake, the broker may include a `session_lifetime_ms` value in its v1 response.
-2. If non-zero, krafka calculates a reauthentication deadline at a **randomised** point between 85% and 95% of the lifetime. The jitter prevents a thundering-herd where many connections to the same broker all expire simultaneously.
-3. When the connection pool serves a connection request, it checks `is_usable()` — which verifies the connection is both alive **and** not past its reauthentication deadline.
-4. Expired-session connections are transparently replaced with a fresh connection that performs a new SASL handshake.
-
-This behaviour matches the Java Kafka client and is fully automatic — no client configuration is required. It works with all SASL mechanisms and is especially important for OAUTHBEARER, where tokens have a natural expiry.
+When a broker reports a session lifetime in `SaslAuthenticate` v1
+([KIP-368](https://cwiki.apache.org/confluence/display/KAFKA/KIP-368%3A+Allow+SASL+Connections+to+Periodically+Re-Authenticate)),
+krafka sets a deadline at a random point between 85 % and 95 % of it. The pool
+replaces a connection past its deadline on the next lookup with a new one that
+authenticates again; the old one closes once its pending requests complete.
+The connection is replaced, not re-authenticated in place. No configuration is
+needed, and it applies to every SASL mechanism.
 
 ## Security Best Practices
 
-1. **Always use TLS in production** - Use `SASL_SSL` instead of `SASL_PLAINTEXT`
-2. **Prefer SCRAM over PLAIN** - SCRAM provides challenge-response security
-3. **Use mTLS for strongest authentication** - Client certificates are harder to steal
-4. **Store credentials securely** - Use environment variables or secrets managers
-5. **Rotate credentials regularly** - Especially for long-running applications
-6. **Verify certificates in production** - Never use `TlsConfig::insecure()` in production
-7. **Automatic secret zeroization** - All credential types (`ScramClient`, `MskIamAuthenticator`, `PlainCredentials`, `ScramCredentials`, `OAuthBearerToken`) zeroize secrets on drop to prevent memory leaks. SASL PLAIN auth bytes are wrapped in `Zeroizing<Vec<u8>>` and automatically zeroized after being sent on the wire.
-8. **Debug safety** - All credential types redact secrets in `Debug` output, so `tracing::debug!("{:?}", auth)` is safe to use
-9. **Cleartext warning** - Using `SASL_PLAINTEXT` with `PLAIN` emits a `tracing::warn!` alerting that credentials will be sent in cleartext
+1. **Use TLS** — `SASL_SSL` rather than `SASL_PLAINTEXT`.
+2. **Prefer SCRAM over PLAIN** — the password is not sent.
+3. **Keep certificate verification on** — never `TlsConfig::insecure()` in production.
+4. **Keep credentials out of code** — environment variables or a secret manager.
 
-## Secure Connection Configuration
+What krafka does on its side:
 
-For integrated TLS and SASL configuration, use `SecureConnectionConfig`:
-
-```rust,compile
-use krafka::network::SecureConnectionConfig;
-use krafka::auth::TlsConfig;
-use std::time::Duration;
-
-let config = SecureConnectionConfig::builder()
-    .client_id("my-app")
-    .connect_timeout(Duration::from_secs(10))
-    .sasl_scram_sha256("username", "password")
-    .tls(TlsConfig::new())
-    .build();
-```
-
-### SaslAuthenticator
-
-For handling SASL handshakes, use `SaslAuthenticator`:
-
-```rust
-use krafka::network::SaslAuthenticator;
-use krafka::auth::{AuthConfig, ChannelBinding};
-
-let auth = AuthConfig::sasl_scram_sha256("user", "pass");
-let mut authenticator = SaslAuthenticator::new(&auth, ChannelBinding::None).unwrap();
-
-// Get mechanism name for SASL handshake
-let mechanism = authenticator.mechanism_name(); // "SCRAM-SHA-256"
-
-// Get initial authentication bytes
-let initial = authenticator.initial_response()?;
-
-// Process server challenges
-// let response = authenticator.process_challenge(&server_bytes)?;
-
-// Check completion
-if authenticator.is_complete() {
-    println!("Authentication successful!");
-}
-```
-
-When using OAUTHBEARER with a token provider, resolve the provider before
-creating the authenticator:
-
-```rust
-use krafka::network::SaslAuthenticator;
-use krafka::auth::{AuthConfig, OAuthBearerToken};
-
-let auth = AuthConfig::sasl_oauthbearer_provider(|| async {
-    Ok(OAuthBearerToken::new("fresh-jwt"))
-});
-
-// Resolve the provider to get a config with the token set
-let resolved = auth.resolve_provider_to_token().await?;
-let auth = resolved.as_ref().unwrap_or(&auth);
-let mut authenticator = SaslAuthenticator::new(auth, ChannelBinding::None).unwrap();
-```
+- **Zeroization** — credential state (`PlainCredentials`, `ScramCredentials`,
+  `OAuthBearerToken`, SCRAM and MSK IAM signing state) is zeroized on drop;
+  SASL PLAIN auth bytes are zeroized after they are sent.
+- **Redacted `Debug`** — credential types redact secrets, so
+  `tracing::debug!("{:?}", auth)` is safe. `just secret-debug` fails when a type
+  under `src/` derives `Debug` with a field named like a credential.
+- **Cleartext warning** — a connect over `SASL_PLAINTEXT` with a mechanism that
+  sends a reusable credential (`PLAIN`, `OAUTHBEARER`) logs a `tracing::warn!`
+  naming the mechanism and the broker. SCRAM is not warned about.
 
 ## Example: Production Configuration
 
-```rust
+```rust,compile
+use krafka::Kafka;
 use krafka::auth::{AuthConfig, TlsConfig};
-use krafka::producer::Producer;
-use krafka::consumer::Consumer;
-use std::env;
 
-fn production_auth_config() -> AuthConfig {
-    let username = env::var("KAFKA_USER").expect("KAFKA_USER required");
-    let password = env::var("KAFKA_PASSWORD").expect("KAFKA_PASSWORD required");
-    
-    let tls_config = TlsConfig::new()
-        .with_ca_cert("/etc/ssl/certs/kafka-ca.pem");
-    
-    // SCRAM-SHA-512 over TLS
-    AuthConfig {
-        security_protocol: krafka::auth::SecurityProtocol::SaslSsl,
-        sasl_mechanism: Some(krafka::auth::SaslMechanism::ScramSha512),
-        scram_credentials: Some(krafka::auth::ScramCredentials::new(username, password)),
-        tls_config: Some(tls_config),
-        ..Default::default()
-    }
-}
+let username = std::env::var("KAFKA_USER").expect("KAFKA_USER required");
+let password = std::env::var("KAFKA_PASSWORD").expect("KAFKA_PASSWORD required");
+let tls = TlsConfig::new().with_ca_cert("/etc/ssl/certs/kafka-ca.pem");
 
-// Use with any client
-async fn create_clients() {
-    let auth = production_auth_config();
-
-    let producer = Producer::builder()
-        .bootstrap_servers("kafka.prod.example.com:9093")
-        .auth(auth.clone())
-        .build()
-        .await
-        .unwrap();
-
-    let consumer = Consumer::builder()
-        .bootstrap_servers("kafka.prod.example.com:9093")
-        .group_id("prod-group")
-        .auth(auth)
-        .build()
-        .await
-        .unwrap();
-}
+// SCRAM-SHA-512 over TLS, shared by every client of the handle.
+let kafka = Kafka::builder("kafka.prod.example.com:9093")
+    .security(AuthConfig::sasl_scram_sha512(username, password).with_tls(tls))
+    .connect()
+    .await?;
+let producer = kafka.producer().build().await?;
+let consumer = kafka.consumer("prod-group").build().await?;
 ```
 
 ## Next Steps

@@ -6,743 +6,380 @@
 [![MSRV](https://img.shields.io/badge/MSRV-1.95-blue.svg)](https://github.com/rust-lang/rust/releases/tag/1.95.0)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 
-A pure-Rust, async-native Apache Kafka client. No librdkafka, no C toolchain,
-no `unsafe`, no panics — enforced by the compiler, not by convention. Protocol
-parity with Apache Kafka 4.3, checked in CI against Kafka's own schemas.
+A pure-Rust, async-native Apache Kafka client: producer, transactions,
+consumer groups, share groups and a full admin client, on Tokio. No C library
+and no system dependency in the default build, no `unsafe`, no panics on a
+malformed response. Protocol versions tracked against
+<!-- generated:kips:kafka-ref -->Apache Kafka 4.3<!-- /generated -->, checked in CI against Kafka's own schemas.
+
+## 🚀 Quick start
+
+```sh
+cargo add krafka
+cargo add tokio --features full
+```
+
+```rust,compile
+use krafka::{Kafka, Record};
+
+let kafka = Kafka::builder("localhost:9092").connect().await?;
+let producer = kafka.producer().build().await?;
+producer.send(Record::new("orders", "hello").key("k")).await?;
+
+let consumer = kafka.consumer("my-group").build().await?;
+consumer.subscribe(["orders"]).await?;
+while let Some(rec) = consumer.recv().await? { println!("{rec:?}"); }
+```
+
+`Kafka` holds every connection setting — bootstrap servers, client id, TLS and
+SASL, transport, proxy, metadata — and one connection pool. Every client is
+built from it and shares the pool: `kafka.producer()`, `kafka.consumer(group)`,
+`kafka.consumer_without_group()`, `kafka.share_consumer(group)`,
+`kafka.admin()`. A second pool is a second `Kafka`. Every client is
+`Send + Sync` and ends with `close().await`.
 
 ## ✨ Why krafka
 
-**Pure Rust, and it stays that way.** No librdkafka, no C toolchain, no
-cross-compilation surprises. The optional `zstd` feature is the single
-exception, and it is opt-in.
+**No C library, no system dependency.** The default build needs a Rust
+toolchain and the C compiler `cc` finds for `ring`, and nothing else: no
+OpenSSL, no librdkafka, no CMake, no pkg-config. `ring` is the only crate in
+the default graph that compiles C; the features that compile more (`zstd`,
+`rustls-aws-lc-rs`, `aws-msk`) say so below. `just no-c` checks this for six
+targets.
 
-**The safety posture is enforced by the compiler.** `unsafe_code = "deny"`
-crate-wide, plus `panic`, `unwrap` and `expect` denied across the whole crate.
-A malformed broker response cannot panic the process, and every allocation
-from untrusted input is bounded twice — by the declared count *and* by the
-bytes actually available.
+**A broker response is untrusted input.** `unsafe_code`, `panic`, `unwrap` and
+`expect` are denied crate-wide. A malformed frame surfaces as a `KrafkaError`,
+and every allocation derived from a response is bounded by its declared count
+and by the bytes actually available. Credential-bearing types do not derive
+`Debug`.
 
-**Protocol currency is a build failure, not a bug report.** Every API version
-is tracked against **Apache Kafka 4.3** — Fetch v18 (KIP-1166), Produce v13,
-Metadata v13, DescribeLogDirs v5 (KIP-1066), DescribeQuorum v2
-(KIP-836/853) — and CI diffs krafka's version table against Kafka's own
-message schemas. `ApiVersions` is negotiated rather than pinned, so a 3.9
-broker gets 3.9-era versions with no configuration.
+**Acknowledged means written.** The idempotent producer is the default; a
+sequence range is never reused, a batch whose outcome is unknown moves the
+producer to the next epoch, and `DeliveryTimeout { possibly_written }` tells
+you whether a timed-out record may be in the log. A transaction with a failed
+send cannot commit. Per-partition order is structural: one send path, at most
+five requests in flight per broker, and a retry cannot reorder a partition.
 
-**Correctness where it is hardest.** KIP-320 truncation detection on all three
-legs — Fetch *and* ListOffsets *and* persisted through OffsetCommit, so it
-survives restarts and rebalances. KIP-447 zombie fencing with a transaction
-state machine that refuses the KAFKA-17754 abort-after-commit-timeout hazard.
-`OUT_OF_ORDER_SEQUENCE_NUMBER` verified head-of-line before any rewind, so a
-silent gap raises a fatal error instead of reporting success.
+**Protocol currency is mechanical.** The API version table is diffed against
+Kafka's message schemas (`just protocol-parity`), every version is negotiated
+through `ApiVersions`, and a broker from 3.9 onwards gets the versions it
+supports with no configuration.
 
-**Per-partition ordering is structural, not a setting you can get wrong.** The
-producer has exactly one send path, and it keeps exactly one batch per
-partition on the wire, dispatched in the order batches were sealed. Sequence
-order and wire order cannot diverge, so there is no
-`max.in.flight.requests.per.connection ≤ 5` rule to remember, a retry cannot
-reorder a partition, and `Arc<Producer>` shared across a hundred tasks is
-simply correct. Different partitions still proceed concurrently.
+**Your code is testable without Docker.** The `test-broker` feature ships an
+in-process fake Kafka cluster with fault injection; see
+[Testing](#-testing-against-a-fake-broker).
 
 ### What is in the box
 
 | | |
 |---|---|
-| **Clients** | Producer — one send path that batches at every `linger` setting including `0`, with compression, idempotence, transactions and tombstones (null keys and values are `Option` end to end) · Consumer (classic **and** KIP-848 server-side assignment with validated revoke-before-assign reconciliation) · `ShareConsumer` (KIP-932 at Kafka 4.2 parity, incl. KIP-1222 `Renew` and KIP-1206 `ShareAcquireMode`) · full `AdminClient` |
-| **Security** | rustls TLS/mTLS with **hot certificate reload** (KIP-1288) · SASL PLAIN, SCRAM-SHA-256/512, OAUTHBEARER · built-in OIDC provider for `client_credentials` (KIP-768) and RFC 7523 client assertions (KIP-1258), with no cryptography dependency added · AWS MSK IAM · every mechanism composes with TLS through one `with_tls`, asserted reachable over both `SASL_PLAINTEXT` and `SASL_SSL` at compile time |
-| **Consistency** | Every client shares one configuration surface and one operational surface (`close`, `rebootstrap`, `update_seed_brokers`, `refresh_tls`, `metrics`) — asserted at compile time, builders included. One builder per client, with `build_config()` to validate without a broker and `build()` to validate and connect, both through the same validator. The transactional producer mirrors the plain one setter for setter, minus the two settings transactions fix (`acks`, `idempotent`) |
-| **Tuning** | Per-codec compression levels (Gzip 0–9, Zstd through 22) validated against the selected codec at build time, so a level set on a codec that has none is rejected rather than ignored — on the plain and the transactional producer alike |
-| **Transport** | One `TransportConfig` on every builder — pass the same instance to every client that shares a network path: TCP keepalive, response ceiling, in-flight cap, idle eviction, file-descriptor cap · KIP-227 incremental fetch sessions · SOCKS5 |
-| **Observability** | Lock-free counters, gauges and latency histograms with bounded per-topic cardinality · Prometheus export · producer interceptors and dead-letter queues on **both** producers, over the single send path, with a per-record `RecordContext` carrying a span or timer from `on_send` to a terminal callback that fires for **every** record `on_send` saw · OAUTHBEARER token-fetch counters and expiry gauge · OpenTelemetry semantic conventions |
-| **Hardening** | Secret zeroization · constant-time comparison (`subtle`) · decompression-bomb limits · decode-loop bounds · RFC 3986 path encoding on every outbound HTTP target · CI forbids any credential-bearing type from deriving `Debug` |
-| **Testing** | 2 350+ tests · 6 cargo-fuzz targets · proptest round-trips across the protocol layer · an in-process fake broker with fault injection that serves the **full transaction protocol** — KIP-360 fencing, commit/abort markers, `read_committed` isolation, TV1 and KIP-890 TV2 — so even exactly-once tests need no Docker |
+| **Clients** | `Producer` (`send` waits, `enqueue` pipelines) and `TypedProducer<K, V>` · `TransactionalProducer` with KIP-447 offset commits and two-phase `prepare`/`complete` · `Consumer`, classic and KIP-848 groups · `ShareConsumer` (KIP-932 share groups) · `AdminClient` |
+| **Security** | rustls TLS and mTLS with certificate reload (KIP-1288) · SASL PLAIN, SCRAM-SHA-256/512, OAUTHBEARER · built-in OIDC provider (`client_credentials`, RFC 7523 client assertions) · AWS MSK IAM · every mechanism composes with TLS through `with_tls` |
+| **Observability** | `metrics()` on every client and on `Kafka` returns one `Metrics` snapshot; `prometheus_text()` renders it · spans through `tracing` on OpenTelemetry messaging conventions · KIP-714 client telemetry to brokers that subscribe · producer and consumer interceptors |
+| **Transport** | Set once on the `Kafka` builder: TCP keepalive, response ceiling, in-flight cap, idle eviction, connection cap · a separate coordination connection per broker · KIP-227 incremental fetch sessions · SOCKS5 |
+| **Testing** | `krafka::testing::FakeBroker`: real clients over a real or in-memory socket, fault injection per request, the full transaction protocol, both group protocols and share groups *(`test-broker`; unstable, outside semver)* |
 
-> **Broker versions:** krafka requires **Apache Kafka 3.9+**; protocol versions below that baseline have been removed. Features needing a newer broker (KIP-848 consumer groups, KIP-932 share groups, KIP-1066 cordoned log dirs) say so where they are documented and fail with a clear `UnknownApiVersion` rather than silently degrading. The Docker integration suite runs against every supported minor in one command (`just integration-matrix`, Kafka 3.9 → 4.3).
->
-> **Redpanda** works out of the box: every API version is negotiated, and transactions fall back to KIP-890 TV1 automatically (Redpanda has no server-side TV2) — pinned by a dedicated smoke suite (`just integration-redpanda`). APIs Redpanda does not implement (share groups, log-dir admin) fail fast with `UnknownApiVersion`, same as against an older Kafka.
+> **Broker versions:** Apache Kafka **3.9+**. KIP-848 groups need 4.0, share
+> groups 4.2; a cluster without a feature fails with an error naming the
+> feature and the setting that avoids it. The Docker suite runs against every
+> supported minor (`just integration-matrix`). **Redpanda** works: versions are
+> negotiated and transactions use transaction version 1 there
+> (`just integration-redpanda`).
 
-## 🚀 Quick Start
+## 📦 Cargo features
+
+| Feature | Default | What it adds |
+|---|---|---|
+| `ring` | **yes** | rustls crypto backend on `ring` (compiles C with `cc`). |
+| `rustls-aws-lc-rs` | no | rustls crypto backend on `aws-lc-rs`; offers post-quantum `X25519MLKEM768` first. Needs CMake. |
+| `zstd` | no | Zstd *encoding* (`zstd-sys`, compiles C). Zstd decoding is always available. |
+| `aws-msk` | no | MSK IAM with the AWS SDK credential chain (pulls `aws-lc-sys`, needs CMake). |
+| `oauth-oidc` | no | Built-in OIDC token provider for OAUTHBEARER. No cryptography dependency. |
+| `native-tls-roots` | no | The platform's root certificates. |
+| `tls-encrypted-keys` | no | Passphrase-encrypted PKCS#8 client keys (`ssl.key.password`). |
+| `unstable-protocol` | no | Protocol versions Kafka marks unstable; outside semver. |
+| `test-broker` | no | `krafka::testing`, the in-process fake broker; outside semver. |
+
+Always compiled in: gzip, Snappy and LZ4, the share consumer, SOCKS5 and
+KIP-714 telemetry. The two TLS backends are additive; with both, `aws-lc-rs`
+wins, and a process-default rustls provider overrides either.
+`default-features = false` also drops `ring`, so name a backend:
 
 ```sh
-cargo add krafka
-cargo add tokio --features full
-
-# For AWS MSK IAM authentication with the full SDK credential chain:
-cargo add krafka --features aws-msk
+cargo add krafka --no-default-features --features rustls-aws-lc-rs
 ```
 
-### Producer
+## 📤 Producer
 
 ```rust,compile
-use krafka::producer::Producer;
-use krafka::error::Result;
+use krafka::{Kafka, Record};
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let producer = Producer::builder()
-        .bootstrap_servers("localhost:9092")
-        .client_id("my-producer")
-        .build()
-        .await?;
+let kafka = Kafka::builder("localhost:9092").client_id("my-producer").connect().await?;
+let producer = kafka.producer().build().await?;
 
-    // Send a message
-    let metadata = producer
-        .send("my-topic", Some(b"key"), Some(b"Hello, Kafka!"))
-        .await?;
+// `send` waits for the acknowledgement.
+let meta = producer
+    .send(Record::new("my-topic", "Hello, Kafka!").key("key").header("trace", "abc"))
+    .await?;
+println!("partition {} offset {}", meta.partition, meta.offset);
 
-    // A null value is a tombstone: on a compacted topic it deletes the key.
-    producer.send("my-topic", Some(b"key"), None).await?;
-    
-    println!("Sent to partition {} at offset {}", 
-             metadata.partition, metadata.offset);
+// `enqueue` returns once the record is buffered; the handle resolves to the
+// acknowledgement. Produce order is enqueue order.
+let ack = producer.enqueue(Record::new("my-topic", "pipelined")).await?;
+ack.await?;
 
-    producer.close().await;
-    Ok(())
+// A null value is a tombstone.
+producer.send(Record::tombstone("my-topic", "key")).await?;
+producer.close().await?;
+```
+
+## 📥 Consumer
+
+```rust,compile
+use krafka::Kafka;
+use krafka::consumer::{AutoOffsetReset, GroupProtocol};
+
+let kafka = Kafka::builder("localhost:9092").connect().await?;
+let consumer = kafka
+    .consumer("my-group")
+    .group_protocol(GroupProtocol::Consumer) // KIP-848; needs Kafka 4.0+
+    .auto_offset_reset(AutoOffsetReset::Earliest)
+    .build()
+    .await?;
+consumer.subscribe(["my-topic"]).await?;
+
+// `None` means the consumer was closed.
+while let Some(record) = consumer.recv().await? {
+    println!("{}/{}@{}: {:?}", record.topic, record.partition, record.offset, record.value_str());
+    consumer.commit().await?;
 }
 ```
 
-### Consumer
+`poll(timeout)` returns a batch. A partition's position is the next record to
+hand out; `commit()` commits the positions, `commit_offsets(offsets)` the
+offsets you choose, and `lag()` reports position, watermarks and lag per
+partition. `GroupProtocol::Classic` is the default and works with every
+supported broker; Apache Kafka 4.3 deprecates it in the Java client
+(KIP-1274), and krafka logs the same warning once per process. The assignors
+are `Range`, `RoundRobin` and `CooperativeSticky`.
+
+## 🔁 Transactions
 
 ```rust,compile
-use krafka::consumer::{Consumer, AutoOffsetReset};
-use krafka::error::Result;
-use std::time::Duration;
+use krafka::{Kafka, Record};
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let consumer = Consumer::builder()
-        .bootstrap_servers("localhost:9092")
-        .group_id("my-consumer-group")
-        .auto_offset_reset(AutoOffsetReset::Earliest)
-        .build()
-        .await?;
+let kafka = Kafka::builder("localhost:9092").connect().await?;
+// Registers the transactional id, fencing an earlier instance with the same id.
+let producer = kafka.producer().build_transactional("my-transaction").await?;
 
-    consumer.subscribe(&["my-topic"]).await?;
-
-    loop {
-        let records = consumer.poll(Duration::from_secs(1)).await?;
-        for record in records {
-            if let Some(ref value) = record.value {
-                println!(
-                    "Received: topic={}, partition={}, offset={}, value={:?}",
-                    record.topic,
-                    record.partition,
-                    record.offset,
-                    String::from_utf8_lossy(value)
-                );
-            }
-        }
+producer.begin()?;
+producer.send(Record::new("topic-a", "value1").key("key")).await?;
+producer.send(Record::new("topic-b", "value2").key("key")).await?;
+if let Err(e) = producer.commit().await {
+    if e.requires_abort() {
+        producer.abort().await?;
     }
 }
+producer.close().await?;
 ```
 
-### Admin Client
+For consume-transform-produce, `send_offsets(&offsets, &group_metadata)` adds
+the consumer's offsets to the transaction. Read `consumer.group_metadata()`
+for every transaction: the generation it carries is what lets the coordinator
+fence a zombie. See [`examples/exactly_once.rs`](examples/exactly_once.rs).
+
+## 🛠️ Admin client
 
 ```rust,compile
-use krafka::admin::{AdminClient, NewTopic};
-use krafka::error::Result;
-use std::time::Duration;
+use krafka::Kafka;
+use krafka::admin::{CreateTopicsOptions, ListTopicsOptions, NewTopic};
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let admin = AdminClient::builder()
-        .bootstrap_servers("localhost:9092")
-        .build()
-        .await?;
+let kafka = Kafka::builder("localhost:9092").connect().await?;
+let admin = kafka.admin();
 
-    // Create a topic
-    // `new` validates the topic name, so it returns a Result.
-    let topic = NewTopic::new("new-topic", 6, 3)?
-        .with_config("retention.ms", "604800000");
-
-    admin.create_topics(vec![topic], Duration::from_secs(30), false).await?;
-
-    // List topics
-    let topics = admin.list_topics().await?;
-    println!("Topics: {:?}", topics);
-
-    Ok(())
+let topic = NewTopic::new("new-topic", 6, 3)?.with_config("retention.ms", "604800000");
+// One result per topic.
+for (name, result) in admin.create_topics([topic], CreateTopicsOptions::default()).await? {
+    if let Err(e) = result {
+        eprintln!("{name}: {e}");
+    }
 }
+println!("{:?}", admin.list_topics(ListTopicsOptions::default()).await?);
+admin.close().await?;
 ```
 
-### Transactional Producer
+Every operation takes an `*Options` struct with a `timeout`; multi-item
+operations return one `Result` per item.
 
-For exactly-once semantics across multiple partitions:
+## 🔐 Authentication
+
+Security is a connection setting, set once on the handle:
 
 ```rust,compile
-use krafka::producer::TransactionalProducer;
-use krafka::error::Result;
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    let producer = TransactionalProducer::builder()
-        .bootstrap_servers("localhost:9092")
-        .transactional_id("my-transaction")
-        .build()
-        .await?;
-
-    // Initialize transactions (once per producer)
-    producer.init_transactions().await?;
-
-    // Atomic transaction
-    producer.begin_transaction()?;
-    producer.send("topic-a", Some(b"key"), Some(b"value1")).await?;
-    producer.send("topic-b", Some(b"key"), Some(b"value2")).await?;
-    producer.commit_transaction().await?;
-
-    Ok(())
-}
-```
-
-### Authentication
-
-Connect to secured Kafka clusters with SASL, SCRAM, OAUTHBEARER, or AWS MSK IAM — available on all client types:
-
-```rust
-use krafka::producer::Producer;
-use krafka::consumer::Consumer;
-use krafka::AdminClient;
-
-// Producer with SASL_SSL + SCRAM-SHA-512 (the usual managed-Kafka listener)
+use krafka::Kafka;
 use krafka::auth::{AuthConfig, TlsConfig};
-let producer = Producer::builder()
-    .bootstrap_servers("broker:9093")
-    .auth(AuthConfig::sasl_scram_sha512_ssl("username", "password", TlsConfig::new()))
-    .build()
+
+// SASL_SSL with SCRAM-SHA-512.
+let kafka = Kafka::builder("broker:9093")
+    .security(AuthConfig::sasl_scram_sha512("username", "password").with_tls(TlsConfig::new()))
+    .connect()
     .await?;
 
-// Any mechanism composes with TLS through `with_tls`
-let auth = AuthConfig::sasl_scram_sha256("username", "password")
+// Any mechanism composes with TLS through `with_tls`.
+let _ = AuthConfig::sasl_plain("username", "password")
     .with_tls(TlsConfig::new().with_ca_cert("/etc/kafka/ca.pem"));
-
-// Consumer with SASL/PLAIN
-let consumer = Consumer::builder()
-    .bootstrap_servers("broker:9092")
-    .group_id("secure-group")
-    .sasl_plain("username", "password")
-    .build()
-    .await?;
-
-// Producer with SASL/OAUTHBEARER
-let producer = Producer::builder()
-    .bootstrap_servers("broker:9093")
-    .sasl_oauthbearer("your-jwt-token")
-    .build()
-    .await?;
-
-// Admin with AWS MSK IAM
-let auth = AuthConfig::aws_msk_iam("access_key", "secret_key", "us-east-1");
-let admin = AdminClient::builder()
-    .bootstrap_servers("broker:9094")
-    .auth(auth)
-    .build()
-    .await?;
+let _ = AuthConfig::sasl_oauthbearer("your-jwt-token");
+let _ = AuthConfig::aws_msk_iam("access_key", "secret_key", "us-east-1");
 ```
 
-## 📦 Modules
+Certificates rotate with `kafka.refresh_tls().await?` or on a timer with
+`tls_reload_interval`; a reload that fails keeps the previous material.
+Recipes for Azure Event Hubs, Google Managed Kafka, Amazon MSK and Confluent
+Cloud are in [Cloud Platforms](https://hupe1980.github.io/krafka/docs/cloud/).
 
-| Module | Description |
-|--------|-------------|
-| `producer` | Batching, compression, idempotence, transactions, partitioners |
-| `consumer` | Consumer groups (classic + KIP-848), offsets, rebalancing, compacted-topic tables |
-| `share_consumer` | KIP-932 share groups — queue semantics on a Kafka topic *(`share-groups`, on by default; needs a Kafka 4.2+ broker)* |
-| `admin` | Cluster administration: topics, partitions, groups, configs, ACLs, quotas, tokens |
-| `client` | `KrafkaClient` — one connection pool and metadata cache shared by several clients |
-| `auth` | SASL PLAIN / SCRAM / OAUTHBEARER / AWS MSK IAM, TLS and mTLS |
-| `serdes` | `Serializer` / `Deserializer` hooks applied on the way to and from the wire |
-| `interceptor` | Producer and consumer hooks for tracing and enrichment |
-| `dlq` | Dead-letter queues for records that exhaust their retries |
-| `metrics` | Lock-free counters, gauges and latency histograms; Prometheus export |
-| `telemetry` | KIP-714 broker-driven client telemetry and OTLP export *(`telemetry`)* |
-| `tracing_ext` | OpenTelemetry semantic-convention fields for `tracing` spans |
-| `testing` | In-process fake broker with fault injection *(`test-broker`)* |
-| `error` | `KrafkaError`, `ErrorCode`, `ProtocolErrorKind` and retriability classification |
-| `util` | Backoff policy, varint codecs, CRC32C, bootstrap-server parsing |
-| `prelude` | One glob import for the common types (`use krafka::prelude::*`) |
-
-Three more modules are public but `#[doc(hidden)]` — `protocol`, `network` and
-`metadata`. They are reachable for advanced use (custom authenticators, raw
-record batches, benchmarks) but are **not** part of the stable API surface.
-
-## 🗜️ Compression
-
-krafka supports all Kafka compression codecs, individually feature-gated:
+## 📈 Observability
 
 ```rust,compile
-use krafka::producer::Producer;
-use krafka::protocol::Compression;
+use krafka::Kafka;
 
-let producer = Producer::builder()
-    .bootstrap_servers("localhost:9092")
-    .compression(Compression::Lz4)  // Fast compression
-    .build()
-    .await?;
+let kafka = Kafka::builder("localhost:9092").connect().await?;
+let producer = kafka.producer().build().await?;
+
+// One owned snapshot per client; `kafka.metrics()` sums the handle's clients.
+let snapshot = producer.metrics();
+println!("{}", snapshot.prometheus_text());
 ```
 
-| Codec | Cargo Feature | Crate | Characteristics |
-|-------|---------------|-------|-----------------|
-| `Compression::Gzip` | `gzip` | flate2 | Best ratio, slower |
-| `Compression::Snappy` | `snappy` | snap | Good balance |
-| `Compression::Lz4` | `lz4` | lz4_flex | Fastest |
-| `Compression::Zstd` | `zstd` | zstd | Best modern choice (requires C toolchain) |
+- **Metrics.** Producer, consumer and connection counters, latencies as
+  count/sum/max, Prometheus series named `krafka_*` with a `client_id` label.
+- **Spans.** `send`, `poll`, `commit` and `rebalance` spans through `tracing`,
+  on OpenTelemetry messaging semantic conventions `krafka::OTEL_SEMCONV_VERSION`.
+  Record keys and values are never recorded. krafka depends on no
+  OpenTelemetry crate; bridge `tracing` in the application.
+- **KIP-714.** Producers and consumers push their metrics to brokers whose
+  operator subscribed to them, like Java's `enable.metrics.push`;
+  `metrics_push(false)` on the role builder turns it off. The admin client
+  pushes only when `metrics_push(true)` is set.
 
-The default `compression` feature enables the pure-Rust codecs: gzip, snappy,
-and LZ4. Zstd remains available through the explicit `zstd` or
-`compression-all` feature because it requires a C toolchain via `zstd-sys`.
-To select only what you need:
+## 🧪 Testing against a fake broker
 
-```sh
-# Only the codecs you need. `--no-default-features` also drops the default
-# `ring` TLS backend, so a crypto backend must be named explicitly.
-cargo add krafka --no-default-features --features lz4,snappy,ring
-
-# Or every codec, including zstd:
-cargo add krafka --features compression-all
-```
-
-### TLS crypto backend
-
-krafka uses `rustls` and needs exactly one crypto backend. `ring` is the
-default; `rustls-aws-lc-rs` selects aws-lc-rs instead, which is the better
-choice on AWS Graviton and in FIPS-oriented deployments:
-
-```sh
-cargo add krafka --no-default-features --features rustls-aws-lc-rs,compression
-```
-
-The two backends are **additive**, not mutually exclusive — a transitive
-dependency may well enable the other one, and Cargo would have no way to
-resolve a conflict if they were exclusive. When both are compiled in,
-aws-lc-rs deterministically wins. krafka always selects the provider
-explicitly rather than letting `rustls` infer it from crate features, so the
-combination cannot produce a runtime panic. Installing a process-wide provider
-with `CryptoProvider::install_default()` overrides the choice for the whole
-application, krafka included.
-
-## 🛠️ Development
-
-Tasks are driven by [`just`](https://just.systems). The `justfile` is the single
-source of truth for what the checks are — CI calls the same recipes, so a check
-cannot pass locally and fail in CI because the two drifted apart.
-
-```bash
-just              # list every recipe
-just ci           # everything CI runs, except the Docker-backed suites
-just ci-full      # ci + supply-chain audit + Docker integration tests
-just pre-commit   # the fast subset (fmt, clippy, check)
-just install-hooks  # wire pre-commit into .git/hooks
-just t <pattern>  # run one test by name, with output
-
-just bench-baseline  # record the performance reference
-just bench-check     # fail if the send path regressed >10% since then
-just semver-check    # classify API changes against the last published release
-```
-
-Individual recipes mirror one CI job each: `fmt-check`, `clippy`, `check`,
-`protocol-parity`, `secret-debug`, `test`, `test-ring`,
-`test-cross-platform`, `minimal-features`, `doc`, `deny`, `integration`, `msrv`.
-`just ci-job-parity` asserts that pairing holds.
-
-`bench-check` and `semver-check` sit outside `just ci`: both are slow and noisy
-on a shared runner, and pre-1.0 a detected API break is allowed rather than
-fatal.
-
-### Checks that exist because a review found what they now catch
-
-**`tests/builder_surface.rs`** — a compile-time assertion that every client
-builder accepts a `TransportConfig`, offers a synchronous `build_config()`
-alongside the async `build()`, exposes `refresh_tls()`, and keeps metrics and
-version negotiation callable without an async context. Every line fails to
-compile if the method it names disappears.
-
-It also asserts two matrices that a per-client check could not see. Every
-`SaslMechanism` must be constructible under **both** `SASL_PLAINTEXT` and
-`SASL_SSL` from the public API alone — `SASL_SSL` + SCRAM, the default secured
-listener on most managed Kafka offerings, was unreachable from outside the crate
-because the `_ssl` constructors were a hand-maintained list and SCRAM was missing
-from it. And both producer builders must expose the same configuration surface —
-the transactional one was missing seventeen setters, including the
-`build_config()` this file already promised for every client.
-
-This replaced a Python parity script. krafka used to have two builders per
-client — 72 hand-maintained forwarding methods whose config half nothing outside
-the crate's own tests ever called — and the script checked that they stayed in
-sync. It found two real defects, then missed a third: both producer builders had
-a `compression` method, but only the unused one *validated* it, so
-`.compression(Zstd)` without the `zstd` feature built a producer that failed on
-its first send. A parity check compares surfaces; the divergence had moved
-underneath it. Deleting the duplication removed both the defect class and the
-need for the script, and Rust checks reachability better than a regex can.
-
-**`just protocol-parity`** — the API version table is diffed against Apache
-Kafka's own message schemas: names and keys agree, MIN is still a version Kafka
-accepts, MAX neither overstates (claiming a version marked
-`latestVersionUnstable`) nor understates (declining a stable one), and the
-flexible-version boundary matches. This is how `Fetch` v17/v18 sat implemented,
-documented and unreachable for two Kafka releases.
-
-It reads a vendored snapshot, so it needs no network and cannot flake. Track a
-newer Kafka release deliberately:
-
-```bash
-just refresh-protocol-snapshot 4.3   # rewrite the snapshot; review the diff
-just protocol-parity                 # see what krafka must do about it
-```
-
-**`just ci-job-parity`** — every recipe in `just ci` has a CI job, one required
-check (`ci-success`) gates every job, and that check carries `if: always()`.
-
-The justfile being the source of truth has a blind spot: a recipe wired to no
-workflow is invisible from both sides, because each list is internally complete
-and neither is compared to the other. `just integration-sasl` ran in no workflow
-for its entire life, and `just docs-test` gated every compiled documentation
-snippet while no pull request ran it.
-
-`if: always()` is not cosmetic: GitHub leaves a required check pending forever
-when its job never runs, and reads a **skipped** required check as success.
-
-**`just bench-check`** — the send path has not regressed more than 10% against
-the recorded baseline, measured against the in-process fake broker.
-
-These are krafka-vs-krafka numbers. The harness holds a single lock and keeps
-its log in memory, so **no figure it produces is quotable** and none appears in
-this README. It is still the right tool for detecting a regression: a constant
-overhead cancels when you subtract two runs of it.
-
-**`just secret-debug`** — no credential-bearing type may derive `Debug`.
-`Debug` is the quiet way secrets reach a log aggregator: a `tracing` field, an
-error context or a panic message that formats the enclosing struct is enough,
-and nobody has to log the secret deliberately. Two instances shipped before this
-check existed — the OIDC client secret, and `SaslAuthenticateRequest.auth_bytes`,
-which for SASL/PLAIN is `\0username\0password` in cleartext.
-
-## ⚡ Performance Tuning
-
-### High Throughput Producer
+With the `test-broker` feature, `krafka::testing::FakeBroker` is an
+in-process Kafka cluster that real clients talk to. Inject a fault per request,
+move leaders, crash brokers, and assert what the client sent:
 
 ```rust,compile
-use krafka::producer::{Producer, Acks};
-use krafka::protocol::Compression;
-use std::time::Duration;
+use krafka::error::ErrorCode;
+use krafka::testing::{ApiKey, Control, FakeBroker};
+use krafka::Kafka;
 
-let producer = Producer::builder()
-    .bootstrap_servers("localhost:9092")
-    .acks(Acks::Leader)
-    .compression(Compression::Lz4)
-    .batch_size(1048576)                  // 1MB batches
-    .linger(Duration::from_millis(10))    // Allow batching
-    .build()
-    .await?;
+let broker = FakeBroker::start().await?;
+broker.on(ApiKey::CreateTopics, |_| Control::Error(ErrorCode::NotController));
+let admin = Kafka::builder(broker.bootstrap_servers()).connect().await?.admin();
 ```
 
-### Low Latency Consumer
-
-```rust,compile
-use krafka::consumer::Consumer;
-use std::time::Duration;
-
-let consumer = Consumer::builder()
-    .bootstrap_servers("localhost:9092")
-    .group_id("low-latency")
-    .fetch_min_bytes(1)
-    .fetch_max_wait(Duration::from_millis(10))
-    .build()
-    .await?;
-```
-
-### Transport tuning
-
-Socket- and pool-level settings live on one `TransportConfig`, accepted by every
-builder (`Producer`, `Consumer`, `AdminClient`, `TransactionalProducer`,
-`ShareConsumer`, `KrafkaClient`). The defaults reproduce krafka's historical
-behaviour exactly, so this is opt-in.
-
-```rust,compile
-use krafka::network::TransportConfig;
-use krafka::consumer::Consumer;
-use std::time::Duration;
-
-let transport = TransportConfig::builder()
-    // Beat the idle timeout of whatever NAT gateway or load balancer sits
-    // between you and the brokers — the usual cause of "the consumer stops
-    // receiving after exactly N minutes".
-    .tcp_keepalive(Some(Duration::from_secs(30)))
-    // Kafka returns at least one full record batch per partition even when it
-    // exceeds fetch.max.bytes. Raise this above the topic's max.message.bytes
-    // or that partition stalls permanently.
-    .max_response_size(200 * 1024 * 1024)
-    // Bound worst-case memory: the per-connection ceiling is
-    // max_response_size × max_in_flight_requests.
-    .max_in_flight_requests(5)
-    // Bound file descriptors on a cluster whose broker count can jump.
-    .max_connections(Some(64))
-    // Re-read certificates from disk hourly (KIP-1288).
-    .tls_reload_interval(Some(Duration::from_secs(3600)))
-    .build()?;
-
-let consumer = Consumer::builder()
-    .bootstrap_servers("localhost:9092")
-    .group_id("tuned")
-    .transport(transport)
-    .build()
-    .await?;
-```
-
-### TLS certificate rotation (KIP-1288)
-
-Two paths, because rotation happens two ways:
-
-```rust,compile
-// Event-driven: an inotify watch or a sidecar signal fired.
-producer.refresh_tls().await?;
-
-// Unattended: set `tls_reload_interval` above and krafka reloads on a timer.
-```
-
-Existing TLS sessions keep the certificates they handshaked with and are
-replaced as connections cycle. A reload that fails — a half-written PEM caught
-mid-rotation — is logged and the previous material stays active, so a
-non-atomic rotation converges on the next attempt instead of breaking every new
-connection in between.
-
-## 🎯 Delivery Semantics
-
-Pick the mode that matches what your data is worth.
-
-| Mode | Guarantee | Cost |
-|------|-----------|------|
-| `acks=0` | At-most-once. No durability — the record may never reach the log. | Lowest latency |
-| `acks=all` + idempotence (**default**) | At-least-once, ordered and gap-free per partition. Batches for a partition are serialised in seal order; sequence numbers are monotonic and never reused. | One round trip to the ISR |
-| Transactions + `send_offsets_to_transaction` | Exactly-once across a read-process-write cycle. | Transaction coordinator round trips |
-
-Under `acks=0`, `RecordMetadata::confirmation` reports `Unacknowledged` — do not
-mistake the returned metadata for a durability guarantee.
-
-### Exactly-once
-
-`send_offsets_to_transaction` takes a [`ConsumerGroupMetadata`], not a bare group
-ID. That metadata is what lets the group coordinator fence a **zombie**: an
-instance that was partitioned away, lost its partitions to a rebalance, and came
-back still holding a transaction. Without it the coordinator accepts the zombie's
-commit and it overwrites the position of the member that now owns the partition.
-
-```rust
-// Re-read for every transaction. The generation changes on every rebalance,
-// so a cached value stops fencing at exactly the moment it matters.
-let group_metadata = consumer
-    .group_metadata()
-    .await
-    .ok_or("consumer has not joined the group yet")?;
-
-producer.begin_transaction()?;
-producer.send("out-topic", Some(b"key"), Some(b"value")).await?;
-producer.send_offsets_to_transaction(&offsets, &group_metadata).await?;
-producer.commit_transaction().await?;
-```
-
-See [`examples/exactly_once.rs`](examples/exactly_once.rs) for the full
-read-process-write loop.
-
-## 🧩 Consumer Groups
-
-Both rebalance protocols are supported, but they are no longer equals.
-
-**Prefer `GroupProtocol::Consumer` (KIP-848).** It has been production ready
-since Apache Kafka 4.0: the coordinator computes assignments server-side, a
-rebalance reconciles incrementally instead of stopping every member, and a slow
-member affects only its own partitions. Apache Kafka 4.3 began *deprecating*
-the classic protocol (KIP-1274 phase 1 — warn in 4.3, default flips in 5.0,
-removed in 6.0), and krafka logs the same warning once per process when a group
-starts on it.
-
-```rust,compile
-use krafka::consumer::{Consumer, GroupProtocol};
-
-let consumer = Consumer::builder()
-    .bootstrap_servers("localhost:9092")
-    .group_id("my-group")
-    .group_protocol(GroupProtocol::Consumer)   // KIP-848
-    .build()
-    .await?;
-```
-
-`Classic` remains the default for now, so that upgrading krafka is never itself
-a protocol migration: krafka supports Kafka 3.9 brokers, and KIP-848 needs 4.0
-(or 3.7–3.9 with `group.coordinator.new.enable=true`). The two protocols cannot
-mix within one group on pre-4.0 brokers — move every member together, or
-upgrade the cluster first.
-
-
-Four assignors ship: `Range`, `RoundRobin`, `Sticky` (eager), and
-`CooperativeSticky`. The default is the preference list
-`[Range, CooperativeSticky]`, matching the Java client — every member advertises
-both, so a group moves from eager to cooperative rebalancing in a single rolling
-bounce rather than a full stop-the-world restart.
-
-Cooperative rebalances enforce revoke-before-assign structurally: a partition
-moving between two live members is withheld from its new owner for one
-generation — the previous owner revokes it, then the follow-up rebalance
-delivers it — so two members of one group can never consume the same partition
-concurrently, and the new owner's committed-offset fetch cannot race the old
-owner's final commit.
-
-Rebalances do not wait on your poll loop. The background group task keeps
-heartbeating through a rebalance and sends `JoinGroup`/`SyncGroup` itself, so a
-consumer that is idle or busy between `poll()` calls does not hold the rest of
-the group up. The new assignment is applied — and your rebalance listener
-called — on the next `poll()`, so callbacks and record delivery stay on one
-thread and an offset commit cannot race a revocation.
-
-`max.poll.interval.ms` is still enforced: an application that genuinely stops
-polling leaves the group so its partitions are reassigned promptly, rather than
-holding them while a background task vouches for it. Static members
-(`group.instance.id`) instead keep their assignment until the session expires,
-so a restart can reclaim it.
+It serves produce and fetch, both group protocols, share groups and the full
+transaction protocol, and runs on Tokio's paused clock with
+`FakeBroker::start_in_memory`. `krafka::testing` is **unstable**: it is outside
+the semver promise. The [Testing guide](https://hupe1980.github.io/krafka/docs/testing/)
+shows how to test your own code with it and with testcontainers.
 
 ## 📐 Scope
 
-krafka speaks the **client** side of the Kafka protocol: 60+ API keys covering
-produce, fetch, group coordination, transactions, share groups, and
-administration, tracked against Apache Kafka 4.3.
+krafka speaks the **client** side of the Kafka protocol, tracked against
+<!-- generated:kips:kafka-ref -->Apache Kafka 4.3<!-- /generated -->.
 
-Broker-internal APIs (`LeaderAndIsr`, `UpdateMetadata`, `Vote`, `FetchSnapshot`,
-`BrokerHeartbeat`, the share-group state persister, …) are deliberately absent
-— a client does not speak them. They are still *named* in the `ApiKey` enum, so
-an `ApiVersions` response from a modern broker decodes to something readable
-rather than `Unknown(87)`.
+<!-- generated:kips:summary -->
+**KIPs named in this documentation:** 58 implemented · 8 partial (KIP-368, KIP-525, KIP-794, KIP-800, KIP-853, KIP-932, KIP-1071, KIP-1242). Each with its status, evidence and reason: [KIP support](https://hupe1980.github.io/krafka/docs/protocol/#kip-support).
+<!-- /generated -->
 
-Not implemented: `StreamsGroupHeartbeat` (KIP-1071, key 88). Its request carries
-the Streams application topology, which is group-wide state — a client with no
-Streams runtime cannot send a truthful one. Its sibling `StreamsGroupDescribe`
-(key 89) *is* implemented, as `AdminClient::describe_streams_groups`.
+Not implemented, or implemented in part:
 
-**Schema registries are out of scope**, as they are for every comparable client
-— Java's `kafka-clients` has none, librdkafka has none, franz-go keeps `pkg/sr`
-out of `kgo`. A registry is a different service with a different protocol, auth
-model and release cadence. krafka provides the *hook* (`serdes::Serializer` /
-`Deserializer`, the equivalent of Java's `key.serializer`); pair it with
-[`schemreg`](https://crates.io/crates/schemreg) for Confluent, AWS Glue or
-Apicurio, and Avro / Protobuf / JSON codecs. See the
-[Cookbook](https://hupe1980.github.io/krafka/docs/cookbook/#use-a-schema-registry).
+<!-- generated:kips:not-implemented -->
+- **SASL/GSSAPI (Kerberos) authentication** (GSSAPI) — No mature pure-Rust GSSAPI implementation exists, and linking system Kerberos libraries would add a C dependency for every user.
+- **Schema registry client** (schema-registry) — A schema registry is a separate service with its own protocol; krafka provides the serdes::Serializer and Deserializer hooks instead.
+- **Async runtimes other than Tokio** (runtime-agnostic) — krafka is built on Tokio and does not abstract over the async runtime.
+- **Kafka Streams runtime** (streams-runtime) — krafka is a client library with no stream-processing runtime, which is also why StreamsGroupHeartbeat is not implemented.
+- **Broker-, controller- and KRaft-internal APIs** (broker-internal-apis) — APIs such as LeaderAndIsr, UpdateMetadata, Vote and the share-group state persister are spoken between brokers, not by clients.
+- **KIP-368 Allow SASL connections to periodically re-authenticate**, partly — The broker-reported session lifetime is honoured by replacing a pooled connection before it expires; in-band re-authentication of a live connection is not implemented.
+- **KIP-525 Return topic metadata and configs in CreateTopics response**, partly — CreateTopics v5+ is negotiated, but create_topics returns only per-topic success, so the partition count, replication factor and configs in the response are not surfaced.
+- **KIP-794 Strictly uniform sticky partitioner**, partly — Keyless records stick to a partition for batch_size bytes and then switch at random, but the next partition is not weighted by per-broker queue size (partitioner.adaptive.partitioning.enable) and slow brokers are not avoided (partitioner.availability.timeout.ms).
+- **KIP-800 Add reason to JoinGroupRequest and LeaveGroupRequest**, partly — JoinGroup v8 and LeaveGroup v5 are negotiated, but the reason field is always sent as null.
+- **KIP-853 KRaft controller membership changes**, partly — Quorum membership can be described, but the AddRaftVoter and RemoveRaftVoter admin RPCs are not implemented.
+- **KIP-932 Queues for Kafka**, partly — The share consumer and share-group offset administration are implemented, but ShareGroupDescribe is never sent, so no admin call describes or lists share groups' members.
+- **KIP-1071 Streams rebalance protocol**, partly — Streams groups can be described, but StreamsGroupHeartbeat is not implemented because its request carries an application topology that only a Streams runtime can supply.
+- **KIP-1242 Detection and handling of misrouted connections**, partly — ApiVersions v5 is encoded behind unstable-protocol, but the ClusterId and NodeId fields are never populated and REBOOTSTRAP_REQUIRED from ApiVersions does not trigger a rebootstrap.
+- `AlterConfigs` is implemented below Kafka's ceiling — superseded by IncrementalAlterConfigs, which krafka uses instead; the legacy whole-config replace is not exposed
+- `SaslHandshake` is implemented below Kafka's ceiling — pinned at v1 by the handshake path; v0 has no mechanism list
+- `SaslAuthenticate` is implemented below Kafka's ceiling — pinned at v1: v2 only adds flexible encoding, and the pre-auth reader is deliberately version-pinned so an unauthenticated peer cannot steer it
+- Not spoken by a client (broker-, controller- and KRaft-internal): `LeaderAndIsr`, `StopReplica`, `UpdateMetadata`, `ControlledShutdown`, `Vote`, `BeginQuorumEpoch`, `EndQuorumEpoch`, `AlterPartition`, `Envelope`, `FetchSnapshot`, `BrokerRegistration`, `BrokerHeartbeat`, `UnregisterBroker`, `AllocateProducerIds`, `ControllerRegistration`, `AssignReplicasToDirs`, `UpdateRaftVoter`, `InitializeShareGroupState`, `ReadShareGroupState`, `WriteShareGroupState`, `DeleteShareGroupState`, `ReadShareGroupStateSummary`
+<!-- /generated -->
 
-Tokio is the async runtime.
+Schema registries are a separate service; krafka provides the
+`serdes::Serializer` and `Deserializer` hooks. See the
+[Cookbook](https://hupe1980.github.io/krafka/docs/cookbook/).
 
-### Authentication
+## 🎮 Examples
 
-SASL/PLAIN, SASL/SCRAM-SHA-256/512 (with RFC 5929 channel binding), SASL/OAUTHBEARER
-(with proactive token refresh, a built-in OIDC `client_credentials` provider and
-KIP-1258 client assertions behind the `oauth-oidc` feature), AWS MSK IAM, and mTLS.
+Each example has a header comment saying what it shows and how to run it.
+Every one reads `KAFKA_BOOTSTRAP_SERVERS` (default `localhost:9092`) except
+`fake_broker`, which needs no broker.
 
-GSSAPI/Kerberos is outside the scope of this client.
-
-## 🧪 Testing Against a Fake Broker
-
-Enable the `test-broker` feature to get an in-process Kafka broker your tests can
-drive directly. Real `Producer`/`Consumer`/`AdminClient` instances connect to it
-over a real TCP socket, so you exercise the actual client — no Docker, no
-containers, and failure modes you cannot reproduce against a healthy cluster.
-
-```rust,compile
-use krafka::testing::{Control, FakeBroker};
-use krafka::protocol::ApiKey;
-use krafka::error::ErrorCode;
-
-let broker = FakeBroker::start().await?;
-
-// Make the next CreateTopics land on a non-controller and assert the client
-// refreshes metadata and retries instead of surfacing the error.
-broker.on(ApiKey::CreateTopics, |_| Control::Error(ErrorCode::NotController));
-
-let admin = AdminClient::builder()
-    .bootstrap_servers(broker.bootstrap_servers())
-    .build()
-    .await?;
-```
-
-`Control` covers `Error`, `Delay`, `DelayThen`, `Disconnect`, `Silence`,
-`CorruptRecords` and pass-through. The cluster is mutable mid-test
-(`set_leader`, `bump_leader_epoch`, `set_group_coordinator`, `set_controller`,
-`set_broker_online`), and `set_api_versions` makes the broker advertise an
-*older* API range so the client's degradation branches are reachable.
-
-It serves the produce/fetch path, both group protocols — classic and KIP-848
-with real revoke-before-assign reconciliation — `DescribeGroups` and
-`StreamsGroupDescribe`, KIP-932 share groups with the share-partition state
-machine, KIP-584 feature administration, and the full transaction protocol.
-
-Transactions are modelled end to end, which is what makes exactly-once testable
-without a cluster: `InitProducerId` returns a stable producer ID per
-transactional ID with an epoch that rises on every re-initialisation (KIP-360
-fencing), `EndTxn` writes real commit and abort control batches, offsets staged
-by `TxnOffsetCommit` apply only on commit, and a `read_committed` fetch stops at
-the last stable offset and reports aborted transactions so the consumer's own
-filtering runs for real. `set_transaction_version(2)` finalizes the
-`transaction.version` feature and the client negotiates KIP-890 TV2 from it —
-the same route a real cluster takes — so both protocols are reachable.
-
-```rust
-broker.set_transaction_version(2);
-// ...run a transaction through a TransactionalProducer...
-assert_eq!(broker.request_count(ApiKey::AddPartitionsToTxn), 0);
-```
-
-See the **[Testing guide](https://hupe1980.github.io/krafka/docs/testing/)** for
-what it does and, just as importantly, what it deliberately does not model.
-
-
-## ⬆️ Upgrading
-
-krafka is pre-1.0: a **minor** bump may carry breaking changes, and every one
-is listed in the `Breaking` section of that release in
-[CHANGELOG.md](CHANGELOG.md).
+| Example | What it shows | Run |
+|---|---|---|
+| [`producer`](examples/producer.rs) | `send`, then `enqueue` with the delivery handles awaited later | `cargo run --example producer` |
+| [`consumer`](examples/consumer.rs) | a group member that commits after each batch, then reports lag | `cargo run --example consumer` |
+| [`share_consumer`](examples/share_consumer.rs) | KIP-932: ack or reject each record, check the commit results (Kafka 4.2+) | `cargo run --example share_consumer` |
+| [`exactly_once`](examples/exactly_once.rs) | consume-transform-produce with `send_offsets`; abort and seek back on failure | `cargo run --example exactly_once` |
+| [`admin`](examples/admin.rs) | describe the cluster; create, describe and delete a topic | `cargo run --example admin` |
+| [`metrics`](examples/metrics.rs) | read `Metrics` fields and print Prometheus text | `cargo run --example metrics` |
+| [`tracing`](examples/tracing.rs) | print the clients' spans with `tracing-subscriber` | `cargo run --example tracing` |
+| [`authentication`](examples/authentication.rs) | TLS and SASL from environment variables (`AuthConfig::from_env`) | `cargo run --example authentication` |
+| [`fake_broker`](examples/fake_broker.rs) | test your own code against `FakeBroker` under injected faults | `cargo run --example fake_broker --features test-broker` |
+| [`oauth_oidc`](examples/oauth_oidc.rs) | the OIDC token provider with a client secret or an assertion file | `cargo run --example oauth_oidc --features oauth-oidc` |
+| [`msk_iam`](examples/msk_iam.rs) | MSK IAM with the AWS SDK default credential chain | `cargo run --example msk_iam --features aws-msk` |
 
 ## 📚 Documentation
 
-Full documentation: **[hupe1980.github.io/krafka](https://hupe1980.github.io/krafka)** ·
+Guides: **[hupe1980.github.io/krafka](https://hupe1980.github.io/krafka)** ·
 API reference: **[docs.rs/krafka](https://docs.rs/krafka)** ·
 Release history: **[CHANGELOG.md](CHANGELOG.md)**
 
 | Start here | Clients | Integration | Operations | Reference |
 |---|---|---|---|---|
 | [Getting Started](https://hupe1980.github.io/krafka/docs/getting-started/) | [Producer](https://hupe1980.github.io/krafka/docs/producer/) | [Authentication](https://hupe1980.github.io/krafka/docs/authentication/) | [Metrics](https://hupe1980.github.io/krafka/docs/metrics/) | [Protocol Support](https://hupe1980.github.io/krafka/docs/protocol/) |
-| [Cookbook](https://hupe1980.github.io/krafka/docs/cookbook/) | [Consumer](https://hupe1980.github.io/krafka/docs/consumer/) | | [Performance](https://hupe1980.github.io/krafka/docs/performance/) | [Architecture](https://hupe1980.github.io/krafka/docs/architecture/) |
-| [Configuration](https://hupe1980.github.io/krafka/docs/configuration/) | [Share Consumer](https://hupe1980.github.io/krafka/docs/share-consumer/) | [Interceptors](https://hupe1980.github.io/krafka/docs/interceptors/) | [Testing](https://hupe1980.github.io/krafka/docs/testing/) | |
-| | [Admin Client](https://hupe1980.github.io/krafka/docs/admin/) | | [Error Handling](https://hupe1980.github.io/krafka/docs/errors/) | |
+| [Cookbook](https://hupe1980.github.io/krafka/docs/cookbook/) | [Consumer](https://hupe1980.github.io/krafka/docs/consumer/) | [Cloud Platforms](https://hupe1980.github.io/krafka/docs/cloud/) | [Performance](https://hupe1980.github.io/krafka/docs/performance/) | [Architecture](https://hupe1980.github.io/krafka/docs/architecture/) |
+| [Configuration](https://hupe1980.github.io/krafka/docs/configuration/) | [Share Consumer](https://hupe1980.github.io/krafka/docs/share-consumer/) | [Interceptors](https://hupe1980.github.io/krafka/docs/interceptors/) | [Testing](https://hupe1980.github.io/krafka/docs/testing/) | [Project and Support](https://hupe1980.github.io/krafka/docs/governance/) |
+| [Upgrading to 0.27](https://hupe1980.github.io/krafka/docs/upgrading/) | [Admin Client](https://hupe1980.github.io/krafka/docs/admin/) | | [Error Handling](https://hupe1980.github.io/krafka/docs/errors/) | |
+| [Migrating from rdkafka](https://hupe1980.github.io/krafka/docs/migrating-from-rdkafka/) | | | | |
 
-The site is built with [Zola](https://www.getzola.org) from `site/`. Run
-`just site-serve` for a local preview with live reload.
+krafka is pre-1.0: a **minor** release may carry breaking changes, and each
+one is listed under `Breaking` in [CHANGELOG.md](CHANGELOG.md).
+[Upgrading to 0.27](https://hupe1980.github.io/krafka/docs/upgrading/) maps
+every removed name to its replacement.
 
-## 🎮 Examples
+## 🛠️ Development
 
-Run the examples with:
+Tasks run through [`just`](https://just.systems); CI calls the same recipes.
 
 ```bash
-# Producer example
-cargo run --example producer
-
-# Consumer example
-cargo run --example consumer
-
-# Advanced consumer example (pause/resume, seek, manual commits)
-cargo run --example consumer_advanced
-
-# Admin client example
-cargo run --example admin
-
-# Transactional producer example
-cargo run --example transactional_producer
-
-# Exactly-once read-process-write (KIP-447 zombie fencing)
-cargo run --example exactly_once
-
-# Authentication examples (SASL, SCRAM, MSK IAM)
-cargo run --example authentication
+just              # list every recipe
+just ci           # everything CI runs, except the Docker-backed suites
+just ci-full      # ci + supply-chain audit + Docker integration suites
+just pre-commit   # fmt, clippy, check
+just t <pattern>  # one test by name, with output
 ```
 
-## 🤝 Contributing
-
-Contributions are welcome!
+`just ci` includes the API-surface and boundary checks
+(`tests/builder_surface.rs`, `private_interfaces` denied), `protocol-parity`,
+`claims-check` (the capability lists above are generated from a registry),
+`no-c`, `secret-debug`, `cancel-safety`, `docs-test` (every `rust,compile`
+block in this README and the guides is built), the deterministic simulation
+(`sim`) and the test suites under both TLS backends. How the project is
+maintained, supported and checked:
+[Project and Support](https://hupe1980.github.io/krafka/docs/governance/).
+Security reports: [SECURITY.md](SECURITY.md).
 
 ## 📄 License
 
-Licensed under either the [MIT License](LICENSE-MIT) or the [Apache License 2.0](LICENSE-APACHE), at your option.
+Licensed under either the [MIT License](LICENSE-MIT) or the
+[Apache License 2.0](LICENSE-APACHE), at your option.

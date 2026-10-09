@@ -13,12 +13,12 @@
 //! exact mirror of the corresponding `decode_vN`, so a mismatch shows up
 //! immediately as a decode failure in a client-driven test.
 //!
-//! # Version pinning
+//! # Versions
 //!
-//! The broker advertises `min == max` for every API it implements, which
-//! forces the client's version negotiation onto exactly the version each
-//! reader/writer pair here was written against. Adding a version means
-//! changing both the advertised range and the codec together. Non-flexible
+//! The broker advertises only the versions a reader/writer pair here was
+//! written against — one version for most APIs, a range where the readers
+//! branch on the version. Adding a version means changing both the advertised
+//! range and the codec together. Non-flexible
 //! versions are preferred where the client still supports them: they need no
 //! tagged-field or compact-length handling, so there is less to get wrong.
 
@@ -402,6 +402,10 @@ pub(crate) struct FetchReq {
     /// Fetch session ID, echoed back in the response so the client's session
     /// bookkeeping stays consistent.
     pub session_id: i32,
+    /// Longest the broker may hold the request waiting for data.
+    pub max_wait_ms: i32,
+    /// Bytes of records the response must hold before `max_wait_ms` is up.
+    pub min_bytes: i32,
     /// `0` = `read_uncommitted`, `1` = `read_committed`.
     ///
     /// Read rather than discarded because it selects whether the fetch stops
@@ -417,8 +421,8 @@ pub(crate) struct FetchReq {
 impl FetchReq {
     pub(crate) fn read(buf: &mut impl Buf) -> Result<Self> {
         let _replica_id = i32::decode(buf)?;
-        let _max_wait_ms = i32::decode(buf)?;
-        let _min_bytes = i32::decode(buf)?;
+        let max_wait_ms = i32::decode(buf)?;
+        let min_bytes = i32::decode(buf)?;
         let _max_bytes = i32::decode(buf)?;
         let isolation_level = i8::decode(buf)?;
         let session_id = i32::decode(buf)?;
@@ -460,6 +464,8 @@ impl FetchReq {
 
         Ok(Self {
             session_id,
+            max_wait_ms,
+            min_bytes,
             isolation_level,
             topics,
         })
@@ -518,7 +524,6 @@ pub(crate) struct ConsumerGroupHeartbeatReq {
     #[allow(dead_code)]
     pub subscribed_topic_regex: Option<String>,
     /// Requested server-side assignor, or `None`.
-    #[allow(dead_code)]
     pub server_assignor: Option<String>,
     /// Partitions the member currently owns, or `None` when unchanged.
     #[allow(dead_code)]
@@ -645,39 +650,134 @@ pub(crate) struct ListOffsetsReqTopic {
     pub partitions: Vec<ListOffsetsReqPartition>,
 }
 
-/// ListOffsets request, v5 wire format.
+/// ListOffsets request, v5–v11 wire format.
 ///
-/// Mirrors `ListOffsetsRequest::encode_v4` (which covers v4–v5).
+/// v6 is the first flexible version; v10 adds `timeout_ms`.
 #[derive(Debug, Clone)]
 pub(crate) struct ListOffsetsReq {
+    /// `0` = `read_uncommitted`, `1` = `read_committed`: whether "latest"
+    /// means the high watermark or the last stable offset.
+    pub isolation_level: i8,
     /// Topics being queried.
     pub topics: Vec<ListOffsetsReqTopic>,
 }
 
 impl ListOffsetsReq {
-    pub(crate) fn read(buf: &mut impl Buf) -> Result<Self> {
+    pub(crate) fn read(buf: &mut impl Buf, version: i16) -> Result<Self> {
+        let flexible = version >= 6;
         let _replica_id = i32::decode(buf)?;
-        let _isolation_level = i8::decode(buf)?;
-        let topic_count = read_array_len(buf)?;
+        let isolation_level = i8::decode(buf)?;
+        let topic_count = if flexible {
+            read_compact_array_len(buf)?
+        } else {
+            read_array_len(buf)?
+        };
         let mut topics = Vec::with_capacity(topic_count);
         for _ in 0..topic_count {
-            let name = read_string(buf)?;
-            let partition_count = read_array_len(buf)?;
+            let name = if flexible {
+                read_compact_string(buf)?
+            } else {
+                read_string(buf)?
+            };
+            let partition_count = if flexible {
+                read_compact_array_len(buf)?
+            } else {
+                read_array_len(buf)?
+            };
             let mut partitions = Vec::with_capacity(partition_count);
             for _ in 0..partition_count {
                 let partition_index = i32::decode(buf)?;
                 let current_leader_epoch = i32::decode(buf)?;
                 let timestamp = i64::decode(buf)?;
+                if flexible {
+                    skip_tagged_fields(buf)?;
+                }
                 partitions.push(ListOffsetsReqPartition {
                     partition_index,
                     current_leader_epoch,
                     timestamp,
                 });
             }
+            if flexible {
+                skip_tagged_fields(buf)?;
+            }
             topics.push(ListOffsetsReqTopic { name, partitions });
         }
-        Ok(Self { topics })
+        if version >= 10 {
+            let _timeout_ms = i32::decode(buf)?;
+        }
+        if flexible {
+            skip_tagged_fields(buf)?;
+        }
+        Ok(Self {
+            isolation_level,
+            topics,
+        })
     }
+}
+
+/// One partition of a ListOffsets response.
+#[derive(Debug, Clone)]
+pub(crate) struct ListOffsetsAnswer {
+    pub partition_index: i32,
+    pub error_code: ErrorCode,
+    pub timestamp: i64,
+    pub offset: i64,
+    pub leader_epoch: i32,
+}
+
+impl ListOffsetsAnswer {
+    /// An error answer with no offset.
+    pub(crate) fn error(partition_index: i32, error_code: ErrorCode) -> Self {
+        Self {
+            partition_index,
+            error_code,
+            timestamp: -1,
+            offset: -1,
+            leader_epoch: -1,
+        }
+    }
+}
+
+/// Write a ListOffsets v5–v11 response body.
+pub(crate) fn write_list_offsets_response(
+    out: &mut impl BufMut,
+    version: i16,
+    topics: &[(String, Vec<ListOffsetsAnswer>)],
+) -> Result<()> {
+    let flexible = version >= 6;
+    out.put_i32(0); // throttle_time_ms
+    if flexible {
+        write_compact_array_len(out, topics.len())?;
+    } else {
+        write_array_len(out, topics.len())?;
+    }
+    for (name, partitions) in topics {
+        if flexible {
+            write_compact_string(out, name)?;
+            write_compact_array_len(out, partitions.len())?;
+        } else {
+            write_string(out, name)?;
+            write_array_len(out, partitions.len())?;
+        }
+        for p in partitions {
+            out.put_i32(p.partition_index);
+            write_error(out, p.error_code);
+            out.put_i64(p.timestamp);
+            out.put_i64(p.offset);
+            out.put_i32(p.leader_epoch);
+            if flexible {
+                write_empty_tagged_fields(out)?;
+            }
+        }
+        if flexible {
+            write_empty_tagged_fields(out)?;
+        }
+    }
+    if flexible {
+        write_empty_tagged_fields(out)?;
+    }
+    Ok(())
 }
 
 /// FindCoordinator request, v2 wire format.
@@ -900,14 +1000,16 @@ pub(crate) struct OffsetCommitReqTopic {
     pub partitions: Vec<OffsetCommitReqPartition>,
 }
 
-/// OffsetCommit request, v7 wire format.
+/// OffsetCommit request, v7–v9 wire format.
 ///
-/// Mirrors `OffsetCommitRequest::encode_v7`.
+/// Mirrors `OffsetCommitRequest::encode_v7` and `encode_v8`, which covers v8
+/// (flexible) and v9 (the generation carries the KIP-848 member epoch).
 #[derive(Debug, Clone)]
 pub(crate) struct OffsetCommitReq {
     /// Group whose offsets are being committed.
     pub group_id: String,
-    /// Generation the member believes it is in.
+    /// Generation the member believes it is in; from v9, a KIP-848 member's
+    /// epoch.
     pub generation_id: i32,
     /// Member sending the commit.
     pub member_id: String,
@@ -916,22 +1018,52 @@ pub(crate) struct OffsetCommitReq {
 }
 
 impl OffsetCommitReq {
-    pub(crate) fn read(buf: &mut impl Buf) -> Result<Self> {
-        let group_id = read_string(buf)?;
+    pub(crate) fn read(buf: &mut impl Buf, version: i16) -> Result<Self> {
+        let flexible = version >= 8;
+        let string = |buf: &mut _| {
+            if flexible {
+                read_compact_string(buf)
+            } else {
+                read_string(buf)
+            }
+        };
+        let nullable_string = |buf: &mut _| {
+            if flexible {
+                read_compact_nullable_string(buf)
+            } else {
+                read_nullable_string(buf)
+            }
+        };
+        let array_len = |buf: &mut _| {
+            if flexible {
+                read_compact_array_len(buf)
+            } else {
+                read_array_len(buf)
+            }
+        };
+        let tagged = |buf: &mut _| {
+            if flexible {
+                skip_tagged_fields(buf)
+            } else {
+                Ok(())
+            }
+        };
+        let group_id = string(buf)?;
         let generation_id = i32::decode(buf)?;
-        let member_id = read_string(buf)?;
-        let _group_instance_id = read_nullable_string(buf)?;
-        let topic_count = read_array_len(buf)?;
+        let member_id = string(buf)?;
+        let _group_instance_id = nullable_string(buf)?;
+        let topic_count = array_len(buf)?;
         let mut topics = Vec::with_capacity(topic_count);
         for _ in 0..topic_count {
-            let name = read_string(buf)?;
-            let partition_count = read_array_len(buf)?;
+            let name = string(buf)?;
+            let partition_count = array_len(buf)?;
             let mut partitions = Vec::with_capacity(partition_count);
             for _ in 0..partition_count {
                 let partition_index = i32::decode(buf)?;
                 let committed_offset = i64::decode(buf)?;
                 let committed_leader_epoch = i32::decode(buf)?;
-                let committed_metadata = read_nullable_string(buf)?;
+                let committed_metadata = nullable_string(buf)?;
+                tagged(buf)?;
                 partitions.push(OffsetCommitReqPartition {
                     partition_index,
                     committed_offset,
@@ -939,8 +1071,10 @@ impl OffsetCommitReq {
                     committed_metadata,
                 });
             }
+            tagged(buf)?;
             topics.push(OffsetCommitReqTopic { name, partitions });
         }
+        tagged(buf)?;
         Ok(Self {
             group_id,
             generation_id,
@@ -984,25 +1118,59 @@ impl OffsetFetchReq {
     }
 }
 
-/// InitProducerId request, v1 wire format.
+/// InitProducerId request, v0–v6 wire format.
 ///
-/// Mirrors `InitProducerIdRequest::encode_v0` (which covers v0–v1).
+/// Mirrors `InitProducerIdRequest::encode_versioned`: v2 is the first flexible
+/// version, v3 adds the producer ID and epoch (KIP-360), v6 the two-phase
+/// commit flags (KIP-939).
 #[derive(Debug, Clone)]
 pub(crate) struct InitProducerIdReq {
     /// Transactional ID, or `None` for a plain idempotent producer.
     ///
     /// This is the fencing key: a known transactional ID must get its existing
     /// producer ID back with a **higher** epoch, so the previous incarnation's
-    /// writes are rejected (KIP-360). Discarding it, as this reader used to,
-    /// makes every `InitProducerId` mint a fresh identity and fences nothing.
+    /// writes are rejected (KIP-360).
     pub transactional_id: Option<String>,
+    /// Transaction timeout the producer asks for, in milliseconds.
+    pub transaction_timeout_ms: i32,
+    /// Producer ID the client already holds (v3+), or `-1`.
+    pub producer_id: i64,
+    /// Producer epoch the client already holds (v3+), or `-1`.
+    pub producer_epoch: i16,
+    /// Keep a prepared transaction instead of aborting it (v6+, KIP-939).
+    pub keep_prepared_txn: bool,
 }
 
 impl InitProducerIdReq {
-    pub(crate) fn read(buf: &mut impl Buf) -> Result<Self> {
-        let transactional_id = read_nullable_string(buf)?.filter(|s| !s.is_empty());
-        let _transaction_timeout_ms = i32::decode(buf)?;
-        Ok(Self { transactional_id })
+    pub(crate) fn read(buf: &mut impl Buf, version: i16) -> Result<Self> {
+        let transactional_id = if version >= 2 {
+            read_compact_nullable_string(buf)?
+        } else {
+            read_nullable_string(buf)?
+        }
+        .filter(|s| !s.is_empty());
+        let transaction_timeout_ms = i32::decode(buf)?;
+        let (producer_id, producer_epoch) = if version >= 3 {
+            (i64::decode(buf)?, i16::decode(buf)?)
+        } else {
+            (-1, -1)
+        };
+        let keep_prepared_txn = if version >= 6 {
+            let _enable_2pc = bool::decode(buf)?;
+            bool::decode(buf)?
+        } else {
+            false
+        };
+        if version >= 2 {
+            skip_tagged_fields(buf)?;
+        }
+        Ok(Self {
+            transactional_id,
+            transaction_timeout_ms,
+            producer_id,
+            producer_epoch,
+            keep_prepared_txn,
+        })
     }
 }
 
@@ -1331,6 +1499,97 @@ pub(crate) fn batch_base_offset(batch: &[u8]) -> Option<i64> {
     Some(i64::from_be_bytes(arr))
 }
 
+/// Byte offset of `attributes` within a v2 record batch.
+const BATCH_ATTRIBUTES_POS: usize = 21;
+/// Byte offset of `producer_id` within a v2 record batch.
+const BATCH_PRODUCER_ID_POS: usize = 43;
+/// Byte offset of `producer_epoch` within a v2 record batch.
+const BATCH_PRODUCER_EPOCH_POS: usize = 51;
+/// Byte offset of `base_sequence` within a v2 record batch.
+const BATCH_BASE_SEQUENCE_POS: usize = 53;
+
+/// The producer fields of a v2 record batch header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BatchProducer {
+    /// Producer ID, `-1` for a producer without idempotence.
+    pub producer_id: i64,
+    /// Producer epoch.
+    pub producer_epoch: i16,
+    /// Sequence number of the first record.
+    pub base_sequence: i32,
+    /// Number of records in the batch.
+    pub record_count: i32,
+    /// Whether the transactional attribute bit is set.
+    pub transactional: bool,
+}
+
+/// Read the producer fields of a v2 record batch header.
+pub(crate) fn batch_producer(batch: &[u8]) -> Option<BatchProducer> {
+    if batch.len() < BATCH_HEADER_LEN {
+        return None;
+    }
+    let i16_at = |pos: usize| -> Option<i16> {
+        Some(i16::from_be_bytes(
+            batch.get(pos..pos + 2)?.try_into().ok()?,
+        ))
+    };
+    let i32_at = |pos: usize| -> Option<i32> {
+        Some(i32::from_be_bytes(
+            batch.get(pos..pos + 4)?.try_into().ok()?,
+        ))
+    };
+    let producer_id = i64::from_be_bytes(
+        batch
+            .get(BATCH_PRODUCER_ID_POS..BATCH_PRODUCER_ID_POS + 8)?
+            .try_into()
+            .ok()?,
+    );
+    Some(BatchProducer {
+        producer_id,
+        producer_epoch: i16_at(BATCH_PRODUCER_EPOCH_POS)?,
+        base_sequence: i32_at(BATCH_BASE_SEQUENCE_POS)?,
+        record_count: i32_at(BATCH_RECORDS_COUNT_POS)?,
+        transactional: i16_at(BATCH_ATTRIBUTES_POS)? & 0x10 != 0,
+    })
+}
+
+/// Build a transaction commit or abort marker.
+///
+/// A control batch is a normal v2 record batch with the control bit set and
+/// one record whose key is `(version: i16, type: i16)` — `0` abort, `1`
+/// commit. The client reads the control bit to skip the batch and to clear the
+/// producer from its aborted set, so the marker has to be a *real* batch that
+/// decodes, not a placeholder.
+pub(crate) fn control_batch(committed: bool, producer_id: i64, producer_epoch: i16) -> Bytes {
+    use crate::protocol::{Record, RecordBatch};
+
+    let mut key = BytesMut::with_capacity(4);
+    key.put_i16(0); // control-record format version
+    key.put_i16(if committed { 1 } else { 0 });
+
+    let mut batch = RecordBatch::new();
+    batch.attributes.is_transactional = true;
+    batch.attributes.is_control_batch = true;
+    batch.producer_id = producer_id;
+    batch.producer_epoch = producer_epoch;
+    batch.base_sequence = -1;
+    batch.last_offset_delta = 0;
+    batch.add_record(Record {
+        attributes: 0,
+        timestamp_delta: 0,
+        offset_delta: 0,
+        key: Some(key.freeze()),
+        value: Some(Bytes::new()),
+        headers: Vec::new(),
+    });
+
+    // Encoding a single-record batch with no compression cannot fail; falling
+    // back to an empty marker would silently produce a partition whose
+    // transaction never completes, so the panic-free path returns something
+    // the test will notice instead.
+    batch.encode().unwrap_or_else(|_| Bytes::new())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -1503,10 +1762,19 @@ pub(crate) struct ShareFetchReq {
     pub member_id: Option<String>,
     /// Share session epoch; `-1` closes the session.
     pub share_session_epoch: i32,
+    /// Longest the broker may hold the request waiting for records.
+    pub max_wait_ms: i32,
     /// Maximum records the broker may acquire for this request.
     pub max_records: i32,
+    /// KIP-1206 acquire mode (v2+): `0` batch-optimized, `1` record-limit.
+    pub share_acquire_mode: i8,
+    /// KIP-1222 (v2+): the request carries `RENEW` acknowledgements and
+    /// fetches nothing.
+    pub is_renew_ack: bool,
     /// Requested topic-partitions, with any piggybacked acknowledgements.
     pub topics: Vec<ShareTopicPartitionAcks>,
+    /// Partitions to remove from the share session, as `(topic_id, partition)`.
+    pub forgotten: Vec<([u8; 16], i32)>,
 }
 
 impl ShareFetchReq {
@@ -1514,18 +1782,20 @@ impl ShareFetchReq {
         let group_id = read_compact_nullable_string(buf)?;
         let member_id = read_compact_nullable_string(buf)?;
         let share_session_epoch = i32::decode(buf)?;
-        let _max_wait_ms = i32::decode(buf)?;
+        let max_wait_ms = i32::decode(buf)?;
         let _min_bytes = i32::decode(buf)?;
         let _max_bytes = i32::decode(buf)?;
         let max_records = i32::decode(buf)?;
         let _batch_size = i32::decode(buf)?;
-        if version >= 2 {
-            let _share_acquire_mode = i8::decode(buf)?;
-            let _is_renew_ack = i8::decode(buf)?;
-        }
+        let (share_acquire_mode, is_renew_ack) = if version >= 2 {
+            (i8::decode(buf)?, bool::decode(buf)?)
+        } else {
+            (0, false)
+        };
         let topics = read_share_topics(buf)?;
         // ForgottenTopicsData: topic_id + partition list, no ack batches.
         let forgotten_count = read_compact_array_len(buf)?;
+        let mut forgotten = Vec::new();
         for _ in 0..forgotten_count {
             if buf.remaining() < 16 {
                 return Err(KrafkaError::protocol_kind(
@@ -1533,10 +1803,11 @@ impl ShareFetchReq {
                     "not enough bytes for forgotten topic_id",
                 ));
             }
-            buf.advance(16);
+            let mut topic_id = [0u8; 16];
+            buf.copy_to_slice(&mut topic_id);
             let n = read_compact_array_len(buf)?;
             for _ in 0..n {
-                let _ = i32::decode(buf)?;
+                forgotten.push((topic_id, i32::decode(buf)?));
             }
             skip_tagged_fields(buf)?;
         }
@@ -1545,8 +1816,12 @@ impl ShareFetchReq {
             group_id,
             member_id,
             share_session_epoch,
+            max_wait_ms,
             max_records,
+            share_acquire_mode,
+            is_renew_ack,
             topics,
+            forgotten,
         })
     }
 }
@@ -1570,7 +1845,9 @@ impl ShareAcknowledgeReq {
         let member_id = read_compact_nullable_string(buf)?;
         let share_session_epoch = i32::decode(buf)?;
         if version >= 2 {
-            let _is_renew_ack = i8::decode(buf)?;
+            // IsRenewAck: an optimisation hint; RENEW types are honoured
+            // either way.
+            let _ = bool::decode(buf)?;
         }
         let topics = read_share_topics(buf)?;
         skip_tagged_fields(buf)?;

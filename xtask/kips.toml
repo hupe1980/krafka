@@ -1,0 +1,487 @@
+# The capability registry: every KIP named in published prose, scope
+# exclusions, Cargo feature descriptions, and which DELIBERATE_GAPS entries are
+# version ceilings. `just gen-claims` generates the README and site tables from
+# it; `just claims-check` fails when they drift or the evidence does not
+# resolve. See xtask/claims.py.
+#
+# [[kip]] / [[scope]]: id, title, status (implemented | partial |
+# not-implemented | out-of-scope), evidence, reason (required unless
+# implemented), absent (DELIBERATE_GAPS APIs the KIP needs).
+# Evidence: "api:<Name>@<version>" (an api_versions! row reaching it),
+# "feature:<cargo feature>", "symbol:krafka::<path>" (compiled in
+# tests/kip_evidence.rs).
+
+[[kip]]
+id = "KIP-219"
+title = "Improve quota communication"
+status = "implemented"
+evidence = ["api:Produce@6", "api:Fetch@8"]
+
+[[kip]]
+id = "KIP-227"
+title = "Introduce incremental FetchRequests to increase partition scalability"
+status = "implemented"
+evidence = ["api:Fetch@7"]
+
+[[kip]]
+id = "KIP-255"
+title = "OAuth authentication via SASL/OAUTHBEARER"
+status = "implemented"
+evidence = ["symbol:krafka::auth::OAuthBearerToken", "symbol:krafka::auth::AuthConfig::sasl_oauthbearer_token"]
+
+[[kip]]
+id = "KIP-320"
+title = "Allow fetchers to detect and handle log truncation"
+status = "implemented"
+evidence = ["api:Fetch@9", "api:OffsetForLeaderEpoch@2", "api:ListOffsets@4", "api:OffsetCommit@6", "symbol:krafka::consumer::OffsetAndMetadata", "symbol:krafka::admin::EpochEndOffset"]
+
+[[kip]]
+id = "KIP-345"
+title = "Introduce static membership protocol to reduce consumer rebalances"
+status = "implemented"
+evidence = ["api:JoinGroup@4", "api:Heartbeat@3", "api:LeaveGroup@3"]
+
+[[kip]]
+id = "KIP-360"
+title = "Improve reliability of idempotent/transactional producer"
+status = "implemented"
+evidence = ["api:InitProducerId@3", "symbol:krafka::producer::TransactionalProducer"]
+
+[[kip]]
+id = "KIP-368"
+title = "Allow SASL connections to periodically re-authenticate"
+status = "partial"
+evidence = ["symbol:krafka::auth::AuthConfig"]
+reason = "The broker-reported session lifetime is honoured by replacing a pooled connection before it expires; in-band re-authentication of a live connection is not implemented."
+
+[[kip]]
+id = "KIP-373"
+title = "Allow users to create delegation tokens for other users"
+status = "implemented"
+evidence = ["api:CreateDelegationToken@3", "api:DescribeDelegationToken@3", "symbol:krafka::admin::CreateDelegationTokenOptions::owner", "symbol:krafka::admin::DelegationToken"]
+
+[[kip]]
+id = "KIP-392"
+title = "Allow consumers to fetch from closest replica"
+status = "implemented"
+evidence = ["api:Fetch@11", "api:OffsetForLeaderEpoch@3"]
+
+[[kip]]
+id = "KIP-405"
+title = "Kafka tiered storage"
+status = "implemented"
+evidence = ["api:ListOffsets@8", "symbol:krafka::admin::OffsetSpec::EarliestLocal"]
+reason = "Tiered storage itself is broker-side; the client part is the local log-start offset spec and the OFFSET_MOVED_TO_TIERED_STORAGE error."
+
+[[kip]]
+id = "KIP-429"
+title = "Kafka consumer incremental rebalance protocol"
+status = "implemented"
+evidence = ["symbol:krafka::consumer::PartitionAssignmentStrategy::CooperativeSticky", "symbol:krafka::consumer::ConsumerRebalanceListener"]
+
+[[kip]]
+id = "KIP-447"
+title = "Producer scalability for exactly once semantics"
+status = "implemented"
+evidence = ["api:TxnOffsetCommit@3", "symbol:krafka::producer::TransactionalProducer::send_offsets", "symbol:krafka::consumer::ConsumerGroupMetadata"]
+
+[[kip]]
+id = "KIP-455"
+title = "Create an administrative API for replica reassignment"
+status = "implemented"
+evidence = ["api:AlterPartitionReassignments@0", "api:ListPartitionReassignments@0", "symbol:krafka::admin::AlterPartitionReassignmentsOptions", "symbol:krafka::admin::PartitionReassignment"]
+
+[[kip]]
+id = "KIP-460"
+title = "Admin leader election RPC"
+status = "implemented"
+evidence = ["api:ElectLeaders@1", "symbol:krafka::admin::ElectionType"]
+
+[[kip]]
+id = "KIP-464"
+title = "Defaults for AdminClient#createTopic"
+status = "implemented"
+evidence = ["api:CreateTopics@4", "symbol:krafka::admin::NewTopic"]
+
+[[kip]]
+id = "KIP-511"
+title = "Collect and expose client's name and version in the brokers"
+status = "implemented"
+evidence = ["api:ApiVersions@3"]
+
+[[kip]]
+id = "KIP-512"
+title = "Make record headers available in onAcknowledgement"
+status = "implemented"
+evidence = ["symbol:krafka::interceptor::ProducerInterceptor"]
+
+[[kip]]
+id = "KIP-516"
+title = "Topic identifiers"
+status = "implemented"
+evidence = ["api:Metadata@10", "api:Fetch@13", "api:Produce@13", "api:DeleteTopics@6"]
+
+[[kip]]
+id = "KIP-518"
+title = "Allow listing consumer groups per state"
+status = "implemented"
+evidence = ["api:ListGroups@4", "symbol:krafka::admin::ListConsumerGroupsOptions::states"]
+
+[[kip]]
+id = "KIP-525"
+title = "Return topic metadata and configs in CreateTopics response"
+status = "partial"
+evidence = ["api:CreateTopics@5"]
+reason = "CreateTopics v5+ is negotiated, but create_topics returns only per-topic success, so the partition count, replication factor and configs in the response are not surfaced."
+
+[[kip]]
+id = "KIP-554"
+title = "Add broker-side SCRAM config API"
+status = "implemented"
+evidence = ["api:DescribeUserScramCredentials@0", "api:AlterUserScramCredentials@0", "symbol:krafka::admin::ScramCredentialInfo", "symbol:krafka::admin::ScramCredentialUpsertion"]
+
+[[kip]]
+id = "KIP-559"
+title = "Make the Kafka protocol friendlier with L7 proxies"
+status = "implemented"
+evidence = ["api:JoinGroup@7", "api:SyncGroup@5"]
+
+[[kip]]
+id = "KIP-584"
+title = "Versioning scheme for features"
+status = "implemented"
+evidence = ["api:ApiVersions@3", "api:UpdateFeatures@1", "symbol:krafka::admin::FeatureMetadata", "symbol:krafka::admin::UpdateFeaturesOptions"]
+
+[[kip]]
+id = "KIP-599"
+title = "Throttle create topic, create partition and delete topic operations"
+status = "implemented"
+evidence = ["api:CreateTopics@6", "api:CreatePartitions@3", "api:DeleteTopics@5"]
+
+[[kip]]
+id = "KIP-664"
+title = "Provide tooling to detect and abort hanging transactions"
+status = "implemented"
+evidence = ["api:DescribeProducers@0", "api:DescribeTransactions@0", "api:ListTransactions@0", "api:WriteTxnMarkers@1", "symbol:krafka::admin::ProducerState", "symbol:krafka::admin::TransactionDescription", "symbol:krafka::admin::TransactionListing", "symbol:krafka::admin::AbortTransactionOptions"]
+
+[[kip]]
+id = "KIP-679"
+title = "Producer will enable the strongest delivery guarantee by default"
+status = "implemented"
+evidence = ["symbol:krafka::producer::ProducerBuilder::idempotent"]
+
+[[kip]]
+id = "KIP-699"
+title = "Update FindCoordinator to resolve multiple coordinators at a time"
+status = "implemented"
+evidence = ["api:FindCoordinator@4"]
+
+[[kip]]
+id = "KIP-714"
+title = "Client metrics and observability"
+status = "implemented"
+evidence = ["api:GetTelemetrySubscriptions@0", "api:PushTelemetry@0", "api:ListConfigResources@0", "symbol:krafka::producer::ProducerBuilder::metrics_push", "symbol:krafka::consumer::Consumer::client_instance_id"]
+
+[[kip]]
+id = "KIP-734"
+title = "Improve AdminClient.listOffsets to return timestamp and offset for the record with the largest timestamp"
+status = "implemented"
+evidence = ["api:ListOffsets@7", "symbol:krafka::admin::OffsetSpec::MaxTimestamp"]
+
+[[kip]]
+id = "KIP-768"
+title = "Extend SASL/OAUTHBEARER with support for OIDC"
+status = "implemented"
+evidence = ["feature:oauth-oidc", "symbol:krafka::auth::OidcTokenProvider", "symbol:krafka::auth::ClientCredentials::Secret"]
+
+[[kip]]
+id = "KIP-794"
+title = "Strictly uniform sticky partitioner"
+status = "partial"
+evidence = ["symbol:krafka::producer::ProducerBuilder::batch_size"]
+reason = "Keyless records stick to a partition for batch_size bytes and then switch at random, but the next partition is not weighted by per-broker queue size (partitioner.adaptive.partitioning.enable) and slow brokers are not avoided (partitioner.availability.timeout.ms)."
+
+[[kip]]
+id = "KIP-800"
+title = "Add reason to JoinGroupRequest and LeaveGroupRequest"
+status = "partial"
+evidence = ["api:JoinGroup@8", "api:LeaveGroup@5"]
+reason = "JoinGroup v8 and LeaveGroup v5 are negotiated, but the reason field is always sent as null."
+
+[[kip]]
+id = "KIP-836"
+title = "Expose replication information of the cluster metadata"
+status = "implemented"
+evidence = ["api:DescribeQuorum@1", "symbol:krafka::admin::QuorumReplica"]
+
+[[kip]]
+id = "KIP-848"
+title = "The next generation of the consumer rebalance protocol"
+status = "implemented"
+evidence = ["api:ConsumerGroupHeartbeat@0", "api:ConsumerGroupDescribe@0", "api:OffsetCommit@9", "symbol:krafka::consumer::GroupProtocol::Consumer", "symbol:krafka::admin::ConsumerGroupDescription"]
+
+[[kip]]
+id = "KIP-853"
+title = "KRaft controller membership changes"
+status = "partial"
+evidence = ["api:DescribeQuorum@2", "api:Fetch@17", "symbol:krafka::admin::QuorumNode"]
+reason = "Quorum membership can be described, but the AddRaftVoter and RemoveRaftVoter admin RPCs are not implemented."
+absent = ["AddRaftVoter", "RemoveRaftVoter"]
+
+[[kip]]
+id = "KIP-890"
+title = "Transactions server-side defense"
+status = "implemented"
+evidence = ["api:Produce@12", "api:EndTxn@5", "api:InitProducerId@5", "api:AddOffsetsToTxn@4", "api:TxnOffsetCommit@5", "symbol:krafka::producer::TransactionVersion"]
+
+[[kip]]
+id = "KIP-899"
+title = "Allow producer and consumer clients to rebootstrap"
+status = "implemented"
+evidence = ["symbol:krafka::MetadataRecoveryStrategy", "symbol:krafka::Kafka::rebootstrap", "symbol:krafka::KafkaBuilder::metadata_recovery_strategy"]
+
+[[kip]]
+id = "KIP-903"
+title = "Replicas with stale broker epoch should not be allowed to join the ISR"
+status = "implemented"
+evidence = ["api:Fetch@15"]
+reason = "Broker-side change; the client only negotiates Fetch v15, which moves ReplicaId into ReplicaState."
+
+[[kip]]
+id = "KIP-932"
+title = "Queues for Kafka"
+status = "partial"
+evidence = ["api:ShareGroupHeartbeat@1", "api:ShareFetch@1", "api:ShareAcknowledge@1", "api:FindCoordinator@6", "api:DescribeShareGroupOffsets@0", "api:AlterShareGroupOffsets@0", "api:DeleteShareGroupOffsets@0", "symbol:krafka::share_consumer::ShareConsumer", "symbol:krafka::admin::SharePartitionOffset"]
+reason = "The share consumer and share-group offset administration are implemented, but ShareGroupDescribe is never sent, so no admin call describes or lists share groups' members."
+
+[[kip]]
+id = "KIP-939"
+title = "Support participation in 2PC"
+status = "implemented"
+evidence = ["api:InitProducerId@6", "feature:unstable-protocol", "symbol:krafka::producer::ProducerBuilder::two_phase_commit", "symbol:krafka::producer::TransactionalProducer::prepare", "symbol:krafka::producer::TransactionalProducer::complete", "symbol:krafka::producer::PreparedTxnState"]
+
+[[kip]]
+id = "KIP-951"
+title = "Leader discovery optimisations for the client"
+status = "implemented"
+evidence = ["api:Fetch@16", "api:Produce@10"]
+
+[[kip]]
+id = "KIP-966"
+title = "Eligible leader replicas"
+status = "implemented"
+evidence = ["api:DescribeTopicPartitions@0", "symbol:krafka::admin::PartitionDescription"]
+
+[[kip]]
+id = "KIP-994"
+title = "Minor enhancements to ListTransactions and DescribeTransactions APIs"
+status = "implemented"
+evidence = ["api:ListTransactions@1", "symbol:krafka::admin::ListTransactionsOptions::min_duration"]
+
+[[kip]]
+id = "KIP-1005"
+title = "Expose EarliestLocalOffset and TieredOffset"
+status = "implemented"
+evidence = ["api:ListOffsets@9", "symbol:krafka::admin::OffsetSpec::LatestTiered"]
+
+[[kip]]
+id = "KIP-1023"
+title = "Follower fetch from tiered offset"
+status = "implemented"
+evidence = ["api:ListOffsets@11", "symbol:krafka::admin::OffsetSpec::EarliestPendingUpload"]
+
+[[kip]]
+id = "KIP-1030"
+title = "Change constraints and default values for various configurations"
+status = "implemented"
+evidence = ["symbol:krafka::producer::ProducerBuilder::linger"]
+
+[[kip]]
+id = "KIP-1043"
+title = "Administration of groups"
+status = "implemented"
+evidence = ["api:DescribeGroups@6", "api:ListGroups@5", "symbol:krafka::admin::GroupType", "symbol:krafka::admin::ListConsumerGroupsOptions::types"]
+
+[[kip]]
+id = "KIP-1066"
+title = "Mechanism to cordon brokers and log directories"
+status = "implemented"
+evidence = ["api:DescribeLogDirs@5", "symbol:krafka::admin::LogDirDescription"]
+
+[[kip]]
+id = "KIP-1071"
+title = "Streams rebalance protocol"
+status = "partial"
+evidence = ["api:StreamsGroupDescribe@0", "symbol:krafka::admin::DescribedStreamsGroup", "symbol:krafka::admin::DescribeStreamsGroupsOptions"]
+reason = "Streams groups can be described, but StreamsGroupHeartbeat is not implemented because its request carries an application topology that only a Streams runtime can supply."
+absent = ["StreamsGroupHeartbeat"]
+
+[[kip]]
+id = "KIP-1075"
+title = "Introduce delayed remote list offsets purgatory to make LIST_OFFSETS async"
+status = "implemented"
+evidence = ["api:ListOffsets@10"]
+
+[[kip]]
+id = "KIP-1082"
+title = "Require client-generated IDs over the ConsumerGroupHeartbeat RPC"
+status = "implemented"
+evidence = ["api:ConsumerGroupHeartbeat@1"]
+
+[[kip]]
+id = "KIP-1092"
+title = "Extend Consumer#close with an option to leave the group or not"
+status = "implemented"
+evidence = ["symbol:krafka::GroupMembershipOperation::RemainInGroup", "symbol:krafka::CloseOptions::group_membership_operation"]
+
+[[kip]]
+id = "KIP-1102"
+title = "Enable clients to rebootstrap based on timeout or error code"
+status = "implemented"
+evidence = ["api:Metadata@13", "symbol:krafka::KafkaBuilder::metadata_recovery_rebootstrap_trigger"]
+
+[[kip]]
+id = "KIP-1106"
+title = "Add duration based offset reset option for consumer clients"
+status = "implemented"
+evidence = ["symbol:krafka::consumer::AutoOffsetReset::ByDuration"]
+
+[[kip]]
+id = "KIP-1123"
+title = "Rack-aware partitioning for Kafka producer"
+status = "implemented"
+evidence = ["symbol:krafka::producer::ProducerBuilder::partitioner_rack_aware"]
+
+[[kip]]
+id = "KIP-1142"
+title = "Allow to list non-existent group which has dynamic config"
+status = "implemented"
+evidence = ["api:ListConfigResources@1", "symbol:krafka::admin::ListedConfigResource", "symbol:krafka::admin::ListConfigResourcesOptions"]
+
+[[kip]]
+id = "KIP-1152"
+title = "Add transactional ID pattern filter to ListTransactions API"
+status = "implemented"
+evidence = ["api:ListTransactions@2", "symbol:krafka::admin::ListTransactionsOptions::transactional_id_pattern"]
+
+[[kip]]
+id = "KIP-1160"
+title = "Enable returning supported features from a specific broker"
+status = "implemented"
+evidence = ["symbol:krafka::admin::DescribeFeaturesOptions::node_id"]
+
+[[kip]]
+id = "KIP-1166"
+title = "Improve high-watermark replication"
+status = "implemented"
+evidence = ["api:Fetch@18"]
+reason = "The new field is populated only by follower fetches; the client negotiates Fetch v18."
+
+[[kip]]
+id = "KIP-1206"
+title = "Strict max fetch records in share fetch"
+status = "implemented"
+evidence = ["api:ShareFetch@2", "symbol:krafka::share_consumer::AcquireMode::RecordLimit", "symbol:krafka::share_consumer::ShareConsumerBuilder::acquire_mode"]
+
+[[kip]]
+id = "KIP-1222"
+title = "Acquisition lock timeout renewal in share consumer explicit mode"
+status = "implemented"
+evidence = ["api:ShareFetch@2", "api:ShareAcknowledge@2", "symbol:krafka::share_consumer::ShareConsumer::renew", "symbol:krafka::share_consumer::ShareConsumer::acquisition_lock_timeout"]
+
+[[kip]]
+id = "KIP-1226"
+title = "Share partition lag persistence and retrieval"
+status = "implemented"
+evidence = ["api:DescribeShareGroupOffsets@1", "symbol:krafka::admin::SharePartitionOffset"]
+
+[[kip]]
+id = "KIP-1242"
+title = "Detection and handling of misrouted connections"
+status = "partial"
+evidence = ["api:ApiVersions@5", "feature:unstable-protocol"]
+reason = "ApiVersions v5 is encoded behind unstable-protocol, but the ClusterId and NodeId fields are never populated and REBOOTSTRAP_REQUIRED from ApiVersions does not trigger a rebootstrap."
+
+[[kip]]
+id = "KIP-1258"
+title = "Add support for OAuth client assertion to client_credentials grant type"
+status = "implemented"
+evidence = ["feature:oauth-oidc", "symbol:krafka::auth::AssertionSource", "symbol:krafka::auth::ClientCredentials::Assertion"]
+
+[[kip]]
+id = "KIP-1274"
+title = "Deprecate and remove support for the classic rebalance protocol in KafkaConsumer"
+status = "implemented"
+evidence = ["symbol:krafka::consumer::GroupProtocol::Classic", "symbol:krafka::consumer::GroupProtocol::Consumer"]
+reason = "As of Kafka 4.3 the client part is a deprecation warning when the classic protocol is used, which krafka emits once per process."
+
+[[kip]]
+id = "KIP-1288"
+title = "SSL certificate hot reload"
+status = "implemented"
+evidence = ["symbol:krafka::Kafka::refresh_tls", "symbol:krafka::KafkaBuilder::tls_reload_interval"]
+
+[[scope]]
+id = "GSSAPI"
+title = "SASL/GSSAPI (Kerberos) authentication"
+status = "out-of-scope"
+reason = "No mature pure-Rust GSSAPI implementation exists, and linking system Kerberos libraries would add a C dependency for every user."
+
+[[scope]]
+id = "schema-registry"
+title = "Schema registry client"
+status = "out-of-scope"
+reason = "A schema registry is a separate service with its own protocol; krafka provides the serdes::Serializer and Deserializer hooks instead."
+
+[[scope]]
+id = "runtime-agnostic"
+title = "Async runtimes other than Tokio"
+status = "out-of-scope"
+reason = "krafka is built on Tokio and does not abstract over the async runtime."
+
+[[scope]]
+id = "streams-runtime"
+title = "Kafka Streams runtime"
+status = "out-of-scope"
+reason = "krafka is a client library with no stream-processing runtime, which is also why StreamsGroupHeartbeat is not implemented."
+
+[[scope]]
+id = "broker-internal-apis"
+title = "Broker-, controller- and KRaft-internal APIs"
+status = "out-of-scope"
+reason = "APIs such as LeaderAndIsr, UpdateMetadata, Vote and the share-group state persister are spoken between brokers, not by clients."
+
+# APIs in DELIBERATE_GAPS that krafka implements below Kafka's ceiling; their
+# reasons live in DELIBERATE_GAPS.
+[gaps]
+ceiling = ["AlterConfigs", "SaslHandshake", "SaslAuthenticate"]
+
+[feature.ring]
+description = "rustls crypto backend using `ring`."
+
+[feature.rustls-aws-lc-rs]
+description = "rustls crypto backend using `aws-lc-rs`; offers post-quantum X25519MLKEM768 key exchange first. Compiles C and needs CMake (`aws-lc-sys`)."
+
+[feature.zstd]
+description = "Zstd compression on the producer via `zstd`, which compiles C (`zstd-sys`). Zstd decompression is pure Rust and always on."
+
+[feature.aws-msk]
+description = "AWS MSK IAM authentication with the SDK credential chain; compiles C and needs CMake (`aws-lc-sys`)."
+
+[feature.oauth-oidc]
+description = "Built-in OIDC token provider for SASL/OAUTHBEARER: the `client_credentials` grant (KIP-768) and RFC 7523 client assertions (KIP-1258). Adds no cryptography dependency."
+
+[feature.native-tls-roots]
+description = "Load platform-native root certificates via `rustls-native-certs`."
+
+[feature.tls-encrypted-keys]
+description = "Passphrase-encrypted PKCS#8 client keys (`ssl.key.password`) via the RustCrypto `pkcs8` crate."
+
+[feature.unstable-protocol]
+description = "Protocol versions Kafka marks `latestVersionUnstable`; a released broker advertises them only with `unstable.api.versions.enable=true`. No semver promise."
+
+[feature.test-broker]
+description = "In-process fake Kafka broker (`krafka::testing`) for testing your own code against a real client. Not for production builds; no semver promise."
+
+[feature.internal]
+description = "Tooling only: exposes `krafka::__private` to krafka's own benches and fuzz targets. Not a user feature; no semver promise."

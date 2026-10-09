@@ -1,0 +1,11 @@
+# `clippy::large_futures` (denied in Cargo.toml) fails any `.await` on a
+# future larger than this. Set just above the largest library future,
+# measured 2026-10-09 with rustc 1.99.0, all features, dev profile:
+#
+#   13 960 B  the connection future awaited in `network/pool.rs`
+#    2 024 B  `Consumer::poll`   (release: 2 024 B)
+#    2 016 B  `Consumer::recv`   (release: 2 016 B)
+#    1 808 B  `Producer::send`   (release: 1 808 B)
+#
+# Raising it is a reviewed change to this line, with a new measurement.
+future-size-threshold = 14336

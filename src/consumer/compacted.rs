@@ -10,15 +10,11 @@
 //! assigned:
 //!
 //! ```rust,ignore
-//! use krafka::consumer::{Consumer, CompactedTable};
+//! use krafka::consumer::CompactedTable;
 //! use std::time::Duration;
 //!
-//! let consumer = Consumer::builder()
-//!     .bootstrap_servers("localhost:9092")
-//!     .group_id("my-group")
-//!     .build()
-//!     .await?;
-//! consumer.subscribe(&["user-profiles"]).await?;
+//! let consumer = kafka.consumer("my-group").build().await?;
+//! consumer.subscribe(["user-profiles"]).await?;
 //!
 //! let mut table = CompactedTable::new();
 //! loop {
@@ -35,11 +31,11 @@
 //! [`CompactedTable`] together with built-in caught-up detection:
 //!
 //! ```rust,ignore
-//! use krafka::consumer::{CompactedTopicConsumer, Consumer};
+//! use krafka::consumer::CompactedTopicConsumer;
 //! use std::time::Duration;
 //!
 //! let mut ctc = CompactedTopicConsumer::from_consumer_builder(
-//!     Consumer::builder().bootstrap_servers("localhost:9092"),
+//!     kafka.consumer_without_group(),
 //!     "user-profiles",
 //! )
 //! .await?;
@@ -224,22 +220,21 @@ impl PartitionRewinder for Consumer {
 /// ```rust,ignore
 /// use std::sync::Arc;
 /// use tokio::sync::Mutex;
-/// use krafka::consumer::{Consumer, CompactedTable, CompactedTableClearListener};
+/// use krafka::consumer::{CompactedTable, CompactedTableClearListener};
 ///
 /// let table = Arc::new(Mutex::new(CompactedTable::new()));
 /// let listener = CompactedTableClearListener::new(Arc::clone(&table));
 ///
 /// let consumer = Arc::new(
-///     Consumer::builder()
-///         .bootstrap_servers("localhost:9092")
-///         .group_id("my-group")
+///     kafka
+///         .consumer("my-group")
 ///         .rebalance_listener(listener.clone())
 ///         .build()
 ///         .await?,
 /// );
 /// // Lets the listener seek newly assigned partitions to the beginning.
 /// listener.attach_consumer(Arc::clone(&consumer));
-/// consumer.subscribe(&["config-topic"]).await?;
+/// consumer.subscribe(["config-topic"]).await?;
 ///
 /// loop {
 ///     let records = consumer.poll(Duration::from_secs(1)).await?;
@@ -388,12 +383,8 @@ impl ConsumerRebalanceListener for CompactedTableClearListener {
 /// **any** consumer setup — group, standalone, or manual assignment:
 ///
 /// ```rust,ignore
-/// let consumer = Consumer::builder()
-///     .bootstrap_servers("localhost:9092")
-///     .group_id("my-group")
-///     .build()
-///     .await?;
-/// consumer.subscribe(&["config-topic"]).await?;
+/// let consumer = kafka.consumer("my-group").build().await?;
+/// consumer.subscribe(["config-topic"]).await?;
 ///
 /// let mut table = CompactedTable::new();
 /// loop {
@@ -532,8 +523,11 @@ impl CompactedTable {
     /// Returns all entries including provenance metadata. Use
     /// [`Clone::clone()`] if you need a full copy including counters.
     #[must_use]
-    pub fn snapshot(&self) -> HashMap<Bytes, CompactedEntry> {
-        self.entries.clone()
+    pub fn snapshot(&self) -> std::collections::HashMap<Bytes, CompactedEntry> {
+        self.entries
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 
     /// Total records processed (including tombstones and keyless records).
@@ -785,7 +779,9 @@ trait ScanSource: Sync {
     fn end_offsets(
         &self,
         topic: &str,
-    ) -> impl std::future::Future<Output = Result<HashMap<PartitionId, Result<Offset>>>> + Send;
+    ) -> impl std::future::Future<
+        Output = Result<std::collections::HashMap<PartitionId, Result<Offset>>>,
+    > + Send;
 }
 
 impl ScanSource for Consumer {
@@ -805,7 +801,10 @@ impl ScanSource for Consumer {
         self.position(topic, partition).await
     }
 
-    async fn end_offsets(&self, topic: &str) -> Result<HashMap<PartitionId, Result<Offset>>> {
+    async fn end_offsets(
+        &self,
+        topic: &str,
+    ) -> Result<std::collections::HashMap<PartitionId, Result<Offset>>> {
         self.offsets_for_times_for_topic(topic, -1).await
     }
 }
@@ -918,7 +917,7 @@ async fn run_scan<S: ScanSource>(
     // Fail fast if no partitions are assigned — avoids a scan that can only
     // ever time out (especially when using from_consumer() without assign()).
     if source.assigned_partitions(topic).await.is_empty() {
-        return Err(KrafkaError::invalid_state(format!(
+        return Err(KrafkaError::illegal_state(format!(
             "no partitions assigned for topic '{topic}'; \
              assign partitions before calling scan()"
         )));
@@ -937,11 +936,7 @@ async fn run_scan<S: ScanSource>(
     let mut scan_target_hwms: HashMap<PartitionId, Offset> =
         HashMap::with_capacity(hwm_results.len());
     for (partition, result) in hwm_results {
-        let offset = result.map_err(|e| {
-            KrafkaError::invalid_state(format!(
-                "failed to fetch high-watermark for '{topic}' partition {partition}: {e}"
-            ))
-        })?;
+        let offset = result?;
         scan_target_hwms.insert(partition, offset);
     }
 
@@ -962,12 +957,12 @@ async fn run_scan<S: ScanSource>(
         "Starting compacted topic scan (HWM snapshot taken)"
     );
 
-    let deadline = std::time::Instant::now() + timeout;
+    let deadline = tokio::time::Instant::now() + timeout;
 
     loop {
         let mut records = source.poll_records(poll_timeout).await?;
         let before_len = records.len();
-        records.retain(|r| r.topic == topic);
+        records.retain(|r| *r.topic == *topic);
         let filtered = before_len - records.len();
         if filtered > 0 {
             debug!("Filtered out {filtered} record(s) from other topics during scan for '{topic}'");
@@ -990,7 +985,7 @@ async fn run_scan<S: ScanSource>(
         // A partition can stall indefinitely (no leader, offsets that never
         // resolve), so the loop is bounded by wall-clock time rather than
         // trusting every partition to eventually converge.
-        if std::time::Instant::now() >= deadline {
+        if tokio::time::Instant::now() >= deadline {
             return Err(scan_timeout_error(topic, timeout, &lagging));
         }
     }
@@ -1014,11 +1009,11 @@ async fn run_scan<S: ScanSource>(
 /// # Example
 ///
 /// ```rust,ignore
-/// use krafka::consumer::{CompactedTopicConsumer, Consumer};
+/// use krafka::consumer::CompactedTopicConsumer;
 /// use std::time::Duration;
 ///
 /// let mut ctc = CompactedTopicConsumer::from_consumer_builder(
-///     Consumer::builder().bootstrap_servers("localhost:9092"),
+///     kafka.consumer_without_group(),
 ///     "user-profiles",
 /// )
 /// .await?;
@@ -1217,7 +1212,7 @@ impl CompactedTopicConsumer {
     pub async fn poll(&mut self, timeout: Duration) -> Result<Vec<TableChange>> {
         let mut records = self.consumer.poll(timeout).await?;
         let before_len = records.len();
-        records.retain(|r| r.topic == self.topic);
+        records.retain(|r| *r.topic == *self.topic);
         let filtered = before_len - records.len();
         if filtered > 0 {
             debug!(
@@ -1307,10 +1302,7 @@ impl CompactedTopicConsumer {
 
         for &partition in partitions {
             let position = self.consumer.position(&self.topic, partition).await;
-            let high_watermark = self
-                .consumer
-                .cached_end_offset(&self.topic, partition)
-                .await;
+            let high_watermark = self.consumer.cached_end_offset(&self.topic, partition);
 
             match (position, high_watermark) {
                 // Position at or past the high watermark — caught up.
@@ -1330,24 +1322,8 @@ impl CompactedTopicConsumer {
     /// Build from a configured [`ConsumerBuilder`], discovering and assigning
     /// every partition of `topic`.
     ///
-    /// This replaces the curated `CompactedTopicConsumerBuilder` that used to
-    /// live here. That builder owned a hand-picked subset of the consumer's
-    /// settings — nine of them — and every setting it omitted was unreachable
-    /// through it. Two of the omissions mattered:
-    ///
-    /// - **`isolation_level`.** The type most likely to be pointed at
-    ///   transactional data was the one whose builder could not ask for
-    ///   `read_committed`, so a table could be materialised from records that
-    ///   were later aborted — wrong in a way the caller cannot see. This
-    ///   constructor sets `ReadCommitted` (see below).
-    /// - **`connect_timeout`.** `build()` rejects `request_timeout <
-    ///   connect_timeout`, so a caller wanting a tight request budget was
-    ///   refused with an error naming a value the builder gave them no way to
-    ///   change.
-    ///
-    /// Taking the real `ConsumerBuilder` removes the whole class: everything a
-    /// consumer can be configured with is available, and nothing has to be
-    /// mirrored here as the consumer grows settings.
+    /// Every consumer setting is available through the builder; the three
+    /// below are overridden.
     ///
     /// # Settings this constructor imposes
     ///
@@ -1372,18 +1348,16 @@ impl CompactedTopicConsumer {
     /// # Example
     ///
     /// ```rust,no_run
-    /// use krafka::consumer::{CompactedTopicConsumer, Consumer};
+    /// use krafka::Kafka;
+    /// use krafka::consumer::CompactedTopicConsumer;
     /// use std::time::Duration;
     ///
     /// # async fn example() -> Result<(), krafka::error::KrafkaError> {
+    /// let kafka = Kafka::builder("localhost:9092").connect().await?;
     /// let compacted = CompactedTopicConsumer::from_consumer_builder(
-    ///     Consumer::builder()
-    ///         .bootstrap_servers("localhost:9092")
-    ///         .client_id("state-reader")
-    ///         // The whole consumer surface is available here, including the
-    ///         // settings the old builder could not express.
-    ///         .connect_timeout(Duration::from_secs(2))
-    ///         .request_timeout(Duration::from_secs(5)),
+    ///     kafka
+    ///         .consumer_without_group()
+    ///         .fetch_max_wait(Duration::from_millis(100)),
     ///     "state-topic",
     /// )
     /// .await?;
@@ -1455,14 +1429,14 @@ mod tests {
         offset: Offset,
     ) -> ConsumerRecord {
         ConsumerRecord {
-            topic: "test-topic".to_string(),
+            topic: "test-topic".into(),
             partition,
             offset,
             timestamp: offset * 1000,
-            timestamp_type: 0,
+            timestamp_type: crate::consumer::TimestampType::CreateTime,
             key: key.map(|k| Bytes::from(k.to_string())),
             value: value.map(|v| Bytes::from(v.to_string())),
-            headers: Vec::new(),
+            headers: crate::Headers::new(),
             leader_epoch: None,
             delivery_count: None,
         }
@@ -1908,16 +1882,19 @@ mod tests {
         assert_send_sync::<CompactedTopicConsumer>();
     }
 
-    /// Required-field validation now comes from `ConsumerBuilder` itself
-    /// rather than being duplicated by a second builder, which is the point of
-    /// taking one.
+    /// Validation comes from `ConsumerBuilder` itself.
     #[tokio::test]
     async fn from_consumer_builder_inherits_consumer_validation() {
-        let result =
-            CompactedTopicConsumer::from_consumer_builder(Consumer::builder(), "test").await;
-        let err = result.expect_err("a builder with no brokers cannot build");
+        let result = CompactedTopicConsumer::from_consumer_builder(
+            crate::Kafka::detached()
+                .consumer_without_group()
+                .max_poll_records(0),
+            "test",
+        )
+        .await;
+        let err = result.expect_err("an invalid builder cannot build");
         assert!(
-            err.to_string().contains("bootstrap_servers"),
+            err.to_string().contains("max_poll_records"),
             "expected the consumer's own validation, got: {err}"
         );
     }
@@ -2141,7 +2118,10 @@ mod tests {
             self.positions.lock().unwrap().get(&partition).copied()
         }
 
-        async fn end_offsets(&self, _topic: &str) -> Result<HashMap<PartitionId, Result<Offset>>> {
+        async fn end_offsets(
+            &self,
+            _topic: &str,
+        ) -> Result<std::collections::HashMap<PartitionId, Result<Offset>>> {
             Ok(self.end_offsets.iter().map(|(&p, &o)| (p, Ok(o))).collect())
         }
     }

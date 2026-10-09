@@ -1,0 +1,12 @@
+diff -ruN a/src/producer/transaction.rs b/src/producer/transaction.rs
+--- a/src/producer/transaction.rs
++++ b/src/producer/transaction.rs
+@@ -647,7 +647,7 @@
+ 
+ impl Drop for PendingAddGuard {
+     fn drop(&mut self) {
+-        if !self.defused {
++        if false {
+             // Best-effort cancel: we can't await the lock in drop, so first
+             // try a non-blocking write. If the lock is contended and a Tokio
+             // runtime is available, spawn a task to perform the cancel.

@@ -5,11 +5,113 @@ All notable changes to krafka are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning is [Semantic Versioning](https://semver.org/spec/v2.0.0.html); while
 the crate is pre-1.0, a **minor** bump may carry breaking changes and the
-`Breaking` section of each release lists them exhaustively.
+`Breaking` section of each release lists them.
 
 Entries before 0.17.0 were reconstructed from the release history and the
 `Upgrading` sections that previously lived in `README.md`. They are summaries,
 not a complete record.
+
+## [Unreleased]
+
+## [0.27.0] — 2026-10-09
+
+Every client is built from one `Kafka` handle. The [upgrading guide](https://hupe1980.github.io/krafka/docs/upgrading/) maps each changed or removed name.
+
+### Breaking
+
+- Clients come from `Kafka::builder(bootstrap)….connect()`: `kafka.producer()`, `consumer(group)`, `consumer_without_group()`, `share_consumer(group)`, `admin()`; connection settings, `refresh_tls`, `update_seed_brokers` and `rebootstrap` are on `Kafka`/`KafkaBuilder` only.
+- Every client's `close()` returns `Result<()>`; `close_with(CloseOptions)` bounds it.
+- Interceptors, partitioners, listeners and deserializers are passed by value (`impl Trait`).
+- `protocol`, `network` and `metadata` are private; their public types are re-exported at the crate root.
+- Cargo features: `ring` (default), `rustls-aws-lc-rs`, `zstd`, `aws-msk`, `oauth-oidc`, `tls-encrypted-keys`, `native-tls-roots`, `unstable-protocol`, `test-broker`; gzip, Snappy, LZ4, share consumer, SOCKS5 and telemetry are always on.
+- Timers and deadlines use `tokio::time::Instant`.
+- `KrafkaError`: new `Closed`, `Wakeup`, `Fenced`, `TransactionAbortable`, `NoOffset`, `UnknownTopic`, `DeliveryTimeout { possibly_written }`, `OutOfOrderSequence`, `IllegalState`, `is_fatal()`, `requires_abort()`; `InvalidState` and `Http` removed.
+- A TLS handshake reset or EOF and reaching `max_connections` are retriable `Network` errors.
+- Producer: `send(Record)`/`enqueue(Record)`; `ProducerRecord` is `Record`; `retries` removed (bounded by `delivery_timeout`); `delivery_timeout < linger + request_timeout` is rejected; `buffer_memory(0)` is rejected.
+- Producer `linger` defaults to 5 ms (KIP-1030).
+- Partitioning matches Java's (murmur2 keys, sticky keyless batches, KIP-794); the built-in partitioner types are removed; an out-of-range custom partition fails the send.
+- `TransactionalProducer` comes from `build_transactional(id)` with `begin`/`send`/`enqueue`/`send_offsets`/`commit`/`abort`/`prepare`/`complete`.
+- A transaction with any failed send refuses to commit with `TransactionAbortable`; `abort` fails buffered records.
+- `serdes::Serializer<T>` and `Deserializer` are synchronous; `TypedProducer<K, V>` replaces `key_serializer`/`value_serializer`.
+- `ProducerInterceptor::on_acknowledgement` takes `Result<&RecordMetadata, &KrafkaError>`; `TransactionState` variants changed.
+- One header type, `krafka::Headers`, everywhere.
+- Consumer position advances only when records are returned; committing never moves it.
+- `Consumer::recv` returns `Result<Option<_>>`; `commit()` commits positions, `commit_offsets` takes any iterator of pairs; `lag()` returns `HashMap<TopicPartition, PartitionLag>`.
+- Public signatures use `std::collections` instead of `ahash` types; `seek_many` and `initial_offsets` are keyed by `TopicPartition`.
+- `subscribe()` does not wait for the join; `seek*` on an unassigned partition fails with `IllegalState`; `seek_to_beginning` seeks to the log start offset.
+- Poll-interval expiry reports `on_partitions_lost` once and rejoins on the next `poll()`; `on_partitions_revoked` has no timeout.
+- `ConsumerRecord::topic` is `Arc<str>`; `timestamp_type` is `TimestampType`.
+- Share consumer: `ack`/`release`/`reject`/`renew`, `commit()` → `CommitResults`, `close_with`; implicit mode accepts the previous delivery on the next `poll()`/`recv()` and on `close()`.
+- Admin: one method per operation with an `*Options` struct; multi-item results are `HashMap<Item, Result<T>>`; several operations renamed or merged.
+- Admin calls are bounded by `default_api_timeout` (60 s); `retries` removed.
+- `MetadataRecoveryStrategy::default()` is `Rebootstrap`.
+- One connection attempt per call, bounded by `connect_timeout`; a request timeout closes the connection.
+- SCRAM channel binding removed; credential providers implement `auth::CredentialProvider<C>`; `sasl_plain` is infallible; the `_ssl` constructors are replaced by `with_tls`.
+- A `TlsConfig` with a key passphrase but no client certificate fails to build.
+- `rustls-aws-lc-rs` offers `X25519MLKEM768` first.
+- Dependency floors: `rustls >= 0.23.45` (RUSTSEC-2026-0285), `bytes >= 1.11.1`, `lz4_flex >= 0.11.6`.
+- `metrics()` returns one owned `krafka::metrics::Metrics` snapshot; latencies are `count`/`sum`/`max`; Prometheus series are `krafka_{producer,consumer,connections}_*` with a `client_id` label.
+- KIP-714 telemetry is on by default for producers and consumers.
+- Fake broker (outside semver): enforces Kafka's producer, transaction and share-session rules; several `testing` types renamed.
+
+### Added
+
+- `TypedProducer<K, V>` with `BytesSerializer`, `StringSerializer` and `NoKey`.
+- `CloseOptions::group_membership_operation` (KIP-1092).
+- `AutoOffsetReset::ByDuration` (KIP-1106).
+- `ConsumerBuilder::group_remote_assignor`.
+- `ShareConsumerBuilder::acquire_mode` (KIP-1206) and `acknowledgement_commit_callback`.
+- `OffsetSpec::EarliestPendingUpload` (KIP-1023) and `DescribeFeaturesOptions::node_id` (KIP-1160).
+- `Metrics::prometheus_text()`.
+- `tracing` spans on OpenTelemetry messaging conventions v1.44.0 (`send`, `poll`, `commit`, `rebalance`).
+- `metrics_push(bool)` on every role builder; `client_instance_id(timeout)` on every client.
+- A separate coordination connection per broker.
+- `RecordBatchHeader::peek`.
+- zstd decoding in every build.
+- `OidcTokenProviderBuilder::ca_cert` and `native_roots`.
+- Errors for a feature the cluster lacks name the feature and the setting that avoids it.
+- `# Cancel safety` docs on every data-path method.
+- Fake broker: in-memory mode on Tokio's paused clock, crash/restart, and more fault injection and protocol versions.
+- Release build-provenance and SBOM attestations; `SECURITY.md`.
+
+### Changed
+
+- One send engine per producer: one coalesced Produce request per broker, at most 5 in flight.
+- Retry backoff capped at 1 s; failing fetch partitions back off from 100 ms to 30 s.
+- Decoding copies no record.
+- KIP-714 pushes use dotted metric names.
+- Raised minimum versions of direct dependencies.
+
+### Fixed
+
+- A record sent after a failed batch could be acknowledged without being written.
+- `commit` could return `Ok` with a send of the transaction in flight.
+- A dropped `commit`/`abort` future left the producer stuck.
+- `flush()` waits only for earlier sends; `delivery_timeout` bounds every record.
+- Each record's own timestamp is encoded.
+- `UNKNOWN_PRODUCER_ID` and `OUT_OF_ORDER_SEQUENCE_NUMBER` move the idempotent producer to a new epoch.
+- Under transaction version 1, `EndTxn` is never sent above v4.
+- Dropping `poll`/`recv` during deserialization or a rejoin lost records or wedged the consumer.
+- Eager rebalances, assignors and commit ordering produced overlapping or wrong assignments.
+- `ListOffsets` carries the leader epoch, and positions are validated without `OffsetForLeaderEpoch`.
+- Share consumer: acknowledgements go only to the acquiring node, once, with correct session epochs; only acquired records are delivered.
+- Concurrent metadata refreshes lost topics; re-created topics kept stale leaders.
+- Admin requests reach the right broker or coordinator; one group's lookup failure fails only that group in `describe_consumer_groups`.
+- Snappy batches from the Java client decode; batches over 100 000 records decode.
+- A KIP-219 throttle mutes the connection instead of timing out.
+- OIDC responses are capped at 1 MiB; `ChallengeResponse`'s `Debug` printed the SASL payload.
+
+### Removed
+
+- `KrafkaClient`, `TransportConfig` and per-role connection setters.
+- Producer: dead-letter queue, `ProducerStateStore`, accumulator types, `TransactionalProducerBuilder`, `init_transactions*`, `send_record`, `close_with_timeout`.
+- Consumer: `RecvError`, `batch_recv`, `commit_sync`, `commit_async`, `commit_with_metadata`, lag helpers, `PartitionAssignmentStrategy::Sticky`, the assignor trait and group internals.
+- Share consumer: `acknowledge_by_offset`, `commit_async`, `AcknowledgeType` and four obsolete settings.
+- Admin: `write_txn_markers`, `get_controller_connection`, `pool` and per-resource config helpers.
+- Request priority, `RetryPolicy`, `LazyRecordBatch` and wire-level re-exports.
+- `OAuthBearerTokenProvider`, `AwsMskIamCredentialProvider`, `SaslAuthenticator`.
+- `KrafkaMetrics`, metrics exporters and recorders, `telemetry` and `tracing_ext` modules.
+- The FIPS wording on `rustls-aws-lc-rs`.
 
 ## [0.26.0] — 2026-10-05
 
@@ -1573,7 +1675,8 @@ Initial development: wire protocol, producer, consumer, admin client,
 authentication (SASL PLAIN / SCRAM / OAUTHBEARER / AWS MSK IAM), TLS,
 compression codecs, schema registry integration and the metrics layer.
 
-[Unreleased]: https://github.com/hupe1980/krafka/compare/v0.26.0...HEAD
+[Unreleased]: https://github.com/hupe1980/krafka/compare/v0.27.0...HEAD
+[0.27.0]: https://github.com/hupe1980/krafka/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/hupe1980/krafka/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/hupe1980/krafka/compare/v0.24.0...v0.25.0
 [0.24.0]: https://github.com/hupe1980/krafka/compare/v0.23.0...v0.24.0

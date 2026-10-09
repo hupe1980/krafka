@@ -1,55 +1,50 @@
 //! Consumer builder.
-//!
-//! This module provides [`ConsumerBuilder`], which is the primary entry point
-//! for constructing a [`Consumer`](super::Consumer).  Obtain a builder via
-//! [`Consumer::builder()`](super::Consumer::builder).
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use ahash::AHashMap as HashMap;
-
-use super::group::ErasedRebalanceListener;
+use super::rebalance::ErasedRebalanceListener;
 use super::{
     AutoOffsetReset, Consumer, ConsumerConfig, ConsumerRebalanceListener, IsolationLevel,
     PartitionAssignmentStrategy,
 };
-use crate::auth::AuthConfig;
-use crate::error::{KrafkaError, Result};
-use crate::metadata::ClusterMetadata;
-use crate::network::ConnectionPool;
-use crate::{Offset, PartitionId};
+use crate::Offset;
+use crate::client::Kafka;
+use crate::error::Result;
 
-/// Builder for creating consumers.
-#[derive(Default)]
+/// Builder for a [`Consumer`]: consumer settings only. Obtain with
+/// [`Kafka::consumer`] or [`Kafka::consumer_without_group`].
 #[must_use = "builders do nothing until .build() is called"]
 pub struct ConsumerBuilder {
+    kafka: Kafka,
     config: ConsumerConfig,
     rebalance_listener: Option<Arc<dyn ErasedRebalanceListener>>,
     interceptors: Vec<Arc<dyn crate::interceptor::ConsumerInterceptor>>,
     key_deserializer: Option<Arc<dyn crate::serdes::Deserializer>>,
     value_deserializer: Option<Arc<dyn crate::serdes::Deserializer>>,
-    /// Pre-built pool and metadata from a [`KrafkaClient`](crate::client::KrafkaClient).
-    shared: Option<(Arc<ConnectionPool>, Arc<ClusterMetadata>)>,
+}
+
+impl std::fmt::Debug for ConsumerBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConsumerBuilder")
+            .field("group_id", &self.config.group_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ConsumerBuilder {
-    /// Set the bootstrap servers.
-    pub fn bootstrap_servers(mut self, servers: impl Into<String>) -> Self {
-        self.config.bootstrap_servers = servers.into();
-        self
-    }
-
-    /// Set the group ID.
-    pub fn group_id(mut self, group_id: impl Into<String>) -> Self {
-        self.config.group_id = Some(group_id.into());
-        self
-    }
-
-    /// Set the client ID.
-    pub fn client_id(mut self, client_id: impl Into<String>) -> Self {
-        self.config.client_id = client_id.into();
-        self
+    pub(crate) fn new(kafka: Kafka, group_id: Option<String>) -> Self {
+        Self {
+            kafka,
+            config: ConsumerConfig {
+                group_id,
+                ..ConsumerConfig::default()
+            },
+            rebalance_listener: None,
+            interceptors: Vec::new(),
+            key_deserializer: None,
+            value_deserializer: None,
+        }
     }
 
     /// Set auto offset reset behavior.
@@ -102,8 +97,8 @@ impl ConsumerBuilder {
         self
     }
 
-    /// Set the maximum number of records buffered internally by
-    /// [`recv()`](super::Consumer::recv).
+    /// Set the maximum number of fetched records held before they are handed
+    /// out.
     ///
     /// When the buffer reaches this limit, `poll()` stops fetching until it
     /// drains, bounding memory when the application consumes more slowly than
@@ -125,33 +120,16 @@ impl ConsumerBuilder {
         self
     }
 
-    /// Set maximum poll interval before consumer is considered dead.
+    /// Set the longest gap allowed between two polls (`max.poll.interval.ms`),
+    /// also sent to the coordinator as the rebalance timeout. Default: 300 s.
+    ///
+    /// Enforced under both group protocols: once the application has not
+    /// polled for longer, the member leaves the group so its partitions are
+    /// reassigned. The next poll reports them to
+    /// [`on_partitions_lost`](super::ConsumerRebalanceListener::on_partitions_lost),
+    /// rejoins the group and carries on; it returns no error.
     pub fn max_poll_interval(mut self, interval: Duration) -> Self {
         self.config.max_poll_interval = interval;
-        self
-    }
-
-    /// Set the request timeout: how long one in-flight request may wait for its
-    /// response. Default: 30 s.
-    ///
-    /// Must be at least [`connect_timeout`](Self::connect_timeout), whose
-    /// default is 10 s — a request's clock covers establishing the connection
-    /// it is sent over, so a shorter value would expire every request before
-    /// the handshake could finish. To go below 10 s, lower `connect_timeout`
-    /// as well; `build()` returns a config error otherwise.
-    pub fn request_timeout(mut self, timeout: Duration) -> Self {
-        self.config.request_timeout = timeout;
-        self
-    }
-
-    /// Set the connect timeout: how long TCP establishment to one broker may
-    /// take. Default: 10 s.
-    ///
-    /// This also acts as the floor on
-    /// [`request_timeout`](Self::request_timeout), so lowering it is what makes
-    /// a sub-10-second request timeout possible.
-    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
-        self.config.connect_timeout = timeout;
         self
     }
 
@@ -205,24 +183,8 @@ impl ConsumerBuilder {
     /// preserves partition assignments across restarts as long as the same
     /// instance ID is used, avoiding unnecessary rebalances.
     ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let consumer = Consumer::builder()
-    ///     .bootstrap_servers("localhost:9092")
-    ///     .group_id("my-group")
-    ///     .group_instance_id("instance-1")
-    ///     .build()
-    ///     .await?;
-    /// ```
     pub fn group_instance_id(mut self, id: impl Into<String>) -> Self {
         self.config.group_instance_id = Some(id.into());
-        self
-    }
-
-    /// Set metadata max age before forcing a refresh.
-    pub fn metadata_max_age(mut self, age: Duration) -> Self {
-        self.config.metadata_max_age = age;
         self
     }
 
@@ -230,7 +192,7 @@ impl ConsumerBuilder {
     ///
     /// A partition's high watermark is considered stale when it has not been
     /// refreshed within this duration. Stale partitions are reported in
-    /// [`LagResult::stale_partitions`](super::LagResult::stale_partitions) so callers can decide whether to trust
+    /// [`PartitionLag::stale`](super::PartitionLag::stale) so callers can decide whether to trust
     /// the lag value.
     ///
     /// Default: 60 seconds.
@@ -244,17 +206,6 @@ impl ConsumerBuilder {
     /// When configured, the consumer includes its rack in fetch requests.
     /// The broker may return a preferred read replica in the same rack,
     /// reducing cross-rack network traffic.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let consumer = Consumer::builder()
-    ///     .bootstrap_servers("localhost:9092")
-    ///     .group_id("my-group")
-    ///     .client_rack("us-east-1a")
-    ///     .build()
-    ///     .await?;
-    /// ```
     pub fn client_rack(mut self, rack: impl Into<String>) -> Self {
         self.config.client_rack = Some(rack.into());
         self
@@ -272,8 +223,26 @@ impl ConsumerBuilder {
     /// default so that upgrading krafka is never itself a protocol migration,
     /// but Apache Kafka 4.3 has begun deprecating it (KIP-1274) and krafka
     /// logs a one-time warning when a group starts on it.
+    ///
+    /// On a cluster without `ConsumerGroupHeartbeat`, `GroupProtocol::Consumer`
+    /// fails the first poll with `UnknownApiVersion` naming
+    /// `GroupProtocol::Classic`.
     pub fn group_protocol(mut self, protocol: super::GroupProtocol) -> Self {
         self.config.group_protocol = protocol;
+        self
+    }
+
+    /// Name the server-side assignor the coordinator uses for this member
+    /// (`group.remote.assignor`); Apache Kafka brokers ship `uniform` and
+    /// `range`. Applies only to
+    /// [`GroupProtocol::Consumer`](super::GroupProtocol::Consumer):
+    /// [`build`](Self::build) rejects it with the classic protocol. Without
+    /// it the broker's default assignor is used.
+    ///
+    /// A name the broker does not know fails the join with a non-retriable
+    /// `UNSUPPORTED_ASSIGNOR` error naming it.
+    pub fn group_remote_assignor(mut self, assignor: impl Into<String>) -> Self {
+        self.config.group_remote_assignor = Some(assignor.into());
         self
     }
 
@@ -287,52 +256,21 @@ impl ConsumerBuilder {
         self
     }
 
-    /// Set the metadata recovery strategy (KIP-1102).
-    ///
-    /// Controls what the client does when every known broker becomes
-    /// unreachable: keep retrying the cached broker set, or fall back to the
-    /// original bootstrap servers.
-    pub fn metadata_recovery_strategy(
-        mut self,
-        strategy: crate::metadata::MetadataRecoveryStrategy,
-    ) -> Self {
-        self.config.metadata_recovery_strategy = strategy;
+    /// Push this consumer's metrics to the brokers when a cluster operator
+    /// subscribes to them (KIP-714, Java `enable.metrics.push`). Default: on.
+    /// Nothing is sent to a cluster without a client-telemetry plugin.
+    pub fn metrics_push(mut self, enable: bool) -> Self {
+        self.config.metrics_push = enable;
         self
     }
 
-    /// How long metadata must stay unrefreshable before a rebootstrap fires.
+    /// Set how long `poll()` waits when no partition can be fetched (all
+    /// paused or backing off).
     ///
-    /// Only effective with
-    /// [`MetadataRecoveryStrategy::Rebootstrap`](crate::metadata::MetadataRecoveryStrategy::Rebootstrap).
-    pub fn metadata_recovery_rebootstrap_trigger(mut self, duration: Duration) -> Self {
-        self.config.metadata_recovery_rebootstrap_trigger = duration;
-        self
-    }
-
-    /// Set the maximum number of cooperative-rebalance rejoin rounds per poll.
-    ///
-    /// Bounds the work one `poll()` will do converging a cooperative
-    /// rebalance. Default: 10; values below 1 are clamped to 1.
-    pub fn max_cooperative_rebalance_rounds(mut self, rounds: usize) -> Self {
-        self.config.max_cooperative_rebalance_rounds = rounds.max(1);
-        self
-    }
-
-    /// Set how long `poll()` sleeps when there is nothing to do.
-    ///
-    /// Smaller values reduce latency when records arrive during the sleep
-    /// window, at the cost of CPU under sustained idle. Default: 10 ms.
+    /// Smaller values reduce latency, at the cost of CPU while idle.
+    /// Default: 10 ms.
     pub fn idle_poll_backoff(mut self, backoff: Duration) -> Self {
         self.config.idle_poll_backoff = backoff;
-        self
-    }
-
-    /// Set the maximum time allowed for the `on_partitions_revoked` callback.
-    ///
-    /// If the callback exceeds this duration the consumer logs a warning and
-    /// proceeds with the rebalance rather than stalling the group. Default: 5 s.
-    pub fn revocation_timeout(mut self, timeout: Duration) -> Self {
-        self.config.revocation_timeout = timeout;
         self
     }
 
@@ -345,302 +283,89 @@ impl ConsumerBuilder {
         self
     }
 
-    /// Set authentication configuration.
-    ///
-    /// Enables TLS and/or SASL authentication for all broker connections.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// use krafka::consumer::Consumer;
-    /// use krafka::auth::AuthConfig;
-    ///
-    /// let consumer = Consumer::builder()
-    ///     .bootstrap_servers("broker:9093")
-    ///     .group_id("my-group")
-    ///     .auth(AuthConfig::sasl_plain("user", "password")?)
-    ///     .build()
-    ///     .await?;
-    /// ```
-    pub fn auth(mut self, auth: AuthConfig) -> Self {
-        self.config.auth = Some(auth);
-        self
-    }
-
-    /// Set SOCKS5 proxy configuration.
-    ///
-    /// Routes all broker connections through the specified SOCKS5 proxy.
-    #[cfg(feature = "socks5")]
-    pub fn proxy(mut self, proxy: crate::network::ProxyConfig) -> Self {
-        self.config.transport.proxy = Some(proxy);
-        self
-    }
-
-    /// Set socket- and pool-level transport tuning.
-    ///
-    /// Covers TCP keepalive and nodelay, the per-connection response ceiling
-    /// and in-flight cap, the priority-channel depths, the Happy Eyeballs
-    /// stagger, idle-connection eviction, a total-connection cap, and the
-    /// KIP-1288 automatic TLS reload interval.
-    ///
-    /// Omitting this call keeps krafka's historical defaults, which
-    /// [`TransportConfig::default`](crate::network::TransportConfig) reproduces
-    /// exactly.
-    pub fn transport(mut self, transport: crate::network::TransportConfig) -> Self {
-        self.config.transport = transport;
-        self
-    }
-
-    /// Configure SASL/PLAIN authentication.
-    pub fn sasl_plain(
-        mut self,
-        username: impl Into<String>,
-        password: impl Into<String>,
-    ) -> crate::Result<Self> {
-        self.config.auth = Some(AuthConfig::sasl_plain(username, password)?);
-        Ok(self)
-    }
-
-    /// Configure SASL/SCRAM-SHA-256 authentication.
-    pub fn sasl_scram_sha256(
-        mut self,
-        username: impl Into<String>,
-        password: impl Into<String>,
-    ) -> Self {
-        self.config.auth = Some(AuthConfig::sasl_scram_sha256(username, password));
-        self
-    }
-
-    /// Configure SASL/SCRAM-SHA-512 authentication.
-    pub fn sasl_scram_sha512(
-        mut self,
-        username: impl Into<String>,
-        password: impl Into<String>,
-    ) -> Self {
-        self.config.auth = Some(AuthConfig::sasl_scram_sha512(username, password));
-        self
-    }
-
-    /// Configure SASL/OAUTHBEARER authentication with a static token.
-    ///
-    /// For automatic token refresh, use [`sasl_oauthbearer_provider()`](Self::sasl_oauthbearer_provider).
-    /// For SASL extensions, use `.auth(AuthConfig::sasl_oauthbearer_token(...))`.
-    pub fn sasl_oauthbearer(mut self, token: impl Into<String>) -> Self {
-        self.config.auth = Some(AuthConfig::sasl_oauthbearer(token));
-        self
-    }
-
-    /// Configure SASL/OAUTHBEARER authentication with an async token provider.
-    ///
-    /// The provider is called on every new broker connection, ensuring
-    /// tokens are always fresh.
-    pub fn sasl_oauthbearer_provider(
-        mut self,
-        provider: impl crate::auth::OAuthBearerTokenProvider + 'static,
-    ) -> Self {
-        self.config.auth = Some(AuthConfig::sasl_oauthbearer_provider(provider));
-        self
-    }
-
-    /// Set a consumer interceptor, replacing any previously added interceptors.
-    ///
-    /// The interceptor's `on_consume` method is called after records are fetched
-    /// but before they are returned from `poll()`, and `on_commit` is called
-    /// after offsets are committed.
-    ///
-    /// To register multiple interceptors as an ordered chain, use
-    /// [`add_interceptor`](Self::add_interceptor) instead.
-    pub fn interceptor(
-        mut self,
-        interceptor: Arc<dyn crate::interceptor::ConsumerInterceptor>,
-    ) -> Self {
-        self.interceptors = vec![interceptor];
-        self
-    }
-
-    /// Append a consumer interceptor to the chain.
-    ///
-    /// Interceptors execute in the order they are added. Each interceptor is
-    /// individually panic-isolated — a panic in one will not prevent the
-    /// remaining interceptors from running.
-    pub fn add_interceptor(
-        mut self,
-        interceptor: Arc<dyn crate::interceptor::ConsumerInterceptor>,
-    ) -> Self {
-        self.interceptors.push(interceptor);
-        self
-    }
-
-    /// Set the topic cache TTL for partial metadata refreshes.
-    ///
-    /// During partial refreshes, cached topics that have not been refreshed
-    /// within this duration are evicted to prevent unbounded cache growth.
-    ///
-    /// Default: 5 minutes (matching Java's `metadata.max.idle.ms`).
-    pub fn metadata_topic_cache_ttl(mut self, ttl: Duration) -> Self {
-        self.config.metadata_topic_cache_ttl = Some(ttl);
-        self
-    }
-
-    /// Disable topic cache TTL eviction for partial metadata refreshes.
-    ///
-    /// By default, cached topics are evicted after 5 minutes to prevent
-    /// unbounded growth on topic churn. Call this to opt out of TTL eviction;
-    /// entries will then persist across partial refreshes indefinitely.
-    pub fn disable_metadata_topic_cache_ttl(mut self) -> Self {
-        self.config.metadata_topic_cache_ttl = None;
-        self
-    }
-
-    /// Let the broker create a topic this consumer subscribes to or assigns
-    /// but the cluster does not have, i.e. `allow.auto.create.topics`.
-    ///
-    /// The broker must additionally be configured with
-    /// `auto.create.topics.enable=true`; this flag only says the client is
-    /// willing.
-    ///
-    /// Default: `false`, where the Java client defaults to `true`. A consumer
-    /// bringing a topic into existence — with the broker's default partition
-    /// count and replication factor — is almost always a typo. Turn it on for
-    /// development and test clusters.
-    ///
-    /// Ignored when the consumer shares a
-    /// [`KrafkaClient`](crate::client::KrafkaClient)'s metadata: that client's
-    /// own setting governs.
-    pub fn allow_auto_create_topics(mut self, allow: bool) -> Self {
-        self.config.allow_auto_create_topics = allow;
-        self
-    }
-
     /// Set per-partition initial offsets applied before auto-offset-reset.
     ///
     /// When a partition is first assigned and has no committed group offset,
     /// the consumer starts fetching from the given offset instead of applying
     /// `auto_offset_reset`. Useful for exactly-once recovery.
     ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// use ahash::AHashMap;
-    ///
-    /// Consumer::builder()
-    ///     .bootstrap_servers("localhost:9092")
-    ///     .initial_offsets(AHashMap::from_iter([
-    ///         (("orders".to_string(), 0), 1_000),
-    ///         (("orders".to_string(), 1), 2_000),
-    ///     ]))
-    ///     .build()
-    ///     .await?;
-    /// ```
-    pub fn initial_offsets(mut self, offsets: HashMap<(String, PartitionId), Offset>) -> Self {
-        self.config.initial_offsets = offsets;
+    pub fn initial_offsets<P, O>(mut self, offsets: impl IntoIterator<Item = (P, O)>) -> Self
+    where
+        P: std::borrow::Borrow<super::TopicPartition>,
+        O: std::borrow::Borrow<Offset>,
+    {
+        self.config.initial_offsets = offsets
+            .into_iter()
+            .map(|(tp, offset)| {
+                let tp = tp.borrow();
+                ((tp.topic.clone(), tp.partition), *offset.borrow())
+            })
+            .collect();
         self
     }
 
-    /// Set a key decoder applied transparently after each `poll()` / `recv()`.
-    ///
-    /// When set, every consumed record's key bytes are passed through this
-    /// decoder before being returned to the caller.  The decoder runs after
-    /// the interceptor.  Equivalent to `key.deserializer` in the Java
-    /// `KafkaConsumer`.
-    pub fn key_deserializer(mut self, decoder: Arc<dyn crate::serdes::Deserializer>) -> Self {
-        self.key_deserializer = Some(decoder);
+    /// Append an interceptor to the chain. Interceptors run in the order they
+    /// were added, each panic-isolated.
+    pub fn interceptor(
+        mut self,
+        interceptor: impl crate::interceptor::ConsumerInterceptor + 'static,
+    ) -> Self {
+        self.interceptors.push(Arc::new(interceptor));
         self
     }
 
-    /// Set a value decoder applied transparently after each `poll()` / `recv()`.
-    ///
-    /// When set, every consumed record's value bytes are passed through this
-    /// decoder before being returned to the caller.  The decoder runs after
-    /// the interceptor.  Equivalent to `value.deserializer` in the Java
-    /// `KafkaConsumer`.
-    pub fn value_deserializer(mut self, decoder: Arc<dyn crate::serdes::Deserializer>) -> Self {
-        self.value_deserializer = Some(decoder);
+    /// Decode every record key before it is returned (Java
+    /// `key.deserializer`). A failure is a
+    /// [`RecordDeserialization`](crate::KrafkaError::RecordDeserialization)
+    /// error; the records before the failing one are returned first.
+    pub fn key_deserializer(
+        mut self,
+        deserializer: impl crate::serdes::Deserializer + 'static,
+    ) -> Self {
+        self.key_deserializer = Some(Arc::new(deserializer));
         self
     }
 
-    /// Share a [`KrafkaClient`](crate::client::KrafkaClient)'s connection pool
-    /// and metadata cache instead of creating a new one.
-    ///
-    /// When multiple clients are created in the same process you should create
-    /// a single [`crate::client::KrafkaClient`] and pass it to each builder.
-    /// All clients will then multiplex over the same TCP connections.
-    ///
-    /// When this method is called, `bootstrap_servers` is optional on the
-    /// builder (the client was already connected at `KrafkaClient::build` time).
-    pub fn with_client(mut self, client: &crate::client::KrafkaClient) -> Self {
-        self.shared = Some((client.pool().clone(), client.metadata().clone()));
+    /// Decode every record value before it is returned (Java
+    /// `value.deserializer`); see [`key_deserializer`](Self::key_deserializer).
+    pub fn value_deserializer(
+        mut self,
+        deserializer: impl crate::serdes::Deserializer + 'static,
+    ) -> Self {
+        self.value_deserializer = Some(Arc::new(deserializer));
         self
     }
 
-    /// Validate the configuration and return it, without connecting.
-    ///
-    /// Runs exactly the checks [`build`](Self::build) runs — they call the same
-    /// validator — so a config that passes here will not be rejected later for
-    /// a configuration reason. Useful for validating settings at startup, in a
-    /// test, or in a config-linting tool, none of which want a broker.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`KrafkaError::Config`](crate::error::KrafkaError::Config) for
-    /// any invalid combination; see
-    /// the consumer configuration validator for the full list.
-    pub fn build_config(self) -> Result<ConsumerConfig> {
-        // A shared pool supplies the connection, so an empty bootstrap list is
-        // legitimate there. Mirror what `build` does rather than duplicating
-        // the reasoning.
-        if self.shared.is_some() && self.config.bootstrap_servers.is_empty() {
-            let mut probe = self.config.clone();
-            probe.bootstrap_servers = "<provided-by-client>".to_string();
-            super::config::validate(&probe)?;
-            return Ok(self.config);
-        }
-        super::config::validate(&self.config)?;
+    fn validate(&self) -> Result<()> {
+        super::config::validate(&self.config, self.kafka.request_timeout())
+    }
+
+    /// The validated settings, without starting a consumer.
+    #[cfg(test)]
+    pub(crate) fn build_config(self) -> Result<ConsumerConfig> {
+        self.validate()?;
         Ok(self.config)
     }
 
-    /// Build the consumer.
+    /// Build the consumer. Contacts no broker: the group is joined by the
+    /// first [`poll`](super::Consumer::poll) after
+    /// [`subscribe`](super::Consumer::subscribe).
     ///
     /// # Errors
     ///
-    /// All configuration constraints are enforced here, via the same
-    /// consumer configuration validator. See its documentation for the full
-    /// list.
-    ///
+    /// [`KrafkaError::Config`](crate::KrafkaError::Config) naming the setting
+    /// for an invalid configuration.
+    // Async like every other client's `build`, so a later version may contact
+    // the cluster here without breaking callers.
+    #[allow(clippy::unused_async)]
     pub async fn build(self) -> Result<Consumer> {
-        // `bootstrap_servers` is optional when a pre-built client supplies the
-        // connection pool, so that one check is done here rather than in the
-        // shared validator, which has no visibility into `shared`.
-        if self.shared.is_none() && self.config.bootstrap_servers.is_empty() {
-            return Err(KrafkaError::config("bootstrap_servers is required"));
-        }
+        self.validate()?;
         if self.config.enable_auto_commit && self.config.group_id.is_none() {
-            tracing::warn!(
-                "enable_auto_commit=true has no effect without group_id; \
-                 offsets will not be persisted to the broker"
-            );
+            tracing::debug!("enable_auto_commit has no effect without a group");
         }
-
-        // Run the shared validator so that constraints such as
-        // `max_poll_records != 0` are enforced on this path too. Without this
-        // the only entry point that checked them was unreachable, and
-        // `max_poll_records(0)` produced a consumer that silently returned no
-        // records forever.
-        if self.shared.is_some() && self.config.bootstrap_servers.is_empty() {
-            // Satisfy the validator's non-empty check without mutating the
-            // caller's config semantics; the pool is already connected.
-            let mut probe = self.config.clone();
-            probe.bootstrap_servers = "<provided-by-client>".to_string();
-            crate::consumer::config::validate(&probe)?;
-        } else {
-            crate::consumer::config::validate(&self.config)?;
-        }
-
         // `session_timeout` and `max_poll_interval` bound two independent
-        // failure modes — coordinator liveness versus application progress —
-        // so neither has to be smaller than the other. A session timeout
-        // larger than the poll interval is unusual enough to flag, but it is
-        // a legitimate configuration and must not block startup.
+        // failure modes, so neither has to be smaller than the other; a
+        // session timeout above the poll interval is only unusual.
         if self.config.session_timeout > self.config.max_poll_interval {
             tracing::warn!(
                 session_timeout = ?self.config.session_timeout,
@@ -651,29 +376,25 @@ impl ConsumerBuilder {
             );
         }
 
-        let mut consumer = Consumer::new(self.config, self.shared).await?;
+        let mut consumer = Consumer::new(&self.kafka, self.config);
         if let Some(listener) = self.rebalance_listener {
             consumer.rebalance_listener = listener;
         }
-        if !self.interceptors.is_empty() {
-            consumer.interceptor = if self.interceptors.len() == 1 {
-                // infallible: len == 1 guaranteed by the surrounding if
-                let Some(single) = self.interceptors.into_iter().next() else {
-                    unreachable!("len == 1 verified above");
-                };
-                single
-            } else {
-                Arc::new(crate::interceptor::ConsumerInterceptorChain::new(
+        match self.interceptors.len() {
+            0 => {}
+            1 => {
+                if let Some(single) = self.interceptors.into_iter().next() {
+                    consumer.interceptor = single;
+                }
+            }
+            _ => {
+                consumer.interceptor = Arc::new(crate::interceptor::ConsumerInterceptorChain::new(
                     self.interceptors,
-                ))
-            };
+                ));
+            }
         }
-        if let Some(dec) = self.key_deserializer {
-            consumer.key_deserializer = Some(dec);
-        }
-        if let Some(dec) = self.value_deserializer {
-            consumer.value_deserializer = Some(dec);
-        }
+        consumer.key_deserializer = self.key_deserializer;
+        consumer.value_deserializer = self.value_deserializer;
         Ok(consumer)
     }
 }
@@ -681,384 +402,113 @@ impl ConsumerBuilder {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use crate::auth::AuthConfig;
+    use crate::Kafka;
     use crate::consumer::{
-        AutoOffsetReset, Consumer, ConsumerRebalanceListener, PartitionAssignmentStrategy,
-        TopicPartition,
+        AutoOffsetReset, ConsumerRebalanceListener, PartitionAssignmentStrategy, TopicPartition,
     };
     use std::sync::Arc;
     use std::time::Duration;
 
-    #[test]
-    fn test_consumer_builder() {
-        let builder = Consumer::builder()
-            .bootstrap_servers("localhost:9092")
-            .group_id("test-group")
-            .client_id("test")
+    fn consumer() -> super::ConsumerBuilder {
+        Kafka::detached().consumer("test-group")
+    }
+
+    #[tokio::test]
+    async fn test_consumer_builder() {
+        let builder = consumer()
             .auto_offset_reset(AutoOffsetReset::Earliest)
             .enable_auto_commit(false)
             .max_poll_records(100)
             .max_poll_interval(Duration::from_secs(600));
 
-        assert_eq!(builder.config.bootstrap_servers, "localhost:9092");
         assert_eq!(builder.config.group_id, Some("test-group".to_string()));
-        assert_eq!(builder.config.client_id, "test");
         assert_eq!(builder.config.auto_offset_reset, AutoOffsetReset::Earliest);
         assert!(!builder.config.enable_auto_commit);
         assert_eq!(builder.config.max_poll_records, 100);
         assert_eq!(builder.config.max_poll_interval, Duration::from_secs(600));
-        assert!(builder.config.auth.is_none());
-    }
-
-    #[test]
-    fn test_consumer_builder_with_auth() {
-        let builder = Consumer::builder()
-            .bootstrap_servers("broker:9093")
-            .group_id("secure-group")
-            .auth(AuthConfig::sasl_plain("user", "pass").unwrap());
-
-        let auth = builder.config.auth.as_ref().unwrap();
-        assert!(auth.requires_sasl());
-        assert!(!auth.requires_tls());
-        assert_eq!(
-            auth.security_protocol,
-            crate::auth::SecurityProtocol::SaslPlaintext
-        );
-        assert_eq!(auth.sasl_mechanism, Some(crate::auth::SaslMechanism::Plain));
-    }
-
-    #[test]
-    fn test_consumer_builder_aws_msk_iam() {
-        let auth = AuthConfig::aws_msk_iam("AKID", "secret", "us-east-1");
-        let builder = Consumer::builder()
-            .bootstrap_servers("broker:9094")
-            .group_id("msk-group")
-            .auth(auth);
-
-        let auth = builder.config.auth.as_ref().unwrap();
-        assert!(auth.requires_tls());
-        assert!(auth.requires_sasl());
-        assert_eq!(
-            auth.sasl_mechanism,
-            Some(crate::auth::SaslMechanism::AwsMskIam)
-        );
-        assert!(auth.aws_msk_iam_credentials.is_some());
-        assert!(auth.tls_config.is_some());
-    }
-
-    #[test]
-    fn test_consumer_builder_no_auth_by_default() {
-        let builder = Consumer::builder()
-            .bootstrap_servers("broker:9092")
-            .group_id("group");
-
-        assert!(builder.config.auth.is_none());
-    }
-
-    #[test]
-    fn test_consumer_builder_sasl_plain() {
-        let builder = Consumer::builder()
-            .bootstrap_servers("broker:9093")
-            .sasl_plain("user", "pass")
-            .unwrap();
-
-        let auth = builder.config.auth.as_ref().unwrap();
-        assert!(auth.requires_sasl());
-        assert!(auth.plain_credentials.is_some());
-    }
-
-    #[test]
-    fn test_consumer_builder_sasl_scram() {
-        let builder = Consumer::builder()
-            .bootstrap_servers("broker:9093")
-            .sasl_scram_sha256("user", "pass");
-
-        let auth = builder.config.auth.as_ref().unwrap();
-        assert!(auth.requires_sasl());
-        assert!(auth.scram_credentials.is_some());
-
-        let builder = Consumer::builder()
-            .bootstrap_servers("broker:9093")
-            .sasl_scram_sha512("user", "pass");
-
-        let auth = builder.config.auth.as_ref().unwrap();
-        assert!(auth.requires_sasl());
-        assert!(auth.scram_credentials.is_some());
     }
 
     #[tokio::test]
-    async fn test_consumer_builder_no_servers() {
-        let result = Consumer::builder().build().await;
-        assert!(result.is_err());
+    async fn a_consumer_without_group_has_no_group_id() {
+        let builder = Kafka::detached().consumer_without_group();
+        assert!(builder.config.group_id.is_none());
     }
 
-    #[test]
-    fn test_consumer_builder_partition_assignment_strategy() {
-        let builder = Consumer::builder()
-            .bootstrap_servers("localhost:9092")
-            .group_id("test-group")
-            .partition_assignment_strategy(PartitionAssignmentStrategy::RoundRobin);
-
-        assert_eq!(
-            builder.config.partition_assignment_strategy(),
-            PartitionAssignmentStrategy::RoundRobin
-        );
-    }
-
-    #[test]
-    fn test_consumer_builder_with_rebalance_listener() {
-        use std::sync::atomic::AtomicBool;
-        use std::sync::atomic::Ordering;
-
-        struct TestListener {
-            assigned: AtomicBool,
-        }
+    #[tokio::test]
+    async fn test_consumer_builder_with_rebalance_listener() {
+        struct TestListener;
         impl ConsumerRebalanceListener for TestListener {
-            async fn on_partitions_assigned(&self, _: &[TopicPartition]) {
-                self.assigned.store(true, Ordering::SeqCst);
-            }
+            async fn on_partitions_assigned(&self, _: &[TopicPartition]) {}
             async fn on_partitions_revoked(&self, _: &[TopicPartition]) {}
         }
-
-        let listener = Arc::new(TestListener {
-            assigned: AtomicBool::new(false),
-        });
-
-        let builder = Consumer::builder()
-            .bootstrap_servers("localhost:9092")
-            .group_id("test-group")
-            .rebalance_listener(listener.clone());
-
+        let builder = consumer().rebalance_listener(Arc::new(TestListener));
         assert!(builder.rebalance_listener.is_some());
     }
 
-    #[test]
-    fn test_consumer_builder_group_instance_id() {
-        let builder = Consumer::builder()
-            .bootstrap_servers("localhost:9092")
-            .group_id("test-group")
-            .group_instance_id("my-instance");
-
-        assert_eq!(
-            builder.config.group_instance_id,
-            Some("my-instance".to_string())
-        );
-    }
-
-    #[test]
-    fn test_consumer_builder_interceptor() {
-        use crate::interceptor::ConsumerInterceptor;
-        use crate::interceptor::InterceptorResult;
-
-        #[derive(Debug)]
-        struct TestInterceptor;
-        impl ConsumerInterceptor for TestInterceptor {
-            fn on_consume(
-                &self,
-                _records: &[crate::consumer::ConsumerRecord],
-            ) -> InterceptorResult {
-                Ok(())
-            }
-        }
-
-        let builder = Consumer::builder()
-            .bootstrap_servers("localhost:9092")
-            .group_id("test-group")
-            .interceptor(Arc::new(TestInterceptor));
-
-        assert_eq!(builder.interceptors.len(), 1);
-    }
-
-    #[test]
-    fn test_consumer_builder_add_interceptor() {
+    #[tokio::test]
+    async fn interceptors_append_in_order() {
         use crate::interceptor::ConsumerInterceptor;
 
         #[derive(Debug)]
         struct A;
         impl ConsumerInterceptor for A {}
 
-        #[derive(Debug)]
-        struct B;
-        impl ConsumerInterceptor for B {}
-
-        let builder = Consumer::builder()
-            .bootstrap_servers("localhost:9092")
-            .group_id("test-group")
-            .add_interceptor(Arc::new(A))
-            .add_interceptor(Arc::new(B));
+        let builder = consumer().interceptor(A).interceptor(Arc::new(A));
         assert_eq!(builder.interceptors.len(), 2);
     }
 
-    #[test]
-    fn test_consumer_builder_interceptor_replaces_chain() {
-        use crate::interceptor::ConsumerInterceptor;
-
-        #[derive(Debug)]
-        struct A;
-        impl ConsumerInterceptor for A {}
-
-        #[derive(Debug)]
-        struct B;
-        impl ConsumerInterceptor for B {}
-
-        let builder = Consumer::builder()
-            .bootstrap_servers("localhost:9092")
-            .group_id("test-group")
-            .add_interceptor(Arc::new(A))
-            .add_interceptor(Arc::new(A))
-            .interceptor(Arc::new(B));
-        assert_eq!(builder.interceptors.len(), 1);
-    }
-
-    // assign() is rejected when group coordinator is active.
-    #[test]
-    fn test_assign_with_group_id_configured() {
-        let builder = Consumer::builder()
-            .bootstrap_servers("localhost:9092")
-            .group_id("test-group");
-
-        // When group_id is set, group_coordinator will be Some after new().
-        // We verify the config at builder level.
-        assert!(builder.config.group_id.is_some());
-    }
-
-    // group field removed — only group_coordinator accessor exists.
-    #[test]
-    fn test_no_legacy_group_field() {
-        let builder = Consumer::builder()
-            .bootstrap_servers("localhost:9092")
-            .group_id("test-group");
-        // The builder should have no group field; only group_coordinator is used
-        assert!(builder.config.group_id.is_some());
-    }
-
-    // ── Builder validation ───────────────────────────────────────────────
-    //
-    // These constraints previously lived only in the deleted `ConsumerConfigBuilder::build`,
-    // which no public API could reach, so `Consumer::builder()` accepted values
-    // that produce a broken consumer.
-
     #[tokio::test]
-    async fn test_builder_rejects_zero_max_poll_records() {
-        // 0 truncates every fetched batch to nothing: the consumer reads from
-        // the broker and returns no records, forever, with no error.
-        let result = Consumer::builder()
-            .bootstrap_servers("localhost:9092")
-            .max_poll_records(0)
-            .build()
-            .await;
-
-        let err = result.err().expect("max_poll_records(0) must be rejected");
-        assert!(
-            err.to_string().contains("max_poll_records"),
-            "error should name the offending setting, got: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_builder_rejects_max_poll_records_below_minus_one() {
-        let result = Consumer::builder()
-            .bootstrap_servers("localhost:9092")
-            .max_poll_records(-2)
-            .build()
-            .await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_builder_rejects_negative_max_buffered_records() {
-        let result = Consumer::builder()
-            .bootstrap_servers("localhost:9092")
-            .max_buffered_records(-1)
-            .build()
-            .await;
-
-        let err = result.err().expect("negative buffer cap must be rejected");
-        assert!(err.to_string().contains("max_buffered_records"));
-    }
-
-    #[tokio::test]
-    async fn test_builder_rejects_fetch_min_above_fetch_max() {
-        let result = Consumer::builder()
-            .bootstrap_servers("localhost:9092")
-            .fetch_min_bytes(1000)
-            .fetch_max_bytes(100)
-            .build()
-            .await;
-
-        let err = result.err().expect("min above max must be rejected");
-        assert!(err.to_string().contains("fetch_min_bytes"));
-    }
-
-    #[tokio::test]
-    async fn test_builder_rejects_empty_group_id() {
-        let result = Consumer::builder()
-            .bootstrap_servers("localhost:9092")
-            .group_id("")
-            .build()
-            .await;
-
-        let err = result.err().expect("empty group id must be rejected");
-        assert!(err.to_string().contains("group_id"));
-    }
-
-    #[tokio::test]
-    async fn test_builder_rejects_empty_assignment_strategy_list() {
-        let result = Consumer::builder()
-            .bootstrap_servers("localhost:9092")
-            .partition_assignment_strategies(Vec::new())
-            .build()
-            .await;
-
-        let err = result.err().expect("empty strategy list must be rejected");
-        assert!(err.to_string().contains("partition_assignment_strategies"));
-    }
-
-    #[tokio::test]
-    async fn test_builder_accepts_session_timeout_above_max_poll_interval() {
-        // These bound two independent failure modes — coordinator liveness
-        // versus application progress — so neither has to be smaller than the
-        // other. This is a warning, not a rejection. The build still fails
-        // here because there is no broker to connect to, but it must not fail
-        // with a *config* error.
-        let result = Consumer::builder()
-            .bootstrap_servers("localhost:1")
-            .session_timeout(Duration::from_secs(120))
-            .max_poll_interval(Duration::from_secs(60))
-            .heartbeat_interval(Duration::from_secs(3))
-            .build()
-            .await;
-
-        if let Err(e) = result {
-            let msg = e.to_string();
-            assert!(
-                !msg.contains("must be <= max_poll_interval"),
-                "session_timeout > max_poll_interval must not be a config error, got: {msg}"
-            );
+    async fn invalid_settings_are_rejected_naming_the_setting() {
+        for (builder, setting) in [
+            (consumer().max_poll_records(0), "max_poll_records"),
+            (consumer().max_poll_records(-2), "max_poll_records"),
+            (consumer().max_buffered_records(-1), "max_buffered_records"),
+            (
+                consumer().fetch_min_bytes(1000).fetch_max_bytes(100),
+                "fetch_min_bytes",
+            ),
+            (Kafka::detached().consumer(""), "group_id"),
+            (
+                consumer().partition_assignment_strategies(Vec::new()),
+                "partition_assignment_strategies",
+            ),
+            (
+                consumer()
+                    .heartbeat_interval(Duration::from_secs(50))
+                    .session_timeout(Duration::from_secs(45)),
+                "heartbeat_interval",
+            ),
+        ] {
+            let err = builder.build().await.err().expect("must be rejected");
+            assert!(err.to_string().contains(setting), "{setting}: {err}");
         }
     }
 
-    #[test]
-    fn test_builder_default_strategies_allow_protocol_migration() {
-        // Advertising both is what lets a group move from the eager to the
-        // cooperative protocol in one rolling bounce.
-        let builder = Consumer::builder();
+    #[tokio::test]
+    async fn session_timeout_above_max_poll_interval_is_accepted() {
+        consumer()
+            .session_timeout(Duration::from_secs(120))
+            .max_poll_interval(Duration::from_secs(60))
+            .heartbeat_interval(Duration::from_secs(3))
+            .build_config()
+            .expect("a warning, not a config error");
+    }
+
+    #[tokio::test]
+    async fn the_default_strategies_allow_protocol_migration() {
         assert_eq!(
-            builder.config.partition_assignment_strategies(),
-            &[
+            consumer().config.partition_assignment_strategies,
+            vec![
                 PartitionAssignmentStrategy::Range,
                 PartitionAssignmentStrategy::CooperativeSticky
             ]
         );
-    }
-
-    #[test]
-    fn test_builder_single_strategy_replaces_list() {
-        let builder =
-            Consumer::builder().partition_assignment_strategy(PartitionAssignmentStrategy::Sticky);
         assert_eq!(
-            builder.config.partition_assignment_strategies(),
-            &[PartitionAssignmentStrategy::Sticky]
+            consumer()
+                .partition_assignment_strategy(PartitionAssignmentStrategy::RoundRobin)
+                .config
+                .partition_assignment_strategies,
+            vec![PartitionAssignmentStrategy::RoundRobin]
         );
     }
 }

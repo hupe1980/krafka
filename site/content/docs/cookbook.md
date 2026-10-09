@@ -1,6 +1,6 @@
 +++
 title = "Cookbook"
-description = "Task-oriented recipes: the shortest correct way to do the things people actually build."
+description = "Task-oriented recipes for common Kafka application patterns."
 weight = 15
 
 [extra]
@@ -8,12 +8,10 @@ slug_id = "cookbook"
 +++
 
 The rest of the documentation is organised by module — [Producer](@/docs/producer.md),
-[Consumer](@/docs/consumer.md), [Admin](@/docs/admin.md). That is the right shape
-for looking something up, and the wrong shape when you know the *outcome* you
-want and not which module owns it.
-
-Each recipe below is a complete, runnable shape with the reasoning that matters
-kept inline and everything else linked.
+[Consumer](@/docs/consumer.md), [Admin](@/docs/admin.md). The recipes below are
+organised by outcome. Each sample compiles against the current API; `kafka`,
+`producer` and `consumer` stand for a connected handle and clients built from
+it.
 
 ## Recipes
 
@@ -22,6 +20,7 @@ kept inline and everything else linked.
 - [Backpressure: stop reading when the sink stalls](#backpressure-stop-reading-when-the-sink-stalls)
 - [Replay from a point in time](#replay-from-a-point-in-time)
 - [Build an in-memory table from a compacted topic](#build-an-in-memory-table-from-a-compacted-topic)
+- [Delete a key from a compacted topic](#delete-a-key-from-a-compacted-topic)
 - [Use a schema registry](#use-a-schema-registry)
 - [Route poison records to a dead-letter topic](#route-poison-records-to-a-dead-letter-topic)
 - [Share one connection pool across clients](#share-one-connection-pool-across-clients)
@@ -37,14 +36,19 @@ The canonical Kafka pipeline: read from one topic, transform, write to another,
 and have the whole thing be atomic. The offsets must be committed **inside** the
 transaction — that is what makes the read and the write one unit.
 
-```rust
-use krafka::consumer::{AutoOffsetReset, Consumer, IsolationLevel};
-use krafka::producer::TransactionalProducer;
+```rust,compile
+use krafka::consumer::{AutoOffsetReset, ConsumerRecord, IsolationLevel};
+use krafka::producer::TopicPartitionOffset;
 use std::time::Duration;
 
-let consumer = Consumer::builder()
-    .bootstrap_servers("localhost:9092")
-    .group_id("transformer")
+fn transform(record: &ConsumerRecord) -> bytes::Bytes {
+    record.value.clone().unwrap_or_default()
+}
+
+let consumer = krafka::Kafka::builder("localhost:9092")
+    .connect()
+    .await?
+    .consumer("transformer")
     .auto_offset_reset(AutoOffsetReset::Earliest)
     // Never read a record whose transaction has not committed, or the pipeline
     // propagates writes that were later rolled back.
@@ -54,16 +58,14 @@ let consumer = Consumer::builder()
     .enable_auto_commit(false)
     .build()
     .await?;
-consumer.subscribe(&["orders"]).await?;
+consumer.subscribe(["orders"]).await?;
 
-let producer = TransactionalProducer::builder()
-    .bootstrap_servers("localhost:9092")
-    // Stable across restarts — this is what lets the broker fence a zombie
-    // instance of this same processor (KIP-360).
-    .transactional_id("orders-transformer-1")
-    .build()
+let producer = krafka::Kafka::builder("localhost:9092")
+    .connect()
+    .await?
+    .producer()
+    .build_transactional("orders-transformer-1")
     .await?;
-producer.init_transactions().await?;
 
 loop {
     let records = consumer.poll(Duration::from_secs(1)).await?;
@@ -71,24 +73,55 @@ loop {
         continue;
     }
 
-    producer.begin_transaction()?;
+    producer.begin()?;
+    let mut offsets = Vec::new();
     for record in &records {
-        let transformed = transform(record);
-        producer.send("orders-enriched", record.key.clone(), Some(&transformed)).await?;
+        let mut output = krafka::Record::new("orders-enriched", transform(record));
+        output.key = record.key.clone();
+        producer.send(output).await?;
+        // Commit the offset of the NEXT record to consume.
+        offsets.push(TopicPartitionOffset::new(&*record.topic, record.partition, record.offset + 1));
     }
 
     // Offsets go to the *group coordinator* as part of this transaction.
     let metadata = consumer.group_metadata().await
-        .ok_or_else(|| krafka::KrafkaError::invalid_state("consumer is not in a group"))?;
-    producer.send_offsets_to_transaction(&consumer, &metadata).await?;
+        .ok_or_else(|| krafka::KrafkaError::illegal_state("consumer is not in a group"))?;
+    producer.send_offsets(&offsets, &metadata).await?;
 
-    producer.commit_transaction().await?;
+    producer.commit().await?;
 }
 ```
 
-If `commit_transaction()` fails with an abortable error, call
-`abort_transaction()` and continue — the consumer will re-deliver. Fatal errors
-require a new producer. See [Transaction States](@/docs/producer.md#transaction-states).
+If `commit()` fails with an error for which `e.requires_abort()` is true, call
+`abort()`. The consumer's position is already past the aborted records, so
+rewind it to the group's committed offsets before the next poll; otherwise
+those records are skipped:
+
+```rust,compile
+use krafka::producer::TransactionalProducer;
+
+async fn abort_and_rewind(
+    producer: &TransactionalProducer,
+    consumer: &Consumer,
+) -> krafka::Result<()> {
+    producer.abort().await?;
+    let assignment = consumer.assignment().await;
+    let mut partitions = Vec::new();
+    for (topic, ps) in &assignment {
+        for &partition in ps {
+            partitions.push((topic.as_str(), partition));
+        }
+    }
+    for ((topic, partition), committed) in consumer.committed(&partitions).await? {
+        consumer.seek(&topic, partition, committed.offset).await?;
+    }
+    Ok(())
+}
+```
+
+A partition the group never committed is absent from `committed`; seek it to
+the start offset your reset policy implies. When `e.is_fatal()` is true, build
+a new producer. See [Transaction States](@/docs/producer.md#transaction-states).
 
 Full example: [`examples/exactly_once.rs`](https://github.com/hupe1980/krafka/blob/main/examples/exactly_once.rs).
 
@@ -96,17 +129,23 @@ Full example: [`examples/exactly_once.rs`](https://github.com/hupe1980/krafka/bl
 
 ## At-least-once with manual commits
 
-Commit only after the work is durable. The ordering is the whole recipe:
-process, *then* commit.
+Commit only after the work is durable: process, *then* commit.
 
-```rust
-let consumer = Consumer::builder()
-    .bootstrap_servers("localhost:9092")
-    .group_id("billing")
+```rust,compile
+use krafka::consumer::ConsumerRecord;
+
+async fn write_to_database(record: &ConsumerRecord) -> krafka::Result<()> {
+    Ok(())
+}
+
+let consumer = krafka::Kafka::builder("localhost:9092")
+    .connect()
+    .await?
+    .consumer("billing")
     .enable_auto_commit(false)
     .build()
     .await?;
-consumer.subscribe(&["invoices"]).await?;
+consumer.subscribe(["invoices"]).await?;
 
 loop {
     let records = consumer.poll(Duration::from_secs(1)).await?;
@@ -127,7 +166,7 @@ krafka has read ahead into its buffer. A crash between `poll()` and `commit()`
 re-delivers, which is the "at least" in at-least-once.
 
 To checkpoint application state alongside the offset, use
-[`commit_with_metadata`](@/docs/consumer.md#commit-with-metadata).
+[`commit_offsets`](@/docs/consumer.md#commit-with-metadata).
 
 ---
 
@@ -137,7 +176,15 @@ To checkpoint application state alongside the offset, use
 for the named partitions while the rest keep flowing, and the consumer stays
 alive in its group — no rebalance.
 
-```rust
+```rust,compile
+/// Your downstream: a channel, a connection pool, a write buffer.
+struct Sink;
+impl Sink {
+    fn is_backed_up(&self) -> bool { false }
+    fn has_drained(&self) -> bool { true }
+}
+let sink = Sink;
+
 let assignment = consumer.assignment().await;
 
 if sink.is_backed_up() {
@@ -159,7 +206,7 @@ if sink.has_drained() {
 
 **Keep calling `poll()` while paused.** A consumer that stops polling for longer
 than `max_poll_interval` is ejected from its group and its partitions are
-reassigned — the exact outcome backpressure was meant to avoid.
+reassigned.
 
 Records already buffered for a paused partition are withheld, not discarded:
 they are delivered on `resume()` without a re-fetch.
@@ -171,12 +218,13 @@ they are delivered on `resume()` without a re-fetch.
 `seek_to_timestamp` resolves a wall-clock instant to an offset with `ListOffsets`
 and repositions there.
 
-```rust
+```rust,compile
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // One hour ago, in epoch milliseconds.
 let since = (SystemTime::now() - Duration::from_secs(3600))
-    .duration_since(UNIX_EPOCH)?
+    .duration_since(UNIX_EPOCH)
+    .unwrap_or_default()
     .as_millis() as i64;
 
 // Assignment must exist before seeking — subscribe() is lazy, so poll once.
@@ -191,21 +239,21 @@ for (topic, partitions) in &consumer.assignment().await {
 
 A seek discards anything already fetched for that partition, so the next
 `poll()` returns data from the new position and the next commit reflects it.
-Use `seek_many()` to reposition many partitions under one lock.
+A partition with no record that new fails with `KrafkaError::NoOffset`.
+`seek_many()` repositions several partitions at once: all or none.
 
 ---
 
 ## Build an in-memory table from a compacted topic
 
 `CompactedTopicConsumer` bundles a consumer, a key→value table and caught-up
-detection. This is the shape behind most configuration and lookup-table
-use cases.
+detection.
 
 ```rust,compile
-use krafka::consumer::{CompactedTopicConsumer, Consumer};
+use krafka::consumer::CompactedTopicConsumer;
 
 let mut table = CompactedTopicConsumer::from_consumer_builder(
-    Consumer::builder().bootstrap_servers("localhost:9092"),
+    kafka.consumer_without_group(),
     "user-profiles",
 )
 .await?;
@@ -238,17 +286,17 @@ A record with a **null value** — a tombstone — retires a key from a
 key, then the tombstone itself after `delete.retention.ms`.
 
 ```rust,compile
-use krafka::producer::ProducerRecord;
+use krafka::producer::Record;
 
 producer
-    .send_record(
-        ProducerRecord::tombstone("users", "user-42")
-            .with_header("X-Reason", &b"gdpr-erasure"[..]),
+    .send(
+        Record::tombstone("users", "user-42")
+            .header("X-Reason", &b"gdpr-erasure"[..]),
     )
     .await?;
 
 // Or, without building a record:
-producer.send("users", Some(b"user-42"), None).await?;
+producer.send(krafka::Record::tombstone("users", "user-42")).await?;
 ```
 
 `Some(b"")` is **not** a deletion — a zero-length value is ordinary data that
@@ -261,180 +309,166 @@ the read side is [Build an in-memory table from a compacted topic](#build-an-in-
 
 ## Use a schema registry
 
-krafka does not ship a schema-registry client, and that is deliberate: every
-comparable client draws the same line. Java's `kafka-clients` has none
-(`kafka-avro-serializer` is a separate artifact), librdkafka has none
-(`libschemaregistry` is a separate library), and franz-go keeps `pkg/sr` out of
-`kgo`. A registry is a different service with a different protocol, auth model
-and release cadence; coupling it to the Kafka client means a registry API change
-forces a Kafka client release.
+krafka has no schema-registry client and no Avro, Protobuf or JSON codec. It
+provides the hooks: [`Serializer<T>`] for [`TypedProducer`] and
+[`Deserializer`] for the consumer. Pair them with a registry crate, such as
+[`schemreg`](https://crates.io/crates/schemreg), through a small adapter.
 
-What krafka provides is the *hook* — [`Serializer`] and [`Deserializer`], the
-equivalent of Java's `key.serializer` / `value.serializer`. Pair it with
-[`schemreg`](https://crates.io/crates/schemreg), which covers the Confluent
-registry, AWS Glue, Apicurio, and Avro / Protobuf / JSON codecs:
+`Serializer<T>` is synchronous, so register the schema before sending (the
+registry client caches it) and encode per record. The serializer may write the
+schema id into a header. The adapter below compiles as shown; `Encode` and
+`Decode` stand for whatever your registry crate provides:
 
-```sh
-cargo add krafka
-cargo add schemreg --features confluent,avro
-```
-
-The two traits do not know about each other, so bridge them with a newtype.
-This is the whole adapter:
-
-```rust
-use std::future::Future;
-use std::pin::Pin;
-
+```rust,compile
 use bytes::Bytes;
-use krafka::serdes::{Deserializer, Serializer};
+use krafka::Headers;
+use krafka::producer::TypedProducer;
+use krafka::serdes::{Deserializer, Serializer, StringSerializer};
 
-/// Bridges a `schemreg` encoder into krafka's producer hook.
-struct SchemaSerializer<T>(T);
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-impl<T> Serializer for SchemaSerializer<T>
-where
-    T: schemreg::traits::SchemaEncoder + Send + Sync,
-{
-    fn serialize(
-        &self,
-        payload: Bytes,
-        topic: &str,
-        record_name: Option<&str>,
-        is_key: bool,
-    ) -> Pin<Box<dyn Future<Output = krafka::Result<Bytes>> + Send + '_>> {
-        let topic = topic.to_owned();
-        let record_name = record_name.map(str::to_owned);
-        Box::pin(async move {
-            self.0
-                .encode(payload, &topic, record_name.as_deref(), is_key)
-                .await
-                .map_err(|e| krafka::KrafkaError::config(e.to_string()))
-        })
+/// Stand-in for your registry crate's encoder: frames `value` with its schema id.
+pub trait Encode<T: ?Sized>: Send + Sync {
+    fn encode(&self, topic: &str, value: &T) -> Result<Vec<u8>, BoxError>;
+}
+
+/// Stand-in for your registry crate's decoder.
+pub trait Decode: Send + Sync {
+    fn decode(&self, topic: &str, payload: &[u8]) -> Result<Vec<u8>, BoxError>;
+}
+
+/// Bridges a registry encoder into krafka's typed producer.
+pub struct SchemaSerializer<E>(pub E);
+
+impl<T: ?Sized, E: Encode<T>> Serializer<T> for SchemaSerializer<E> {
+    fn serialize(&self, topic: &str, _headers: &mut Headers, value: &T) -> krafka::Result<Bytes> {
+        self.0
+            .encode(topic, value)
+            .map(Bytes::from)
+            .map_err(|e| krafka::KrafkaError::serialization(e.to_string()))
     }
+}
+
+/// Bridges a registry decoder into the consumer.
+pub struct SchemaDeserializer<D>(pub D);
+
+impl<D: Decode> Deserializer for SchemaDeserializer<D> {
+    fn deserialize(
+        &self,
+        topic: &str,
+        _headers: &Headers,
+        payload: Bytes,
+        _is_key: bool,
+    ) -> krafka::Result<Bytes> {
+        self.0
+            .decode(topic, &payload)
+            .map(Bytes::from)
+            .map_err(|e| krafka::KrafkaError::serialization(e.to_string()))
+    }
+}
+
+pub struct Order {
+    pub id: u64,
+}
+
+async fn wire<E, D>(kafka: &Kafka, encoder: E, decoder: D) -> krafka::Result<()>
+where
+    E: Encode<Order> + 'static,
+    D: Decode + 'static,
+{
+    let producer: TypedProducer<str, Order> = TypedProducer::new(
+        kafka.producer().build().await?,
+        StringSerializer,
+        SchemaSerializer(encoder),
+    );
+    producer.send("orders", Some("order-1"), Some(&Order { id: 1 })).await?;
+
+    let consumer = kafka
+        .consumer("orders")
+        .value_deserializer(SchemaDeserializer(decoder))
+        .build()
+        .await?;
+    Ok(())
 }
 ```
 
-Write the mirror image for `Deserializer` (it takes no `record_name` — on the
-read path the framing identifies the schema), then wire both in:
+A deserializer error reaches the application as
+`KrafkaError::RecordDeserialization`, carrying the record's topic, partition
+and offset so it can [skip past it](@/docs/errors.md#handling-poll-errors).
 
-```rust
-let producer = Producer::builder()
-    .bootstrap_servers("localhost:9092")
-    .value_serializer(Arc::new(SchemaSerializer(encoder)))
-    .build()
-    .await?;
-
-let consumer = Consumer::builder()
-    .bootstrap_servers("localhost:9092")
-    .group_id("orders")
-    .value_deserializer(Arc::new(SchemaDeserializer(decoder)))
-    .build()
-    .await?;
-```
-
-From here `send()` frames every value on the way out and `poll()` unframes it on
-the way in — the application only ever sees decoded bytes.
-
-> **Map the error type deliberately.** The adapter above collapses every
-> registry failure into `KrafkaError::config`, which is fine for getting
-> started and wrong for production: a registry that is *unreachable* is
-> retriable, a schema that is *incompatible* is not, and `is_retriable()` cannot
-> tell them apart once both are `Config`. Match on `schemreg`'s error and map
-> the transport cases to `KrafkaError::network` so krafka's retry logic can act
-> on them.
+> **Map the error type.** The adapter above maps every registry
+> failure to `KrafkaError::serialization`, and `is_retriable()` is false for
+> it. A registry that is *unreachable* is worth retrying and a schema that is
+> *incompatible* is not: match on your registry crate's error and map transport
+> failures to `KrafkaError::network` so the caller can tell them apart.
 
 ### Beyond schemas
 
-The traits are plain `Bytes -> Bytes`, so the same hook covers envelope
+A serializer is any `T -> Bytes` encoding, so the same hook covers envelope
 encryption, an application-level compression scheme, or a bare `serde_json`
-round-trip. Nothing about it is schema-specific.
+encoding.
 
-[`Serializer`]: https://docs.rs/krafka/latest/krafka/serdes/trait.Serializer.html
+[`Serializer<T>`]: https://docs.rs/krafka/latest/krafka/serdes/trait.Serializer.html
+[`TypedProducer`]: https://docs.rs/krafka/latest/krafka/producer/struct.TypedProducer.html
 [`Deserializer`]: https://docs.rs/krafka/latest/krafka/serdes/trait.Deserializer.html
 
 ---
 
 ## Route poison records to a dead-letter topic
 
-A `DeadLetterQueue` receives records that exhaust their retries, on both send
-paths and on both producers — so a record cannot be lost because it failed in
-the batching path rather than the direct one.
-
-Routing dead letters back into Kafka is the common case, so it ships in the
-crate:
+When a consumed record cannot be processed, send it to a dead-letter topic
+and keep consuming. `krafka::dlq::record_for` builds the record: it keeps the
+key, value and headers and adds `__krafka.dlq.original.topic`,
+`__krafka.dlq.original.partition`, `__krafka.dlq.original.offset` and
+`__krafka.dlq.exception.message`, so a replay job can tell where it came from
+and why it is here. The source partition index is not carried over, because
+the dead-letter topic has its own partition count.
 
 ```rust,compile
-use std::sync::Arc;
-
-use krafka::dlq::KafkaDeadLetterQueue;
+use krafka::consumer::Consumer;
 use krafka::producer::Producer;
+use std::time::Duration;
 
-// A *dedicated* producer. Sharing the one whose sends are failing puts the
-// dead-letter write behind the same stalled broker that caused the failure.
-let dlq = Arc::new(KafkaDeadLetterQueue::new(
-    Producer::builder()
-        .bootstrap_servers("localhost:9092")
-        .build()
-        .await?,
-    "orders.DLQ",
-));
-
-let producer = Producer::builder()
-    .bootstrap_servers("localhost:9092")
-    // `dlq.clone()` and not `Arc::clone(&dlq)`: the method call is a coercion
-    // site, so `Arc<KafkaDeadLetterQueue>` unsizes to `Arc<dyn DeadLetterQueue>`.
-    // The free function fixes its own return type first and will not coerce.
-    .dead_letter_queue(dlq.clone())
+// A *dedicated* producer, so dead-letter writes do not queue behind the
+// application's own sends.
+let dlq = krafka::Kafka::builder("localhost:9092")
+    .connect()
+    .await?
+    .producer()
     .build()
     .await?;
 
-// Alert on this: a non-zero value means the safety net itself is failing, and
-// nothing else reports it.
-assert_eq!(dlq.failures(), 0);
+for record in consumer.poll(Duration::from_secs(1)).await? {
+    if let Err(error) = std::str::from_utf8(record.value.as_deref().unwrap_or_default()) {
+        dlq.send(krafka::dlq::record_for("orders.DLQ", &record, &error))
+            .await?;
+    }
+}
 ```
 
-The record keeps its key, value and headers, and gains
-`__krafka.dlq.original.topic` and `__krafka.dlq.exception.message` so a replay
-job can tell where it came from and why it is here. The source partition index
-is dropped, because the dead-letter topic has its own partition count.
-
-For any other destination — S3, a database, a file — implement
-[`DeadLetterQueue`](https://docs.rs/krafka/latest/krafka/dlq/trait.DeadLetterQueue.html)
-yourself; it is one method.
-
-For the consumer side, `krafka::dlq::build_dlq_record` turns a `ConsumerRecord`
-into a `ProducerRecord` carrying provenance headers (original topic, partition,
-offset and the error), so a replay job can reconstruct where each record came
-from.
-
-The DLQ is invoked *before* the error reaches the caller, so code reacting to a
-failed `send()` can rely on the record already being safe. See
-[Dead Letter Queues](@/docs/errors.md).
+The producer itself has no dead-letter path: a failed `send()` returns its
+error, and `send` takes the record by value, so clone it first to route it
+elsewhere on failure. See
+[Dead Letter Queue](@/docs/errors.md#dead-letter-queue).
 
 ---
 
 ## Share one connection pool across clients
 
-A producer, a consumer and an admin client pointed at the same cluster do not
-need three connection pools and three metadata caches.
+A producer, a consumer and an admin client built from one `Kafka` handle share
+one connection pool and one metadata cache.
 
-```rust
-use krafka::client::KrafkaClient;
+```rust,compile
+let kafka = krafka::Kafka::builder("localhost:9092").connect().await?;
 
-let client = KrafkaClient::builder()
-    .bootstrap_servers("localhost:9092")
-    .build()
-    .await?;
-
-let producer = Producer::builder().with_client(&client).build().await?;
-let consumer = Consumer::builder().with_client(&client).group_id("g").build().await?;
-let admin    = AdminClient::builder().with_client(&client).build().await?;
+let producer = kafka.producer().build().await?;
+let consumer = kafka.consumer("g").build().await?;
+let admin = kafka.admin();
 ```
 
-Each client reports `owns_pool()`; a borrowed pool is left alone by `close()`,
-so shutting one client down does not tear out its siblings' connections. Close
-the `KrafkaClient` last.
+A client's `close()` leaves the pool alone, so shutting one client down does
+not tear out its siblings' connections. The pool closes when the handle and
+every client built from it are gone.
 
 ---
 
@@ -444,16 +478,16 @@ the `KrafkaClient` last.
 the connector. Existing sessions keep the connector they handshook with; every
 new connection uses the new material.
 
-```rust
-let producer = Arc::new(producer);
-let rotating = Arc::clone(&producer);
+```rust,compile
+use std::time::Duration;
 
+let rotating = kafka.clone();
 tokio::spawn(async move {
     let mut ticker = tokio::time::interval(Duration::from_secs(3600));
     loop {
         ticker.tick().await;
         if let Err(e) = rotating.refresh_tls().await {
-            // The old connector stays active on failure — nothing breaks.
+            // On failure the old connector stays active.
             tracing::warn!("TLS reload failed: {e}");
         }
     }
@@ -467,33 +501,29 @@ The connection pool can also do this for you on a timer — see
 
 ## Export lag to Prometheus
 
-Every client exposes shared metrics handles that render themselves in the
-Prometheus text format. The producer's is `metrics_handle()` (`metrics()`
-returns a plain value snapshot); the consumer's is `metrics()`; the transport's
-is `connection_metrics()`, and it is shared by every client on the same pool:
+Every client's `metrics()` returns an owned snapshot, and `Kafka::metrics()`
+sums the clients of a handle with the shared pool counted once. Render the sum
+in the Prometheus text format:
 
 ```rust,compile
-use krafka::metrics::MetricsVisitable;
+use krafka::Kafka;
 
-fn scrape(producer: &Producer, consumer: &Consumer) -> String {
-    let mut body = String::new();
-    body.push_str(&producer.metrics_handle().to_prometheus_text("krafka_producer"));
-    body.push_str(&consumer.metrics().to_prometheus_text("krafka_consumer"));
-    body.push_str(&consumer.connection_metrics().to_prometheus_text("krafka_connection"));
-    body
+fn scrape(kafka: &Kafka) -> String {
+    kafka.metrics().prometheus_text()
 }
 ```
 
-Two things worth knowing before you alert on the output:
+Before alerting on the output:
 
 - **Lag counts records read ahead into the buffer.** Fetched is not delivered,
   so the number reflects what the application still has to process.
 - **Under `read_committed`, lag is measured against the last stable offset**,
-  not the high watermark — otherwise an open transaction pins a fully drained
-  consumer at permanent non-zero lag and an autoscaler chases it forever.
+  not the high watermark, so an open transaction does not hold a drained
+  consumer at non-zero lag.
 
-`consumer.lag()` additionally reports `stale_partitions`, so a lag value that is
-merely out of date is distinguishable from a real one. See
+`consumer.lag()` additionally marks each partition `stale` when its watermarks
+are old, so a lag value that is merely out of date is distinguishable from a
+real one. See
 [Metrics](@/docs/metrics.md).
 
 ---
@@ -506,7 +536,7 @@ exactly-once paths are testable in a unit test.
 
 ```rust,compile
 use krafka::testing::{Control, FakeBroker};
-use krafka::protocol::ApiKey;
+use krafka::testing::ApiKey;
 
 #[tokio::test]
 async fn the_consumer_survives_a_coordinator_failover() {

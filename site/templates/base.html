@@ -15,7 +15,8 @@
 
     Resolved once here rather than per-template: a meta tag that exists on some
     pages and not others is worse than one that exists nowhere, because the gap
-    is invisible in review. `is_home` is set by index.html. -#}
+    is invisible in review. -#}
+{%- set is_home = current_path is defined and current_path == "/" -%}
 {%- if is_home -%}
   {%- set page_title = "krafka — a pure-Rust Apache Kafka client" -%}
 {%- elif page.title -%}

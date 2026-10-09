@@ -1,7 +1,7 @@
 //! Client-driven tests: real `krafka` clients against the fake broker.
 //!
-//! Each test here exercises a client behaviour that previously needed Docker
-//! and a well-timed cluster failure to reach at all. The assertions are on what
+//! Each test here exercises a client behaviour that would otherwise need
+//! Docker and a well-timed cluster failure to reach. The assertions are on what
 //! the *client* did — how many attempts it made, which broker it went to, and
 //! whether it recovered — not on the broker's internals.
 
@@ -10,7 +10,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use crate::admin::{AdminClient, NewTopic};
+use crate::admin::{AdminClient, CreateTopicsOptions, NewTopic};
 use crate::error::ErrorCode;
 use crate::producer::Producer;
 use crate::protocol::ApiKey;
@@ -33,13 +33,13 @@ const SHORT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const SHORT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 async fn admin_for(broker: &FakeBroker) -> AdminClient {
-    AdminClient::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
+    crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
-        .build()
+        .connect()
         .await
         .expect("admin client should connect to the fake broker")
+        .admin()
 }
 
 // ---------------------------------------------------------------------------
@@ -55,12 +55,18 @@ async fn a_real_admin_client_completes_a_handshake_and_creates_a_topic() {
     let admin = admin_for(&broker).await;
 
     let results = admin
-        .create_topics(vec![NewTopic::new("orders", 3, 1).unwrap()], SETTLE, false)
+        .create_topics(
+            vec![NewTopic::new("orders", 3, 1).unwrap()],
+            CreateTopicsOptions::default().timeout(SETTLE),
+        )
         .await
         .expect("CreateTopics should succeed");
 
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].error, None, "topic creation reported an error");
+    assert!(
+        results["orders"].is_ok(),
+        "topic creation reported an error"
+    );
 
     broker.with_state(|s| {
         let topic = s
@@ -81,10 +87,13 @@ async fn a_real_producer_appends_records_at_broker_assigned_offsets() {
     let broker = FakeBroker::start().await.unwrap();
     broker.create_topic("events", 1);
 
-    let producer = Producer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
+    let producer = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .connect()
+        .await
+        .expect("producer should connect")
+        .producer()
         .linger(Duration::from_millis(5))
         .build()
         .await
@@ -92,7 +101,10 @@ async fn a_real_producer_appends_records_at_broker_assigned_offsets() {
 
     for i in 0..3u8 {
         let _ = producer
-            .send("events", None, Some(&[b'v', i]))
+            .send(crate::Record::new(
+                "events",
+                bytes::Bytes::copy_from_slice(&[b'v', i]),
+            ))
             .await
             .expect("send should be acknowledged");
     }
@@ -108,7 +120,7 @@ async fn a_real_producer_appends_records_at_broker_assigned_offsets() {
 /// are awaited in.
 ///
 /// This is the guarantee `enqueue()` exists to provide, and the reason a fused
-/// `send_record()` future cannot provide it: a fused future does its append
+/// `enqueue()` future cannot provide it: a fused future does its append
 /// somewhere inside its own polling, so N of them polled concurrently append in
 /// poll order. Under buffer-memory backpressure the two orders diverge — a send
 /// that cannot get its permit yields and a later one appends first.
@@ -123,10 +135,13 @@ async fn produce_order_follows_enqueue_order_not_await_order() {
     let broker = FakeBroker::start().await.unwrap();
     broker.create_topic("events", 1);
 
-    let producer = Producer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
+    let producer = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .connect()
+        .await
+        .expect("producer should connect")
+        .producer()
         .build()
         .await
         .expect("producer should connect");
@@ -135,9 +150,7 @@ async fn produce_order_follows_enqueue_order_not_await_order() {
     let mut handles = Vec::with_capacity(RECORDS);
     for i in 0..RECORDS {
         let handle = producer
-            .enqueue(
-                crate::producer::ProducerRecord::new("events", vec![i as u8]).with_partition(0),
-            )
+            .enqueue(crate::producer::Record::new("events", vec![i as u8]).partition(0))
             .await
             .expect("enqueue should succeed");
         assert_eq!(
@@ -157,7 +170,7 @@ async fn produce_order_follows_enqueue_order_not_await_order() {
             .offset;
     }
 
-    producer.close().await;
+    producer.close().await.unwrap();
 
     assert_eq!(
         broker.next_offset("events", 0),
@@ -197,11 +210,13 @@ async fn the_default_producer_batches_concurrent_sends_to_one_partition() {
     broker.create_topic("events", 1);
 
     let producer = std::sync::Arc::new(
-        Producer::builder()
-            .bootstrap_servers(broker.bootstrap_servers())
+        crate::Kafka::builder(broker.bootstrap_servers())
             .request_timeout(SHORT_REQUEST_TIMEOUT)
             .connect_timeout(SHORT_CONNECT_TIMEOUT)
-            // No `.linger(..)`: this is the out-of-the-box configuration.
+            .connect()
+            .await
+            .expect("producer should connect")
+            .producer()
             .build()
             .await
             .expect("producer should connect"),
@@ -213,9 +228,9 @@ async fn the_default_producer_batches_concurrent_sends_to_one_partition() {
         let producer = producer.clone();
         tasks.spawn(async move {
             producer
-                .send_record(
-                    crate::producer::ProducerRecord::new("events", format!("v{i}").into_bytes())
-                        .with_partition(0),
+                .send(
+                    crate::producer::Record::new("events", format!("v{i}").into_bytes())
+                        .partition(0),
                 )
                 .await
         });
@@ -228,7 +243,7 @@ async fn the_default_producer_batches_concurrent_sends_to_one_partition() {
             .expect("every send must be acknowledged");
         acknowledged += 1;
     }
-    producer.close().await;
+    producer.close().await.unwrap();
 
     assert_eq!(acknowledged, RECORDS);
     assert_eq!(
@@ -252,9 +267,6 @@ async fn the_default_producer_batches_concurrent_sends_to_one_partition() {
 
 /// `NOT_CONTROLLER` must make the admin client refresh metadata, re-resolve the
 /// controller and retry — not surface the error to the caller.
-///
-/// This is the behaviour the controller-routing retry was added for, and it had
-/// no test outside Docker.
 #[tokio::test]
 async fn not_controller_on_create_topics_makes_the_client_refresh_and_retry() {
     let broker = FakeBroker::start().await.unwrap();
@@ -268,11 +280,14 @@ async fn not_controller_on_create_topics_makes_the_client_refresh_and_retry() {
     let metadata_before = broker.request_count(ApiKey::Metadata);
 
     let results = admin
-        .create_topics(vec![NewTopic::new("orders", 1, 1).unwrap()], SETTLE, false)
+        .create_topics(
+            vec![NewTopic::new("orders", 1, 1).unwrap()],
+            CreateTopicsOptions::default().timeout(SETTLE),
+        )
         .await
         .expect("the client should retry past NOT_CONTROLLER, not fail");
 
-    assert_eq!(results[0].error, None, "the retry should have succeeded");
+    assert!(results["orders"].is_ok(), "the retry should have succeeded");
     assert_eq!(
         broker.request_count(ApiKey::CreateTopics),
         2,
@@ -287,7 +302,7 @@ async fn not_controller_on_create_topics_makes_the_client_refresh_and_retry() {
 /// A controller that never comes back must eventually surface as an error
 /// rather than retrying forever.
 #[tokio::test]
-async fn a_permanently_missing_controller_gives_up_instead_of_looping() {
+async fn a_permanently_missing_controller_gives_up_at_the_deadline() {
     let broker = FakeBroker::start().await.unwrap();
     let admin = admin_for(&broker).await;
 
@@ -295,65 +310,70 @@ async fn a_permanently_missing_controller_gives_up_instead_of_looping() {
         Control::Error(ErrorCode::NotController)
     });
 
-    let outcome = admin
-        .create_topics(vec![NewTopic::new("orders", 1, 1).unwrap()], SETTLE, false)
-        .await;
+    let started = std::time::Instant::now();
+    let results = admin
+        .create_topics(
+            vec![NewTopic::new("orders", 1, 1).unwrap()],
+            CreateTopicsOptions::default().timeout(Duration::from_secs(2)),
+        )
+        .await
+        .expect("only the topic fails, not the call");
 
     assert!(
-        outcome.is_err(),
-        "a permanent NOT_CONTROLLER must terminate, got {outcome:?}"
+        matches!(
+            results["orders"],
+            Err(crate::error::KrafkaError::Broker {
+                code: ErrorCode::NotController,
+                ..
+            })
+        ),
+        "a permanent NOT_CONTROLLER must surface with its code, got {:?}",
+        results["orders"]
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the call outlived its 2 s deadline: {:?}",
+        started.elapsed()
     );
     let attempts = broker.request_count(ApiKey::CreateTopics);
     assert!(
-        (2..=10).contains(&attempts),
-        "retries should be bounded, saw {attempts} attempts"
+        attempts >= 2,
+        "NOT_CONTROLLER was not retried ({attempts} attempts)"
     );
 }
 
-/// The controller retry budget must be the *configured* one.
-///
-/// It used to be a hardcoded 5 attempts spaced by a flat 100 ms — no jitter, no
-/// growth, and no way to change it. On a cluster whose controller elections
-/// take longer than the ~500 ms that buys, `create_topics` during a rolling
-/// controller restart failed with "the controller did not stabilise" when
-/// waiting a little longer would have worked. The docs meanwhile claimed the
-/// gap was `retry.backoff.ms`, a setting that did not exist.
+/// The default deadline is the configured one: a client built with a short
+/// `default_api_timeout` stops retrying at it.
 #[tokio::test]
-async fn the_controller_retry_budget_is_the_configured_one() {
+async fn the_default_api_timeout_bounds_every_call() {
     let broker = FakeBroker::start().await.unwrap();
-    let admin = AdminClient::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
+    let admin = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
-        // `retries` counts additional attempts, so this is four tries.
-        .retries(3)
-        .retry_backoff(Duration::from_millis(1))
-        .build()
+        .connect()
         .await
-        .expect("admin client should connect");
+        .expect("admin client should connect")
+        .admin()
+        .default_api_timeout(Duration::from_secs(1))
+        .retry_backoff(Duration::from_millis(1));
 
     broker.on(ApiKey::CreateTopics, |_| {
         Control::Error(ErrorCode::NotController)
     });
 
-    let outcome = admin
-        .create_topics(vec![NewTopic::new("orders", 1, 1).unwrap()], SETTLE, false)
-        .await;
+    let started = std::time::Instant::now();
+    let results = admin
+        .create_topics(
+            vec![NewTopic::new("orders", 1, 1).unwrap()],
+            CreateTopicsOptions::default(),
+        )
+        .await
+        .expect("only the topic fails, not the call");
+    let elapsed = started.elapsed();
+    assert!(results["orders"].is_err());
     assert!(
-        outcome.is_err(),
-        "a permanent NOT_CONTROLLER must terminate"
-    );
-
-    assert_eq!(
-        broker.request_count(ApiKey::CreateTopics),
-        4,
-        "retries(3) must mean three retries on top of the first attempt"
-    );
-
-    let message = outcome.expect_err("checked above").to_string();
-    assert!(
-        message.contains("retries"),
-        "the error must name the setting to raise, got: {message}"
+        elapsed >= Duration::from_millis(900) && elapsed < Duration::from_millis(1600),
+        "the call should end at its 1 s deadline, took {elapsed:?}"
     );
 }
 
@@ -376,18 +396,21 @@ async fn a_producer_follows_a_partition_leader_to_another_broker() {
         }
     });
 
-    let producer = Producer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
+    let producer = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
         .metadata_max_age(Duration::from_millis(500))
+        .connect()
+        .await
+        .expect("producer should connect")
+        .producer()
         .linger(Duration::from_millis(5))
         .build()
         .await
         .expect("producer should connect");
 
     let _ = producer
-        .send("events", None, Some(b"before-the-move"))
+        .send(crate::Record::new("events", "before-the-move"))
         .await
         .expect("the first send should land on the original leader");
 
@@ -395,7 +418,7 @@ async fn a_producer_follows_a_partition_leader_to_another_broker() {
     assert!(broker.set_leader("events", 0, 1));
 
     let _ = producer
-        .send("events", None, Some(b"after-the-move"))
+        .send(crate::Record::new("events", "after-the-move"))
         .await
         .expect("the producer should follow the leader rather than fail");
 
@@ -436,10 +459,13 @@ async fn a_leader_move_is_followed_without_waiting_for_the_cache_to_age() {
         }
     });
 
-    let producer = Producer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
+    let producer = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .connect()
+        .await
+        .expect("producer should connect")
+        .producer()
         .delivery_timeout(Duration::from_secs(20))
         .linger(Duration::from_millis(5))
         .build()
@@ -447,7 +473,7 @@ async fn a_leader_move_is_followed_without_waiting_for_the_cache_to_age() {
         .expect("producer should connect");
 
     let _ = producer
-        .send("events", None, Some(b"before"))
+        .send(crate::Record::new("events", "before"))
         .await
         .unwrap();
 
@@ -455,7 +481,7 @@ async fn a_leader_move_is_followed_without_waiting_for_the_cache_to_age() {
     assert!(broker.set_leader("events", 0, 1));
 
     let _ = producer
-        .send("events", None, Some(b"after"))
+        .send(crate::Record::new("events", "after"))
         .await
         .expect("a leader move must be followed without waiting out metadata_max_age");
 
@@ -484,18 +510,21 @@ async fn an_error_without_a_leader_hint_still_forces_a_metadata_refresh() {
     let broker = FakeBroker::start().await.unwrap();
     broker.create_topic("events", 1);
 
-    let producer = Producer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
+    let producer = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
         .metadata_max_age(Duration::from_millis(500))
+        .connect()
+        .await
+        .expect("producer should connect")
+        .producer()
         .linger(Duration::from_millis(5))
         .build()
         .await
         .expect("producer should connect");
 
     let _ = producer
-        .send("events", None, Some(b"before"))
+        .send(crate::Record::new("events", "before"))
         .await
         .unwrap();
 
@@ -505,7 +534,7 @@ async fn an_error_without_a_leader_hint_still_forces_a_metadata_refresh() {
     });
 
     let _ = producer
-        .send("events", None, Some(b"after"))
+        .send(crate::Record::new("events", "after"))
         .await
         .expect("the retry should succeed once the injected error is spent");
 
@@ -532,12 +561,14 @@ async fn a_group_coordinator_move_is_rediscovered_on_the_new_broker() {
     broker.create_topic("events", 1);
     broker.set_group_coordinator("analytics", 0);
 
-    let consumer = crate::consumer::Consumer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
-        .group_id("analytics")
+    let consumer = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
         .metadata_max_age(Duration::from_millis(500))
+        .connect()
+        .await
+        .expect("consumer should connect")
+        .consumer("analytics")
         .build()
         .await
         .expect("consumer should connect");
@@ -563,10 +594,11 @@ async fn a_group_coordinator_move_is_rediscovered_on_the_new_broker() {
     broker.set_group_coordinator("analytics", 1);
 
     // The client only notices when it next talks to the coordinator, so keep it
-    // polling rather than sleeping and hoping.
+    // polling rather than sleeping and hoping. Each `recv` runs to completion:
+    // cancelling one mid-rejoin is a different test.
     let poller = tokio::spawn(async move {
         loop {
-            let _ = tokio::time::timeout(Duration::from_millis(200), consumer.recv()).await;
+            let _ = consumer.recv().await;
         }
     });
 
@@ -611,13 +643,13 @@ async fn a_group_coordinator_move_is_rediscovered_on_the_new_broker() {
 async fn a_response_arriving_after_the_client_timeout_leaves_the_connection_usable() {
     let broker = FakeBroker::start().await.unwrap();
 
-    let admin = AdminClient::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
+    let admin = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
-        .build()
+        .connect()
         .await
-        .expect("admin client should connect");
+        .expect("admin client should connect")
+        .admin();
 
     // Answer a second past the request timeout, so the response is orphaned by
     // the time it reaches the client.
@@ -626,10 +658,14 @@ async fn a_response_arriving_after_the_client_timeout_leaves_the_connection_usab
     });
 
     let timed_out = admin
-        .create_topics(vec![NewTopic::new("slow", 1, 1).unwrap()], SETTLE, false)
+        .create_topics(
+            vec![NewTopic::new("slow", 1, 1).unwrap()],
+            CreateTopicsOptions::default().timeout(SETTLE),
+        )
         .await;
+    let timed_out = timed_out.expect("only the topic fails, not the call");
     assert!(
-        timed_out.is_err(),
+        timed_out["slow"].is_err(),
         "the request should have timed out client-side, got {timed_out:?}"
     );
 
@@ -638,10 +674,13 @@ async fn a_response_arriving_after_the_client_timeout_leaves_the_connection_usab
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let after = admin
-        .create_topics(vec![NewTopic::new("after", 1, 1).unwrap()], SETTLE, false)
+        .create_topics(
+            vec![NewTopic::new("after", 1, 1).unwrap()],
+            CreateTopicsOptions::default().timeout(SETTLE),
+        )
         .await
         .expect("the client must still be usable after an orphaned response");
-    assert_eq!(after[0].error, None);
+    assert!(after["after"].is_ok());
 
     broker.with_state(|s| {
         assert!(
@@ -658,13 +697,13 @@ async fn a_delayed_response_does_not_fail_requests_on_other_connections() {
     let broker = FakeBroker::start().await.unwrap();
     broker.create_topic("events", 1);
 
-    let slow = AdminClient::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
+    let slow = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
-        .build()
+        .connect()
         .await
-        .expect("admin client should connect");
+        .expect("admin client should connect")
+        .admin();
 
     let healthy = admin_for(&broker).await;
 
@@ -673,15 +712,23 @@ async fn a_delayed_response_does_not_fail_requests_on_other_connections() {
     });
 
     let (slow_result, healthy_result) = tokio::join!(
-        slow.create_topics(vec![NewTopic::new("slow", 1, 1).unwrap()], SETTLE, false),
+        slow.create_topics(
+            vec![NewTopic::new("slow", 1, 1).unwrap()],
+            CreateTopicsOptions::default().timeout(SETTLE)
+        ),
         async {
             // Give the delayed request a head start so it is genuinely in flight.
             tokio::time::sleep(Duration::from_millis(50)).await;
-            healthy.list_topics().await
+            healthy
+                .list_topics(crate::admin::ListTopicsOptions::default())
+                .await
         }
     );
 
-    assert!(slow_result.is_err(), "the delayed request should time out");
+    assert!(
+        slow_result.expect("only the topic fails")["slow"].is_err(),
+        "the delayed request should time out"
+    );
     assert!(
         healthy_result.is_ok(),
         "an unrelated connection must be unaffected, got {healthy_result:?}"
@@ -700,14 +747,20 @@ async fn a_dropped_connection_is_re_established() {
     let admin = admin_for(&broker).await;
 
     admin
-        .create_topics(vec![NewTopic::new("first", 1, 1).unwrap()], SETTLE, false)
+        .create_topics(
+            vec![NewTopic::new("first", 1, 1).unwrap()],
+            CreateTopicsOptions::default().timeout(SETTLE),
+        )
         .await
         .expect("the first request should succeed");
 
     broker.on_once(ApiKey::Metadata, |_| Control::Disconnect);
 
     let outcome = admin
-        .create_topics(vec![NewTopic::new("second", 1, 1).unwrap()], SETTLE, false)
+        .create_topics(
+            vec![NewTopic::new("second", 1, 1).unwrap()],
+            CreateTopicsOptions::default().timeout(SETTLE),
+        )
         .await;
     assert!(
         outcome.is_ok(),
@@ -726,7 +779,10 @@ async fn on_times_applies_to_exactly_that_many_requests() {
     });
 
     admin
-        .create_topics(vec![NewTopic::new("orders", 1, 1).unwrap()], SETTLE, false)
+        .create_topics(
+            vec![NewTopic::new("orders", 1, 1).unwrap()],
+            CreateTopicsOptions::default().timeout(SETTLE),
+        )
         .await
         .expect("two rejections should still be within the retry budget");
 
@@ -813,7 +869,10 @@ async fn an_unsupported_api_versions_ceiling_falls_back_instead_of_failing() {
     let admin = admin_for(&broker).await;
 
     admin
-        .create_topics(vec![NewTopic::new("orders", 1, 1).unwrap()], SETTLE, false)
+        .create_topics(
+            vec![NewTopic::new("orders", 1, 1).unwrap()],
+            CreateTopicsOptions::default().timeout(SETTLE),
+        )
         .await
         .expect("the client should fall back and complete the handshake");
 
@@ -830,10 +889,13 @@ async fn an_unsupported_api_versions_ceiling_falls_back_instead_of_failing() {
 
 /// Build a producer against the fake broker with the short test timeouts.
 async fn producer_for(broker: &FakeBroker) -> Producer {
-    Producer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
+    crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .connect()
+        .await
+        .expect("producer should connect to the fake broker")
+        .producer()
         .linger(Duration::from_millis(5))
         .build()
         .await
@@ -850,7 +912,7 @@ async fn a_swallowed_request_does_not_wedge_the_connection() {
 
     // Establish the connection, then have the broker swallow the next Produce.
     let _ = producer
-        .send("events", None, Some(b"first"))
+        .send(crate::Record::new("events", "first"))
         .await
         .expect("send should be acknowledged");
     broker.on_once(ApiKey::Produce, |_| Control::Silence);
@@ -859,35 +921,28 @@ async fn a_swallowed_request_does_not_wedge_the_connection() {
     // far below the delivery timeout a wedged connection would run into.
     let metadata = tokio::time::timeout(
         SHORT_REQUEST_TIMEOUT * 5,
-        producer.send("events", None, Some(b"second")),
+        producer.send(crate::Record::new("events", "second")),
     )
     .await
     .expect("the retry must not hang on the wedged connection")
     .expect("the retry must succeed on a fresh connection");
     assert_eq!(metadata.offset, 1);
     assert_eq!(
-        producer.connection_metrics().snapshot().stalled_connections,
+        producer.metrics().connections.stalled_connections,
         1,
         "the swallowed request must be what closed the connection"
     );
 
-    producer.close().await;
+    producer.close().await.unwrap();
 }
 
 /// A record batch that fails its CRC must reach the application as an error,
 /// and must not silently stall the partition.
 ///
-/// The failure mode this guards against is specific and nasty: a decode error
-/// leaving the partition unable to advance used to `break` out of the batch
-/// loop with a `debug!`, producing no offset update. The consumer then
-/// re-fetched the same bytes forever, delivering nothing from that partition
-/// while looking perfectly healthy — the reason confined to a log line
-/// production filters out.
-///
-/// Asserting through the *public* `poll()` API is the point. An earlier version
-/// of this fix reported the fault correctly from the decode loop but returned it
-/// from a helper whose only caller logged and discarded it, so nothing reached
-/// the application. Only an end-to-end assertion catches that.
+/// A decode error that leaves the partition unable to advance would otherwise
+/// re-fetch the same bytes forever while the consumer looks healthy. The
+/// assertion goes through the *public* `poll()` API, so an error dropped by
+/// any internal caller fails it.
 #[tokio::test]
 async fn a_corrupt_record_batch_surfaces_from_poll_instead_of_stalling() {
     let broker = FakeBroker::start().await.unwrap();
@@ -895,18 +950,21 @@ async fn a_corrupt_record_batch_surfaces_from_poll_instead_of_stalling() {
 
     let producer = producer_for(&broker).await;
     let _ = producer
-        .send("events", None, Some(b"payload"))
+        .send(crate::Record::new("events", "payload"))
         .await
         .expect("produce should succeed");
 
-    let consumer = crate::consumer::Consumer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
+    let consumer = crate::Kafka::builder(broker.bootstrap_servers())
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .connect()
+        .await
+        .expect("consumer should connect")
+        .consumer_without_group()
         // Standalone (manually assigned): manual assignment and group
         // subscription are mutually exclusive, and the fault path under test
         // is identical either way.
         .auto_offset_reset(crate::consumer::AutoOffsetReset::Earliest)
-        .request_timeout(SHORT_REQUEST_TIMEOUT)
-        .connect_timeout(SHORT_CONNECT_TIMEOUT)
         .build()
         .await
         .expect("consumer should connect");
@@ -961,7 +1019,7 @@ async fn a_corrupt_record_batch_surfaces_from_poll_instead_of_stalling() {
         "a CRC failure is not retriable: re-fetching returns the same bytes"
     );
     assert!(
-        consumer.metrics().batch_decode_errors.get() > 0,
+        consumer.metrics().consumer.batch_decode_errors > 0,
         "the corruption must be counted, so it is alertable without log scraping"
     );
 }
@@ -980,22 +1038,22 @@ async fn pausing_a_corrupt_partition_lets_the_others_keep_flowing() {
     let producer = producer_for(&broker).await;
     for partition in 0..2 {
         let _ = producer
-            .send_record(
-                crate::producer::ProducerRecord::new("events", &b"payload"[..])
-                    .with_partition(partition),
-            )
+            .send(crate::producer::Record::new("events", &b"payload"[..]).partition(partition))
             .await
             .expect("produce should succeed");
     }
 
-    let consumer = crate::consumer::Consumer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
+    let consumer = crate::Kafka::builder(broker.bootstrap_servers())
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .connect()
+        .await
+        .expect("consumer should connect")
+        .consumer_without_group()
         // Standalone (manually assigned): manual assignment and group
         // subscription are mutually exclusive, and the fault path under test
         // is identical either way.
         .auto_offset_reset(crate::consumer::AutoOffsetReset::Earliest)
-        .request_timeout(SHORT_REQUEST_TIMEOUT)
-        .connect_timeout(SHORT_CONNECT_TIMEOUT)
         .build()
         .await
         .expect("consumer should connect");
@@ -1082,17 +1140,19 @@ async fn a_commit_carries_the_leader_epoch_it_was_read_at() {
 
     let producer = producer_for(&broker).await;
     let _ = producer
-        .send("events", None, Some(b"payload"))
+        .send(crate::Record::new("events", "payload"))
         .await
         .expect("produce should succeed");
 
-    let consumer = crate::consumer::Consumer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
-        .group_id("readers")
-        .auto_offset_reset(crate::consumer::AutoOffsetReset::Earliest)
-        .enable_auto_commit(false)
+    let consumer = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .connect()
+        .await
+        .expect("consumer should connect")
+        .consumer("readers")
+        .auto_offset_reset(crate::consumer::AutoOffsetReset::Earliest)
+        .enable_auto_commit(false)
         .build()
         .await
         .expect("consumer should connect");
@@ -1146,16 +1206,19 @@ async fn a_stale_leader_epoch_on_list_offsets_recovers_after_a_refresh() {
 
     let producer = producer_for(&broker).await;
     let _ = producer
-        .send("events", None, Some(b"payload"))
+        .send(crate::Record::new("events", "payload"))
         .await
         .expect("produce should succeed");
 
-    let consumer = crate::consumer::Consumer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
-        .auto_offset_reset(crate::consumer::AutoOffsetReset::Earliest)
+    let consumer = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
         .metadata_max_age(Duration::from_secs(300))
+        .connect()
+        .await
+        .expect("consumer should connect")
+        .consumer_without_group()
+        .auto_offset_reset(crate::consumer::AutoOffsetReset::Earliest)
         .build()
         .await
         .expect("consumer should connect");
@@ -1205,17 +1268,19 @@ async fn a_kip848_consumer_joins_and_receives_a_server_side_assignment() {
 
     let producer = producer_for(&broker).await;
     let _ = producer
-        .send("events", None, Some(b"payload"))
+        .send(crate::Record::new("events", "payload"))
         .await
         .expect("produce should succeed");
 
-    let consumer = crate::consumer::Consumer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
-        .group_id("modern")
-        .group_protocol(crate::consumer::GroupProtocol::Consumer)
-        .auto_offset_reset(crate::consumer::AutoOffsetReset::Earliest)
+    let consumer = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .connect()
+        .await
+        .expect("consumer should connect")
+        .consumer("modern")
+        .group_protocol(crate::consumer::GroupProtocol::Consumer)
+        .auto_offset_reset(crate::consumer::AutoOffsetReset::Earliest)
         .build()
         .await
         .expect("consumer should connect");
@@ -1263,6 +1328,93 @@ async fn a_kip848_consumer_joins_and_receives_a_server_side_assignment() {
     );
 }
 
+/// A KIP-848 member commits at OffsetCommit v9 with its member epoch, and
+/// the coordinator accepts it; a commit carrying an epoch the coordinator has
+/// moved past is refused with `STALE_MEMBER_EPOCH` and changes nothing.
+#[tokio::test]
+async fn a_kip848_commit_is_validated_against_the_member_epoch() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("events", 1);
+    let producer = producer_for(&broker).await;
+    for value in ["a", "b"] {
+        let _ = producer
+            .send(crate::Record::new("events", value))
+            .await
+            .expect("produce should succeed");
+    }
+
+    let consumer = crate::Kafka::builder(broker.bootstrap_servers())
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .connect()
+        .await
+        .expect("consumer should connect")
+        .consumer("modern")
+        .group_protocol(crate::consumer::GroupProtocol::Consumer)
+        .auto_offset_reset(crate::consumer::AutoOffsetReset::Earliest)
+        .enable_auto_commit(false)
+        .max_poll_records(1)
+        .build()
+        .await
+        .expect("consumer should connect");
+    consumer
+        .subscribe(&["events"])
+        .await
+        .expect("subscribe should succeed");
+
+    let deadline = tokio::time::Instant::now() + SETTLE;
+    let mut delivered = Vec::new();
+    while tokio::time::Instant::now() < deadline && delivered.is_empty() {
+        delivered.extend(consumer.poll(Duration::from_millis(200)).await.unwrap());
+    }
+    assert_eq!(delivered.len(), 1, "{delivered:?}");
+
+    consumer
+        .commit()
+        .await
+        .expect("the member's commit succeeds");
+    assert_eq!(broker.committed_offset("modern", "events", 0), Some(1));
+    let versions: Vec<i16> = broker
+        .requests()
+        .iter()
+        .filter(|r| r.api_key == ApiKey::OffsetCommit)
+        .map(|r| r.api_version)
+        .collect();
+    assert_eq!(versions, [9], "a KIP-848 member commits at v9");
+
+    let mut delivered = Vec::new();
+    let deadline = tokio::time::Instant::now() + SETTLE;
+    while tokio::time::Instant::now() < deadline && delivered.is_empty() {
+        delivered.extend(consumer.poll(Duration::from_millis(200)).await.unwrap());
+    }
+    assert_eq!(delivered.len(), 1, "{delivered:?}");
+
+    // Negative control: the coordinator moves the member to a newer epoch
+    // right before the commit, before a heartbeat (one a second) can tell the
+    // member, so the commit carries a stale epoch.
+    broker.with_state(|s| {
+        let group = s.groups.get_mut("modern").expect("group should exist");
+        for member in group.consumer_members.values_mut() {
+            member.member_epoch += 1;
+        }
+    });
+    let err = consumer
+        .commit()
+        .await
+        .expect_err("a stale epoch is refused");
+    assert!(
+        matches!(
+            err,
+            crate::error::KrafkaError::Broker {
+                code: ErrorCode::StaleMemberEpoch,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(broker.committed_offset("modern", "events", 0), Some(1));
+}
+
 /// A fenced member must give up **all** its partitions, not merely reset its
 /// epoch.
 ///
@@ -1283,13 +1435,15 @@ async fn a_fenced_kip848_member_gives_up_its_partitions() {
     let broker = FakeBroker::start().await.unwrap();
     broker.create_topic("events", 2);
 
-    let consumer = crate::consumer::Consumer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
-        .group_id("modern")
-        .group_protocol(crate::consumer::GroupProtocol::Consumer)
-        .auto_offset_reset(crate::consumer::AutoOffsetReset::Earliest)
+    let consumer = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .connect()
+        .await
+        .expect("consumer should connect")
+        .consumer("modern")
+        .group_protocol(crate::consumer::GroupProtocol::Consumer)
+        .auto_offset_reset(crate::consumer::AutoOffsetReset::Earliest)
         .build()
         .await
         .expect("consumer should connect");
@@ -1343,13 +1497,15 @@ async fn a_fenced_kip848_member_rejoins_once_the_fencing_clears() {
     let broker = FakeBroker::start().await.unwrap();
     broker.create_topic("events", 2);
 
-    let consumer = crate::consumer::Consumer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
-        .group_id("modern")
-        .group_protocol(crate::consumer::GroupProtocol::Consumer)
-        .auto_offset_reset(crate::consumer::AutoOffsetReset::Earliest)
+    let consumer = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .connect()
+        .await
+        .expect("consumer should connect")
+        .consumer("modern")
+        .group_protocol(crate::consumer::GroupProtocol::Consumer)
+        .auto_offset_reset(crate::consumer::AutoOffsetReset::Earliest)
         .build()
         .await
         .expect("consumer should connect");
@@ -1403,32 +1559,27 @@ async fn a_fenced_kip848_member_rejoins_once_the_fencing_clears() {
 
 /// Steady-state heartbeats must not spin.
 ///
-/// This pins a *rate*, which is the property that actually matters to a
-/// coordinator, rather than any one line of client logic. It was written after
-/// an earlier version of this file recorded 43 446 `ConsumerGroupHeartbeat`
-/// requests in fifteen seconds: a `null` Assignment means "nothing changed
-/// since your last heartbeat", and reading it as "not joined yet" left the
-/// member outside `Stable`, which `needs_rejoin()` reports as "rejoin
-/// required", so every poll sent another full heartbeat and got another null
-/// assignment.
-///
-/// Two changes close that loop — the client treats an accepted non-zero epoch
-/// as confirmation of membership, and the fake coordinator resends the
-/// assignment when a member re-registers at epoch 0 — and either alone is
-/// enough to keep this test green. It is a guard against the behaviour
-/// returning, not a bisect of which change fixed it.
+/// This pins a *rate*, which is the property that matters to a coordinator.
+/// A `null` Assignment means "nothing changed since your last heartbeat";
+/// reading it as "not joined yet" would leave the member outside `Stable`, so
+/// every poll would send another full heartbeat. The client treats an
+/// accepted non-zero epoch as confirmation of membership, and the fake
+/// coordinator resends the assignment when a member re-registers at epoch 0;
+/// either alone keeps this test green.
 #[tokio::test]
 async fn a_settled_kip848_member_does_not_spin_on_heartbeats() {
     let broker = FakeBroker::start().await.unwrap();
     broker.create_topic("events", 1);
 
-    let consumer = crate::consumer::Consumer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
-        .group_id("modern")
-        .group_protocol(crate::consumer::GroupProtocol::Consumer)
-        .auto_offset_reset(crate::consumer::AutoOffsetReset::Earliest)
+    let consumer = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .connect()
+        .await
+        .expect("consumer should connect")
+        .consumer("modern")
+        .group_protocol(crate::consumer::GroupProtocol::Consumer)
+        .auto_offset_reset(crate::consumer::AutoOffsetReset::Earliest)
         .build()
         .await
         .expect("consumer should connect");
@@ -1476,12 +1627,14 @@ async fn the_fake_coordinator_fences_a_stale_member_epoch() {
     let broker = FakeBroker::start().await.unwrap();
     broker.create_topic("events", 1);
 
-    let consumer = crate::consumer::Consumer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
-        .group_id("modern")
-        .group_protocol(crate::consumer::GroupProtocol::Consumer)
+    let consumer = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .connect()
+        .await
+        .expect("consumer should connect")
+        .consumer("modern")
+        .group_protocol(crate::consumer::GroupProtocol::Consumer)
         .build()
         .await
         .expect("consumer should connect");
@@ -1534,14 +1687,16 @@ async fn two_kip848_members_converge_on_a_disjoint_split() {
     let build = |name: &'static str| {
         let servers = broker.bootstrap_servers();
         async move {
-            let consumer = crate::consumer::Consumer::builder()
-                .bootstrap_servers(servers)
-                .group_id("modern")
+            let consumer = crate::Kafka::builder(servers)
                 .client_id(name)
-                .group_protocol(crate::consumer::GroupProtocol::Consumer)
-                .auto_offset_reset(crate::consumer::AutoOffsetReset::Earliest)
                 .request_timeout(SHORT_REQUEST_TIMEOUT)
                 .connect_timeout(SHORT_CONNECT_TIMEOUT)
+                .connect()
+                .await
+                .expect("consumer should connect")
+                .consumer("modern")
+                .group_protocol(crate::consumer::GroupProtocol::Consumer)
+                .auto_offset_reset(crate::consumer::AutoOffsetReset::Earliest)
                 .build()
                 .await
                 .expect("consumer should connect");
@@ -1639,14 +1794,16 @@ async fn a_departing_kip848_member_hands_its_partitions_back() {
     let build = |name: &'static str| {
         let servers = broker.bootstrap_servers();
         async move {
-            let consumer = crate::consumer::Consumer::builder()
-                .bootstrap_servers(servers)
-                .group_id("modern")
+            let consumer = crate::Kafka::builder(servers)
                 .client_id(name)
-                .group_protocol(crate::consumer::GroupProtocol::Consumer)
-                .auto_offset_reset(crate::consumer::AutoOffsetReset::Earliest)
                 .request_timeout(SHORT_REQUEST_TIMEOUT)
                 .connect_timeout(SHORT_CONNECT_TIMEOUT)
+                .connect()
+                .await
+                .expect("consumer should connect")
+                .consumer("modern")
+                .group_protocol(crate::consumer::GroupProtocol::Consumer)
+                .auto_offset_reset(crate::consumer::AutoOffsetReset::Earliest)
                 .build()
                 .await
                 .expect("consumer should connect");
@@ -1701,16 +1858,9 @@ async fn a_departing_kip848_member_hands_its_partitions_back() {
 
 // ── TransportConfig reaches the socket ───────────────────────────────────
 //
-// A review found eleven documented `ConnectionConfig` / `ConnectionPool`
-// settings that no client builder could reach: every client constructed its
-// config from four fields and called `ConnectionPool::new`, so the rest were
-// pinned to their defaults forever. `TransportConfig` is the fix.
-//
-// Unit tests already assert the value survives the builder and lands on
-// `ConnectionConfig`. That is not the same claim as "it changes what the socket
-// does" — the previous defect was precisely a value that existed in a config
-// struct and never reached the wire. These tests close that gap by observing
-// the *behaviour* against a real TCP listener.
+// Unit tests assert each value survives the builder and lands on
+// `ConnectionConfig`. These observe that it changes what the socket does,
+// against a real TCP listener.
 
 /// `max_response_size` must bound the frame the reader accepts.
 ///
@@ -1718,9 +1868,8 @@ async fn a_departing_kip848_member_hands_its_partitions_back() {
 /// connection must fail rather than accept the oversized frame. If the setting
 /// never reached `Decoder::with_max_size`, the client would connect happily.
 ///
-/// The partition count matters — an earlier draft of this test used eight
-/// partitions, whose response fits comfortably inside 1 KiB, and passed for the
-/// wrong reason.
+/// The partition count matters: with eight partitions the response fits
+/// inside 1 KiB and the test would pass for the wrong reason.
 #[tokio::test]
 async fn transport_max_response_size_reaches_the_frame_decoder() {
     let broker = FakeBroker::start().await.unwrap();
@@ -1728,24 +1877,17 @@ async fn transport_max_response_size_reaches_the_frame_decoder() {
         broker.create_topic(topic, 32);
     }
 
-    let transport = crate::network::TransportConfig::builder()
+    let result = crate::Kafka::builder(broker.bootstrap_servers())
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
         // 1 KiB is the enforced minimum, and far below a metadata response
         // describing 128 partitions.
         .max_response_size(1024)
-        .build()
-        .expect("valid transport config");
-
-    let result = crate::admin::AdminClient::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
-        .request_timeout(SHORT_REQUEST_TIMEOUT)
-        .connect_timeout(SHORT_CONNECT_TIMEOUT)
-        .transport(transport)
-        .build()
+        .connect()
         .await;
 
-    let err = result
-        .err()
-        .expect("a 1 KiB response ceiling must reject a 128-partition metadata response");
+    let err =
+        result.expect_err("a 1 KiB response ceiling must reject a 128-partition metadata response");
     let message = err.to_string();
     assert!(
         message.contains("exceeds maximum")
@@ -1765,16 +1907,12 @@ async fn transport_default_response_size_still_connects() {
         broker.create_topic(topic, 32);
     }
 
-    let admin = crate::admin::AdminClient::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
+    crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
-        .transport(crate::network::TransportConfig::default())
-        .build()
+        .connect()
         .await
         .expect("the default ceiling must not reject a normal metadata response");
-
-    admin.close().await;
 }
 
 /// `max_connections` must bound the pool, not just live in the config struct.
@@ -1786,21 +1924,18 @@ async fn transport_default_response_size_still_connects() {
 /// The refusal may land on the initial metadata refresh or on a later send,
 /// depending on which broker the client bootstraps against and whether the
 /// refresh needed the second node. Asserting on *either* keeps the test
-/// deterministic; an earlier draft asserted the build must fail and passed
-/// alone but failed under the full suite.
+/// deterministic.
 ///
-/// Without the cap reaching `ConnectionPool` — which it could not before,
-/// because `with_max_total_connections` takes `self` by value and the pool is
-/// `Arc`-wrapped on the next line — both sockets would open and nothing here
-/// would be refused.
+/// Without the cap reaching `ConnectionPool`, both sockets would open and
+/// nothing here would be refused.
 #[tokio::test]
 async fn broker_throttle_is_honoured_and_counted() {
     let broker = FakeBroker::start().await.unwrap();
 
-    let client = crate::client::KrafkaClient::builder(broker.bootstrap_servers())
+    let client = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
-        .build()
+        .connect()
         .await
         .expect("client should connect");
 
@@ -1833,8 +1968,11 @@ async fn broker_throttle_is_honoured_and_counted() {
         "a later, smaller throttle must not cut a longer window short"
     );
 
-    let metrics = client.pool().metrics();
-    assert_eq!(metrics.snapshot().throttle_delays, 0, "nothing waited yet");
+    assert_eq!(
+        client.pool().metrics().throttle_delays,
+        0,
+        "nothing waited yet"
+    );
 
     // Waiting it out both sleeps and counts.
     let waited = conn
@@ -1847,7 +1985,7 @@ async fn broker_throttle_is_honoured_and_counted() {
         "the window is spent once it has been waited out"
     );
 
-    let snapshot = metrics.snapshot();
+    let snapshot = client.pool().metrics();
     assert_eq!(snapshot.throttle_delays, 1);
     assert!(
         snapshot.throttle_delay_ms > 0,
@@ -1856,7 +1994,7 @@ async fn broker_throttle_is_honoured_and_counted() {
 
     // And an un-throttled connection neither sleeps nor counts.
     assert!(conn.await_throttle().await.is_none());
-    assert_eq!(metrics.snapshot().throttle_delays, 1);
+    assert_eq!(client.pool().metrics().throttle_delays, 1);
 }
 
 #[tokio::test]
@@ -1864,29 +2002,28 @@ async fn a_throttle_the_producer_waits_out_is_counted() {
     let broker = FakeBroker::start().await.unwrap();
     broker.create_topic("events", 1);
 
-    let client = crate::client::KrafkaClient::builder(broker.bootstrap_servers())
+    let client = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
-        .build()
+        .connect()
         .await
         .expect("client should connect");
     let pool = client.pool().clone();
 
-    let producer = crate::producer::Producer::builder()
-        .with_client(&client)
+    let producer = client
+        .producer()
         .build()
         .await
         .expect("producer should connect");
 
     // One send establishes the connection to the leader.
     let _ = producer
-        .send("events", None, Some(b"warm-up"))
+        .send(crate::Record::new("events", "warm-up"))
         .await
         .expect("send should be acknowledged");
 
-    let metrics = producer.connection_metrics();
     assert_eq!(
-        metrics.snapshot().throttle_delays,
+        producer.metrics().connections.throttle_delays,
         0,
         "nothing has been throttled yet"
     );
@@ -1901,13 +2038,12 @@ async fn a_throttle_the_producer_waits_out_is_counted() {
     conn.notify_throttle(40);
 
     let _ = producer
-        .send("events", None, Some(b"throttled"))
+        .send(crate::Record::new("events", "throttled"))
         .await
         .expect("a throttled send still succeeds, just later");
 
-    producer.close().await;
-
-    let snapshot = metrics.snapshot();
+    let snapshot = producer.metrics().connections;
+    producer.close().await.unwrap();
     assert_eq!(
         snapshot.throttle_delays, 1,
         "the producer waits out the throttle before dispatching, and that wait \
@@ -1928,32 +2064,33 @@ async fn transport_max_connections_bounds_the_pool() {
     broker.set_leader("events", 0, 0);
     broker.set_leader("events", 1, 1);
 
-    let transport = crate::network::TransportConfig::builder()
-        .max_connections(Some(1))
-        .build()
-        .expect("valid transport config");
-
     let mut refusal: Option<String> = None;
 
-    match crate::producer::Producer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
-        .request_timeout(SHORT_REQUEST_TIMEOUT)
-        .connect_timeout(SHORT_CONNECT_TIMEOUT)
-        .linger(Duration::from_millis(5))
-        .transport(transport)
-        .build()
-        .await
-    {
+    let producer = async {
+        crate::Kafka::builder(broker.bootstrap_servers())
+            .request_timeout(SHORT_REQUEST_TIMEOUT)
+            .connect_timeout(SHORT_CONNECT_TIMEOUT)
+            .max_connections(Some(1))
+            .connect()
+            .await?
+            .producer()
+            .linger(Duration::from_millis(5))
+            // The cap error is retriable: bound the producer's retries.
+            .delivery_timeout(Duration::from_secs(3))
+            .build()
+            .await
+    };
+    match producer.await {
         Err(e) => refusal = Some(e.to_string()),
         Ok(producer) => {
             for partition in 0..2 {
-                let record = crate::producer::ProducerRecord::new("events", b"payload".to_vec())
-                    .with_partition(partition);
-                if let Err(e) = producer.send_record(record).await {
+                let record = crate::producer::Record::new("events", b"payload".to_vec())
+                    .partition(partition);
+                if let Err(e) = producer.send(record).await {
                     refusal.get_or_insert_with(|| e.to_string());
                 }
             }
-            producer.close().await;
+            let _ = producer.close().await;
         }
     }
 
@@ -1976,31 +2113,29 @@ async fn transport_sufficient_max_connections_connects() {
     broker.set_leader("events", 0, 0);
     broker.set_leader("events", 1, 1);
 
-    let transport = crate::network::TransportConfig::builder()
-        .max_connections(Some(8))
-        .build()
-        .expect("valid transport config");
-
-    let producer = crate::producer::Producer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
+    let producer = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .max_connections(Some(8))
+        .connect()
+        .await
+        .expect("a cap of 8 must accommodate a two-broker cluster")
+        .producer()
         .linger(Duration::from_millis(5))
-        .transport(transport)
         .build()
         .await
         .expect("a cap of 8 must accommodate a two-broker cluster");
 
     for partition in 0..2 {
-        let record = crate::producer::ProducerRecord::new("events", b"payload".to_vec())
-            .with_partition(partition);
+        let record =
+            crate::producer::Record::new("events", b"payload".to_vec()).partition(partition);
         let _metadata = producer
-            .send_record(record)
+            .send(record)
             .await
             .expect("both partitions should be reachable under a sufficient cap");
     }
 
-    producer.close().await;
+    producer.close().await.unwrap();
 }
 
 // ── Streams groups (KIP-1071) ────────────────────────────────────────────
@@ -2056,12 +2191,14 @@ async fn describe_streams_groups_decodes_topology_and_members() {
 
     let admin = admin_for(&broker).await;
     let groups = admin
-        .describe_streams_groups(&["wordcount"])
+        .describe_streams_groups(["wordcount"], Default::default())
         .await
         .expect("StreamsGroupDescribe should succeed");
 
     assert_eq!(groups.len(), 1);
-    let group = &groups[0];
+    let group = groups["wordcount"]
+        .as_ref()
+        .expect("wordcount is described");
     assert_eq!(group.group_id, "wordcount");
     assert_eq!(group.group_state, "Stable");
     assert_eq!(group.group_epoch, 7);
@@ -2155,12 +2292,17 @@ async fn describe_streams_groups_distinguishes_null_from_empty() {
 
     let admin = admin_for(&broker).await;
     let groups = admin
-        .describe_streams_groups(&["no-topology", "uninitialized", "empty-topology"])
+        .describe_streams_groups(
+            ["no-topology", "uninitialized", "empty-topology"],
+            Default::default(),
+        )
         .await
         .expect("all three should decode");
 
-    let by_id: std::collections::HashMap<_, _> =
-        groups.iter().map(|g| (g.group_id.as_str(), g)).collect();
+    let by_id: std::collections::HashMap<_, _> = groups
+        .iter()
+        .map(|(id, g)| (id.as_str(), g.as_ref().expect("described")))
+        .collect();
 
     assert!(
         by_id["no-topology"].topology.is_none(),
@@ -2207,14 +2349,18 @@ async fn describe_streams_groups_reports_unknown_groups_individually() {
 
     let admin = admin_for(&broker).await;
     let groups = admin
-        .describe_streams_groups(&["known", "missing"])
+        .describe_streams_groups(["known", "missing"], Default::default())
         .await
         .expect("one unknown group must not fail the call");
 
-    let by_id: std::collections::HashMap<_, _> =
-        groups.iter().map(|g| (g.group_id.as_str(), g)).collect();
-    assert!(by_id["known"].error_code.is_ok());
-    assert_eq!(by_id["missing"].error_code, ErrorCode::GroupIdNotFound);
+    assert!(groups["known"].is_ok());
+    assert!(matches!(
+        groups["missing"],
+        Err(crate::error::KrafkaError::Broker {
+            code: ErrorCode::GroupIdNotFound,
+            ..
+        })
+    ));
 }
 
 // ── Consumer wakeup and committed-offset lookup ──────────────────────────
@@ -2235,11 +2381,13 @@ async fn wakeup_interrupts_a_poll_parked_on_a_fetch() {
     broker.create_topic("events", 1);
 
     let consumer = Arc::new(
-        crate::consumer::Consumer::builder()
-            .bootstrap_servers(broker.bootstrap_servers())
-            .group_id("wakeup-group")
+        crate::Kafka::builder(broker.bootstrap_servers())
             .request_timeout(SHORT_REQUEST_TIMEOUT)
             .connect_timeout(SHORT_CONNECT_TIMEOUT)
+            .connect()
+            .await
+            .expect("consumer should connect")
+            .consumer("wakeup-group")
             .build()
             .await
             .expect("consumer should connect"),
@@ -2289,11 +2437,13 @@ async fn wakeup_before_poll_is_not_lost() {
     let broker = FakeBroker::start().await.unwrap();
     broker.create_topic("events", 1);
 
-    let consumer = crate::consumer::Consumer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
-        .group_id("wakeup-race-group")
+    let consumer = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .connect()
+        .await
+        .expect("consumer should connect")
+        .consumer("wakeup-race-group")
         .build()
         .await
         .expect("consumer should connect");
@@ -2324,20 +2474,21 @@ async fn committed_reports_the_groups_offsets_from_the_coordinator() {
     let producer = producer_for(&broker).await;
     for partition in 0..2i32 {
         for i in 0..3u8 {
-            let record =
-                crate::producer::ProducerRecord::new("events", vec![i]).with_partition(partition);
-            let _ = producer.send_record(record).await.unwrap();
+            let record = crate::producer::Record::new("events", vec![i]).partition(partition);
+            let _ = producer.send(record).await.unwrap();
         }
     }
-    producer.close().await;
+    producer.close().await.unwrap();
 
-    let consumer = crate::consumer::Consumer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
-        .group_id("committed-group")
-        .auto_offset_reset(crate::consumer::AutoOffsetReset::Earliest)
-        .enable_auto_commit(false)
+    let consumer = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .connect()
+        .await
+        .expect("consumer should connect")
+        .consumer("committed-group")
+        .auto_offset_reset(crate::consumer::AutoOffsetReset::Earliest)
+        .enable_auto_commit(false)
         .build()
         .await
         .expect("consumer should connect");
@@ -2365,7 +2516,7 @@ async fn committed_reports_the_groups_offsets_from_the_coordinator() {
             .len();
     }
     assert_eq!(seen, 6, "all produced records should arrive");
-    consumer.commit_sync().await.expect("commit should succeed");
+    consumer.commit().await.expect("commit should succeed");
 
     let after = consumer
         .committed(&[("events", 0), ("events", 1)])
@@ -2391,10 +2542,13 @@ async fn committed_without_a_group_id_is_an_error() {
     let broker = FakeBroker::start().await.unwrap();
     broker.create_topic("events", 1);
 
-    let consumer = crate::consumer::Consumer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
+    let consumer = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .connect()
+        .await
+        .expect("an assign-only consumer needs no group")
+        .consumer_without_group()
         .build()
         .await
         .expect("an assign-only consumer needs no group");
@@ -2440,7 +2594,7 @@ async fn validate_only_is_refused_by_a_broker_that_predates_the_field() {
                 "metadata.version",
                 17,
             )],
-            true, // validate_only
+            crate::admin::UpdateFeaturesOptions::default().validate_only(true),
         )
         .await;
 
@@ -2477,7 +2631,7 @@ async fn validate_only_reaches_a_current_broker_and_applies_nothing() {
                 "metadata.version",
                 17,
             )],
-            true, // validate_only
+            crate::admin::UpdateFeaturesOptions::default().validate_only(true),
         )
         .await
         .expect("a v2 broker supports validate_only");
@@ -2508,7 +2662,7 @@ async fn a_feature_update_is_applied_by_the_controller() {
                 "metadata.version",
                 17,
             )],
-            false,
+            crate::admin::UpdateFeaturesOptions::default(),
         )
         .await
         .expect("the update should be applied");
@@ -2528,29 +2682,26 @@ async fn a_feature_update_is_applied_by_the_controller() {
 
 /// `describe_features` must report what `update_features` applied.
 ///
-/// Both halves were previously tested only against themselves: `update_features`
-/// by asserting its request encodes, `describe_features` not at all. Neither
-/// could catch a mismatch between them, and KIP-584 has a specific trap for
-/// that — `SupportedFeatures` carries `(min, max)` while `FinalizedFeatures`
-/// carries `(max, min)`. A response with those transposed decodes cleanly and
-/// reports the wrong levels.
+/// KIP-584 has a trap here: `SupportedFeatures` carries `(min, max)` while
+/// `FinalizedFeatures` carries `(max, min)`. A response with those transposed
+/// decodes cleanly and reports the wrong levels.
 #[tokio::test]
 async fn describe_features_reports_what_update_features_applied() {
     let broker = FakeBroker::start().await.unwrap();
     let admin = admin_for(&broker).await;
 
     let before = admin
-        .describe_features()
+        .describe_features(Default::default())
         .await
         .expect("describe_features should work on a cluster with no features");
     assert!(
-        before.finalized_features.is_empty(),
+        before.finalized.is_empty(),
         "a cluster that has finalized nothing must report nothing"
     );
     assert!(
-        before.finalized_features_epoch < 0,
-        "an absent epoch means the finalized list is not to be trusted, saw {}",
-        before.finalized_features_epoch
+        before.finalized_epoch.is_none(),
+        "an absent epoch means the finalized list is not to be trusted, saw {:?}",
+        before.finalized_epoch
     );
 
     admin
@@ -2559,18 +2710,18 @@ async fn describe_features_reports_what_update_features_applied() {
                 "metadata.version",
                 17,
             )],
-            false,
+            crate::admin::UpdateFeaturesOptions::default(),
         )
         .await
         .expect("the update should be applied");
 
     let after = admin
-        .describe_features()
+        .describe_features(Default::default())
         .await
         .expect("describe_features should work after an update");
 
     let finalized = after
-        .finalized_features
+        .finalized
         .iter()
         .find(|f| f.name == "metadata.version")
         .expect("the finalized feature must be reported back");
@@ -2580,12 +2731,12 @@ async fn describe_features_reports_what_update_features_applied() {
          (max, min) pair here decodes without error and reports 1"
     );
     assert!(
-        after.finalized_features_epoch >= 0,
+        after.finalized_epoch.is_some(),
         "finalized features are only valid alongside a non-negative epoch"
     );
 
     let supported = after
-        .supported_features
+        .supported
         .iter()
         .find(|f| f.name == "metadata.version")
         .expect("the broker must also advertise what it supports");
@@ -2606,7 +2757,6 @@ async fn describe_features_reports_what_update_features_applied() {
 // modelled — in particular, acquisition locks never expire here, so a record
 // is redelivered only when it is explicitly released.
 
-#[cfg(feature = "share-groups")]
 async fn share_consumer_for(
     broker: &FakeBroker,
     group_id: &str,
@@ -2615,7 +2765,6 @@ async fn share_consumer_for(
 }
 
 /// A share consumer with the short test timeouts, plus whatever `tune` adds.
-#[cfg(feature = "share-groups")]
 async fn share_consumer_with(
     broker: &FakeBroker,
     group_id: &str,
@@ -2623,26 +2772,22 @@ async fn share_consumer_with(
         crate::share_consumer::ShareConsumerBuilder,
     ) -> crate::share_consumer::ShareConsumerBuilder,
 ) -> crate::share_consumer::ShareConsumer {
-    tune(
-        crate::share_consumer::ShareConsumer::builder()
-            .bootstrap_servers(broker.bootstrap_servers())
-            .group_id(group_id)
-            .request_timeout(SHORT_REQUEST_TIMEOUT)
-            // Before this setter existed, a `request_timeout` below the 10 s
-            // default `connect_timeout` was rejected at build time with an error
-            // naming a value the builder had no way to change.
-            .connect_timeout(SHORT_CONNECT_TIMEOUT),
-    )
-    .build()
-    .await
-    .expect("share consumer should connect")
+    let kafka = crate::Kafka::builder(broker.bootstrap_servers())
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .connect()
+        .await
+        .expect("share consumer should connect");
+    tune(kafka.share_consumer(group_id))
+        .build()
+        .await
+        .expect("share consumer should connect")
 }
 
 /// Poll until `want` records have arrived or the deadline passes.
 ///
 /// A share consumer's first poll is a heartbeat that returns no assignment, so
 /// a single `poll()` proving nothing is expected rather than a failure.
-#[cfg(feature = "share-groups")]
 async fn drain_share(
     consumer: &crate::share_consumer::ShareConsumer,
     want: usize,
@@ -2661,12 +2806,9 @@ async fn drain_share(
 /// A share consumer must receive the records a producer wrote, and its
 /// delivery counters must move with them.
 ///
-/// A share group used to be operable but not observable: the transport
-/// counters showed requests and nothing showed records. A metric that exists
-/// but is never incremented is worse than none, because it reads as "zero
-/// records" rather than "not measured" — so this asserts the counters against
-/// the records actually returned, not merely that they are non-zero.
-#[cfg(feature = "share-groups")]
+/// A metric that is never incremented reads as "zero records" rather than
+/// "not measured", so this asserts the counters against the records actually
+/// returned, not merely that they are non-zero.
 #[tokio::test]
 async fn a_share_consumer_receives_records_and_counts_them() {
     let broker = FakeBroker::start().await.unwrap();
@@ -2675,15 +2817,21 @@ async fn a_share_consumer_receives_records_and_counts_them() {
     let producer = producer_for(&broker).await;
     for i in 0..5u8 {
         let _ = producer
-            .send("events", None, Some(&[b'v', i]))
+            .send(crate::Record::new(
+                "events",
+                bytes::Bytes::copy_from_slice(&[b'v', i]),
+            ))
             .await
             .expect("send should be acknowledged");
     }
-    producer.close().await;
+    producer.close().await.unwrap();
 
     let consumer = share_consumer_for(&broker, "delivery-group").await;
-    let metrics = consumer.metrics();
-    assert_eq!(metrics.records_received.get(), 0, "nothing polled yet");
+    assert_eq!(
+        consumer.metrics().consumer.records_received,
+        0,
+        "nothing polled yet"
+    );
 
     consumer
         .subscribe(&["events"])
@@ -2704,18 +2852,18 @@ async fn a_share_consumer_receives_records_and_counts_them() {
         "delivered payloads must be the produced ones"
     );
 
+    let metrics = consumer.metrics().consumer;
     assert_eq!(
-        metrics.records_received.get(),
-        5,
+        metrics.records_received, 5,
         "records_received must match what poll() actually returned"
     );
     assert!(
-        metrics.bytes_received.get() >= 10,
+        metrics.bytes_received >= 10,
         "five two-byte values is at least ten bytes, saw {}",
-        metrics.bytes_received.get()
+        metrics.bytes_received
     );
     assert!(
-        metrics.polls.get() >= 1,
+        metrics.polls >= 1,
         "every poll() must be counted, empty or not"
     );
 
@@ -2723,7 +2871,6 @@ async fn a_share_consumer_receives_records_and_counts_them() {
 }
 
 /// `subscribe()` retries `FindCoordinator` while the coordinator is loading.
-#[cfg(feature = "share-groups")]
 #[tokio::test]
 async fn share_subscribe_retries_while_find_coordinator_is_unavailable() {
     let broker = FakeBroker::start().await.unwrap();
@@ -2748,7 +2895,6 @@ async fn share_subscribe_retries_while_find_coordinator_is_unavailable() {
 
 /// `subscribe()` re-discovers and retries on a coordinator error from the
 /// joining heartbeat.
-#[cfg(feature = "share-groups")]
 #[tokio::test]
 async fn share_subscribe_retries_a_coordinator_error_on_the_joining_heartbeat() {
     let broker = FakeBroker::start().await.unwrap();
@@ -2776,7 +2922,6 @@ async fn share_subscribe_retries_a_coordinator_error_on_the_joining_heartbeat() 
 
 /// `poll(timeout)` without an assignment waits out the timeout. Two members
 /// share one partition, so one stays unassigned.
-#[cfg(feature = "share-groups")]
 #[tokio::test]
 async fn an_unassigned_share_member_waits_out_its_poll_timeout() {
     let broker = FakeBroker::start().await.unwrap();
@@ -2792,10 +2937,7 @@ async fn an_unassigned_share_member_waits_out_its_poll_timeout() {
     let idle = loop {
         let _ = a.poll(Duration::from_millis(100)).await;
         let _ = b.poll(Duration::from_millis(100)).await;
-        let (a_has, b_has) = (
-            !a.assignment().await.is_empty(),
-            !b.assignment().await.is_empty(),
-        );
+        let (a_has, b_has) = (!a.assignment().is_empty(), !b.assignment().is_empty());
         if a_has != b_has {
             break if a_has { &b } else { &a };
         }
@@ -2836,7 +2978,6 @@ async fn an_unassigned_share_member_waits_out_its_poll_timeout() {
 
 /// `close()` ends each share session with a final-epoch `ShareAcknowledge`,
 /// as the Java client does.
-#[cfg(feature = "share-groups")]
 #[tokio::test]
 async fn closing_a_share_consumer_closes_each_session_with_share_acknowledge() {
     let broker = FakeBroker::start().await.unwrap();
@@ -2844,10 +2985,10 @@ async fn closing_a_share_consumer_closes_each_session_with_share_acknowledge() {
 
     let producer = producer_for(&broker).await;
     let _ = producer
-        .send("events", None, Some(b"v"))
+        .send(crate::Record::new("events", "v"))
         .await
         .expect("send should be acknowledged");
-    producer.close().await;
+    producer.close().await.unwrap();
 
     let consumer = share_consumer_for(&broker, "close-group").await;
     consumer.subscribe(&["events"]).await.unwrap();
@@ -2870,9 +3011,8 @@ async fn closing_a_share_consumer_closes_each_session_with_share_acknowledge() {
     assert!(!closes[0].member_id.is_empty());
 }
 
-/// `close_with_timeout` stays within its budget when a broker never answers
-/// the session close.
-#[cfg(feature = "share-groups")]
+/// `close_with` stays within its budget when a broker never answers the
+/// session close.
 #[tokio::test]
 async fn share_close_with_timeout_is_bounded_when_the_session_close_goes_unanswered() {
     let broker = FakeBroker::start().await.unwrap();
@@ -2880,10 +3020,10 @@ async fn share_close_with_timeout_is_bounded_when_the_session_close_goes_unanswe
 
     let producer = producer_for(&broker).await;
     let _ = producer
-        .send("events", None, Some(b"v"))
+        .send(crate::Record::new("events", "v"))
         .await
         .expect("send should be acknowledged");
-    producer.close().await;
+    producer.close().await.unwrap();
 
     let consumer = share_consumer_for(&broker, "bounded-close-group").await;
     consumer.subscribe(&["events"]).await.unwrap();
@@ -2894,11 +3034,13 @@ async fn share_close_with_timeout_is_bounded_when_the_session_close_goes_unanswe
     // Well under SHORT_REQUEST_TIMEOUT, so waiting out one request would show.
     let budget = Duration::from_secs(1);
     let started = std::time::Instant::now();
-    let _ = consumer.close_with_timeout(budget).await;
+    let _ = consumer
+        .close_with(crate::CloseOptions::new().timeout(budget))
+        .await;
     let took = started.elapsed();
     assert!(
         took < budget + Duration::from_millis(500),
-        "close_with_timeout({budget:?}) took {took:?}"
+        "close_with({budget:?}) took {took:?}"
     );
     assert!(consumer.is_closed());
 }
@@ -2910,19 +3052,22 @@ async fn share_close_with_timeout_is_bounded_when_the_session_close_goes_unanswe
 /// acknowledgement that does not advance the share-partition start offset
 /// turns every restart into a full replay, and a release that does not rewind
 /// the cursor silently drops the record the application asked to retry.
-#[cfg(feature = "share-groups")]
 #[tokio::test]
 async fn accepting_retires_a_record_and_releasing_redelivers_it() {
-    use crate::share_consumer::AcknowledgeType;
-
     let broker = FakeBroker::start().await.unwrap();
     broker.create_topic("events", 1);
 
     let producer = producer_for(&broker).await;
     for i in 0..2u8 {
-        let _ = producer.send("events", None, Some(&[i])).await.unwrap();
+        let _ = producer
+            .send(crate::Record::new(
+                "events",
+                bytes::Bytes::copy_from_slice(&[i]),
+            ))
+            .await
+            .unwrap();
     }
-    producer.close().await;
+    producer.close().await.unwrap();
 
     // Implicit mode acknowledges everything the poll returned on the next
     // fetch, which would make "accept one, release the other" unexpressible.
@@ -2938,15 +3083,12 @@ async fn accepting_retires_a_record_and_releasing_redelivers_it() {
     // Accept offset 0, release offset 1. Both acknowledgements are flushed on
     // the next fetch, which is where a real client piggybacks them too.
     for record in &first {
-        let ack = if record.offset == 0 {
-            AcknowledgeType::Accept
+        if record.offset == 0 {
+            consumer.ack(record)
         } else {
-            AcknowledgeType::Release
-        };
-        consumer
-            .acknowledge(record, ack)
-            .await
-            .expect("acknowledgement should be accepted");
+            consumer.release(record)
+        }
+        .expect("acknowledgement should be accepted");
     }
 
     let redelivered = drain_share(&consumer, 1).await;
@@ -2983,19 +3125,24 @@ async fn accepting_retires_a_record_and_releasing_redelivers_it() {
 /// difference only shows once the holder leaves and the in-flight records are
 /// returned to the pool — at which point an accepted record is below the
 /// share-partition start offset and an unacknowledged one is not.
-#[cfg(feature = "share-groups")]
 #[tokio::test]
 async fn an_accepted_record_is_not_redelivered_to_the_next_member() {
-    use crate::share_consumer::{AcknowledgeType, AcknowledgementMode};
+    use crate::share_consumer::AcknowledgementMode;
 
     let broker = FakeBroker::start().await.unwrap();
     broker.create_topic("events", 1);
 
     let producer = producer_for(&broker).await;
     for i in 0..2u8 {
-        let _ = producer.send("events", None, Some(&[i])).await.unwrap();
+        let _ = producer
+            .send(crate::Record::new(
+                "events",
+                bytes::Bytes::copy_from_slice(&[i]),
+            ))
+            .await
+            .unwrap();
     }
-    producer.close().await;
+    producer.close().await.unwrap();
 
     let first = share_consumer_with(&broker, "restart-group", |b| {
         b.acknowledgement_mode(AcknowledgementMode::Explicit)
@@ -3016,8 +3163,7 @@ async fn an_accepted_record_is_not_redelivered_to_the_next_member() {
         .find(|r| r.offset == 0)
         .expect("offset 0 should have been delivered");
     first
-        .acknowledge(accepted, AcknowledgeType::Accept)
-        .await
+        .ack(accepted)
         .expect("acknowledgement should be accepted");
     // The acknowledgement is flushed on close; without it the accept would
     // never reach the broker and this test would prove nothing.
@@ -3049,7 +3195,6 @@ async fn an_accepted_record_is_not_redelivered_to_the_next_member() {
 /// share state to one member at a time. A client that ignored its assignment
 /// and fetched every partition would still pass a "did I get records?" test
 /// and fail this one.
-#[cfg(feature = "share-groups")]
 #[tokio::test]
 async fn two_share_group_members_split_the_partitions() {
     let broker = FakeBroker::start().await.unwrap();
@@ -3058,12 +3203,12 @@ async fn two_share_group_members_split_the_partitions() {
     let producer = producer_for(&broker).await;
     for partition in 0..2i32 {
         for i in 0..3u8 {
-            let record = crate::producer::ProducerRecord::new("events", vec![partition as u8, i])
-                .with_partition(partition);
-            let _ = producer.send_record(record).await.unwrap();
+            let record = crate::producer::Record::new("events", vec![partition as u8, i])
+                .partition(partition);
+            let _ = producer.send(record).await.unwrap();
         }
     }
-    producer.close().await;
+    producer.close().await.unwrap();
 
     let a = share_consumer_for(&broker, "split-group").await;
     let b = share_consumer_for(&broker, "split-group").await;
@@ -3090,8 +3235,8 @@ async fn two_share_group_members_split_the_partitions() {
 
     let deadline = tokio::time::Instant::now() + SETTLE;
     while tokio::time::Instant::now() < deadline {
-        let (assign_a, assign_b) = (a.assignment().await, b.assignment().await);
-        let count = |m: &ahash::AHashMap<String, Vec<crate::PartitionId>>| {
+        let (assign_a, assign_b) = (a.assignment(), b.assignment());
+        let count = |m: &std::collections::HashMap<String, Vec<crate::PartitionId>>| {
             m.values().map(Vec::len).sum::<usize>()
         };
         if count(&assign_a) == 1 && count(&assign_b) == 1 {
@@ -3101,9 +3246,9 @@ async fn two_share_group_members_split_the_partitions() {
         drain(&b, &mut seen).await;
     }
 
-    let assign_a = a.assignment().await;
-    let assign_b = b.assignment().await;
-    let partitions = |m: &ahash::AHashMap<String, Vec<crate::PartitionId>>| {
+    let assign_a = a.assignment();
+    let assign_b = b.assignment();
+    let partitions = |m: &std::collections::HashMap<String, Vec<crate::PartitionId>>| {
         m.values().flatten().copied().collect::<HashSet<_>>()
     };
     let (pa, pb) = (partitions(&assign_a), partitions(&assign_b));
@@ -3135,7 +3280,6 @@ async fn two_share_group_members_split_the_partitions() {
 
 /// A poll with no subscription must be counted as an empty poll and deliver
 /// nothing.
-#[cfg(feature = "share-groups")]
 #[tokio::test]
 async fn share_consumer_poll_metrics_are_wired() {
     let broker = FakeBroker::start().await.unwrap();
@@ -3143,9 +3287,9 @@ async fn share_consumer_poll_metrics_are_wired() {
 
     let consumer = share_consumer_for(&broker, "metrics-share-group").await;
 
-    let metrics = consumer.metrics();
-    assert_eq!(metrics.polls.get(), 0, "no poll has happened yet");
-    assert_eq!(metrics.empty_polls.get(), 0);
+    let metrics = consumer.metrics().consumer;
+    assert_eq!(metrics.polls, 0, "no poll has happened yet");
+    assert_eq!(metrics.empty_polls, 0);
 
     // No subscription, so every poll legitimately returns nothing. That is
     // exactly the path `empty_polls` exists to count.
@@ -3153,19 +3297,17 @@ async fn share_consumer_poll_metrics_are_wired() {
         let _ = consumer.poll(Duration::from_millis(20)).await;
     }
 
+    let metrics = consumer.metrics().consumer;
     assert_eq!(
-        metrics.polls.get(),
-        3,
+        metrics.polls, 3,
         "every poll() must be counted, empty or not"
     );
     assert_eq!(
-        metrics.empty_polls.get(),
-        3,
+        metrics.empty_polls, 3,
         "a poll with no assignment is an empty poll"
     );
     assert_eq!(
-        metrics.records_received.get(),
-        0,
+        metrics.records_received, 0,
         "nothing was delivered, so nothing may be counted as delivered"
     );
 
@@ -3176,11 +3318,9 @@ async fn share_consumer_poll_metrics_are_wired() {
 // Transactions (KIP-98, KIP-360, KIP-447, KIP-890)
 // ══════════════════════════════════════════════════════════════════════════
 //
-// These used to need Docker. The transactional paths — the two-phase commit,
-// epoch fencing, `read_committed` isolation, offsets that move only when the
-// transaction does — are the ones where a client bug costs data, and they were
-// the ones the in-process broker could not reach: it served `InitProducerId`
-// by minting a fresh producer ID and nothing else.
+// The transactional paths — the two-phase commit, epoch fencing,
+// `read_committed` isolation, offsets that move only when the transaction
+// does — are the ones where a client bug costs data.
 //
 // Everything asserted below is client-observable. `transaction.version` is
 // finalized through the same `ApiVersions` feature a real cluster uses, so the
@@ -3190,24 +3330,29 @@ use crate::consumer::{AutoOffsetReset, Consumer, IsolationLevel};
 use crate::producer::{TopicPartitionOffset, TransactionVersion, TransactionalProducer};
 
 async fn txn_producer_for(broker: &FakeBroker, transactional_id: &str) -> TransactionalProducer {
-    TransactionalProducer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
-        .transactional_id(transactional_id)
+    crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
-        .build()
+        .connect()
+        .await
+        .expect("transactional producer should connect")
+        .producer()
+        .build_transactional(transactional_id)
         .await
         .expect("transactional producer should connect")
 }
 
 /// A standalone consumer reading `topic` from the beginning at `isolation`.
 async fn reader_for(broker: &FakeBroker, topic: &str, isolation: IsolationLevel) -> Consumer {
-    let consumer = Consumer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
-        .auto_offset_reset(AutoOffsetReset::Earliest)
-        .isolation_level(isolation)
+    let consumer = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .connect()
+        .await
+        .expect("consumer should connect")
+        .consumer_without_group()
+        .auto_offset_reset(AutoOffsetReset::Earliest)
+        .isolation_level(isolation)
         .build()
         .await
         .expect("consumer should connect");
@@ -3243,10 +3388,9 @@ async fn committed_transaction_becomes_visible_to_read_committed() {
     broker.create_topic("orders", 1);
 
     let producer = txn_producer_for(&broker, "txn-visible").await;
-    producer.init_transactions().await.expect("init");
-    producer.begin_transaction().expect("begin");
+    producer.begin().expect("begin");
     let _ = producer
-        .send("orders", None, Some(b"committed-1"))
+        .send(crate::Record::new("orders", "committed-1"))
         .await
         .expect("send");
 
@@ -3261,7 +3405,7 @@ async fn committed_transaction_becomes_visible_to_read_committed() {
     );
     assert!(broker.transaction_is_open("txn-visible"));
 
-    producer.commit_transaction().await.expect("commit");
+    producer.commit().await.expect("commit");
     assert!(!broker.transaction_is_open("txn-visible"));
 
     let consumer = reader_for(&broker, "orders", IsolationLevel::ReadCommitted).await;
@@ -3273,7 +3417,7 @@ async fn committed_transaction_becomes_visible_to_read_committed() {
     );
 
     let _ = consumer.close().await;
-    producer.close().await;
+    producer.close().await.unwrap();
 }
 
 /// An aborted transaction must be invisible to a `read_committed` consumer,
@@ -3288,13 +3432,12 @@ async fn aborted_transaction_is_filtered_only_for_read_committed() {
     broker.create_topic("orders", 1);
 
     let producer = txn_producer_for(&broker, "txn-abort").await;
-    producer.init_transactions().await.expect("init");
-    producer.begin_transaction().expect("begin");
+    producer.begin().expect("begin");
     let _ = producer
-        .send("orders", None, Some(b"doomed"))
+        .send(crate::Record::new("orders", "doomed"))
         .await
         .expect("send");
-    producer.abort_transaction().await.expect("abort");
+    producer.abort().await.expect("abort");
 
     let (producer_id, _) = broker
         .transactional_producer("txn-abort")
@@ -3321,7 +3464,7 @@ async fn aborted_transaction_is_filtered_only_for_read_committed() {
     );
     let _ = uncommitted.close().await;
 
-    producer.close().await;
+    producer.close().await.unwrap();
 }
 
 /// A committed transaction must not filter the *next* one from the same
@@ -3337,21 +3480,20 @@ async fn an_abort_does_not_poison_the_next_transaction() {
     broker.create_topic("orders", 1);
 
     let producer = txn_producer_for(&broker, "txn-sequence").await;
-    producer.init_transactions().await.expect("init");
 
-    producer.begin_transaction().expect("begin 1");
+    producer.begin().expect("begin 1");
     let _ = producer
-        .send("orders", None, Some(b"aborted"))
+        .send(crate::Record::new("orders", "aborted"))
         .await
         .expect("send");
-    producer.abort_transaction().await.expect("abort");
+    producer.abort().await.expect("abort");
 
-    producer.begin_transaction().expect("begin 2");
+    producer.begin().expect("begin 2");
     let _ = producer
-        .send("orders", None, Some(b"committed"))
+        .send(crate::Record::new("orders", "committed"))
         .await
         .expect("send");
-    producer.commit_transaction().await.expect("commit");
+    producer.commit().await.expect("commit");
 
     let consumer = reader_for(&broker, "orders", IsolationLevel::ReadCommitted).await;
     assert_eq!(
@@ -3361,7 +3503,7 @@ async fn an_abort_does_not_poison_the_next_transaction() {
     );
 
     let _ = consumer.close().await;
-    producer.close().await;
+    producer.close().await.unwrap();
 }
 
 /// `committed_records` and `all_records` must differ by exactly the aborted
@@ -3380,26 +3522,31 @@ async fn the_fake_brokers_two_record_views_differ_by_the_aborted_records() {
     broker.create_topic("orders", 1);
 
     let producer = txn_producer_for(&broker, "txn-views").await;
-    producer.init_transactions().await.expect("init");
 
-    producer.begin_transaction().expect("begin 1");
+    producer.begin().expect("begin 1");
     for i in 0..3 {
         let _ = producer
-            .send("orders", None, Some(format!("aborted-{i}").as_bytes()))
+            .send(crate::Record::new(
+                "orders",
+                bytes::Bytes::copy_from_slice(format!("aborted-{i}").as_bytes()),
+            ))
             .await
             .expect("send");
     }
-    producer.abort_transaction().await.expect("abort");
+    producer.abort().await.expect("abort");
 
-    producer.begin_transaction().expect("begin 2");
+    producer.begin().expect("begin 2");
     for i in 0..2 {
         let _ = producer
-            .send("orders", None, Some(format!("committed-{i}").as_bytes()))
+            .send(crate::Record::new(
+                "orders",
+                bytes::Bytes::copy_from_slice(format!("committed-{i}").as_bytes()),
+            ))
             .await
             .expect("send");
     }
-    producer.commit_transaction().await.expect("commit");
-    producer.close().await;
+    producer.commit().await.expect("commit");
+    producer.close().await.unwrap();
 
     let committed = broker.committed_records("orders").expect("log decodes");
     let all = broker.all_records("orders").expect("log decodes");
@@ -3448,7 +3595,6 @@ async fn transactional_offsets_move_only_on_commit() {
     broker.create_topic("orders", 1);
 
     let producer = txn_producer_for(&broker, "txn-offsets").await;
-    producer.init_transactions().await.expect("init");
 
     // KIP-447 requires a fenceable committer: the client refuses to stage
     // offsets carrying no generation, because such a commit could not be
@@ -3458,16 +3604,16 @@ async fn transactional_offsets_move_only_on_commit() {
     let offsets = vec![TopicPartitionOffset::new("orders", 0, 42)];
 
     // Aborted: the group must not move.
-    producer.begin_transaction().expect("begin 1");
+    producer.begin().expect("begin 1");
     let _ = producer
-        .send("orders", None, Some(b"x"))
+        .send(crate::Record::new("orders", "x"))
         .await
         .expect("send");
     producer
-        .send_offsets_to_transaction(&offsets, &group)
+        .send_offsets(&offsets, &group)
         .await
         .expect("stage offsets");
-    producer.abort_transaction().await.expect("abort");
+    producer.abort().await.expect("abort");
     assert_eq!(
         broker.committed_offset("etl-group", "orders", 0),
         None,
@@ -3475,23 +3621,23 @@ async fn transactional_offsets_move_only_on_commit() {
     );
 
     // Committed: the group moves to the staged position.
-    producer.begin_transaction().expect("begin 2");
+    producer.begin().expect("begin 2");
     let _ = producer
-        .send("orders", None, Some(b"y"))
+        .send(crate::Record::new("orders", "y"))
         .await
         .expect("send");
     producer
-        .send_offsets_to_transaction(&offsets, &group)
+        .send_offsets(&offsets, &group)
         .await
         .expect("stage offsets");
-    producer.commit_transaction().await.expect("commit");
+    producer.commit().await.expect("commit");
     assert_eq!(
         broker.committed_offset("etl-group", "orders", 0),
         Some(42),
         "a committed transaction must apply the offsets it staged"
     );
 
-    producer.close().await;
+    producer.close().await.unwrap();
 }
 
 /// Re-initialising a transactional ID must fence the previous incarnation
@@ -3505,11 +3651,9 @@ async fn re_initialising_fences_the_previous_producer() {
     broker.create_topic("orders", 1);
 
     let zombie = txn_producer_for(&broker, "txn-fenced").await;
-    zombie.init_transactions().await.expect("init");
     let (first_pid, first_epoch) = broker.transactional_producer("txn-fenced").unwrap();
 
     let successor = txn_producer_for(&broker, "txn-fenced").await;
-    successor.init_transactions().await.expect("init");
     let (second_pid, second_epoch) = broker.transactional_producer("txn-fenced").unwrap();
 
     assert_eq!(
@@ -3523,13 +3667,13 @@ async fn re_initialising_fences_the_previous_producer() {
 
     // The zombie is now writing with a stale epoch. Its next transactional
     // operation must fail fatally rather than silently interleaving.
-    zombie.begin_transaction().expect("begin");
-    let outcome = zombie.send("orders", None, Some(b"zombie")).await;
+    zombie.begin().expect("begin");
+    let outcome = zombie.send(crate::Record::new("orders", "zombie")).await;
     let outcome = match outcome {
         Err(e) => Err(e),
         // The send may be accepted into the accumulator; the commit is where
         // the coordinator rejects the stale epoch.
-        Ok(_) => zombie.commit_transaction().await.map(|()| unreachable!()),
+        Ok(_) => zombie.commit().await.map(|()| unreachable!()),
     };
     assert!(
         outcome.is_err(),
@@ -3537,11 +3681,11 @@ async fn re_initialising_fences_the_previous_producer() {
     );
     assert_eq!(
         zombie.state(),
-        crate::producer::TransactionState::FatalError,
+        crate::producer::TransactionState::Fatal,
         "a fencing error is fatal: the producer must be recreated, not retried"
     );
 
-    successor.close().await;
+    successor.close().await.unwrap();
 }
 
 /// TV1 is the default, and it registers partitions explicitly.
@@ -3551,19 +3695,18 @@ async fn tv1_registers_partitions_with_add_partitions_to_txn() {
     broker.create_topic("orders", 1);
 
     let producer = txn_producer_for(&broker, "txn-tv1").await;
-    producer.init_transactions().await.expect("init");
     assert_eq!(
         producer.transaction_version(),
         TransactionVersion::V1,
         "a cluster that has not finalized transaction.version is TV1"
     );
 
-    producer.begin_transaction().expect("begin");
+    producer.begin().expect("begin");
     let _ = producer
-        .send("orders", None, Some(b"v1"))
+        .send(crate::Record::new("orders", "v1"))
         .await
         .expect("send");
-    producer.commit_transaction().await.expect("commit");
+    producer.commit().await.expect("commit");
 
     assert!(
         broker.request_count(ApiKey::AddPartitionsToTxn) > 0,
@@ -3573,7 +3716,7 @@ async fn tv1_registers_partitions_with_add_partitions_to_txn() {
     let consumer = reader_for(&broker, "orders", IsolationLevel::ReadCommitted).await;
     assert_eq!(drain(&consumer, 6).await, vec!["v1".to_string()]);
     let _ = consumer.close().await;
-    producer.close().await;
+    producer.close().await.unwrap();
 }
 
 /// TV2 (KIP-890) must skip `AddPartitionsToTxn` entirely and still commit.
@@ -3589,7 +3732,6 @@ async fn tv2_commits_without_add_partitions_to_txn() {
     broker.set_transaction_version(2);
 
     let producer = txn_producer_for(&broker, "txn-tv2").await;
-    producer.init_transactions().await.expect("init");
     assert_eq!(
         producer.transaction_version(),
         TransactionVersion::V2,
@@ -3598,12 +3740,12 @@ async fn tv2_commits_without_add_partitions_to_txn() {
 
     let (_, epoch_before) = broker.transactional_producer("txn-tv2").unwrap();
 
-    producer.begin_transaction().expect("begin");
+    producer.begin().expect("begin");
     let _ = producer
-        .send("orders", None, Some(b"v2"))
+        .send(crate::Record::new("orders", "v2"))
         .await
         .expect("send");
-    producer.commit_transaction().await.expect("commit");
+    producer.commit().await.expect("commit");
 
     assert_eq!(
         broker.request_count(ApiKey::AddPartitionsToTxn),
@@ -3620,7 +3762,7 @@ async fn tv2_commits_without_add_partitions_to_txn() {
     let consumer = reader_for(&broker, "orders", IsolationLevel::ReadCommitted).await;
     assert_eq!(drain(&consumer, 6).await, vec!["v2".to_string()]);
     let _ = consumer.close().await;
-    producer.close().await;
+    producer.close().await.unwrap();
 }
 
 /// A transaction spanning two partitions must commit atomically.
@@ -3630,16 +3772,13 @@ async fn a_multi_partition_transaction_commits_atomically() {
     broker.create_topic("orders", 2);
 
     let producer = txn_producer_for(&broker, "txn-multi").await;
-    producer.init_transactions().await.expect("init");
-    producer.begin_transaction().expect("begin");
+    producer.begin().expect("begin");
 
     for partition in 0..2 {
-        let record = crate::producer::ProducerRecord::new(
-            "orders",
-            bytes::Bytes::from(format!("p{partition}")),
-        )
-        .with_partition(partition);
-        let _ = producer.send_record(record).await.expect("send");
+        let record =
+            crate::producer::Record::new("orders", bytes::Bytes::from(format!("p{partition}")))
+                .partition(partition);
+        let _ = producer.send(record).await.expect("send");
     }
     producer.flush().await.expect("flush");
 
@@ -3651,7 +3790,7 @@ async fn a_multi_partition_transaction_commits_atomically() {
         );
     }
 
-    producer.commit_transaction().await.expect("commit");
+    producer.commit().await.expect("commit");
 
     for partition in 0..2 {
         assert!(
@@ -3659,7 +3798,7 @@ async fn a_multi_partition_transaction_commits_atomically() {
             "the commit must release every partition, not just the first"
         );
     }
-    producer.close().await;
+    producer.close().await.unwrap();
 }
 
 /// An old abort must not filter a later committed transaction from the same
@@ -3680,21 +3819,20 @@ async fn an_old_abort_is_not_reported_to_a_consumer_that_has_read_past_it() {
     broker.create_topic("orders", 1);
 
     let producer = txn_producer_for(&broker, "txn-stale").await;
-    producer.init_transactions().await.expect("init");
 
-    producer.begin_transaction().expect("begin 1");
+    producer.begin().expect("begin 1");
     let _ = producer
-        .send("orders", None, Some(b"aborted"))
+        .send(crate::Record::new("orders", "aborted"))
         .await
         .expect("send");
-    producer.abort_transaction().await.expect("abort");
+    producer.abort().await.expect("abort");
 
-    producer.begin_transaction().expect("begin 2");
+    producer.begin().expect("begin 2");
     let _ = producer
-        .send("orders", None, Some(b"committed"))
+        .send(crate::Record::new("orders", "committed"))
         .await
         .expect("send");
-    producer.commit_transaction().await.expect("commit");
+    producer.commit().await.expect("commit");
 
     // Fetching from *after* the abort marker must see the committed record.
     // The abort lives at offsets 0–1, so offset 2 is past it.
@@ -3707,11 +3845,14 @@ async fn an_old_abort_is_not_reported_to_a_consumer_that_has_read_past_it() {
         "the abort under test must lie below the fetch offset"
     );
 
-    let consumer = Consumer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
-        .isolation_level(IsolationLevel::ReadCommitted)
+    let consumer = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .connect()
+        .await
+        .expect("consumer should connect")
+        .consumer_without_group()
+        .isolation_level(IsolationLevel::ReadCommitted)
         .build()
         .await
         .expect("consumer should connect");
@@ -3732,7 +3873,7 @@ async fn an_old_abort_is_not_reported_to_a_consumer_that_has_read_past_it() {
     );
 
     let _ = consumer.close().await;
-    producer.close().await;
+    producer.close().await.unwrap();
 }
 
 // ── Prefetch buffer ────────────────────────────────────────────────────────
@@ -3741,39 +3882,46 @@ async fn an_old_abort_is_not_reported_to_a_consumer_that_has_read_past_it() {
 ///
 /// The consumer decodes one delivery's worth plus the buffer's free capacity,
 /// so a fetch that returns more than `max_poll_records` fills the buffer and
-/// the *next* poll is served from memory with no Fetch on the wire. The
-/// previous design truncated the surplus and re-fetched it, which paid for the
-/// same bytes twice — once in decode, once on the network.
+/// the *next* poll is served from memory with no Fetch on the wire.
 ///
 /// Counting Fetch requests is what makes this a real assertion: comparing only
-/// the records returned would pass just as well against the old behaviour.
+/// the records returned would also pass if the surplus were re-fetched.
 #[tokio::test]
 async fn a_second_poll_is_served_from_the_prefetch_buffer_without_a_fetch() {
     let broker = FakeBroker::start().await.unwrap();
     broker.create_topic("events", 1);
 
-    let producer = crate::producer::Producer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
+    let producer = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .connect()
+        .await
+        .expect("producer should connect")
+        .producer()
         .build()
         .await
         .expect("producer should connect");
     for i in 0..20u32 {
         let _ = producer
-            .send("events", None, Some(format!("v{i}").as_bytes()))
+            .send(crate::Record::new(
+                "events",
+                bytes::Bytes::copy_from_slice(format!("v{i}").as_bytes()),
+            ))
             .await
             .expect("send");
     }
-    producer.close().await;
+    producer.close().await.unwrap();
 
-    let consumer = Consumer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
+    let consumer = crate::Kafka::builder(broker.bootstrap_servers())
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .connect()
+        .await
+        .expect("consumer should connect")
+        .consumer_without_group()
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .max_poll_records(5)
         .max_buffered_records(50)
-        .request_timeout(SHORT_REQUEST_TIMEOUT)
-        .connect_timeout(SHORT_CONNECT_TIMEOUT)
         .build()
         .await
         .expect("consumer should connect");
@@ -3830,30 +3978,38 @@ async fn a_commit_never_acknowledges_records_still_parked_in_the_buffer() {
     let broker = FakeBroker::start().await.unwrap();
     broker.create_topic("events", 1);
 
-    let producer = crate::producer::Producer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
+    let producer = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .connect()
+        .await
+        .expect("producer should connect")
+        .producer()
         .build()
         .await
         .expect("producer should connect");
     for i in 0..20u32 {
         let _ = producer
-            .send("events", None, Some(format!("v{i}").as_bytes()))
+            .send(crate::Record::new(
+                "events",
+                bytes::Bytes::copy_from_slice(format!("v{i}").as_bytes()),
+            ))
             .await
             .expect("send");
     }
-    producer.close().await;
+    producer.close().await.unwrap();
 
-    let consumer = Consumer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
-        .group_id("prefetch-commit-group")
+    let consumer = crate::Kafka::builder(broker.bootstrap_servers())
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .connect()
+        .await
+        .expect("consumer should connect")
+        .consumer("prefetch-commit-group")
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .enable_auto_commit(false)
         .max_poll_records(5)
         .max_buffered_records(50)
-        .request_timeout(SHORT_REQUEST_TIMEOUT)
-        .connect_timeout(SHORT_CONNECT_TIMEOUT)
         .build()
         .await
         .expect("consumer should connect");
@@ -3917,19 +4073,13 @@ async fn a_commit_never_acknowledges_records_still_parked_in_the_buffer() {
 /// A commit must stop admitting records *before* it drains the accumulator,
 /// not after.
 ///
-/// `send_record` admits a record when it observes `InTransaction`. The commit
-/// path used to flush first and transition second, which left a window between
-/// the flush completing and the state changing where a concurrent send was
-/// still accepted — and its record was then still buffered when `EndTxn` went
-/// out. It would either be rejected by the broker as `INVALID_TXN_STATE` or,
-/// once `begin_transaction` had been called again, silently join the *next*
-/// transaction: a record the application was told had been committed could
-/// disappear when a later transaction aborted.
+/// `enqueue` admits a record when it observes `InTransaction`. Flushing
+/// before transitioning would leave a window where a concurrent send is
+/// accepted and still buffered when `EndTxn` goes out — so it could silently
+/// join the *next* transaction.
 ///
 /// The test holds the commit inside its drain (by delaying `Produce`) and
-/// asserts that a send issued during that window is refused. Under the old
-/// ordering the state observed here is `InTransaction` and the send is
-/// accepted.
+/// asserts that a send issued during that window is refused.
 #[tokio::test]
 async fn a_commit_stops_admitting_records_before_it_drains() {
     use std::sync::Arc;
@@ -3938,24 +4088,27 @@ async fn a_commit_stops_admitting_records_before_it_drains() {
     broker.create_topic("orders", 1);
 
     let producer = Arc::new(
-        TransactionalProducer::builder()
-            .bootstrap_servers(broker.bootstrap_servers())
-            .transactional_id("txn-commit-ordering")
+        crate::Kafka::builder(broker.bootstrap_servers())
+            .request_timeout(SHORT_REQUEST_TIMEOUT)
+            .connect_timeout(SHORT_CONNECT_TIMEOUT)
+            .connect()
+            .await
+            .expect("transactional producer should connect")
+            .producer()
             // Batch, so the record below sits in the accumulator and the
             // commit's flush is what pushes it to the broker.
             .linger(Duration::from_millis(200))
-            .request_timeout(SHORT_REQUEST_TIMEOUT)
-            .connect_timeout(SHORT_CONNECT_TIMEOUT)
-            .build()
+            .build_transactional("txn-commit-ordering")
             .await
             .expect("transactional producer should connect"),
     );
-    producer.init_transactions().await.expect("init");
-    producer.begin_transaction().expect("begin");
+    producer.begin().expect("begin");
 
-    // One record, buffered by the linger window.
-    let buffered = Arc::clone(&producer);
-    let send = tokio::spawn(async move { buffered.send("orders", None, Some(b"first")).await });
+    // One record, queued and buffered by the linger window.
+    let send = producer
+        .enqueue(crate::producer::Record::new("orders", b"first".to_vec()))
+        .await
+        .expect("the record is admitted before the commit starts");
 
     // Hold the commit inside its flush.
     broker.on(ApiKey::Produce, |_| {
@@ -3963,7 +4116,7 @@ async fn a_commit_stops_admitting_records_before_it_drains() {
     });
 
     let committing = Arc::clone(&producer);
-    let commit = tokio::spawn(async move { committing.commit_transaction().await });
+    let commit = tokio::spawn(async move { committing.commit().await });
 
     // Give the commit time to transition and enter its drain.
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -3975,7 +4128,9 @@ async fn a_commit_stops_admitting_records_before_it_drains() {
          can be admitted into a transaction that is already closing"
     );
 
-    let refused = producer.send("orders", None, Some(b"too-late")).await;
+    let refused = producer
+        .send(crate::Record::new("orders", "too-late"))
+        .await;
     let error = refused.expect_err("a send during the commit's drain must be refused");
     assert!(
         error.to_string().contains("Committing"),
@@ -3983,19 +4138,19 @@ async fn a_commit_stops_admitting_records_before_it_drains() {
     );
 
     broker.clear_hooks();
-    let _ = send.await.expect("send task should not panic");
+    let _ = send.await;
     let _ = commit.await.expect("commit task should not panic");
 
-    producer.close().await;
+    producer.close().await.unwrap();
 }
 
-/// A commit must not write the `EndTxn` marker while `send_offsets_to_transaction`
+/// A commit must not write the `EndTxn` marker while `send_offsets`
 /// is still in flight.
 ///
-/// `send_offsets_to_transaction` is the join between the consumer's position
+/// `send_offsets` is the join between the consumer's position
 /// and the producer's output — the whole point of consume-transform-produce is
 /// that the two commit atomically. It did not register with the in-flight
-/// barrier, so a concurrent `commit_transaction()` could not see it: the commit
+/// barrier, so a concurrent `commit()` could not see it: the commit
 /// would transition, find the barrier idle, flush and send `EndTxn` while the
 /// `TxnOffsetCommit` was still on the wire, leaving the offsets outside the
 /// transaction.
@@ -4004,9 +4159,8 @@ async fn a_commit_stops_admitting_records_before_it_drains() {
 ///
 /// `TxnOffsetCommit` goes to the **group** coordinator and `EndTxn` to the
 /// **transaction** coordinator. On a single node they share one connection, and
-/// the broker's own per-connection serialisation masks the client-side race —
-/// an earlier version of this test passed with the fix reverted for exactly
-/// that reason. Splitting the two coordinators across nodes gives them
+/// the broker's own per-connection serialisation masks the client-side race.
+/// Splitting the two coordinators across nodes gives them
 /// independent connections, which is the arrangement a real cluster has.
 #[tokio::test]
 async fn a_commit_waits_for_an_in_flight_offset_commit() {
@@ -4024,19 +4178,20 @@ async fn a_commit_waits_for_an_in_flight_offset_commit() {
     broker.set_txn_coordinator("txn-offsets-ordering", 1);
 
     let producer = Arc::new(
-        TransactionalProducer::builder()
-            .bootstrap_servers(broker.bootstrap_servers())
-            .transactional_id("txn-offsets-ordering")
+        crate::Kafka::builder(broker.bootstrap_servers())
             .request_timeout(SHORT_REQUEST_TIMEOUT)
             .connect_timeout(SHORT_CONNECT_TIMEOUT)
-            .build()
+            .connect()
+            .await
+            .expect("transactional producer should connect")
+            .producer()
+            .build_transactional("txn-offsets-ordering")
             .await
             .expect("transactional producer should connect"),
     );
-    producer.init_transactions().await.expect("init");
-    producer.begin_transaction().expect("begin");
+    producer.begin().expect("begin");
     let _ = producer
-        .send("orders", None, Some(b"payload"))
+        .send(crate::Record::new("orders", "payload"))
         .await
         .expect("send");
 
@@ -4051,7 +4206,7 @@ async fn a_commit_waits_for_an_in_flight_offset_commit() {
     let offsets = tokio::spawn(async move {
         let metadata = ConsumerGroupMetadata::new("g", 1, "member-1", None);
         let result = offsets_producer
-            .send_offsets_to_transaction(&[TopicPartitionOffset::new("orders", 0, 42)], &metadata)
+            .send_offsets(&[TopicPartitionOffset::new("orders", 0, 42)], &metadata)
             .await;
         offsets_done.store(true, Ordering::SeqCst);
         result
@@ -4064,11 +4219,11 @@ async fn a_commit_waits_for_an_in_flight_offset_commit() {
         "the offset commit must still be in flight for this test to mean anything"
     );
 
-    producer.commit_transaction().await.expect("commit");
+    producer.commit().await.expect("commit");
 
     assert!(
         done.load(Ordering::SeqCst),
-        "commit_transaction() returned while TxnOffsetCommit was still in flight —          the EndTxn marker would have been written with the offsets outside the          transaction"
+        "commit() returned while TxnOffsetCommit was still in flight —          the EndTxn marker would have been written with the offsets outside the          transaction"
     );
 
     let offsets_result = offsets.await.expect("offset task should not panic");
@@ -4078,71 +4233,7 @@ async fn a_commit_waits_for_an_in_flight_offset_commit() {
     );
 
     broker.clear_hooks();
-    producer.close().await;
-}
-
-// ── Share consumer: a flush must not race a poll holding the acks ─────────
-
-/// `commit_sync()` must not report success while a concurrent `poll()` is
-/// holding the acknowledgements.
-///
-/// `poll()` drains every entry out of `pending_acks` into a `PendingAckGuard`
-/// for the duration of its `ShareFetch`. During that window the map is empty,
-/// so a `commit_sync()` (or the flush inside `close()`) would take nothing,
-/// report success, and strand the acknowledgements the guard restores a moment
-/// later — leaving the records to be redelivered even though the application
-/// had explicitly acknowledged them.
-///
-/// The documented shutdown is `wakeup()` then `close()`, and `wakeup()` does
-/// not wait for the poll it interrupts to unwind, so this interleaving is the
-/// normal one rather than an exotic race.
-#[cfg(feature = "share-groups")]
-#[tokio::test]
-async fn a_flush_waits_for_a_poll_holding_the_acknowledgements() {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    let broker = FakeBroker::start().await.unwrap();
-    broker.create_topic("events", 1);
-
-    let consumer = Arc::new(share_consumer_for(&broker, "share-flush-race").await);
-    consumer.subscribe(&["events"]).await.unwrap();
-    // Let the group settle so the next poll reaches the fetch stage.
-    let _ = consumer.poll(Duration::from_millis(300)).await;
-
-    // Hold the poll inside its ShareFetch, with the acks drained out of the map.
-    broker.on(ApiKey::ShareFetch, |_| {
-        Control::Delay(Duration::from_millis(600))
-    });
-
-    let polling = Arc::clone(&consumer);
-    let poll_done = Arc::new(AtomicBool::new(false));
-    let poll_flag = Arc::clone(&poll_done);
-    let poll = tokio::spawn(async move {
-        let out = polling.poll(Duration::from_secs(2)).await;
-        poll_flag.store(true, Ordering::SeqCst);
-        out
-    });
-
-    // Let the poll register with the barrier and drain the acks.
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    assert!(
-        !poll_done.load(Ordering::SeqCst),
-        "the poll must still be in flight for this test to mean anything"
-    );
-
-    consumer.commit_sync().await.expect("commit_sync");
-
-    assert!(
-        poll_done.load(Ordering::SeqCst),
-        "commit_sync() returned while a poll was still holding the pending \
-         acknowledgements — it would have flushed an empty map and reported \
-         success, stranding them"
-    );
-
-    broker.clear_hooks();
-    let _ = poll.await.expect("poll task should not panic");
-    let _ = consumer.close().await;
+    producer.close().await.unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -4151,7 +4242,7 @@ async fn a_flush_waits_for_a_poll_holding_the_acknowledgements() {
 
 /// The end-to-end proof that krafka can write a Kafka tombstone.
 ///
-/// Everything between `ProducerRecord::tombstone` and the log is exercised for
+/// Everything between `Record::tombstone` and the log is exercised for
 /// real here — interceptors, validation, size estimation, batch encoding, the
 /// Produce request — and the record is read back off the broker's log through
 /// the same decoder a consumer uses. The three records pin the distinction the
@@ -4162,32 +4253,35 @@ async fn a_tombstone_reaches_the_log_as_a_null_value() {
     let broker = FakeBroker::start().await.unwrap();
     broker.create_topic("users", 1);
 
-    let producer = Producer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
+    let producer = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .connect()
+        .await
+        .expect("producer should connect")
+        .producer()
         .build()
         .await
         .expect("producer should connect");
 
     // 1. An ordinary record.
     let _ = producer
-        .send("users", Some(b"user-42"), Some(b"alice"))
+        .send(crate::Record::new("users", "alice").key("user-42"))
         .await
         .expect("valued send should be acknowledged");
 
     // 2. A zero-length value — compaction keeps this one.
     let _ = producer
-        .send("users", Some(b"user-42"), Some(b""))
+        .send(crate::Record::new("users", "").key("user-42"))
         .await
         .expect("empty send should be acknowledged");
 
     // 3. The tombstone — compaction deletes the key for this one.
     let _ = producer
-        .send_record(
-            crate::producer::ProducerRecord::tombstone("users", "user-42")
-                .with_header("X-Reason", &b"gdpr-erasure"[..])
-                .with_null_header("X-Flag"),
+        .send(
+            crate::producer::Record::tombstone("users", "user-42")
+                .header("X-Reason", &b"gdpr-erasure"[..])
+                .null_header("X-Flag"),
         )
         .await
         .expect("tombstone send should be acknowledged");
@@ -4214,9 +4308,9 @@ async fn a_tombstone_reaches_the_log_as_a_null_value() {
 
     // Header nullness survives the same round trip.
     let headers = &stored[2].headers;
-    assert_eq!(headers[0].0.as_ref(), b"X-Reason");
+    assert_eq!(headers[0].0, "X-Reason");
     assert_eq!(headers[0].1.as_deref(), Some(&b"gdpr-erasure"[..]));
-    assert_eq!(headers[1].0.as_ref(), b"X-Flag");
+    assert_eq!(headers[1].0, "X-Flag");
     assert_eq!(headers[1].1, None, "a null header value must stay null");
 }
 
@@ -4231,21 +4325,30 @@ async fn a_tombstone_routes_to_the_same_partition_as_its_key() {
     let broker = FakeBroker::start().await.unwrap();
     broker.create_topic("users", 8);
 
-    let producer = Producer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
+    let producer = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .connect()
+        .await
+        .expect("producer should connect")
+        .producer()
         .build()
         .await
         .expect("producer should connect");
 
     for key in ["user-1", "user-2", "user-3", "user-4"] {
         let valued = producer
-            .send("users", Some(key.as_bytes()), Some(b"payload"))
+            .send(
+                crate::Record::new("users", "payload")
+                    .key(bytes::Bytes::copy_from_slice(key.as_bytes())),
+            )
             .await
             .expect("valued send should be acknowledged");
         let tombstone = producer
-            .send("users", Some(key.as_bytes()), None)
+            .send(crate::Record::tombstone(
+                "users",
+                bytes::Bytes::copy_from_slice(key.as_bytes()),
+            ))
             .await
             .expect("tombstone send should be acknowledged");
 
@@ -4260,7 +4363,7 @@ async fn a_tombstone_routes_to_the_same_partition_as_its_key() {
 /// to krafka's own `CompactedTable` must delete the key.
 ///
 /// The table's own unit tests build `ConsumerRecord`s by hand. This one starts
-/// from `ProducerRecord::tombstone` and goes through encoding and decoding, so
+/// from `Record::tombstone` and goes through encoding and decoding, so
 /// a null that collapsed anywhere on the produce path would leave the key in
 /// the table instead of removing it.
 #[tokio::test]
@@ -4270,20 +4373,23 @@ async fn a_produced_tombstone_deletes_a_key_from_a_compacted_table() {
     let broker = FakeBroker::start().await.unwrap();
     broker.create_topic("users", 1);
 
-    let producer = Producer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
+    let producer = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .connect()
+        .await
+        .expect("producer should connect")
+        .producer()
         .build()
         .await
         .expect("producer should connect");
 
     let _ = producer
-        .send("users", Some(b"keep-me"), Some(b"v"))
+        .send(crate::Record::new("users", "v").key("keep-me"))
         .await
         .expect("send should be acknowledged");
     let _ = producer
-        .send("users", Some(b"delete-me"), Some(b"v"))
+        .send(crate::Record::new("users", "v").key("delete-me"))
         .await
         .expect("send should be acknowledged");
 
@@ -4292,10 +4398,7 @@ async fn a_produced_tombstone_deletes_a_key_from_a_compacted_table() {
     assert_eq!(table.len(), 2, "both keys should be present");
 
     let _ = producer
-        .send_record(crate::producer::ProducerRecord::tombstone(
-            "users",
-            "delete-me",
-        ))
+        .send(crate::producer::Record::tombstone("users", "delete-me"))
         .await
         .expect("tombstone send should be acknowledged");
 
@@ -4338,7 +4441,8 @@ struct AckObservation {
     header_keys: Vec<String>,
     partition: crate::PartitionId,
     offset: i64,
-    delivery: crate::producer::DeliveryConfirmation,
+    /// `None` when the send failed.
+    delivery: Option<crate::producer::DeliveryConfirmation>,
     failed: bool,
 }
 
@@ -4358,7 +4462,7 @@ impl RecordingInterceptor {
 impl crate::interceptor::ProducerInterceptor for RecordingInterceptor {
     fn on_send(
         &self,
-        record: &mut crate::producer::ProducerRecord,
+        record: &mut crate::producer::Record,
         ctx: &mut crate::interceptor::RecordContext,
     ) -> crate::interceptor::InterceptorResult {
         let n = self.sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -4368,18 +4472,19 @@ impl crate::interceptor::ProducerInterceptor for RecordingInterceptor {
 
     fn on_acknowledgement(
         &self,
-        metadata: &crate::producer::RecordMetadata,
-        error: Option<&crate::error::KrafkaError>,
-        headers: &crate::producer::RecordHeaders,
+        _topic: &str,
+        partition: crate::PartitionId,
+        result: Result<&crate::producer::RecordMetadata, &crate::error::KrafkaError>,
+        headers: &crate::Headers,
         ctx: &mut crate::interceptor::RecordContext,
     ) -> crate::interceptor::InterceptorResult {
         self.acks().push(AckObservation {
             token: ctx.take::<SendToken>().map(|t| t.0),
             header_keys: headers.iter().map(|(k, _)| k.clone()).collect(),
-            partition: metadata.partition,
-            offset: metadata.offset,
-            delivery: metadata.delivery,
-            failed: error.is_some(),
+            partition,
+            offset: result.map_or(-1, |m| m.offset),
+            delivery: result.ok().map(|m| m.delivery),
+            failed: result.is_err(),
         });
         Ok(())
     }
@@ -4389,15 +4494,18 @@ async fn producer_with(
     broker: &FakeBroker,
     interceptor: &std::sync::Arc<RecordingInterceptor>,
 ) -> Producer {
-    Producer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
+    crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
-        // A send to a topic the cluster does not have now retries the metadata
+        .connect()
+        .await
+        .expect("producer should connect")
+        .producer()
+        // A send to a topic the cluster does not have retries the metadata
         // fetch for the whole `max_block` budget before giving up, so these
         // tests would otherwise sit out the 60 s default.
         .max_block(SHORT_MAX_BLOCK)
-        .add_interceptor(std::sync::Arc::clone(interceptor) as std::sync::Arc<_>)
+        .interceptor(std::sync::Arc::clone(interceptor) as std::sync::Arc<_>)
         .build()
         .await
         .expect("producer should connect")
@@ -4407,15 +4515,12 @@ async fn producer_with(
 /// short enough that a deliberately unroutable record fails fast.
 const SHORT_MAX_BLOCK: Duration = Duration::from_secs(2);
 
-/// Regression: a topic-specific metadata refresh for one topic must not make a
+/// A topic-specific metadata refresh for one topic must not make a
 /// *different* topic permanently unsendable.
 ///
-/// Both topics exist in the cluster and both have been produced to. A refresh
-/// naming only `topic-a` used to evict `topic-b` — the TTL was keyed off the
-/// last *refresh* of an entry, and a partial refresh stamps only the topic it
-/// asked about — after which every send to `topic-b` failed with
-/// `unknown topic: topic-b` for the remaining life of the producer, because
-/// nothing on the send path ever asked the broker again.
+/// Both topics exist in the cluster and both have been produced to. A partial
+/// refresh stamps only the topic it asked about, so a TTL keyed off the last
+/// refresh would evict `topic-b` after a refresh naming only `topic-a`.
 #[tokio::test]
 async fn a_partial_refresh_for_one_topic_does_not_strand_another() {
     let broker = FakeBroker::start().await.unwrap();
@@ -4423,23 +4528,26 @@ async fn a_partial_refresh_for_one_topic_does_not_strand_another() {
     broker.create_topic("topic-b", 1);
 
     // Short ages reproduce the five-minute defaults without a five-minute test.
-    let producer = Producer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
+    let producer = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
-        .max_block(SHORT_MAX_BLOCK)
         .metadata_max_age(Duration::from_millis(50))
-        .metadata_topic_cache_ttl(Duration::from_millis(50))
+        .metadata_topic_cache_ttl(Some(Duration::from_millis(50)))
+        .connect()
+        .await
+        .expect("producer should connect")
+        .producer()
+        .max_block(SHORT_MAX_BLOCK)
         .build()
         .await
         .expect("producer should connect");
 
     let _ = producer
-        .send("topic-a", None, Some(b"warm-a"))
+        .send(crate::Record::new("topic-a", "warm-a"))
         .await
         .expect("warm a");
     let _ = producer
-        .send("topic-b", None, Some(b"warm-b"))
+        .send(crate::Record::new("topic-b", "warm-b"))
         .await
         .expect("warm b");
 
@@ -4448,16 +4556,16 @@ async fn a_partial_refresh_for_one_topic_does_not_strand_another() {
 
     // Routing this record refreshes metadata for `topic-a` alone.
     let _ = producer
-        .send("topic-a", None, Some(b"refresh-a"))
+        .send(crate::Record::new("topic-a", "refresh-a"))
         .await
         .expect("a stale topic refreshes itself");
 
     let _ = producer
-        .send("topic-b", None, Some(b"after-refresh"))
+        .send(crate::Record::new("topic-b", "after-refresh"))
         .await
         .expect("a topic that exists must stay sendable after an unrelated refresh");
 
-    producer.close().await;
+    producer.close().await.unwrap();
 }
 
 /// A topic that is still being produced to survives partial refreshes for a
@@ -4473,27 +4581,31 @@ async fn a_topic_in_active_use_is_not_evicted_by_an_unrelated_refresh() {
     broker.create_topic("hot", 1);
     broker.create_topic("cold", 1);
 
-    let producer = Producer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
+    let kafka = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
-        .max_block(SHORT_MAX_BLOCK)
         .metadata_max_age(Duration::from_secs(30))
-        .metadata_topic_cache_ttl(Duration::from_millis(400))
+        .metadata_topic_cache_ttl(Some(Duration::from_millis(400)))
+        .connect()
+        .await
+        .expect("producer should connect");
+    let producer = kafka
+        .producer()
+        .max_block(SHORT_MAX_BLOCK)
         .build()
         .await
         .expect("producer should connect");
 
     for _ in 0..6 {
         let _ = producer
-            .send("hot", None, Some(b"v"))
+            .send(crate::Record::new("hot", "v"))
             .await
             .expect("hot send");
         // A partial refresh naming only "cold" — the eviction pass that used
         // to drop "hot" because "hot" was not in the response.
-        producer
+        kafka
             .metadata()
-            .refresh_for_topics_forced(Some(&["cold"]))
+            .force_refresh(Some(&["cold"]))
             .await
             .expect("partial refresh");
         tokio::time::sleep(Duration::from_millis(60)).await;
@@ -4502,24 +4614,26 @@ async fn a_topic_in_active_use_is_not_evicted_by_an_unrelated_refresh() {
     // The loop runs well past the 400 ms TTL, so "hot" long ago stopped being
     // "recently refreshed". Only its continued use keeps it in the cache.
     assert!(
-        producer.metadata().partition_count("hot").is_some(),
+        kafka.metadata().partition_count("hot").is_some(),
         "a topic still being produced to must never be evicted as idle"
     );
 
-    producer.close().await;
+    producer.close().await.unwrap();
 }
 
-/// A group-less `subscribe()` used to resolve its partitions exactly once, so
-/// a topic created afterwards was never consumed and no error ever said so.
-/// `poll()` now re-derives the assignment from metadata.
+/// A group-less `subscribe()` re-derives its assignment from metadata on
+/// `poll()`, so a topic created afterwards is consumed.
 #[tokio::test]
 async fn a_standalone_subscription_picks_up_a_topic_created_later() {
     let broker = FakeBroker::start().await.unwrap();
 
-    let consumer = crate::consumer::Consumer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
+    let consumer = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .connect()
+        .await
+        .expect("consumer should connect")
+        .consumer_without_group()
         .auto_offset_reset(crate::consumer::AutoOffsetReset::Earliest)
         .build()
         .await
@@ -4568,13 +4682,16 @@ async fn a_standalone_subscription_picks_up_new_partitions() {
     let broker = FakeBroker::start().await.unwrap();
     broker.create_topic("grows", 1);
 
-    let consumer = crate::consumer::Consumer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
+    let consumer = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
-        .auto_offset_reset(crate::consumer::AutoOffsetReset::Earliest)
         // Short, so the "everything already resolves" cadence fires quickly.
         .metadata_max_age(Duration::from_millis(50))
+        .connect()
+        .await
+        .expect("consumer should connect")
+        .consumer_without_group()
+        .auto_offset_reset(crate::consumer::AutoOffsetReset::Earliest)
         .build()
         .await
         .expect("consumer should connect");
@@ -4609,12 +4726,15 @@ async fn assign_overrides_a_standalone_subscription_for_that_topic() {
     let broker = FakeBroker::start().await.unwrap();
     broker.create_topic("narrow", 4);
 
-    let consumer = crate::consumer::Consumer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
+    let consumer = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
-        .auto_offset_reset(crate::consumer::AutoOffsetReset::Earliest)
         .metadata_max_age(Duration::from_millis(50))
+        .connect()
+        .await
+        .expect("consumer should connect")
+        .consumer_without_group()
+        .auto_offset_reset(crate::consumer::AutoOffsetReset::Earliest)
         .build()
         .await
         .expect("consumer should connect");
@@ -4645,23 +4765,26 @@ async fn auto_create_topics_lets_a_send_materialise_its_topic() {
     let broker = FakeBroker::start().await.unwrap();
     // Deliberately no `create_topic`.
 
-    let producer = Producer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
+    let producer = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
-        .max_block(SHORT_MAX_BLOCK)
         .allow_auto_create_topics(true)
+        .connect()
+        .await
+        .expect("producer should connect")
+        .producer()
+        .max_block(SHORT_MAX_BLOCK)
         .build()
         .await
         .expect("producer should connect");
 
     let metadata = producer
-        .send("created-on-demand", None, Some(b"v"))
+        .send(crate::Record::new("created-on-demand", "v"))
         .await
         .expect("the broker creates the topic because the client asked it to");
     assert_eq!(metadata.topic, "created-on-demand");
 
-    producer.close().await;
+    producer.close().await.unwrap();
 }
 
 /// The default is off, so the same send fails rather than quietly bringing a
@@ -4670,17 +4793,20 @@ async fn auto_create_topics_lets_a_send_materialise_its_topic() {
 async fn auto_create_topics_is_off_by_default() {
     let broker = FakeBroker::start().await.unwrap();
 
-    let producer = Producer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
+    let producer = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .connect()
+        .await
+        .expect("producer should connect")
+        .producer()
         .max_block(SHORT_MAX_BLOCK)
         .build()
         .await
         .expect("producer should connect");
 
     let error = producer
-        .send("not-created-on-demand", None, Some(b"v"))
+        .send(crate::Record::new("not-created-on-demand", "v"))
         .await
         .expect_err("a typo must not materialise a topic");
     assert!(
@@ -4694,7 +4820,7 @@ async fn auto_create_topics_is_off_by_default() {
         "expected the broker's own topic error, got: {error}"
     );
 
-    producer.close().await;
+    producer.close().await.unwrap();
 }
 
 /// A record addressed to a partition the topic does not have is rejected at
@@ -4705,19 +4831,20 @@ async fn an_out_of_range_partition_is_rejected_at_send() {
     let broker = FakeBroker::start().await.unwrap();
     broker.create_topic("events", 2);
 
-    let producer = Producer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
+    let producer = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .connect()
+        .await
+        .expect("producer should connect")
+        .producer()
         .max_block(SHORT_MAX_BLOCK)
         .build()
         .await
         .expect("producer should connect");
 
     let error = producer
-        .send_record(
-            crate::producer::ProducerRecord::new("events", b"v".to_vec()).with_partition(7),
-        )
+        .send(crate::producer::Record::new("events", b"v".to_vec()).partition(7))
         .await
         .expect_err("partition 7 does not exist on a 2-partition topic");
     assert!(
@@ -4725,7 +4852,7 @@ async fn an_out_of_range_partition_is_rejected_at_send() {
         "the error must name the valid range, got: {error}"
     );
 
-    producer.close().await;
+    producer.close().await.unwrap();
 }
 
 /// The whole point of `RecordContext`: what `on_send` parks comes back to
@@ -4739,7 +4866,10 @@ async fn interceptor_state_survives_from_on_send_to_on_acknowledgement() {
 
     for i in 0..3u8 {
         let _ = producer
-            .send("events", None, Some(&[b'v', i]))
+            .send(crate::Record::new(
+                "events",
+                bytes::Bytes::copy_from_slice(&[b'v', i]),
+            ))
             .await
             .expect("send should be acknowledged");
     }
@@ -4754,7 +4884,10 @@ async fn interceptor_state_survives_from_on_send_to_on_acknowledgement() {
     );
     for ack in acks.iter() {
         assert!(!ack.failed, "a successful send reports no error");
-        assert_eq!(ack.delivery, crate::producer::DeliveryConfirmation::Offset);
+        assert_eq!(
+            ack.delivery,
+            Some(crate::producer::DeliveryConfirmation::Offset)
+        );
         assert!(ack.offset >= 0, "a successful send carries a real offset");
     }
 }
@@ -4768,13 +4901,13 @@ async fn a_record_rejected_by_validation_still_reaches_on_acknowledgement() {
     let interceptor = std::sync::Arc::new(RecordingInterceptor::default());
     let producer = producer_with(&broker, &interceptor).await;
 
-    let mut record = crate::producer::ProducerRecord::new("events", b"v".to_vec());
+    let mut record = crate::producer::Record::new("events", b"v".to_vec());
     for i in 0..(crate::protocol::MAX_RECORD_HEADERS + 1) {
-        record = record.with_header(format!("h{i}"), bytes::Bytes::from_static(b"x"));
+        record = record.header(format!("h{i}"), bytes::Bytes::from_static(b"x"));
     }
 
     let error = producer
-        .send_record(record)
+        .send(record)
         .await
         .expect_err("a record over the header limit must be rejected");
     assert!(error.to_string().contains("headers"));
@@ -4790,62 +4923,46 @@ async fn a_record_rejected_by_validation_still_reaches_on_acknowledgement() {
     assert!(acks[0].failed);
     assert_eq!(acks[0].partition, crate::producer::UNKNOWN_PARTITION);
     assert_eq!(acks[0].offset, -1);
-    assert_eq!(
-        acks[0].delivery,
-        crate::producer::DeliveryConfirmation::Failed
-    );
+    assert_eq!(acks[0].delivery, None);
 }
 
-/// Same guarantee one step earlier in the path: a serializer that fails runs
-/// after `on_send` and before anything else, and used to end the record's life
-/// silently.
+/// A serializer that fails rejects the record before the producer — and its
+/// interceptors — ever see it: nothing is reserved and nothing is owed.
 #[tokio::test]
-async fn a_record_rejected_by_a_serializer_still_reaches_on_acknowledgement() {
-    /// A serializer that always fails, standing in for a schema registry that
-    /// rejects a payload.
-    #[derive(Debug)]
-    struct FailingSerializer;
+async fn a_serializer_failure_rejects_the_record_before_the_producer() {
+    struct Failing;
 
-    impl crate::serdes::Serializer for FailingSerializer {
+    impl crate::serdes::Serializer<str> for Failing {
         fn serialize(
             &self,
-            _payload: bytes::Bytes,
             _topic: &str,
-            _record_name: Option<&str>,
-            _is_key: bool,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = crate::error::Result<bytes::Bytes>> + Send + '_>,
-        > {
-            Box::pin(async {
-                Err(crate::error::KrafkaError::invalid_state(
-                    "schema registry rejected the payload",
-                ))
-            })
+            _headers: &mut Vec<(String, Option<bytes::Bytes>)>,
+            _value: &str,
+        ) -> crate::error::Result<bytes::Bytes> {
+            Err(crate::error::KrafkaError::serialization(
+                "schema registry rejected the payload",
+            ))
         }
     }
 
     let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("events", 1);
     let interceptor = std::sync::Arc::new(RecordingInterceptor::default());
-    let producer = Producer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
-        .request_timeout(SHORT_REQUEST_TIMEOUT)
-        .connect_timeout(SHORT_CONNECT_TIMEOUT)
-        .add_interceptor(std::sync::Arc::clone(&interceptor) as std::sync::Arc<_>)
-        .value_serializer(std::sync::Arc::new(FailingSerializer))
-        .build()
-        .await
-        .expect("producer should connect");
+    let producer = producer_with(&broker, &interceptor).await;
+    let typed: crate::producer::TypedProducer<str, str> =
+        crate::producer::TypedProducer::new(producer, crate::serdes::StringSerializer, Failing);
 
-    let _ = producer
-        .send("events", None, Some(b"v"))
+    let error = typed
+        .send("events", None, Some("v"))
         .await
         .expect_err("the serializer must reject the record");
-
-    let acks = interceptor.acks();
-    assert_eq!(acks.len(), 1, "the rejected record still owes a callback");
-    assert_eq!(acks[0].token.as_deref(), Some("events#0"));
-    assert!(acks[0].failed);
-    assert_eq!(acks[0].partition, crate::producer::UNKNOWN_PARTITION);
+    assert!(matches!(
+        error,
+        crate::error::KrafkaError::Serialization { .. }
+    ));
+    assert_eq!(interceptor.sends(), 0, "the interceptors never saw it");
+    assert!(broker.all_records("events").unwrap().is_empty());
+    typed.close().await.unwrap();
 }
 
 /// Dropping a `DeliveryHandle` discards the *caller's* view of the
@@ -4862,10 +4979,7 @@ async fn a_dropped_delivery_handle_does_not_suppress_on_acknowledgement() {
         // Enqueued, then the handle is dropped on the spot.
         drop(
             producer
-                .enqueue(crate::producer::ProducerRecord::new(
-                    "events",
-                    vec![b'v', i],
-                ))
+                .enqueue(crate::producer::Record::new("events", vec![b'v', i]))
                 .await
                 .expect("enqueue should succeed"),
         );
@@ -4896,7 +5010,7 @@ async fn a_record_for_an_unknown_topic_still_reaches_on_acknowledgement() {
     let producer = producer_with(&broker, &interceptor).await;
 
     let error = producer
-        .send("no-such-topic", None, Some(b"v"))
+        .send(crate::Record::new("no-such-topic", "v"))
         .await
         .expect_err("an unrouteable record must be rejected");
     // The broker said why, and that reason survives to the caller instead of a
@@ -4921,10 +5035,7 @@ async fn a_record_for_an_unknown_topic_still_reaches_on_acknowledgement() {
     assert_eq!(acks[0].token.as_deref(), Some("no-such-topic#0"));
     assert!(acks[0].failed);
     assert_eq!(acks[0].partition, crate::producer::UNKNOWN_PARTITION);
-    assert_eq!(
-        acks[0].delivery,
-        crate::producer::DeliveryConfirmation::Failed
-    );
+    assert_eq!(acks[0].delivery, None);
 }
 
 /// `send()` is an ordinary future, so a caller may drop it —
@@ -4940,21 +5051,24 @@ async fn a_cancelled_send_still_reaches_on_acknowledgement() {
     let broker = FakeBroker::start().await.unwrap();
     let interceptor = std::sync::Arc::new(RecordingInterceptor::default());
 
-    let producer = Producer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
+    let producer = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .connect()
+        .await
+        .expect("producer should connect")
+        .producer()
         // Long enough that the metadata retry loop is still running when the
         // timeout below fires, so the send is cancelled rather than rejected.
         .max_block(Duration::from_secs(30))
-        .add_interceptor(std::sync::Arc::clone(&interceptor) as std::sync::Arc<_>)
+        .interceptor(std::sync::Arc::clone(&interceptor) as std::sync::Arc<_>)
         .build()
         .await
         .expect("producer should connect");
 
     let cancelled = tokio::time::timeout(
         Duration::from_millis(200),
-        producer.send("no-such-topic", None, Some(b"v")),
+        producer.send(crate::Record::new("no-such-topic", "v")),
     )
     .await;
     assert!(cancelled.is_err(), "the send must still be in flight");
@@ -4969,50 +5083,48 @@ async fn a_cancelled_send_still_reaches_on_acknowledgement() {
         assert_eq!(acks[0].token.as_deref(), Some("no-such-topic#0"));
         assert!(acks[0].failed);
         assert_eq!(acks[0].partition, crate::producer::UNKNOWN_PARTITION);
-        assert_eq!(
-            acks[0].delivery,
-            crate::producer::DeliveryConfirmation::Failed
-        );
+        assert_eq!(acks[0].delivery, None);
     }
 
-    producer.close().await;
+    producer.close().await.unwrap();
 }
 
 /// The same guarantee across the *other* long await: the wait for buffer
 /// memory. The record has been routed by then and its context is on its way to
-/// the accumulator, so a cancellation here used to drop it inside the
-/// abandoned future with nothing to notice.
+/// the accumulator, so a cancellation here must not drop it inside the
+/// abandoned future.
 #[tokio::test]
 async fn a_send_cancelled_waiting_for_buffer_memory_still_acknowledges() {
     let broker = FakeBroker::start().await.unwrap();
     broker.create_topic("events", 1);
     let interceptor = std::sync::Arc::new(RecordingInterceptor::default());
 
-    let producer = Producer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
+    let producer = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .connect()
+        .await
+        .expect("producer should connect")
+        .producer()
         // A budget that one record fills, so the second has to wait for it.
         .buffer_memory(256)
         .batch_size(256)
         // Long enough that the first record stays buffered, holding its permit.
         .linger(Duration::from_secs(30))
         .max_block(Duration::from_secs(30))
-        .add_interceptor(std::sync::Arc::clone(&interceptor) as std::sync::Arc<_>)
+        .interceptor(std::sync::Arc::clone(&interceptor) as std::sync::Arc<_>)
         .build()
         .await
         .expect("producer should connect");
 
     let first = producer
-        .enqueue(crate::producer::ProducerRecord::new("events", vec![0u8; 100]).with_partition(0))
+        .enqueue(crate::producer::Record::new("events", vec![0u8; 100]).partition(0))
         .await
         .expect("the first record fits");
 
     let cancelled = tokio::time::timeout(
         Duration::from_millis(200),
-        producer.enqueue(
-            crate::producer::ProducerRecord::new("events", vec![1u8; 100]).with_partition(0),
-        ),
+        producer.enqueue(crate::producer::Record::new("events", vec![1u8; 100]).partition(0)),
     )
     .await;
     assert!(
@@ -5030,7 +5142,7 @@ async fn a_send_cancelled_waiting_for_buffer_memory_still_acknowledges() {
     }
 
     drop(first);
-    producer.close().await;
+    producer.close().await.unwrap();
 }
 
 /// A batch rejected as too large is halved and both halves resubmitted. The
@@ -5051,13 +5163,16 @@ async fn a_split_batch_acknowledges_every_record_exactly_once_with_its_context()
     });
 
     let interceptor = std::sync::Arc::new(RecordingInterceptor::default());
-    let producer = Producer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
+    let producer = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .connect()
+        .await
+        .expect("producer should connect")
+        .producer()
         // Long enough that all four records share one batch.
         .linger(Duration::from_millis(200))
-        .add_interceptor(std::sync::Arc::clone(&interceptor) as std::sync::Arc<_>)
+        .interceptor(std::sync::Arc::clone(&interceptor) as std::sync::Arc<_>)
         .build()
         .await
         .expect("producer should connect");
@@ -5065,10 +5180,7 @@ async fn a_split_batch_acknowledges_every_record_exactly_once_with_its_context()
     for i in 0..RECORDS {
         drop(
             producer
-                .enqueue(
-                    crate::producer::ProducerRecord::new("events", vec![b'v', i as u8])
-                        .with_partition(0),
-                )
+                .enqueue(crate::producer::Record::new("events", vec![b'v', i as u8]).partition(0))
                 .await
                 .expect("enqueue should succeed"),
         );
@@ -5110,33 +5222,34 @@ async fn the_transactional_send_path_pairs_on_send_with_on_acknowledgement() {
     broker.create_topic("orders", 1);
 
     let interceptor = std::sync::Arc::new(RecordingInterceptor::default());
-    let producer = crate::producer::TransactionalProducer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
-        .transactional_id("txn-interceptor")
+    let producer = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .connect()
+        .await
+        .expect("transactional producer should connect")
+        .producer()
         .max_block(SHORT_MAX_BLOCK)
-        .add_interceptor(std::sync::Arc::clone(&interceptor) as std::sync::Arc<_>)
-        .build()
+        .interceptor(std::sync::Arc::clone(&interceptor) as std::sync::Arc<_>)
+        .build_transactional("txn-interceptor")
         .await
         .expect("transactional producer should connect");
 
-    producer.init_transactions().await.expect("init");
-    producer.begin_transaction().expect("begin");
+    producer.begin().expect("begin");
     let _ = producer
-        .send("orders", None, Some(b"committed"))
+        .send(crate::Record::new("orders", "committed"))
         .await
         .expect("send");
 
     // Rejected before the accumulator, inside an open transaction: the record
     // still owes an acknowledgement.
     let _ = producer
-        .send("no-such-topic", None, Some(b"unrouteable"))
+        .send(crate::Record::new("no-such-topic", "unrouteable"))
         .await
         .expect_err("an unrouteable record must be rejected");
 
-    producer.commit_transaction().await.expect("commit");
-    producer.close().await;
+    producer.commit().await.expect("commit");
+    producer.close().await.unwrap();
 
     let acks = interceptor.acks();
     assert_eq!(acks.len(), 2, "both records owe an acknowledgement");
@@ -5148,7 +5261,7 @@ async fn the_transactional_send_path_pairs_on_send_with_on_acknowledgement() {
     assert!(!committed.failed);
     assert_eq!(
         committed.delivery,
-        crate::producer::DeliveryConfirmation::Offset
+        Some(crate::producer::DeliveryConfirmation::Offset)
     );
 
     let rejected = acks
@@ -5157,10 +5270,7 @@ async fn the_transactional_send_path_pairs_on_send_with_on_acknowledgement() {
         .expect("the rejected record must report with its own context");
     assert!(rejected.failed);
     assert_eq!(rejected.partition, crate::producer::UNKNOWN_PARTITION);
-    assert_eq!(
-        rejected.delivery,
-        crate::producer::DeliveryConfirmation::Failed
-    );
+    assert_eq!(rejected.delivery, None);
 }
 
 /// `on_acknowledgement` reports the record's **final** header set — including
@@ -5178,7 +5288,7 @@ async fn on_acknowledgement_sees_headers_written_later_in_the_chain() {
     impl crate::interceptor::ProducerInterceptor for LateHeaderInterceptor {
         fn on_send(
             &self,
-            record: &mut crate::producer::ProducerRecord,
+            record: &mut crate::producer::Record,
             _ctx: &mut crate::interceptor::RecordContext,
         ) -> crate::interceptor::InterceptorResult {
             record.headers.push((
@@ -5192,20 +5302,23 @@ async fn on_acknowledgement_sees_headers_written_later_in_the_chain() {
     let broker = FakeBroker::start().await.unwrap();
     broker.create_topic("events", 1);
     let interceptor = std::sync::Arc::new(RecordingInterceptor::default());
-    let producer = Producer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
+    let producer = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
-        .add_interceptor(std::sync::Arc::clone(&interceptor) as std::sync::Arc<_>)
-        .add_interceptor(std::sync::Arc::new(LateHeaderInterceptor))
+        .connect()
+        .await
+        .expect("producer should connect")
+        .producer()
+        .interceptor(std::sync::Arc::clone(&interceptor) as std::sync::Arc<_>)
+        .interceptor(std::sync::Arc::new(LateHeaderInterceptor))
         .build()
         .await
         .expect("producer should connect");
 
     let _ = producer
-        .send_record(
-            crate::producer::ProducerRecord::new("events", b"v".to_vec())
-                .with_header("added-first", bytes::Bytes::from_static(b"0")),
+        .send(
+            crate::producer::Record::new("events", b"v".to_vec())
+                .header("added-first", bytes::Bytes::from_static(b"0")),
         )
         .await
         .expect("send should be acknowledged");
@@ -5229,9 +5342,9 @@ async fn a_rejected_record_still_reports_its_headers() {
     let producer = producer_with(&broker, &interceptor).await;
 
     let _ = producer
-        .send_record(
-            crate::producer::ProducerRecord::new("no-such-topic", b"v".to_vec())
-                .with_header("trace-id", bytes::Bytes::from_static(b"abc")),
+        .send(
+            crate::producer::Record::new("no-such-topic", b"v".to_vec())
+                .header("trace-id", bytes::Bytes::from_static(b"abc")),
         )
         .await
         .expect_err("an unrouteable record must be rejected");
@@ -5263,11 +5376,13 @@ async fn not_coordinator_on_join_is_retried_after_rediscovery() {
     let broker = FakeBroker::start().await.unwrap();
     broker.create_topic("events", 1);
 
-    let consumer = crate::consumer::Consumer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
-        .group_id("analytics")
+    let consumer = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .connect()
+        .await
+        .expect("consumer should connect")
+        .consumer("analytics")
         .build()
         .await
         .expect("consumer should connect");
@@ -5282,8 +5397,9 @@ async fn not_coordinator_on_join_is_retried_after_rediscovery() {
         .await
         .expect("subscribe should ride out NOT_COORDINATOR, not surface it");
 
+    // The join runs on its own task; wait for the retry.
     assert!(
-        broker.request_count(ApiKey::JoinGroup) >= 2,
+        broker.wait_for_requests(ApiKey::JoinGroup, 2, SETTLE).await,
         "the client should have retried JoinGroup after re-discovering the \
          coordinator, but sent {} request(s)",
         broker.request_count(ApiKey::JoinGroup)
@@ -5298,19 +5414,20 @@ async fn not_coordinator_on_join_is_retried_after_rediscovery() {
 
 /// The same guarantee for the KIP-848 path, where the heartbeat *is* the join.
 ///
-/// This path had the defect in a worse form: it returned the error without even
-/// dropping the cached coordinator, so nothing downstream could have recovered.
+/// The cached coordinator must be dropped, or nothing downstream can recover.
 #[tokio::test]
 async fn not_coordinator_on_the_kip848_join_is_retried_after_rediscovery() {
     let broker = FakeBroker::start().await.unwrap();
     broker.create_topic("events", 1);
 
-    let consumer = crate::consumer::Consumer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
-        .group_id("analytics-848")
-        .group_protocol(crate::consumer::GroupProtocol::Consumer)
+    let consumer = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .connect()
+        .await
+        .expect("consumer should connect")
+        .consumer("analytics-848")
+        .group_protocol(crate::consumer::GroupProtocol::Consumer)
         .build()
         .await
         .expect("consumer should connect");
@@ -5363,12 +5480,14 @@ async fn describing_a_classic_group_reports_what_its_member_owns() {
     let broker = FakeBroker::start().await.unwrap();
     broker.create_topic("events", 3);
 
-    let consumer = crate::consumer::Consumer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
-        .group_id("reporting")
-        .client_rack("us-east-1a")
+    let consumer = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .connect()
+        .await
+        .expect("consumer should connect")
+        .consumer("reporting")
+        .client_rack("us-east-1a")
         .build()
         .await
         .expect("consumer should connect");
@@ -5385,11 +5504,13 @@ async fn describing_a_classic_group_reports_what_its_member_owns() {
 
     let admin = admin_for(&broker).await;
     let described = admin
-        .describe_consumer_groups(vec!["reporting".to_string()])
+        .describe_consumer_groups(["reporting"], Default::default())
         .await
         .expect("describe should succeed");
 
-    let group = described.first().expect("the group should be described");
+    let group = described["reporting"]
+        .as_ref()
+        .expect("the group should be described");
     assert_eq!(group.group_type, crate::admin::GroupType::Classic);
     assert_eq!(group.state, "Stable");
 
@@ -5433,11 +5554,13 @@ async fn describing_a_group_whose_members_all_left_reports_it_as_empty() {
     let broker = FakeBroker::start().await.unwrap();
     broker.create_topic("events", 1);
 
-    let consumer = crate::consumer::Consumer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
-        .group_id("departed")
+    let consumer = crate::Kafka::builder(broker.bootstrap_servers())
         .request_timeout(SHORT_REQUEST_TIMEOUT)
         .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .connect()
+        .await
+        .expect("consumer should connect")
+        .consumer("departed")
         .build()
         .await
         .expect("consumer should connect");
@@ -5455,14 +5578,15 @@ async fn describing_a_group_whose_members_all_left_reports_it_as_empty() {
 
     let admin = admin_for(&broker).await;
     let described = admin
-        .describe_consumer_groups(vec!["departed".to_string()])
+        .describe_consumer_groups(["departed"], Default::default())
         .await
         .expect("describe should succeed");
 
-    let group = described.first().expect("the group should be described");
+    let group = described["departed"]
+        .as_ref()
+        .expect("an empty group is not an error");
     assert_eq!(group.state, "Empty");
     assert!(group.members.is_empty());
-    assert!(group.error.is_none(), "an empty group is not an error");
 }
 
 /// DescribeGroups reports failures per group. One unauthorized group must
@@ -5477,11 +5601,15 @@ async fn a_per_group_describe_failure_does_not_fail_the_call() {
 
     let admin = admin_for(&broker).await;
     let described = admin
-        .describe_consumer_groups(vec!["forbidden".to_string()])
+        .describe_consumer_groups(["forbidden"], Default::default())
         .await
         .expect("a per-group error is reported, not returned as a call failure");
 
-    let group = described.first().expect("the group should be described");
-    assert_eq!(group.error.as_deref(), Some("GroupAuthorizationFailed"));
-    assert!(group.members.is_empty());
+    assert!(matches!(
+        described["forbidden"],
+        Err(crate::error::KrafkaError::Broker {
+            code: ErrorCode::GroupAuthorizationFailed,
+            ..
+        })
+    ));
 }

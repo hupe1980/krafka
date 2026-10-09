@@ -28,11 +28,17 @@ target
 # cite one.
 concepts/
 
+# This project's own feature specifications and the Spec Kit machinery that
+# produces them (`/speckit-*` skills, templates, `.specify/memory/constitution.md`).
+# Same rule as `concepts/`: internal, and the published tree may not cite a path
+# its reader does not have.
+/specs/
+/.specify/
+
 # Third-party specifications — Apache Kafka message schemas and protocol guide,
-# KIP wiki pages, IETF RFCs, AWS and OpenTelemetry documents. Copyrighted
-# publications that are not ours to redistribute; `concepts/REFERENCES.md`
-# indexes every one with its retrieval URL, so the folder can be rebuilt.
-specs/
+# KIP wiki pages, IETF RFCs, AWS and OpenTelemetry documents — live at
+# `concepts/reference/` and are covered by `concepts/` above. The old root-level
+# path is the feature-spec folder now; nothing third-party may be put back there.
 
 # Zola documentation site (site/) build output.
 #

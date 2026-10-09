@@ -124,7 +124,7 @@ def wrap(index: int, source: str, line: int, body: str) -> str:
       * **Imports**, as *glob* imports only. A glob does not collide with an
         explicit `use` of the same type, so a snippet that spells out its own
         imports still compiles.
-      * **Ambient bindings** — `producer`, `consumer`, `admin`, `client` — as
+      * **Ambient bindings** — `kafka`, `producer`, `consumer`, `admin` — as
         parameters. A snippet that builds its own shadows the parameter.
 
     What is left is exactly what the check is for: whether the API calls are
@@ -162,10 +162,10 @@ def wrap(index: int, source: str, line: int, body: str) -> str:
         + "\n".join(f"    {line}" for line in items)
         + "\n"
         f"    pub async fn __check(\n"
+        f"        kafka: &Kafka,\n"
         f"        producer: &Producer,\n"
         f"        consumer: &Consumer,\n"
         f"        admin: &AdminClient,\n"
-        f"        client: &KrafkaClient,\n"
         f"    ) -> krafka::Result<()> {{\n"
         f"{indented}\n"
         f"        Ok(())\n"

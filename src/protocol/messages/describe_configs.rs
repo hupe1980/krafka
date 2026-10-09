@@ -744,7 +744,7 @@ mod tests {
         assert_eq!(c.documentation.as_deref(), Some("doc"));
     }
 
-    // ── Regression: allocation amplification ───────────────────────────
+    // ── Allocation amplification ───────────────────────────────────────
 
     /// A tiny hostile body must not drive a large pre-allocation.
     ///

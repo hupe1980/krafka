@@ -1,16 +1,15 @@
-//! Pluggable serialization applied on the way to and from the wire.
+//! Typed serialization for the producer, pluggable byte transforms for the
+//! consumer.
 //!
-//! A [`Serializer`] runs on every record the producer sends, after the
-//! interceptors and before partitioning. A [`Deserializer`] runs on every
-//! record the consumer delivers, after the interceptors and immediately before
-//! `poll()` returns. Attach them with `key_serializer` / `value_serializer` on
-//! either producer builder and `key_deserializer` / `value_deserializer` on the
-//! consumer builder.
+//! A [`Serializer<T>`] turns an application value into the bytes of a
+//! record's key or value. [`TypedProducer`](crate::producer::TypedProducer)
+//! runs one for the key and one for the value before the record enters the
+//! producer, so the interceptors see the encoded record. A serializer may write
+//! headers too, which is where a schema registry puts a schema id.
 //!
-//! This is the same hook the Java client exposes as `key.serializer` /
-//! `value.serializer`, and it exists for the same reason: the Kafka client
-//! should own the *place* the transformation happens, and the ecosystem should
-//! own the transformations.
+//! A [`Deserializer`] runs on every record the consumer delivers, after the
+//! interceptors and immediately before `poll()` returns. Attach it with
+//! `key_deserializer` / `value_deserializer` on the consumer builder.
 //!
 //! # What krafka deliberately does not ship
 //!
@@ -18,187 +17,265 @@
 //! codec. Every comparable client draws the line in the same place — Java's
 //! `kafka-clients` has no registry support (`kafka-avro-serializer` is a
 //! separate artifact), librdkafka has none (`libschemaregistry` is a separate
-//! library), and franz-go keeps `pkg/sr` out of `kgo`. A schema registry is a
-//! different service, with a different protocol, auth model and release
-//! cadence; coupling it to the Kafka protocol client means a registry API
-//! change forces a Kafka client release.
-//!
-//! krafka carried a Confluent + AWS Glue registry client until 0.18. It now
-//! lives in [`schemreg`](https://crates.io/crates/schemreg), which also has
-//! native Apicurio support and real Avro / Protobuf / JSON codecs that krafka
-//! never had. Pair the two with a small adapter — see the
+//! library), and franz-go keeps `pkg/sr` out of `kgo`. Pair krafka with a
+//! registry crate such as [`schemreg`](https://crates.io/crates/schemreg)
+//! through a small adapter — see the
 //! [Cookbook](https://hupe1980.github.io/krafka/docs/cookbook/#use-a-schema-registry).
-//!
-//! # Beyond schemas
-//!
-//! Because the traits are plain `Bytes -> Bytes`, they are not limited to
-//! schema framing. Envelope encryption, an application-level compression
-//! scheme, or a bare `serde_json` round-trip all fit the same hook.
 //!
 //! # Errors
 //!
-//! An error from either trait fails the operation: the producer's `send`
-//! returns it, and `poll` returns it rather than delivering a record it could
-//! not decode. Neither is invoked for an absent key or value.
+//! An error from a serializer fails the send before anything is reserved or
+//! queued. A deserializer error makes `poll` return it rather than deliver a
+//! record it could not decode. Neither is invoked for an absent key or value.
 
-use std::future::Future;
-use std::pin::Pin;
+use std::sync::Arc;
 
 use bytes::Bytes;
 
-use crate::error::Result;
+use crate::Headers;
+use crate::error::{KrafkaError, Result};
 
-/// Transforms a record's key or value on its way to the broker.
+/// Encodes an application value as the bytes of a record key or value.
 ///
-/// Implementations must be cheap to share: one instance handles every record on
-/// the producer, so keep per-call work off the hot path and cache anything
-/// derived from the topic.
+/// Synchronous: registration with a schema registry belongs before the send,
+/// in the registry client's own cache, so the per-record call only encodes.
+/// One instance serves every record, so it must be cheap to share.
+///
+/// `headers` are the record's headers; a serializer may add to them (a
+/// header-based schema id, a content type).
+///
+/// krafka ships [`BytesSerializer`] (pass-through for `Bytes`, `Vec<u8>` and
+/// `[u8]`) and [`StringSerializer`] (UTF-8 for `String` and `str`).
 ///
 /// # Example
 ///
-/// A serializer that prefixes a version byte.
-///
 /// ```rust
-/// use std::future::Future;
-/// use std::pin::Pin;
-///
-/// use bytes::{BufMut, Bytes, BytesMut};
+/// use bytes::Bytes;
+/// use krafka::Headers;
 /// use krafka::serdes::Serializer;
 ///
-/// #[derive(Debug)]
-/// struct VersionTagged(u8);
+/// /// Big-endian `u64`, tagged with a content-type header.
+/// struct BigEndian;
 ///
-/// impl Serializer for VersionTagged {
+/// impl Serializer<u64> for BigEndian {
 ///     fn serialize(
 ///         &self,
-///         payload: Bytes,
 ///         _topic: &str,
-///         _record_name: Option<&str>,
-///         _is_key: bool,
-///     ) -> Pin<Box<dyn Future<Output = krafka::Result<Bytes>> + Send + '_>> {
-///         let version = self.0;
-///         Box::pin(async move {
-///             let mut out = BytesMut::with_capacity(1 + payload.len());
-///             out.put_u8(version);
-///             out.put_slice(&payload);
-///             Ok(out.freeze())
-///         })
+///         headers: &mut Headers,
+///         value: &u64,
+///     ) -> krafka::Result<Bytes> {
+///         headers.push(("content-type".into(), Some(Bytes::from_static(b"u64-be"))));
+///         Ok(Bytes::copy_from_slice(&value.to_be_bytes()))
 ///     }
 /// }
 /// ```
-pub trait Serializer: Send + Sync {
-    /// Transform `payload` before it is written to the record batch.
-    ///
-    /// `topic` is the target topic. `record_name` is
-    /// [`ProducerRecord::record_name`](crate::producer::ProducerRecord::record_name),
-    /// carried through for implementations that derive a subject or type name
-    /// from it; it is `None` unless the caller set one. `is_key` distinguishes
-    /// the key from the value, since the two usually map to different schemas.
-    ///
-    /// Takes `Bytes` rather than `&[u8]` so an implementation can move the
-    /// buffer into the returned future without copying.
-    ///
-    /// The producer skips a `None` key or value rather than passing an empty
-    /// buffer, so an implementation never sees one — that is what keeps a
-    /// tombstone null on the wire.
-    fn serialize(
-        &self,
-        payload: Bytes,
-        topic: &str,
-        record_name: Option<&str>,
-        is_key: bool,
-    ) -> Pin<Box<dyn Future<Output = Result<Bytes>> + Send + '_>>;
+pub trait Serializer<T: ?Sized>: Send + Sync {
+    /// Encode `value` for `topic`, optionally adding `headers`.
+    fn serialize(&self, topic: &str, headers: &mut Headers, value: &T) -> Result<Bytes>;
+}
+
+/// Passes byte values through unchanged: `Bytes`, `Vec<u8>` and `[u8]`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BytesSerializer;
+
+impl Serializer<Bytes> for BytesSerializer {
+    fn serialize(&self, _topic: &str, _headers: &mut Headers, value: &Bytes) -> Result<Bytes> {
+        Ok(value.clone())
+    }
+}
+
+impl Serializer<Vec<u8>> for BytesSerializer {
+    fn serialize(&self, _topic: &str, _headers: &mut Headers, value: &Vec<u8>) -> Result<Bytes> {
+        Ok(Bytes::copy_from_slice(value))
+    }
+}
+
+impl Serializer<[u8]> for BytesSerializer {
+    fn serialize(&self, _topic: &str, _headers: &mut Headers, value: &[u8]) -> Result<Bytes> {
+        Ok(Bytes::copy_from_slice(value))
+    }
+}
+
+/// Encodes strings as UTF-8: `String` and `str`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StringSerializer;
+
+impl Serializer<String> for StringSerializer {
+    fn serialize(&self, _topic: &str, _headers: &mut Headers, value: &String) -> Result<Bytes> {
+        Ok(Bytes::copy_from_slice(value.as_bytes()))
+    }
+}
+
+impl Serializer<str> for StringSerializer {
+    fn serialize(&self, _topic: &str, _headers: &mut Headers, value: &str) -> Result<Bytes> {
+        Ok(Bytes::copy_from_slice(value.as_bytes()))
+    }
+}
+
+/// A serializer that refuses every value, for a key type a producer never
+/// sends. Its `serialize` is never called for a `None` key.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoKey;
+
+impl<T: ?Sized> Serializer<T> for NoKey {
+    fn serialize(&self, topic: &str, _headers: &mut Headers, _value: &T) -> Result<Bytes> {
+        Err(KrafkaError::serialization(format!(
+            "this producer sends no keys, but a key was given for topic {topic}"
+        )))
+    }
 }
 
 /// Transforms a record's key or value on its way to the application.
 ///
-/// The inverse of [`Serializer`], applied by the consumer immediately before
-/// `poll()` returns.
+/// The inverse of [`Serializer`], applied by the consumer and the share
+/// consumer to every record before `poll()`/`recv()` returns it.
+/// Synchronous: it runs inside the cancel-safe receive path. A panic
+/// propagates out of `poll()`/`recv()`.
+///
+/// ```rust
+/// use bytes::Bytes;
+/// use krafka::Headers;
+/// use krafka::serdes::Deserializer;
+///
+/// /// Strips a 5-byte schema-registry prefix.
+/// struct StripPrefix;
+///
+/// impl Deserializer for StripPrefix {
+///     fn deserialize(
+///         &self,
+///         _topic: &str,
+///         _headers: &Headers,
+///         payload: Bytes,
+///         _is_key: bool,
+///     ) -> krafka::Result<Bytes> {
+///         Ok(payload.slice(5.min(payload.len())..))
+///     }
+/// }
+/// ```
 pub trait Deserializer: Send + Sync {
     /// Transform `payload` before it is handed to the application.
     ///
-    /// `topic` is the source topic and `is_key` distinguishes key from value,
-    /// for the same reason as on [`Serializer::serialize`]. There is no
-    /// `record_name`: on the read path the framing itself identifies the
-    /// schema, which is why registry decoders need no hint.
+    /// `topic` is the source topic, `headers` the record's headers, and
+    /// `is_key` distinguishes key from value. Takes `Bytes` so an
+    /// implementation can return a sub-slice of its input without
+    /// allocating.
     ///
-    /// Takes `Bytes` so an implementation can return a sub-slice of its input
-    /// without allocating — stripping a fixed-size header is a slice, not a
-    /// copy.
+    /// # Errors
+    ///
+    /// The consumer reports an error as
+    /// [`RecordDeserialization`](KrafkaError::RecordDeserialization).
     fn deserialize(
         &self,
-        payload: Bytes,
         topic: &str,
+        headers: &Headers,
+        payload: Bytes,
         is_key: bool,
-    ) -> Pin<Box<dyn Future<Output = Result<Bytes>> + Send + '_>>;
+    ) -> Result<Bytes>;
+}
+
+impl<T: Deserializer + ?Sized> Deserializer for Arc<T> {
+    fn deserialize(
+        &self,
+        topic: &str,
+        headers: &Headers,
+        payload: Bytes,
+        is_key: bool,
+    ) -> Result<Bytes> {
+        (**self).deserialize(topic, headers, payload, is_key)
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     #[derive(Debug)]
     struct Prefix(&'static [u8]);
 
-    impl Serializer for Prefix {
-        fn serialize(
-            &self,
-            payload: Bytes,
-            _topic: &str,
-            _record_name: Option<&str>,
-            _is_key: bool,
-        ) -> Pin<Box<dyn Future<Output = Result<Bytes>> + Send + '_>> {
-            Box::pin(async move {
-                let mut out = Vec::with_capacity(self.0.len() + payload.len());
-                out.extend_from_slice(self.0);
-                out.extend_from_slice(&payload);
-                Ok(Bytes::from(out))
-            })
-        }
-    }
-
     impl Deserializer for Prefix {
         fn deserialize(
             &self,
-            payload: Bytes,
             _topic: &str,
+            _headers: &Headers,
+            payload: Bytes,
             _is_key: bool,
-        ) -> Pin<Box<dyn Future<Output = Result<Bytes>> + Send + '_>> {
-            let len = self.0.len();
-            Box::pin(async move { Ok(payload.slice(len..)) })
+        ) -> Result<Bytes> {
+            Ok(payload.slice(self.0.len()..))
         }
     }
 
-    /// Both traits must be usable as `Arc<dyn _>`, which is how the builders
-    /// store them — a non-object-safe signature would only fail at the call
-    /// site, far from the definition.
-    #[tokio::test]
-    async fn traits_are_object_safe_and_round_trip() {
-        let ser: Arc<dyn Serializer> = Arc::new(Prefix(b"\x00\x01"));
+    /// `Deserializer` must be usable as `Arc<dyn _>`, which is how the
+    /// consumer builder stores it.
+    #[test]
+    fn deserializer_is_object_safe() {
         let de: Arc<dyn Deserializer> = Arc::new(Prefix(b"\x00\x01"));
-
-        let framed = ser
-            .serialize(Bytes::from_static(b"payload"), "orders", None, false)
-            .await
+        let plain = de
+            .deserialize(
+                "orders",
+                &Headers::new(),
+                Bytes::from_static(b"\x00\x01payload"),
+                false,
+            )
             .unwrap();
-        assert_eq!(&framed[..], b"\x00\x01payload");
-
-        let plain = de.deserialize(framed, "orders", false).await.unwrap();
         assert_eq!(&plain[..], b"payload");
     }
 
     /// Deserializing must be able to return a slice of its input rather than a
     /// fresh allocation; that is the reason the signature takes `Bytes`.
-    #[tokio::test]
-    async fn deserialize_can_be_zero_copy() {
+    #[test]
+    fn deserialize_can_be_zero_copy() {
         let de = Prefix(b"\x00\x01");
         let input = Bytes::from_static(b"\x00\x01payload");
         let out = de
-            .deserialize(input.clone(), "orders", false)
-            .await
+            .deserialize("orders", &Headers::new(), input.clone(), false)
             .unwrap();
         assert_eq!(out.as_ptr(), input[2..].as_ptr(), "expected a sub-slice");
+    }
+
+    #[test]
+    fn byte_and_string_serializers_pass_values_through() {
+        let mut headers = Vec::new();
+        let bytes = Bytes::from_static(b"raw");
+        assert_eq!(
+            BytesSerializer
+                .serialize("t", &mut headers, &bytes)
+                .unwrap(),
+            bytes
+        );
+        assert_eq!(
+            BytesSerializer
+                .serialize("t", &mut headers, &b"raw".to_vec())
+                .unwrap(),
+            bytes
+        );
+        assert_eq!(
+            BytesSerializer
+                .serialize("t", &mut headers, &b"raw"[..])
+                .unwrap(),
+            bytes
+        );
+        assert_eq!(
+            StringSerializer
+                .serialize("t", &mut headers, "héllo")
+                .unwrap(),
+            Bytes::from("héllo")
+        );
+        assert_eq!(
+            StringSerializer
+                .serialize("t", &mut headers, &"héllo".to_string())
+                .unwrap(),
+            Bytes::from("héllo")
+        );
+        assert!(
+            headers.is_empty(),
+            "pass-through serializers add no headers"
+        );
+    }
+
+    #[test]
+    fn no_key_refuses_a_key() {
+        let mut headers = Vec::new();
+        assert!(NoKey.serialize("t", &mut headers, "k").is_err());
     }
 }

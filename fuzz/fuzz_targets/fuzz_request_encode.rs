@@ -16,7 +16,7 @@
 use bytes::{Bytes, BytesMut};
 use libfuzzer_sys::fuzz_target;
 
-use krafka::protocol::{
+use krafka::__private::protocol::{
     AddOffsetsToTxnRequest, ConfigResourceType, CreatableTopic, CreateTopicsRequest,
     DeleteGroupsRequest, DeleteTopicState, DeleteTopicsRequest, DescribeClusterRequest,
     DescribeConfigsRequest, DescribeConfigsResource, DescribeGroupsRequest,

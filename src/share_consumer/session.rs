@@ -1,122 +1,117 @@
-//! Share session management (KIP-932).
+//! Share session state of one broker node (KIP-932).
 //!
-//! Share sessions are similar to fetch sessions (KIP-227) but operate on
-//! share group partitions. Each broker maintains a share session per
-//! (group_id, member_id) pair. The client tracks session epochs:
+//! A share session is identified by `(group, member)` on one broker and
+//! numbered by an epoch the client sends with every `ShareFetch` and
+//! `ShareAcknowledge`:
 //!
-//! - Epoch `0`: open a new session (full fetch)
-//! - Epoch `1..=i32::MAX`: incremental fetches
-//! - Epoch `-1`: close the session
+//! - `0` opens a session. Only a `ShareFetch` may open one, and it must not
+//!   carry acknowledgements.
+//! - `1..=i32::MAX` continue it; each answered request advances the epoch by
+//!   one, wrapping from `i32::MAX` to `1`.
+//! - `-1` closes it. The broker applies the request's acknowledgements and
+//!   then releases every record the member still holds.
 //!
-//! A share session also carries piggybacked acknowledgements: the client
-//! reports accepted/released/rejected offsets alongside the next fetch
-//! request, reducing round trips.
+//! The broker remembers which partitions the session fetches, so a request
+//! after the first names only partitions to add (`Topics`) and to drop
+//! (`ForgottenTopicsData`).
 
-use ahash::AHashMap as HashMap;
+use ahash::AHashSet as HashSet;
 
-use crate::BrokerId;
+use crate::PartitionId;
 
-/// Epoch value for opening a new share session.
-pub const INITIAL_EPOCH: i32 = 0;
+/// Epoch that opens a share session.
+pub(crate) const INITIAL_EPOCH: i32 = 0;
 
-/// Epoch value for closing a share session.
-///
-/// Sent in the `share_session_epoch` field of a `ShareFetch` request to
-/// signal that the broker should release the server-side session immediately.
+/// Epoch that closes a share session.
 pub(crate) const FINAL_EPOCH: i32 = -1;
 
-/// Per-broker share session state.
-#[derive(Debug)]
-pub struct ShareSessionState {
-    /// Current epoch. Starts at 0 (open), incremented after each successful
-    /// response. Set to -1 to close.
+/// A partition as the share APIs name it.
+pub(crate) type SessionPartition = ([u8; 16], PartitionId);
+
+/// The client's view of its share session on one node.
+#[derive(Debug, Default)]
+pub(crate) struct ShareSession {
     epoch: i32,
-    /// Whether a session is established (at least one successful exchange).
-    established: bool,
+    /// Partitions the broker fetches for this session.
+    partitions: HashSet<SessionPartition>,
 }
 
-impl ShareSessionState {
-    /// Create a new share session for a broker. Starts with no session.
-    fn new() -> Self {
-        Self {
-            epoch: INITIAL_EPOCH,
-            established: false,
-        }
-    }
+/// What the next `ShareFetch` must say about the session's partitions.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct SessionDelta {
+    /// Partitions to list in `Topics`.
+    pub added: Vec<SessionPartition>,
+    /// Partitions to list in `ForgottenTopicsData`.
+    pub forgotten: Vec<SessionPartition>,
+}
 
-    /// Returns the current epoch to send in the next request.
-    pub fn epoch(&self) -> i32 {
+impl ShareSession {
+    /// The epoch to send with the next request.
+    pub(crate) fn epoch(&self) -> i32 {
         self.epoch
     }
 
-    /// Update after a successful share fetch response.
-    /// Bumps the epoch for the next incremental fetch.
-    pub fn on_success(&mut self) {
-        self.established = true;
-        // Wraps from MAX to 1 (0 is "open new session").
+    /// Whether the broker holds a session for this node.
+    pub(crate) fn is_established(&self) -> bool {
+        self.epoch != INITIAL_EPOCH
+    }
+
+    /// How a `ShareFetch` for `wanted` differs from the session. An opening
+    /// request lists every wanted partition.
+    pub(crate) fn delta(&self, wanted: &[SessionPartition]) -> SessionDelta {
+        if !self.is_established() {
+            return SessionDelta {
+                added: wanted.to_vec(),
+                forgotten: Vec::new(),
+            };
+        }
+        let wanted_set: HashSet<SessionPartition> = wanted.iter().copied().collect();
+        let mut forgotten: Vec<SessionPartition> = self
+            .partitions
+            .iter()
+            .filter(|p| !wanted_set.contains(p))
+            .copied()
+            .collect();
+        forgotten.sort_unstable();
+        SessionDelta {
+            added: wanted
+                .iter()
+                .filter(|p| !self.partitions.contains(p))
+                .copied()
+                .collect(),
+            forgotten,
+        }
+    }
+
+    /// Record an answered `ShareFetch` that applied `delta`.
+    pub(crate) fn on_fetch(&mut self, delta: &SessionDelta) {
+        if !self.is_established() {
+            self.partitions.clear();
+        }
+        self.partitions.extend(delta.added.iter().copied());
+        for partition in &delta.forgotten {
+            self.partitions.remove(partition);
+        }
+        self.advance();
+    }
+
+    /// Record an answered `ShareAcknowledge`.
+    pub(crate) fn on_acknowledge(&mut self) {
+        self.advance();
+    }
+
+    /// Forget the session; the next request opens a new one.
+    pub(crate) fn reset(&mut self) {
+        self.epoch = INITIAL_EPOCH;
+        self.partitions.clear();
+    }
+
+    fn advance(&mut self) {
         self.epoch = if self.epoch == i32::MAX {
             1
         } else {
             self.epoch + 1
         };
-    }
-
-    /// Reset the session (e.g., on error or rebalance).
-    /// The next fetch will open a new session (epoch 0).
-    pub fn reset(&mut self) {
-        self.epoch = INITIAL_EPOCH;
-        self.established = false;
-    }
-}
-
-/// Cache of share sessions, one per broker.
-#[derive(Debug, Default)]
-pub struct ShareSessionCache {
-    sessions: HashMap<BrokerId, ShareSessionState>,
-}
-
-impl ShareSessionCache {
-    /// Create a new empty cache.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Get or create the session state for a broker.
-    pub fn get_or_create(&mut self, broker_id: BrokerId) -> &mut ShareSessionState {
-        self.sessions
-            .entry(broker_id)
-            .or_insert_with(ShareSessionState::new)
-    }
-
-    /// Get the session state for a broker (read-only).
-    pub fn get(&self, broker_id: BrokerId) -> Option<&ShareSessionState> {
-        self.sessions.get(&broker_id)
-    }
-
-    /// Reset the session for a specific broker.
-    pub fn reset_broker(&mut self, broker_id: BrokerId) {
-        if let Some(session) = self.sessions.get_mut(&broker_id) {
-            session.reset();
-        }
-    }
-
-    /// Reset all sessions (e.g., on group leave).
-    pub fn reset_all(&mut self) {
-        for session in self.sessions.values_mut() {
-            session.reset();
-        }
-    }
-
-    /// Return the IDs of all brokers with an established session.
-    ///
-    /// Used during close to send FINAL_EPOCH ShareAcknowledge requests that
-    /// allow brokers to release server-side session state promptly.
-    pub fn established_broker_ids(&self) -> Vec<BrokerId> {
-        self.sessions
-            .iter()
-            .filter(|(_, s)| s.established)
-            .map(|(&id, _)| id)
-            .collect()
     }
 }
 
@@ -125,93 +120,49 @@ impl ShareSessionCache {
 mod tests {
     use super::*;
 
+    const A: SessionPartition = ([1; 16], 0);
+    const B: SessionPartition = ([1; 16], 1);
+
     #[test]
-    fn new_session_starts_at_epoch_zero() {
-        let state = ShareSessionState::new();
-        assert_eq!(state.epoch(), INITIAL_EPOCH);
-        assert!(!state.established);
+    fn an_opening_fetch_lists_every_partition() {
+        let session = ShareSession::default();
+        assert_eq!(session.epoch(), INITIAL_EPOCH);
+        let delta = session.delta(&[A, B]);
+        assert_eq!(delta.added, vec![A, B]);
+        assert!(delta.forgotten.is_empty());
     }
 
     #[test]
-    fn on_success_bumps_epoch() {
-        let mut state = ShareSessionState::new();
-        state.on_success();
-        assert_eq!(state.epoch(), 1);
-        assert!(state.established);
+    fn a_later_fetch_names_only_the_difference() {
+        let mut session = ShareSession::default();
+        let delta = session.delta(&[A, B]);
+        session.on_fetch(&delta);
+        assert_eq!(session.epoch(), 1);
 
-        state.on_success();
-        assert_eq!(state.epoch(), 2);
+        let delta = session.delta(&[A]);
+        assert!(delta.added.is_empty());
+        assert_eq!(delta.forgotten, vec![B]);
+        session.on_fetch(&delta);
+        assert_eq!(session.epoch(), 2);
+        assert_eq!(session.delta(&[A]), SessionDelta::default());
     }
 
     #[test]
-    fn epoch_wraps_at_max() {
-        let mut state = ShareSessionState::new();
-        state.epoch = i32::MAX;
-        state.on_success();
-        assert_eq!(state.epoch(), 1);
+    fn the_epoch_wraps_to_one() {
+        let mut session = ShareSession {
+            epoch: i32::MAX,
+            partitions: HashSet::new(),
+        };
+        session.on_acknowledge();
+        assert_eq!(session.epoch(), 1);
     }
 
     #[test]
-    fn reset_returns_to_initial() {
-        let mut state = ShareSessionState::new();
-        state.on_success();
-        state.on_success();
-        assert_eq!(state.epoch(), 2);
-        assert!(state.established);
-
-        state.reset();
-        assert_eq!(state.epoch(), INITIAL_EPOCH);
-        assert!(!state.established);
-    }
-
-    #[test]
-    fn final_epoch_is_minus_one() {
-        assert_eq!(FINAL_EPOCH, -1);
-    }
-
-    #[test]
-    fn cache_get_or_create_returns_same_session() {
-        let mut cache = ShareSessionCache::new();
-        cache.get_or_create(1).on_success();
-        assert_eq!(cache.get_or_create(1).epoch(), 1);
-    }
-
-    #[test]
-    fn cache_reset_broker() {
-        let mut cache = ShareSessionCache::new();
-        cache.get_or_create(1).on_success();
-        cache.get_or_create(1).on_success();
-        assert_eq!(cache.get(1).unwrap().epoch(), 2);
-
-        cache.reset_broker(1);
-        assert_eq!(cache.get(1).unwrap().epoch(), INITIAL_EPOCH);
-    }
-
-    #[test]
-    fn cache_reset_all() {
-        let mut cache = ShareSessionCache::new();
-        cache.get_or_create(1).on_success();
-        cache.get_or_create(2).on_success();
-        cache.get_or_create(2).on_success();
-
-        cache.reset_all();
-        assert_eq!(cache.get(1).unwrap().epoch(), INITIAL_EPOCH);
-        assert_eq!(cache.get(2).unwrap().epoch(), INITIAL_EPOCH);
-    }
-
-    #[test]
-    fn established_broker_ids_returns_only_established() {
-        let mut cache = ShareSessionCache::new();
-        // Broker 1: established (on_success called).
-        cache.get_or_create(1).on_success();
-        // Broker 2: NOT established (just created, no success yet).
-        cache.get_or_create(2);
-        // Broker 3: was established, then reset.
-        cache.get_or_create(3).on_success();
-        cache.reset_broker(3);
-
-        let mut ids = cache.established_broker_ids();
-        ids.sort_unstable();
-        assert_eq!(ids, vec![1], "only broker 1 should be established");
+    fn a_reset_reopens_with_every_partition() {
+        let mut session = ShareSession::default();
+        session.on_fetch(&session.delta(&[A]));
+        session.reset();
+        assert!(!session.is_established());
+        assert_eq!(session.delta(&[A]).added, vec![A]);
     }
 }

@@ -1,233 +1,17 @@
-//! Secure connection with TLS and SASL support.
-//!
-//! This module provides authenticated connections to Kafka brokers.
-
-use std::time::Duration;
+//! SASL authentication state machine for broker connections.
 
 #[cfg(test)]
 use crate::auth::SecurityProtocol;
-use crate::auth::{
-    AuthConfig, AwsMskIamCredentialProvider, ChannelBinding, MskIamAuthenticator, OAuthBearerToken,
-    OAuthBearerTokenProvider, PlainCredentials, SaslMechanism, ScramClient, ScramMechanism,
-    TlsConfig,
-};
+use crate::auth::msk_iam::MskIamAuthenticator;
+use crate::auth::scram::{ScramClient, ScramState};
+use crate::auth::{AuthConfig, OAuthBearerToken, PlainCredentials, SaslMechanism, ScramMechanism};
 use crate::error::{KrafkaError, Result};
 use zeroize::Zeroizing;
 
-use super::connection::ConnectionConfig;
-
-/// Extended connection config with authentication.
-#[derive(Debug, Clone)]
-pub struct SecureConnectionConfig {
-    /// Base connection config.
-    pub connection: ConnectionConfig,
-    /// Authentication config.
-    pub auth: AuthConfig,
-}
-
-impl Default for SecureConnectionConfig {
-    fn default() -> Self {
-        Self {
-            connection: ConnectionConfig::default(),
-            auth: AuthConfig::plaintext(),
-        }
-    }
-}
-
-impl SecureConnectionConfig {
-    /// Create a new secure connection config builder.
-    pub fn builder() -> SecureConnectionConfigBuilder {
-        SecureConnectionConfigBuilder::default()
-    }
-}
-
-/// Builder for SecureConnectionConfig.
-#[must_use = "builders do nothing until .build() is called"]
-#[derive(Debug, Default)]
-pub struct SecureConnectionConfigBuilder {
-    connection: ConnectionConfig,
-    auth: AuthConfig,
-}
-
-impl SecureConnectionConfigBuilder {
-    /// Set connection timeout.
-    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
-        self.connection.connect_timeout = timeout;
-        self
-    }
-
-    /// Set request timeout.
-    pub fn request_timeout(mut self, timeout: Duration) -> Self {
-        self.connection.request_timeout = timeout;
-        self
-    }
-
-    /// Set client ID.
-    pub fn client_id(mut self, client_id: impl Into<String>) -> Self {
-        self.connection.client_id = client_id.into();
-        self
-    }
-
-    /// Set TCP nodelay.
-    pub fn nodelay(mut self, nodelay: bool) -> Self {
-        self.connection.nodelay = nodelay;
-        self
-    }
-
-    /// Set the authentication config.
-    ///
-    /// Any TLS already configured with [`tls`](Self::tls) is carried forward
-    /// unless `auth` brings its own, so order does not matter here either.
-    pub fn auth(mut self, auth: AuthConfig) -> Self {
-        self.set_auth(auth);
-        self
-    }
-
-    /// Configure SASL/PLAIN authentication.
-    pub fn sasl_plain(
-        mut self,
-        username: impl Into<String>,
-        password: impl Into<String>,
-    ) -> crate::Result<Self> {
-        self.set_auth(AuthConfig::sasl_plain(username, password)?);
-        Ok(self)
-    }
-
-    /// Configure SASL/SCRAM-SHA-256 authentication.
-    pub fn sasl_scram_sha256(
-        mut self,
-        username: impl Into<String>,
-        password: impl Into<String>,
-    ) -> Self {
-        self.set_auth(AuthConfig::sasl_scram_sha256(username, password));
-        self
-    }
-
-    /// Configure SASL/SCRAM-SHA-512 authentication.
-    pub fn sasl_scram_sha512(
-        mut self,
-        username: impl Into<String>,
-        password: impl Into<String>,
-    ) -> Self {
-        self.set_auth(AuthConfig::sasl_scram_sha512(username, password));
-        self
-    }
-
-    /// Configure AWS MSK IAM authentication.
-    pub fn aws_msk_iam(
-        mut self,
-        access_key_id: impl Into<String>,
-        secret_access_key: impl Into<String>,
-        region: impl Into<String>,
-    ) -> Self {
-        self.set_auth(AuthConfig::aws_msk_iam(
-            access_key_id,
-            secret_access_key,
-            region,
-        ));
-        self
-    }
-
-    /// Configure AWS MSK IAM authentication with a credential provider.
-    ///
-    /// The provider is called on every new broker connection, ensuring
-    /// credentials are always fresh. Recommended for temporary credentials.
-    pub fn aws_msk_iam_provider(
-        mut self,
-        provider: impl AwsMskIamCredentialProvider + 'static,
-    ) -> Self {
-        self.set_auth(AuthConfig::aws_msk_iam_provider(provider));
-        self
-    }
-
-    /// Configure SASL/OAUTHBEARER authentication with a static token.
-    ///
-    /// For automatic token refresh, use [`sasl_oauthbearer_provider()`](Self::sasl_oauthbearer_provider).
-    /// For SASL extensions, use [`sasl_oauthbearer_token()`](Self::sasl_oauthbearer_token).
-    pub fn sasl_oauthbearer(mut self, token: impl Into<String>) -> Self {
-        self.set_auth(AuthConfig::sasl_oauthbearer(token));
-        self
-    }
-
-    /// Configure SASL/OAUTHBEARER authentication with a pre-built token.
-    pub fn sasl_oauthbearer_token(mut self, token: OAuthBearerToken) -> Self {
-        self.set_auth(AuthConfig::sasl_oauthbearer_token(token));
-        self
-    }
-
-    /// Configure SASL/OAUTHBEARER authentication with an async token provider.
-    ///
-    /// The provider is called on every new broker connection, ensuring
-    /// tokens are always fresh.
-    pub fn sasl_oauthbearer_provider(
-        mut self,
-        provider: impl OAuthBearerTokenProvider + 'static,
-    ) -> Self {
-        self.set_auth(AuthConfig::sasl_oauthbearer_provider(provider));
-        self
-    }
-
-    /// Wrap the configured authentication in TLS.
-    ///
-    /// `PLAINTEXT` becomes `SSL` and `SASL_PLAINTEXT` becomes `SASL_SSL`; an
-    /// already-encrypted config keeps its protocol and takes the new settings.
-    /// Delegates to [`AuthConfig::with_tls`], so there is one implementation of
-    /// the upgrade rule rather than two that can drift.
-    ///
-    /// **Order does not matter.** Calling `.tls(..)` before a SASL setter used
-    /// to lose the TLS configuration, because each SASL setter replaced the
-    /// whole `AuthConfig`; the setters now carry any TLS already configured
-    /// forward. Both of these produce `SASL_SSL`:
-    ///
-    /// ```rust
-    /// use krafka::auth::{SecurityProtocol, TlsConfig};
-    /// use krafka::network::SecureConnectionConfig;
-    ///
-    /// let a = SecureConnectionConfig::builder()
-    ///     .sasl_scram_sha512("user", "pass")
-    ///     .tls(TlsConfig::new())
-    ///     .build();
-    /// let b = SecureConnectionConfig::builder()
-    ///     .tls(TlsConfig::new())
-    ///     .sasl_scram_sha512("user", "pass")
-    ///     .build();
-    ///
-    /// assert_eq!(a.auth.security_protocol(), &SecurityProtocol::SaslSsl);
-    /// assert_eq!(b.auth.security_protocol(), &SecurityProtocol::SaslSsl);
-    /// ```
-    pub fn tls(mut self, tls_config: TlsConfig) -> Self {
-        self.auth = std::mem::take(&mut self.auth).with_tls(tls_config);
-        self
-    }
-
-    /// Replace the authentication config, carrying forward any TLS settings
-    /// already configured on the builder.
-    ///
-    /// Without this, `.tls(..).sasl_scram_sha512(..)` silently produced a
-    /// cleartext SASL handshake against a TLS listener — the exact failure
-    /// [`AuthConfig::with_tls`] exists to make unreachable.
-    fn set_auth(&mut self, auth: AuthConfig) {
-        let carried_tls = self.auth.tls_config().cloned();
-        self.auth = match carried_tls {
-            // An explicit `auth(..)` that already carries TLS wins over the
-            // builder's earlier `.tls(..)`.
-            Some(tls) if auth.tls_config().is_none() => auth.with_tls(tls),
-            _ => auth,
-        };
-    }
-
-    /// Build the config.
-    pub fn build(self) -> SecureConnectionConfig {
-        SecureConnectionConfig {
-            connection: self.connection,
-            auth: self.auth,
-        }
-    }
-}
-
 /// Response from processing a SASL challenge.
+///
+/// `Debug` reports lengths only: the bytes are a SASL payload.
 #[non_exhaustive]
-#[derive(Debug)]
 pub enum ChallengeResponse {
     /// Send these bytes and continue the handshake.
     ///
@@ -246,6 +30,23 @@ pub enum ChallengeResponse {
     },
     /// Authentication step complete, no response to send.
     Done,
+}
+
+impl std::fmt::Debug for ChallengeResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Continue(bytes) => f
+                .debug_tuple("Continue")
+                .field(&format_args!("{} bytes", bytes.len()))
+                .finish(),
+            Self::AckThenFail { ack, error } => f
+                .debug_struct("AckThenFail")
+                .field("ack", &format_args!("{} bytes", ack.len()))
+                .field("error", error)
+                .finish(),
+            Self::Done => f.write_str("Done"),
+        }
+    }
 }
 
 /// SASL authenticator for handling authentication handshakes.
@@ -271,16 +72,14 @@ impl SaslAuthenticator {
     /// # Arguments
     ///
     /// * `auth` - The authentication configuration
-    /// * `channel_binding` - Channel binding data for SCRAM mechanisms; pass
-    ///   [`ChannelBinding::TlsServerEndPoint`] when authenticating over TLS
     ///
     /// For OAUTHBEARER with a token provider, call
-    /// [`AuthConfig::resolve_provider_to_token()`] first and pass the
+    /// `AuthConfig::resolve_provider_to_token()` first and pass the
     /// resolved config. Provider-based configs without a resolved token
     /// return an error.
     ///
     /// For MSK IAM, you must provide the broker host after creation using `set_msk_host()`.
-    pub fn new(auth: &AuthConfig, channel_binding: ChannelBinding) -> Result<Option<Self>> {
+    pub fn new(auth: &AuthConfig) -> Result<Option<Self>> {
         let Some(mechanism) = auth.sasl_mechanism.as_ref() else {
             // No SASL mechanism — plaintext connection, no authenticator needed.
             return Ok(None);
@@ -308,7 +107,6 @@ impl SaslAuthenticator {
                         &creds.username,
                         &creds.password,
                         ScramMechanism::Sha256,
-                        channel_binding,
                     )),
                     msk_iam_authenticator: None,
                     msk_iam_complete: false,
@@ -328,7 +126,6 @@ impl SaslAuthenticator {
                         &creds.username,
                         &creds.password,
                         ScramMechanism::Sha512,
-                        channel_binding,
                     )),
                     msk_iam_authenticator: None,
                     msk_iam_complete: false,
@@ -512,11 +309,11 @@ impl SaslAuthenticator {
 
                 // Process based on current state
                 match scram.state() {
-                    crate::auth::ScramState::WaitingServerFirst => {
+                    ScramState::WaitingServerFirst => {
                         let response = scram.process_server_first(challenge).await?;
                         Ok(ChallengeResponse::Continue(Zeroizing::new(response)))
                     }
-                    crate::auth::ScramState::WaitingServerFinal => {
+                    ScramState::WaitingServerFinal => {
                         scram.verify_server_final(challenge)?;
                         Ok(ChallengeResponse::Done)
                     }
@@ -566,7 +363,7 @@ impl SaslAuthenticator {
             SaslMechanism::ScramSha256 | SaslMechanism::ScramSha512 => self
                 .scram_client
                 .as_ref()
-                .is_some_and(|c| *c.state() == crate::auth::ScramState::Complete),
+                .is_some_and(|c| *c.state() == ScramState::Complete),
             SaslMechanism::AwsMskIam => self.msk_iam_complete,
             SaslMechanism::OAuthBearer => self.oauthbearer_complete,
             SaslMechanism::Gssapi => false,
@@ -580,106 +377,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_secure_connection_config_default() {
-        let config = SecureConnectionConfig::default();
-        assert_eq!(config.auth.security_protocol, SecurityProtocol::Plaintext);
-        assert!(!config.auth.requires_tls());
-        assert!(!config.auth.requires_sasl());
-    }
-
-    /// `.tls(..)` must survive whatever SASL setter follows it.
-    ///
-    /// Each SASL setter replaced the whole `AuthConfig`, so `.tls(t)` before
-    /// `.sasl_scram_sha512(..)` silently produced `SASL_PLAINTEXT` with a
-    /// `tls_config` nobody would read — a cleartext SASL handshake against a
-    /// TLS listener, which is the failure `AuthConfig::with_tls` exists to
-    /// make unreachable.
-    ///
-    /// Negative control: reverting `set_auth` to a plain `self.auth = auth`
-    /// assignment fails the `tls_first` half.
-    #[test]
-    fn tls_composes_with_sasl_in_either_order() {
-        for (label, config) in [
-            (
-                "sasl_first",
-                SecureConnectionConfig::builder()
-                    .sasl_scram_sha512("user", "pass")
-                    .tls(TlsConfig::new().with_ca_cert("/etc/kafka/ca.pem"))
-                    .build(),
-            ),
-            (
-                "tls_first",
-                SecureConnectionConfig::builder()
-                    .tls(TlsConfig::new().with_ca_cert("/etc/kafka/ca.pem"))
-                    .sasl_scram_sha512("user", "pass")
-                    .build(),
-            ),
-        ] {
-            assert_eq!(
-                config.auth.security_protocol(),
-                &SecurityProtocol::SaslSsl,
-                "{label}: SCRAM over TLS must be SASL_SSL"
-            );
-            assert_eq!(
-                config.auth.sasl_mechanism(),
-                Some(&SaslMechanism::ScramSha512),
-                "{label}: the mechanism must survive"
-            );
-            assert_eq!(
-                config.auth.tls_config().and_then(|t| t.ca_cert_path()),
-                Some("/etc/kafka/ca.pem"),
-                "{label}: the caller's CA must survive"
-            );
-        }
-    }
-
-    /// An `AuthConfig` that brings its own TLS must win over the builder's.
-    #[test]
-    fn an_explicit_auth_config_keeps_its_own_tls() {
-        let config = SecureConnectionConfig::builder()
-            .tls(TlsConfig::new().with_ca_cert("/builder/ca.pem"))
-            .auth(AuthConfig::sasl_scram_sha256_ssl(
-                "user",
-                "pass",
-                TlsConfig::new().with_ca_cert("/explicit/ca.pem"),
-            ))
-            .build();
-
-        assert_eq!(
-            config.auth.tls_config().and_then(|t| t.ca_cert_path()),
-            Some("/explicit/ca.pem")
-        );
-    }
-
-    #[test]
-    fn test_secure_connection_config_builder() {
-        let config = SecureConnectionConfig::builder()
-            .client_id("test-client")
-            .connect_timeout(Duration::from_secs(5))
-            .sasl_plain("user", "pass")
-            .unwrap()
-            .build();
-
-        assert_eq!(config.connection.client_id, "test-client");
-        assert_eq!(config.connection.connect_timeout, Duration::from_secs(5));
-        assert!(config.auth.requires_sasl());
-    }
-
-    #[test]
-    fn test_secure_connection_config_with_tls() {
-        let config = SecureConnectionConfig::builder()
-            .tls(TlsConfig::new())
-            .build();
-
-        assert!(config.auth.requires_tls());
-    }
-
-    #[test]
     fn test_sasl_authenticator_plain() {
-        let auth = AuthConfig::sasl_plain("user", "pass").unwrap();
-        let mut authenticator = SaslAuthenticator::new(&auth, ChannelBinding::None)
-            .unwrap()
-            .unwrap();
+        let auth = AuthConfig::sasl_plain("user", "pass");
+        let mut authenticator = SaslAuthenticator::new(&auth).unwrap().unwrap();
 
         assert_eq!(authenticator.mechanism_name(), "PLAIN");
 
@@ -691,9 +391,7 @@ mod tests {
     #[test]
     fn test_sasl_authenticator_scram() {
         let auth = AuthConfig::sasl_scram_sha256("user", "pass");
-        let mut authenticator = SaslAuthenticator::new(&auth, ChannelBinding::None)
-            .unwrap()
-            .unwrap();
+        let mut authenticator = SaslAuthenticator::new(&auth).unwrap().unwrap();
 
         assert_eq!(authenticator.mechanism_name(), "SCRAM-SHA-256");
 
@@ -729,23 +427,10 @@ mod tests {
         assert!(authenticator.is_complete());
     }
 
-    #[test]
-    fn test_secure_connection_config_builder_msk_iam() {
-        let config = SecureConnectionConfig::builder()
-            .aws_msk_iam("AKID", "secret", "us-east-1")
-            .build();
-
-        assert!(config.auth.requires_tls());
-        assert!(config.auth.requires_sasl());
-        assert_eq!(config.auth.sasl_mechanism, Some(SaslMechanism::AwsMskIam));
-    }
-
     #[tokio::test]
     async fn test_sasl_authenticator_oauthbearer() {
         let auth = AuthConfig::sasl_oauthbearer("my-jwt-token");
-        let mut authenticator = SaslAuthenticator::new(&auth, ChannelBinding::None)
-            .unwrap()
-            .unwrap();
+        let mut authenticator = SaslAuthenticator::new(&auth).unwrap().unwrap();
 
         assert_eq!(authenticator.mechanism_name(), "OAUTHBEARER");
 
@@ -764,9 +449,7 @@ mod tests {
     fn test_sasl_authenticator_oauthbearer_with_extensions() {
         let token = OAuthBearerToken::new("tok").with_extension("logicalCluster", "lkc-123");
         let auth = AuthConfig::sasl_oauthbearer_token(token);
-        let mut authenticator = SaslAuthenticator::new(&auth, ChannelBinding::None)
-            .unwrap()
-            .unwrap();
+        let mut authenticator = SaslAuthenticator::new(&auth).unwrap().unwrap();
 
         let initial = authenticator.initial_response().unwrap();
         let initial_str = String::from_utf8_lossy(&initial);
@@ -778,9 +461,7 @@ mod tests {
     #[tokio::test]
     async fn test_sasl_authenticator_oauthbearer_server_error() {
         let auth = AuthConfig::sasl_oauthbearer("bad-token");
-        let mut authenticator = SaslAuthenticator::new(&auth, ChannelBinding::None)
-            .unwrap()
-            .unwrap();
+        let mut authenticator = SaslAuthenticator::new(&auth).unwrap().unwrap();
         let _ = authenticator.initial_response().unwrap();
 
         // Server error returns AckThenFail: the \x01 byte and the auth error together.
@@ -809,7 +490,7 @@ mod tests {
             oauthbearer_token: None,
             ..Default::default()
         };
-        assert!(SaslAuthenticator::new(&auth, ChannelBinding::None).is_err());
+        assert!(SaslAuthenticator::new(&auth).is_err());
     }
 
     #[test]
@@ -819,41 +500,7 @@ mod tests {
             sasl_mechanism: Some(SaslMechanism::Gssapi),
             ..Default::default()
         };
-        assert!(SaslAuthenticator::new(&auth, ChannelBinding::None).is_err());
-    }
-
-    #[test]
-    fn test_secure_connection_config_builder_oauthbearer() {
-        let config = SecureConnectionConfig::builder()
-            .sasl_oauthbearer("my-token")
-            .build();
-
-        assert!(config.auth.requires_sasl());
-        assert_eq!(config.auth.sasl_mechanism, Some(SaslMechanism::OAuthBearer));
-        assert!(config.auth.oauthbearer_token.is_some());
-    }
-
-    #[test]
-    fn test_secure_connection_config_builder_oauthbearer_token() {
-        let token = OAuthBearerToken::new("tok").with_extension("key", "val");
-        let config = SecureConnectionConfig::builder()
-            .sasl_oauthbearer_token(token)
-            .build();
-
-        assert!(config.auth.requires_sasl());
-        assert_eq!(config.auth.sasl_mechanism, Some(SaslMechanism::OAuthBearer));
-    }
-
-    #[test]
-    fn test_secure_connection_config_builder_oauthbearer_provider() {
-        let config = SecureConnectionConfig::builder()
-            .sasl_oauthbearer_provider(|| async { Ok(OAuthBearerToken::new("provider-token")) })
-            .build();
-
-        assert!(config.auth.requires_sasl());
-        assert_eq!(config.auth.sasl_mechanism, Some(SaslMechanism::OAuthBearer));
-        assert!(config.auth.oauthbearer_provider.is_some());
-        assert!(config.auth.oauthbearer_token.is_none());
+        assert!(SaslAuthenticator::new(&auth).is_err());
     }
 
     #[test]
@@ -868,9 +515,7 @@ mod tests {
             - 3_600_000;
         let token = OAuthBearerToken::new("expired-jwt").with_lifetime_ms(past_ms);
         let auth = AuthConfig::sasl_oauthbearer_token(token);
-        let mut authenticator = SaslAuthenticator::new(&auth, ChannelBinding::None)
-            .unwrap()
-            .unwrap();
+        let mut authenticator = SaslAuthenticator::new(&auth).unwrap().unwrap();
 
         let result = authenticator.initial_response();
         assert!(result.is_err());
@@ -889,9 +534,7 @@ mod tests {
             + 3_600_000;
         let token = OAuthBearerToken::new("valid-jwt").with_lifetime_ms(future_ms);
         let auth = AuthConfig::sasl_oauthbearer_token(token);
-        let mut authenticator = SaslAuthenticator::new(&auth, ChannelBinding::None)
-            .unwrap()
-            .unwrap();
+        let mut authenticator = SaslAuthenticator::new(&auth).unwrap().unwrap();
 
         let result = authenticator.initial_response();
         assert!(result.is_ok());
@@ -908,9 +551,7 @@ mod tests {
             + 10_000;
         let token = OAuthBearerToken::new("near-expiry-jwt").with_lifetime_ms(near_future_ms);
         let auth = AuthConfig::sasl_oauthbearer_token(token);
-        let mut authenticator = SaslAuthenticator::new(&auth, ChannelBinding::None)
-            .unwrap()
-            .unwrap();
+        let mut authenticator = SaslAuthenticator::new(&auth).unwrap().unwrap();
 
         let result = authenticator.initial_response();
         assert!(result.is_err());

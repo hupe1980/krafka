@@ -1,0 +1,25 @@
+diff -ruN a/src/barrier.rs b/src/barrier.rs
+--- a/src/barrier.rs
++++ b/src/barrier.rs
+@@ -82,15 +82,13 @@
+ 
+     /// Wait until no operation of `generation` or an earlier one is running.
+     pub(crate) async fn wait_for(&self, generation: u64) {
+-        loop {
+-            let notified = self.notify.notified();
+-            tokio::pin!(notified);
+-            notified.as_mut().enable();
+-            if self.is_drained(generation) {
+-                return;
+-            }
+-            notified.await;
++        let notified = self.notify.notified();
++        tokio::pin!(notified);
++        notified.as_mut().enable();
++        if self.is_drained(generation) {
++            return;
+         }
++        notified.await;
+     }
+ 
+     fn is_drained(&self, generation: u64) -> bool {

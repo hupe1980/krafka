@@ -1,55 +1,55 @@
 +++
 title = "krafka — a pure-Rust Apache Kafka client"
-description = "krafka is a pure-Rust, async-native Apache Kafka client. No librdkafka, no C toolchain, no unsafe, no panics. Protocol parity with Apache Kafka 4.3, enforced in CI."
+description = "krafka is a pure-Rust, async-native Apache Kafka client. No C library, no system dependency, no unsafe, no panics on malformed input."
 template = "index.html"
 
 [extra]
-tagline = "The Apache Kafka client that Rust should have had."
+tagline = "An async Apache Kafka client in pure Rust."
 lede = """
-Pure Rust on Tokio. No librdkafka, no C toolchain, no `unsafe`, no panics — \
-enforced by the compiler, not by convention. Protocol parity with Apache \
-Kafka 4.3, checked in CI against Kafka's own schemas.
+Pure Rust on Tokio. No C library and no system dependency in the default \
+build, no `unsafe`, no panics on a malformed response. Protocol versions \
+tracked against Apache Kafka 4.3 and checked in CI against Kafka's own schemas.
 """
 
 [[extra.pillars]]
-title = "Nothing to link, nothing to build"
+title = "Nothing to link"
 body = """
-`cargo add krafka` and you are done. No librdkafka, no cmake, no C compiler, \
-no cross-compilation surprises, no ~5 MiB of resident C library. Optional \
-zstd is the single exception, and it is opt-in.
+`cargo add krafka` needs a Rust toolchain and the C compiler `ring` uses — \
+no librdkafka, no OpenSSL, no CMake, no pkg-config, no system library. \
+`ring` is the only crate in the default build that compiles C; `zstd` \
+encoding, the aws-lc-rs backend and MSK IAM are opt-in features that add more.
 """
 
 [[extra.pillars]]
-title = "The safety posture is enforced, not claimed"
+title = "No unsafe, no panics"
 body = """
-Unsafe code is denied crate-wide, as are panic, unwrap and expect, across \
-~148 000 lines. A malformed broker response cannot panic the process; every \
+Unsafe code is denied crate-wide, as are panic, unwrap and expect. A \
+malformed broker response surfaces as an error, never a panic; every \
 allocation from untrusted input is bounded twice, by the declared count and \
 by the bytes actually available.
 """
 
 [[extra.pillars]]
-title = "Current, and provably so"
+title = "Current protocol"
 body = """
 Apache Kafka 4.3 API versions, including KIP-848 consumer groups and KIP-932 \
 share groups. A CI job diffs krafka's version table against Kafka's own \
-message schemas, so falling behind is a failed build rather than a bug report.
+message schemas.
 """
 
 [[extra.pillars]]
-title = "Correctness where it is hardest"
+title = "Acknowledged means written"
 body = """
-KIP-320 truncation detection on all three legs — Fetch, ListOffsets and \
-persisted through OffsetCommit. A transaction state machine that refuses \
-KAFKA-17754 by construction. Out-of-order sequence numbers verified \
-head-of-line before any rewind, so a silent gap is a fatal error rather than \
-a reported success.
+An idempotent producer by default that never reuses a sequence range, a \
+timeout that says whether the record may have been written, a transaction \
+that cannot commit after a failed send, and KIP-320 truncation detection on \
+Fetch, ListOffsets and OffsetCommit.
 """
 
 [[extra.highlights]]
 label = "Protocol"
 value = "Kafka 4.3"
-note = "65 APIs, CI-diffed against Kafka's schemas"
+note = "CI-diffed against Kafka's schemas"
 
 [[extra.highlights]]
 label = "Unsafe blocks"
@@ -57,27 +57,15 @@ value = "0"
 note = "denied crate-wide"
 
 [[extra.highlights]]
-label = "C dependencies"
+label = "C libraries"
 value = "0"
-note = "zstd optional, opt-in"
+note = "only ring compiles C by default"
 
 [[extra.highlights]]
-label = "Tests"
-value = "2400+"
-note = "incl. an in-process fake broker"
+label = "Fake broker"
+value = "built in"
+note = "test your code without Docker"
 +++
-
-## Why another Kafka client?
-
-Because the Rust ecosystem's practical choice has been a binding.
-`rust-rdkafka` is a mature, well-maintained wrapper over librdkafka — and it
-inherits C's memory model, C's build requirements and C's failure modes
-wholesale. A cross-compilation toolchain, a multi-megabyte resident footprint
-in a container that exists to move bytes, and a safety story that stops at the
-FFI boundary.
-
-krafka is the other trade: a native implementation, so the guarantees Rust can
-make actually reach the wire.
 
 ## Install
 
@@ -89,43 +77,38 @@ cargo add tokio --features full
 ## Produce
 
 ```rust,compile
-use krafka::producer::Producer;
+use krafka::{Kafka, Record};
 
 #[tokio::main]
-async fn main() -> krafka::error::Result<()> {
-    let producer = Producer::builder()
-        .bootstrap_servers("localhost:9092")
-        .build()
-        .await?;
+async fn main() -> krafka::Result<()> {
+    let kafka = Kafka::builder("localhost:9092").connect().await?;
+    let producer = kafka.producer().build().await?;
 
-    producer.send("orders", Some(b"key"), Some(b"hello")).await?;
-    producer.close().await;
-    Ok(())
+    producer.send(Record::new("orders", "hello").key("key")).await?;
+    producer.close().await
 }
 ```
 
 ## Consume
 
 ```rust,compile
-use krafka::consumer::{AutoOffsetReset, Consumer};
-use std::time::Duration;
+use krafka::Kafka;
+use krafka::consumer::AutoOffsetReset;
 
 #[tokio::main]
-async fn main() -> krafka::error::Result<()> {
-    let consumer = Consumer::builder()
-        .bootstrap_servers("localhost:9092")
-        .group_id("order-processor")
+async fn main() -> krafka::Result<()> {
+    let kafka = Kafka::builder("localhost:9092").connect().await?;
+    let consumer = kafka
+        .consumer("order-processor")
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .build()
         .await?;
 
-    consumer.subscribe(&["orders"]).await?;
-
-    loop {
-        for record in consumer.poll(Duration::from_secs(1)).await? {
-            println!("{}-{} @ {}", record.topic, record.partition, record.offset);
-        }
+    consumer.subscribe(["orders"]).await?;
+    while let Some(record) = consumer.recv().await? {
+        println!("{}-{} @ {}", record.topic, record.partition, record.offset);
     }
+    Ok(())
 }
 ```
 
@@ -135,43 +118,39 @@ async fn main() -> krafka::error::Result<()> {
 idempotence and exactly-once transactions. A [consumer](@/docs/consumer.md)
 supporting both group protocols — classic and KIP-848 server-side assignment. A
 [share consumer](@/docs/share-consumer.md) for queue-like per-record
-acknowledgement (KIP-932), at Kafka 4.2 parity with the offset administration
-to operate it. A full [admin client](@/docs/admin.md): topics, partitions,
+acknowledgement (KIP-932). An [admin client](@/docs/admin.md): topics, partitions,
 configs, ACLs, quotas, groups, delegation tokens, SCRAM credentials and cluster
 features.
 
 **Security.** TLS and mTLS over rustls with hot certificate reload (KIP-1288).
 SASL PLAIN, SCRAM-SHA-256/512 and OAUTHBEARER, including a built-in OIDC token
 provider covering both the client-secret flow (KIP-768) and RFC 7523 client
-assertions (KIP-1258) — without pulling in a JWT or RSA crate. Secrets are
-zeroized, credential comparison is constant-time, and no credential-bearing
-type may derive `Debug`. That last one is a CI job, because it had already
-happened twice. See [Authentication](@/docs/authentication.md).
+assertions (KIP-1258), with no JWT or RSA dependency. Secrets are zeroized,
+credential comparison is constant-time, and no credential-bearing type derives
+`Debug`. See
+[Authentication](@/docs/authentication.md) and
+[Cloud Platforms](@/docs/cloud.md).
 
-**Operability.** Built-in [counters, gauges and histograms](@/docs/metrics.md)
-with Prometheus export. [Interceptors](@/docs/interceptors.md) for tracing,
-redaction and auditing. OpenTelemetry semantic conventions. A `TransportConfig`
-on every builder covering keepalive, the response ceiling, the in-flight cap
-and the file-descriptor cap.
+**Operability.** `metrics()` on every client returns one
+[metrics snapshot](@/docs/metrics.md) with Prometheus text output; spans go
+through `tracing` on OpenTelemetry messaging conventions; KIP-714 pushes
+client metrics to brokers that subscribe. [Interceptors](@/docs/interceptors.md)
+for redaction and auditing. Connection settings — keepalive, the
+response ceiling, the in-flight cap, the connection cap — are set once on the
+`Kafka` handle and shared by every client built from it.
 
-**Testing.** An in-process fake broker behind the `test-broker` feature,
-speaking the real wire protocol with fault injection — leader moves,
-coordinator failover, late responses, controller churn — so client tests need
-no Docker. It can also advertise *older* API versions on demand, which is how
-you reach the branches that degrade gracefully against an old cluster.
+**Testing.** An in-process fake broker behind the `test-broker` feature
+speaks the wire protocol with fault injection (leader moves, coordinator
+failover, late responses, controller churn), needs no Docker and runs on
+Tokio's paused clock. See [Testing](@/docs/testing.md). Coming from rdkafka? Read
+[Migrating from rdkafka](@/docs/migrating-from-rdkafka.md).
 
-## Honest limits
+## Limits
 
-A page that lists only strengths is a page you cannot calibrate against, so:
-
-- **No GSSAPI/Kerberos.** A deliberate boundary, and the one SASL mechanism
-  librdkafka has that krafka does not.
-- **Tokio only.** `rskafka` is runtime-agnostic; krafka is not.
-- **No published throughput number.** Criterion micro-benchmarks cover the
-  protocol layer and a regression gate guards the send path, but neither
-  produces a figure comparable against `rust-rdkafka` on a real cluster. Treat
-  performance claims here as architectural reasoning rather than evidence —
-  which is why the word "fastest" appears nowhere on this page. See
-  [Performance](@/docs/performance.md) for what is and is not measured.
+- **No GSSAPI/Kerberos.** The full list of what is not implemented is on the
+  [Protocol](@/docs/protocol.md) page.
+- **Tokio only.**
+- **No published throughput number.** The benchmarks are micro-benchmarks and
+  a send-path regression gate; see [Performance](@/docs/performance.md).
 - **Assertion signing is your job.** krafka sources a signed JWT from a file or
   a callback rather than choosing an RSA implementation for you.

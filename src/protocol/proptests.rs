@@ -32,7 +32,7 @@ use crate::protocol::messages::{
 use crate::protocol::primitives::{
     Decode, KafkaArray, KafkaBytes, KafkaString, TaggedField, TaggedFields, TryEncode,
 };
-use crate::protocol::record::{Compression, LazyRecordBatch, Record, RecordBatch};
+use crate::protocol::record::{Compression, Record, RecordBatch, RecordBatchHeader};
 use crate::util::varint;
 
 // ---------------------------------------------------------------------------
@@ -66,7 +66,7 @@ fn arb_tagged_fields() -> impl Strategy<Value = TaggedFields> {
     // anything else with InvalidRequestException — so an out-of-order section
     // is not a case the codec has to round-trip, it is a case that must never
     // be built. Generating sorted, deduplicated tags keeps this property test
-    // about the encoding rather than about a shape the encoder now refuses.
+    // about the encoding rather than about a shape the encoder refuses.
     prop::collection::vec(
         (any::<u32>(), prop::collection::vec(any::<u8>(), 0..32)),
         0..8,
@@ -289,27 +289,22 @@ proptest! {
                 prop_assert_eq!(a.timestamp_delta, e.timestamp_delta);
             }
 
-            // The lazy path must agree with the eager one on identical bytes.
-            let mut b2 = encoded.clone();
-            let lazy = LazyRecordBatch::decode(&mut b2).unwrap();
-            let lazy_records = lazy.decode_all().unwrap();
-            prop_assert_eq!(lazy_records.len(), records.len());
+            // The header the decoder skips on agrees with the decoded batch.
+            let header = RecordBatchHeader::peek(&encoded).unwrap();
+            prop_assert_eq!(header.total_size(), encoded.len());
+            prop_assert_eq!(header.records_count as usize, records.len());
         }
     }
 }
 
 /// Compression codecs actually compiled into this build.
 fn compiled_codecs() -> Vec<Compression> {
-    let mut v = vec![Compression::None];
-    if cfg!(feature = "gzip") {
-        v.push(Compression::Gzip);
-    }
-    if cfg!(feature = "snappy") {
-        v.push(Compression::Snappy);
-    }
-    if cfg!(feature = "lz4") {
-        v.push(Compression::Lz4);
-    }
+    let mut v = vec![
+        Compression::None,
+        Compression::Gzip,
+        Compression::Snappy,
+        Compression::Lz4,
+    ];
     if cfg!(feature = "zstd") {
         v.push(Compression::Zstd);
     }

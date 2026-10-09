@@ -389,8 +389,7 @@ def main() -> int:
                 f"Kafka {kafka_ref} ships v{stable_max} as stable "
                 f"(latestVersionUnstable={spec['latest_version_unstable']}). The gate "
                 f"means 'Kafka marks this latestVersionUnstable' and nothing else — "
-                f"remove the cfg, or move the surface to its own feature the way "
-                f"`share-groups` did."
+                f"remove the cfg, or move the surface to its own feature."
             )
 
         # 6. flexible boundary

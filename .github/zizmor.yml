@@ -1,0 +1,7 @@
+# zizmor configuration for `just workflow-lint`. No audit is disabled.
+rules:
+  # Every action, first-party included, is pinned to a full commit SHA.
+  unpinned-uses:
+    config:
+      policies:
+        "*": hash-pin

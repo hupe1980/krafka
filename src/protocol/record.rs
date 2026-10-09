@@ -12,13 +12,11 @@ use crate::util::{crc32c, varint};
 /// Compression codec.
 ///
 /// All variants are always available because they represent wire-format values
-/// (bits 0–2 of the record batch attributes field). The actual
-/// compress/decompress implementation for each codec is gated behind
-/// its Cargo feature (`gzip`, `snappy`, `lz4`, `zstd`). All four are
-/// enabled by the `compression` convenience feature (on by default).
+/// (bits 0–2 of the record batch attributes field). Every codec decodes in
+/// every build. Gzip, Snappy and LZ4 also encode in every build; Zstd encodes
+/// only with the `zstd` Cargo feature.
 ///
-/// Use [`Compression::is_available`] to check at runtime whether the
-/// underlying codec implementation was compiled in.
+/// Use [`Compression::is_available`] to check whether the codec can encode.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[repr(u8)]
@@ -27,21 +25,15 @@ pub enum Compression {
     #[default]
     None = 0,
     /// Gzip compression.
-    ///
-    /// Requires the `gzip` Cargo feature for compression/decompression.
     Gzip = 1,
     /// Snappy compression.
-    ///
-    /// Requires the `snappy` Cargo feature for compression/decompression.
     Snappy = 2,
     /// LZ4 compression.
-    ///
-    /// Requires the `lz4` Cargo feature for compression/decompression.
     Lz4 = 3,
     /// Zstd compression.
     ///
-    /// Requires the `zstd` Cargo feature for compression/decompression.
-    /// Note: `zstd` pulls in `zstd-sys` which requires a C toolchain.
+    /// Decoding is pure Rust and always available. Encoding requires the
+    /// `zstd` Cargo feature, which pulls in `zstd-sys` and needs a C toolchain.
     Zstd = 4,
 }
 
@@ -79,15 +71,15 @@ impl Compression {
         }
     }
 
-    /// Returns `true` if the codec's feature was enabled at compile time.
+    /// Returns `true` if the codec can encode in this build.
     ///
-    /// `Compression::None` is always available. Other codecs require their
-    /// corresponding Cargo feature (`gzip`, `snappy`, `lz4`, `zstd`).
+    /// Only `Compression::Zstd` can be missing: encoding it needs the `zstd`
+    /// Cargo feature. Every codec decodes in every build.
     ///
     /// # Examples
     ///
     /// ```
-    /// use krafka::protocol::Compression;
+    /// use krafka::Compression;
     ///
     /// assert!(Compression::None.is_available());
     /// ```
@@ -95,26 +87,8 @@ impl Compression {
     #[must_use]
     pub const fn is_available(&self) -> bool {
         match self {
-            Self::None => true,
-            Self::Gzip => cfg!(feature = "gzip"),
-            Self::Snappy => cfg!(feature = "snappy"),
-            Self::Lz4 => cfg!(feature = "lz4"),
             Self::Zstd => cfg!(feature = "zstd"),
-        }
-    }
-
-    /// Returns the Cargo feature name required for this codec, if any.
-    ///
-    /// Returns `None` for `Compression::None` (always available).
-    #[inline]
-    #[must_use]
-    pub const fn required_feature(&self) -> Option<&'static str> {
-        match self {
-            Self::None => Option::None,
-            Self::Gzip => Option::Some("gzip"),
-            Self::Snappy => Option::Some("snappy"),
-            Self::Lz4 => Option::Some("lz4"),
-            Self::Zstd => Option::Some("zstd"),
+            Self::None | Self::Gzip | Self::Snappy | Self::Lz4 => true,
         }
     }
 
@@ -160,7 +134,6 @@ impl Compression {
         let _ = level;
         match self {
             Self::None => Ok(Bytes::copy_from_slice(payload)),
-            #[cfg(feature = "gzip")]
             Self::Gzip => {
                 use flate2::write::GzEncoder;
                 use std::io::Write;
@@ -181,28 +154,8 @@ impl Compression {
                     .map_err(|e| KrafkaError::compression(e.to_string()))?;
                 Ok(Bytes::from(compressed))
             }
-            #[cfg(not(feature = "gzip"))]
-            Self::Gzip => Err(KrafkaError::compression(
-                "gzip compression requires the `gzip` Cargo feature",
-            )),
-            #[cfg(feature = "snappy")]
-            Self::Snappy => {
-                // Kafka RecordBatch v2 uses *raw* Snappy (RFC-defined stream format),
-                // NOT the older "framed Snappy" that Kafka message format v0/v1 used.
-                // `snap::raw::Encoder` produces the correct raw format for v2 batches.
-                // Do NOT switch to `snap::write::FrameEncoder`, which would produce
-                // framed Snappy and cause broker decode failures on v2 batches.
-                let mut encoder = snap::raw::Encoder::new();
-                let compressed = encoder
-                    .compress_vec(payload)
-                    .map_err(|e| KrafkaError::compression(e.to_string()))?;
-                Ok(Bytes::from(compressed))
-            }
-            #[cfg(not(feature = "snappy"))]
-            Self::Snappy => Err(KrafkaError::compression(
-                "snappy compression requires the `snappy` Cargo feature",
-            )),
-            #[cfg(feature = "lz4")]
+            // snappy-java's stream format, as the Java client writes it.
+            Self::Snappy => compress_snappy_xerial(payload),
             Self::Lz4 => {
                 use std::io::Write;
 
@@ -222,10 +175,6 @@ impl Compression {
                     .map_err(|e| KrafkaError::compression(e.to_string()))?;
                 Ok(Bytes::from(compressed))
             }
-            #[cfg(not(feature = "lz4"))]
-            Self::Lz4 => Err(KrafkaError::compression(
-                "lz4 compression requires the `lz4` Cargo feature",
-            )),
             #[cfg(feature = "zstd")]
             Self::Zstd => {
                 // 3 is libzstd's default and the Java client's.
@@ -929,145 +878,89 @@ impl RecordBatch {
             .compress_with_level(records, self.compression_level)
     }
 
-    /// Decode a record batch from bytes.
+    /// Decode a record batch.
     ///
     /// Uses [`MAX_DECOMPRESSED_SIZE`](Self::MAX_DECOMPRESSED_SIZE) as the
     /// decompression limit. For a configurable limit, use
     /// [`decode_with_limit`](Self::decode_with_limit).
-    pub fn decode(buf: &mut impl Buf) -> Result<Self> {
+    pub fn decode(buf: &mut Bytes) -> Result<Self> {
         Self::decode_with_limit(buf, Self::MAX_DECOMPRESSED_SIZE)
     }
 
-    /// Decode a record batch from bytes with a custom decompression size limit.
+    /// Decode a record batch with a custom decompression size limit.
+    ///
+    /// The header is parsed first ([`RecordBatchHeader::peek`]), then the CRC
+    /// is checked, then the records are decompressed and decoded. On success
+    /// `buf` is advanced past the batch; on error it is left untouched.
+    ///
+    /// Record keys, values and header values are slices of `buf` (or of the
+    /// decompressed buffer), not copies: a record that is kept alive keeps the
+    /// buffer it came from alive.
     ///
     /// Compressed payloads that decompress beyond `max_decompressed_size` bytes
-    /// are rejected as potential compression bombs.
-    pub fn decode_with_limit(buf: &mut impl Buf, max_decompressed_size: usize) -> Result<Self> {
-        if buf.remaining() < 12 {
+    /// are rejected as potential compression bombs. The number of records is
+    /// bounded by the bytes that hold them, not by a constant.
+    pub fn decode_with_limit(buf: &mut Bytes, max_decompressed_size: usize) -> Result<Self> {
+        let header = RecordBatchHeader::peek(buf)?;
+        let total_size = header.total_size();
+        if buf.len() < total_size {
             return Err(KrafkaError::protocol_kind(
                 ProtocolErrorKind::TruncatedFrame,
-                "not enough bytes for record batch header",
-            ));
-        }
-
-        let base_offset = buf.get_i64();
-        let batch_length_i32 = buf.get_i32();
-
-        if batch_length_i32 < 49 {
-            return Err(KrafkaError::protocol_kind(
-                ProtocolErrorKind::InvalidValue,
-                format!("invalid record batch length: {batch_length_i32}"),
-            ));
-        }
-
-        let batch_length = batch_length_i32 as usize;
-
-        if buf.remaining() < batch_length {
-            return Err(KrafkaError::protocol_kind(
-                ProtocolErrorKind::TruncatedFrame,
-                "not enough bytes for record batch",
-            ));
-        }
-
-        let partition_leader_epoch = buf.get_i32();
-        let magic = buf.get_i8();
-
-        if magic != 2 {
-            return Err(KrafkaError::protocol_kind(
-                ProtocolErrorKind::UnsupportedMagic,
-                format!("unsupported record batch magic: {magic}"),
-            ));
-        }
-
-        let crc = buf.get_u32();
-
-        // Capture the CRC-covered region as raw wire bytes BEFORE decoding
-        // individual fields.  The CRC covers everything after the 4-byte CRC
-        // field itself; within `batch_length` we have already consumed:
-        //   partition_leader_epoch (4) + magic (1) + crc (4) = 9 bytes.
-        // So the CRC-covered region is `batch_length - 9` bytes.
-        //
-        // Computing the CRC over raw bytes (rather than re-encoding decoded
-        // fields) is semantically correct: it preserves reserved attribute
-        // bits 6–13 that `to_i16()` would silently drop, making the check
-        // immune to future broker extensions that set those bits.
-        //
-        // This also eliminates the per-batch `BytesMut` allocation of the
-        // previous implementation.  `buf.remaining() >= batch_length` was
-        // verified above; after consuming 9 bytes we have at least
-        // `batch_length - 9` bytes remaining.
-        let crc_covered_len = batch_length - 9;
-        let crc_covered = buf.copy_to_bytes(crc_covered_len);
-
-        let computed_crc = crc32c(&crc_covered);
-        if computed_crc != crc {
-            return Err(KrafkaError::protocol_kind(
-                ProtocolErrorKind::CrcMismatch,
-                format!("CRC mismatch: expected {crc:08x}, got {computed_crc:08x}"),
-            ));
-        }
-
-        // Decode the fixed header fields from the CRC-covered slice.
-        // We consume `crc_covered` in place — no clone needed.
-        let mut cbuf = crc_covered;
-        let attributes = RecordBatchAttributes::from_i16(cbuf.get_i16())?;
-        let last_offset_delta = cbuf.get_i32();
-        let base_timestamp = cbuf.get_i64();
-        let max_timestamp = cbuf.get_i64();
-        let producer_id = cbuf.get_i64();
-        let producer_epoch = cbuf.get_i16();
-        let base_sequence = cbuf.get_i32();
-        let records_count = cbuf.get_i32();
-
-        if records_count < 0 {
-            return Err(KrafkaError::protocol_kind(
-                ProtocolErrorKind::InvalidValue,
-                format!("invalid negative records count: {records_count}"),
-            ));
-        }
-
-        // The remaining bytes in `cbuf` are the (possibly compressed) records.
-        // records_len = (batch_length - 9) - 40 fixed-field bytes = batch_length - 49.
-        let compressed_records = cbuf;
-
-        // Decompress records
-        let decompressed = Self::decompress_records(
-            attributes.compression,
-            &compressed_records,
-            max_decompressed_size,
-        )?;
-        let mut records_buf = decompressed.as_ref();
-
-        // Decode records — records_count already validated as non-negative above;
-        // apply upper-bound check before looping.
-        let records_len = records_count as usize;
-        if records_len > super::MAX_DECODE_ARRAY_LEN {
-            return Err(KrafkaError::protocol_kind(
-                ProtocolErrorKind::InvalidLength,
                 format!(
-                    "records count {records_len} exceeds safety limit {}",
-                    super::MAX_DECODE_ARRAY_LEN
+                    "not enough bytes for record batch: need {total_size}, have {}",
+                    buf.len()
                 ),
             ));
         }
-        // Bound the pre-allocation by the *decompressed* record bytes actually
-        // present — `buf` has already been split past this batch.
-        let mut records = Vec::with_capacity(decode_capacity(records_len, records_buf.len()));
-        for _ in 0..records_len {
+
+        // The CRC covers everything after the CRC field, computed over the raw
+        // wire bytes so reserved attribute bits are included as written.
+        let computed_crc = crc32c(&buf[RecordBatchHeader::CRC_COVERED_START..total_size]);
+        if computed_crc != header.crc {
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::CrcMismatch,
+                format!(
+                    "CRC mismatch: expected {:08x}, got {computed_crc:08x}",
+                    header.crc
+                ),
+            ));
+        }
+
+        let compressed = buf.slice(RecordBatchHeader::SIZE..total_size);
+        let mut records_buf = decompress_records(
+            header.attributes.compression,
+            &compressed,
+            max_decompressed_size,
+        )?;
+
+        let records_count = header.records_count as usize;
+        if records_count > records_buf.len() / MIN_RECORD_SIZE {
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidLength,
+                format!(
+                    "record batch declares {records_count} records but holds only {} record bytes \
+                     (at least {MIN_RECORD_SIZE} bytes per record)",
+                    records_buf.len()
+                ),
+            ));
+        }
+        let mut records = Vec::with_capacity(records_count);
+        for _ in 0..records_count {
             records.push(Record::decode(&mut records_buf)?);
         }
 
+        buf.advance(total_size);
         Ok(Self {
-            base_offset,
-            partition_leader_epoch,
-            magic,
-            attributes,
-            last_offset_delta,
-            base_timestamp,
-            max_timestamp,
-            producer_id,
-            producer_epoch,
-            base_sequence,
+            base_offset: header.base_offset,
+            partition_leader_epoch: header.partition_leader_epoch,
+            magic: header.magic,
+            attributes: header.attributes,
+            last_offset_delta: header.last_offset_delta,
+            base_timestamp: header.base_timestamp,
+            max_timestamp: header.max_timestamp,
+            producer_id: header.producer_id,
+            producer_epoch: header.producer_epoch,
+            base_sequence: header.base_sequence,
             records,
             compression_level: None,
         })
@@ -1077,136 +970,327 @@ impl RecordBatch {
     ///
     /// Set to 128 MiB. Records exceeding this limit after decompression are rejected.
     /// Kafka's `max.message.bytes` defaults to 1 MiB; this is much higher to
-    /// accommodate edge cases. Future versions may make this runtime-configurable.
+    /// accommodate edge cases. The consumer's `max_decompressed_size` setting
+    /// overrides it per client.
     pub const MAX_DECOMPRESSED_SIZE: usize = 128 * 1024 * 1024;
+}
 
-    /// Decompress the record section of a batch.
+/// Smallest encoding of one record: length, attributes, timestamp delta, offset
+/// delta, key length, value length and header count, one byte each.
+const MIN_RECORD_SIZE: usize = 7;
+
+/// The fixed 61-byte header of a v2 record batch.
+///
+/// [`peek`](Self::peek) parses it without decompressing or copying, so a
+/// reader can decide to skip a batch (a control batch, or a batch of an
+/// aborted transaction) before paying for its records.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct RecordBatchHeader {
+    /// Offset of the first record.
+    pub base_offset: i64,
+    /// Bytes in the batch after this field.
+    pub batch_length: i32,
+    /// Partition leader epoch.
+    pub partition_leader_epoch: i32,
+    /// Magic byte (always 2).
+    pub magic: i8,
+    /// CRC-32C of everything after the CRC field.
+    pub crc: u32,
+    /// Batch attributes.
+    pub attributes: RecordBatchAttributes,
+    /// Offset of the last record relative to `base_offset`.
+    pub last_offset_delta: i32,
+    /// Base timestamp.
+    pub base_timestamp: i64,
+    /// Max timestamp.
+    pub max_timestamp: i64,
+    /// Producer ID.
+    pub producer_id: i64,
+    /// Producer epoch.
+    pub producer_epoch: i16,
+    /// Base sequence.
+    pub base_sequence: i32,
+    /// Number of records the batch declares.
+    pub records_count: i32,
+}
+
+impl RecordBatchHeader {
+    /// Size of the v2 record batch header in bytes.
+    pub const SIZE: usize = 61;
+
+    /// Offset of the first byte covered by the CRC (the attributes field).
+    const CRC_COVERED_START: usize = 21;
+
+    /// Parse the header at the start of `buf` without consuming it.
     ///
-    /// `data` is taken as `&Bytes` rather than `&[u8]` so the uncompressed case
-    /// — the common one on the consumer hot path — is a refcount bump on the
-    /// already-sliced, CRC-covered region instead of a full copy of the record
-    /// payload. The compression arms deref to `&[u8]` transparently.
-    fn decompress_records(
-        compression: Compression,
-        data: &Bytes,
-        _max_decompressed_size: usize,
-    ) -> Result<Bytes> {
-        // Borrowed view for the codec arms, which all want `&[u8]`.
-        #[allow(unused_variables)]
-        let compressed: &[u8] = data.as_ref();
-        #[allow(unused_variables)]
-        let result: Vec<u8> = match compression {
-            // Zero-copy: the caller already holds a `Bytes` slice of the
-            // CRC-covered region, so share it instead of copying.
-            Compression::None => return Ok(data.clone()),
-            #[cfg(feature = "gzip")]
-            Compression::Gzip => {
-                use flate2::read::GzDecoder;
-                use std::io::Read;
+    /// Fails if `buf` is shorter than the header, the batch length is too
+    /// small to hold a header, the magic is not 2, the compression codec is
+    /// unknown or the record count is negative. Does not check that the whole
+    /// batch is present or that its CRC matches; [`RecordBatch::decode`] does.
+    pub fn peek(buf: &[u8]) -> Result<Self> {
+        if buf.len() < 12 {
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::TruncatedFrame,
+                "not enough bytes for record batch header",
+            ));
+        }
+        let mut b = buf;
+        let base_offset = b.get_i64();
+        let batch_length = b.get_i32();
+        if batch_length < (Self::SIZE - 12) as i32 {
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidValue,
+                format!("invalid record batch length: {batch_length}"),
+            ));
+        }
+        if buf.len() < Self::SIZE {
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::TruncatedFrame,
+                "not enough bytes for record batch header",
+            ));
+        }
+        let partition_leader_epoch = b.get_i32();
+        let magic = b.get_i8();
+        if magic != 2 {
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::UnsupportedMagic,
+                format!("unsupported record batch magic: {magic}"),
+            ));
+        }
+        let crc = b.get_u32();
+        let attributes = RecordBatchAttributes::from_i16(b.get_i16())?;
+        let last_offset_delta = b.get_i32();
+        let base_timestamp = b.get_i64();
+        let max_timestamp = b.get_i64();
+        let producer_id = b.get_i64();
+        let producer_epoch = b.get_i16();
+        let base_sequence = b.get_i32();
+        let records_count = b.get_i32();
+        if records_count < 0 {
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidValue,
+                format!("invalid negative records count: {records_count}"),
+            ));
+        }
+        Ok(Self {
+            base_offset,
+            batch_length,
+            partition_leader_epoch,
+            magic,
+            crc,
+            attributes,
+            last_offset_delta,
+            base_timestamp,
+            max_timestamp,
+            producer_id,
+            producer_epoch,
+            base_sequence,
+            records_count,
+        })
+    }
 
-                let decoder = GzDecoder::new(compressed);
-                let mut limited = decoder.take(_max_decompressed_size as u64 + 1);
-                let capacity = compressed
-                    .len()
-                    .saturating_mul(3)
-                    .min(_max_decompressed_size);
-                let mut decompressed = Vec::with_capacity(capacity);
-                limited
-                    .read_to_end(&mut decompressed)
-                    .map_err(|e| KrafkaError::compression(e.to_string()))?;
-                decompressed
-            }
-            #[cfg(not(feature = "gzip"))]
-            Compression::Gzip => {
-                return Err(KrafkaError::compression(
-                    "gzip decompression requires the `gzip` Cargo feature",
-                ));
-            }
-            #[cfg(feature = "snappy")]
-            Compression::Snappy => {
-                // Pre-check decompressed length from snappy header before allocating.
-                // snap::raw::decompress_len reads the varint length prefix without decompressing.
-                let declared_len = snap::raw::decompress_len(compressed)
-                    .map_err(|e| KrafkaError::compression(e.to_string()))?;
-                if declared_len > _max_decompressed_size {
-                    return Err(KrafkaError::compression(format!(
-                        "snappy declared decompressed size {} exceeds maximum {} bytes (possible compression bomb)",
-                        declared_len, _max_decompressed_size
-                    )));
-                }
-                let mut decoder = snap::raw::Decoder::new();
-                decoder
-                    .decompress_vec(compressed)
-                    .map_err(|e| KrafkaError::compression(e.to_string()))?
-            }
-            #[cfg(not(feature = "snappy"))]
-            Compression::Snappy => {
-                return Err(KrafkaError::compression(
-                    "snappy decompression requires the `snappy` Cargo feature",
-                ));
-            }
-            #[cfg(feature = "lz4")]
-            Compression::Lz4 => {
-                use std::io::Read;
-                let decoder = lz4_flex::frame::FrameDecoder::new(compressed);
-                let mut limited = decoder.take(_max_decompressed_size as u64 + 1);
-                let capacity = compressed
-                    .len()
-                    .saturating_mul(4)
-                    .min(_max_decompressed_size);
-                let mut decompressed = Vec::with_capacity(capacity);
-                limited
-                    .read_to_end(&mut decompressed)
-                    .map_err(|e| KrafkaError::compression(e.to_string()))?;
-                decompressed
-            }
-            #[cfg(not(feature = "lz4"))]
-            Compression::Lz4 => {
-                return Err(KrafkaError::compression(
-                    "lz4 decompression requires the `lz4` Cargo feature",
-                ));
-            }
-            #[cfg(feature = "zstd")]
-            Compression::Zstd => {
-                // Use streaming decoder with size limit instead of decode_all
-                // to prevent decompression bombs from causing OOM.
-                use std::io::Read;
-                let decoder = zstd::Decoder::new(compressed)
-                    .map_err(|e| KrafkaError::compression(e.to_string()))?;
-                let mut limited = decoder.take(_max_decompressed_size as u64 + 1);
-                let capacity = compressed
-                    .len()
-                    .saturating_mul(3)
-                    .min(_max_decompressed_size);
-                let mut decompressed = Vec::with_capacity(capacity);
-                limited
-                    .read_to_end(&mut decompressed)
-                    .map_err(|e| KrafkaError::compression(e.to_string()))?;
-                decompressed
-            }
-            #[cfg(not(feature = "zstd"))]
-            Compression::Zstd => {
-                return Err(KrafkaError::compression(
-                    "zstd decompression requires the `zstd` Cargo feature",
-                ));
-            }
-        };
+    /// Size of the whole batch on the wire, header included.
+    #[inline]
+    #[must_use]
+    pub fn total_size(&self) -> usize {
+        12 + self.batch_length as usize
+    }
 
-        // When all compression features are disabled, every non-None arm
-        // diverges via `return Err(...)`, making this code unreachable.
-        #[allow(unreachable_code)]
-        {
-            if result.len() > _max_decompressed_size {
-                return Err(KrafkaError::compression(format!(
-                    "decompressed size {} exceeds maximum {} bytes (possible compression bomb)",
-                    result.len(),
-                    _max_decompressed_size
+    /// Offset of the last record in the batch.
+    #[inline]
+    #[must_use]
+    pub fn last_offset(&self) -> i64 {
+        self.base_offset
+            .saturating_add(i64::from(self.last_offset_delta))
+    }
+}
+
+/// The 8-byte magic that starts a snappy-java (xerial) stream.
+const XERIAL_MAGIC: [u8; 8] = [0x82, b'S', b'N', b'A', b'P', b'P', b'Y', 0];
+
+/// Magic, version and minimum compatible version: the xerial stream header.
+const XERIAL_HEADER_LEN: usize = 16;
+
+/// Uncompressed bytes per xerial chunk, snappy-java's default block size.
+const XERIAL_BLOCK_SIZE: usize = 32 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    /// Times `decompress_records` ran a codec on this thread; lets tests prove
+    /// a batch was skipped without being decompressed.
+    pub(crate) static DECOMPRESSIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Decompress the record section of a batch.
+///
+/// The uncompressed case shares `data` instead of copying it.
+fn decompress_records(
+    compression: Compression,
+    data: &Bytes,
+    max_decompressed_size: usize,
+) -> Result<Bytes> {
+    #[cfg(test)]
+    if compression != Compression::None {
+        DECOMPRESSIONS.with(|c| c.set(c.get() + 1));
+    }
+
+    let compressed: &[u8] = data.as_ref();
+    let result: Vec<u8> = match compression {
+        Compression::None => return Ok(data.clone()),
+        Compression::Gzip => read_limited(
+            flate2::read::GzDecoder::new(compressed),
+            compressed.len().saturating_mul(3),
+            max_decompressed_size,
+        )?,
+        Compression::Snappy => decompress_snappy(compressed, max_decompressed_size)?,
+        Compression::Lz4 => read_limited(
+            lz4_flex::frame::FrameDecoder::new(compressed),
+            compressed.len().saturating_mul(4),
+            max_decompressed_size,
+        )?,
+        Compression::Zstd => decompress_zstd(compressed, max_decompressed_size)?,
+    };
+
+    if result.len() > max_decompressed_size {
+        return Err(KrafkaError::compression(format!(
+            "decompressed size {} exceeds maximum {max_decompressed_size} bytes (possible compression bomb)",
+            result.len(),
+        )));
+    }
+    Ok(Bytes::from(result))
+}
+
+/// Decompress zstd with the pure-Rust decoder. A batch may hold several
+/// concatenated frames; all are decoded, bounded by `max` in total.
+fn decompress_zstd(data: &[u8], max: usize) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let mut out = Vec::with_capacity(data.len().saturating_mul(3).min(max));
+    let mut input = data;
+    while !input.is_empty() && out.len() <= max {
+        let decoder = ruzstd::decoding::StreamingDecoder::new(&mut input)
+            .map_err(|e| KrafkaError::compression(format!("zstd: {e}")))?;
+        let budget = (max as u64 + 1) - out.len() as u64;
+        decoder
+            .take(budget)
+            .read_to_end(&mut out)
+            .map_err(|e| KrafkaError::compression(format!("zstd: {e}")))?;
+    }
+    Ok(out)
+}
+
+/// Read a decoder to the end, stopping one byte past `max` so an oversized
+/// stream is detected without being materialised.
+fn read_limited(decoder: impl std::io::Read, capacity_hint: usize, max: usize) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let mut out = Vec::with_capacity(capacity_hint.min(max));
+    decoder
+        .take(max as u64 + 1)
+        .read_to_end(&mut out)
+        .map_err(|e| KrafkaError::compression(e.to_string()))?;
+    Ok(out)
+}
+
+/// Decompress snappy as Kafka writes it: xerial-framed (snappy-java's
+/// `SnappyOutputStream`, what the Java client and a broker recompressing for
+/// `compression.type=snappy` write) or raw.
+///
+/// The output is bounded by `max` across all chunks before each chunk is
+/// allocated.
+fn decompress_snappy(data: &[u8], max: usize) -> Result<Vec<u8>> {
+    let mut decoder = snap::raw::Decoder::new();
+    let mut out = Vec::new();
+    if data.len() > XERIAL_HEADER_LEN && data.starts_with(&XERIAL_MAGIC) {
+        let mut rest = &data[XERIAL_HEADER_LEN..];
+        while !rest.is_empty() {
+            let Some((len_bytes, tail)) = rest.split_first_chunk::<4>() else {
+                return Err(xerial_error(format!(
+                    "truncated chunk length ({} bytes left)",
+                    rest.len()
+                )));
+            };
+            let len = u32::from_be_bytes(*len_bytes) as usize;
+            if len == 0 {
+                return Err(xerial_error("zero-length chunk".to_string()));
+            }
+            if len > tail.len() {
+                return Err(xerial_error(format!(
+                    "chunk of {len} bytes but only {} left",
+                    tail.len()
                 )));
             }
-
-            Ok(Bytes::from(result))
+            let (block, next) = tail.split_at(len);
+            append_snappy_block(&mut decoder, block, &mut out, max)?;
+            rest = next;
         }
+    } else {
+        append_snappy_block(&mut decoder, data, &mut out, max)?;
     }
+    Ok(out)
+}
+
+fn xerial_error(detail: String) -> KrafkaError {
+    KrafkaError::protocol_kind(
+        ProtocolErrorKind::Malformed,
+        format!("xerial snappy stream: {detail}"),
+    )
+}
+
+/// Decompress one raw snappy block onto the end of `out`, refusing before
+/// allocation if the block's declared length would take `out` past `max`.
+fn append_snappy_block(
+    decoder: &mut snap::raw::Decoder,
+    block: &[u8],
+    out: &mut Vec<u8>,
+    max: usize,
+) -> Result<()> {
+    let declared =
+        snap::raw::decompress_len(block).map_err(|e| KrafkaError::compression(e.to_string()))?;
+    let start = out.len();
+    if declared > max.saturating_sub(start) {
+        return Err(KrafkaError::compression(format!(
+            "snappy decompressed size {} exceeds maximum {max} bytes (possible compression bomb)",
+            start.saturating_add(declared)
+        )));
+    }
+    out.resize(start + declared, 0);
+    let written = decoder
+        .decompress(block, &mut out[start..])
+        .map_err(|e| KrafkaError::compression(e.to_string()))?;
+    out.truncate(start + written);
+    Ok(())
+}
+
+/// Compress with snappy in snappy-java's stream format, as the Java client
+/// does: the 16-byte xerial header, then `[u32 BE length][raw block]` per
+/// 32 KiB of input.
+fn compress_snappy_xerial(payload: &[u8]) -> Result<Bytes> {
+    let mut encoder = snap::raw::Encoder::new();
+    let blocks = payload.len().div_ceil(XERIAL_BLOCK_SIZE).max(1);
+    let mut out = BytesMut::with_capacity(
+        XERIAL_HEADER_LEN + snap::raw::max_compress_len(payload.len()) + 4 * blocks,
+    );
+    out.put_slice(&XERIAL_MAGIC);
+    out.put_i32(1); // stream version
+    out.put_i32(1); // minimum compatible version
+    let mut block = vec![0u8; snap::raw::max_compress_len(payload.len().min(XERIAL_BLOCK_SIZE))];
+    let mut put_block = |chunk: &[u8]| -> Result<()> {
+        let n = encoder
+            .compress(chunk, &mut block)
+            .map_err(|e| KrafkaError::compression(e.to_string()))?;
+        let len =
+            u32::try_from(n).map_err(|_| KrafkaError::compression("snappy block too large"))?;
+        out.put_u32(len);
+        out.put_slice(&block[..n]);
+        Ok(())
+    };
+    for chunk in payload.chunks(XERIAL_BLOCK_SIZE) {
+        put_block(chunk)?;
+    }
+    if payload.is_empty() {
+        put_block(payload)?;
+    }
+    Ok(out.freeze())
 }
 
 impl Default for RecordBatch {
@@ -1360,276 +1444,6 @@ impl RecordBatchBuilder {
     }
 }
 
-/// A lazily-decoded record batch for improved performance.
-///
-/// This struct stores the decompressed record bytes and metadata,
-/// deferring individual record parsing until iteration. This is
-/// useful when filtering records based on offset before accessing
-/// the key/value, avoiding unnecessary deserialization.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// let lazy = LazyRecordBatch::decode(&mut buf)?;
-/// for result in lazy.records() {
-///     let record = result?;
-///     println!("Key: {:?}", record.key);
-/// }
-/// ```
-#[must_use = "contains lazily-decoded record batch data"]
-#[derive(Debug, Clone)]
-pub struct LazyRecordBatch {
-    /// Base offset.
-    pub base_offset: i64,
-    /// Partition leader epoch.
-    pub partition_leader_epoch: i32,
-    /// Batch attributes.
-    pub attributes: RecordBatchAttributes,
-    /// Last offset delta.
-    pub last_offset_delta: i32,
-    /// Base timestamp.
-    pub base_timestamp: i64,
-    /// Max timestamp.
-    pub max_timestamp: i64,
-    /// Producer ID.
-    pub producer_id: i64,
-    /// Producer epoch.
-    pub producer_epoch: i16,
-    /// Base sequence.
-    pub base_sequence: i32,
-    /// Number of records.
-    pub records_count: i32,
-    /// Raw (decompressed) record bytes.
-    raw_records: Bytes,
-}
-
-impl LazyRecordBatch {
-    /// Decode a lazy record batch from bytes.
-    ///
-    /// This performs decompression but defers record parsing.
-    /// Uses [`RecordBatch::MAX_DECOMPRESSED_SIZE`] as the decompression limit.
-    /// For a configurable limit, use [`decode_with_limit`](Self::decode_with_limit).
-    pub fn decode(buf: &mut impl Buf) -> Result<Self> {
-        Self::decode_with_limit(buf, RecordBatch::MAX_DECOMPRESSED_SIZE)
-    }
-
-    /// Decode a lazy record batch with a custom decompression size limit.
-    ///
-    /// Compressed payloads that decompress beyond `max_decompressed_size` bytes
-    /// are rejected as potential compression bombs.
-    pub fn decode_with_limit(buf: &mut impl Buf, max_decompressed_size: usize) -> Result<Self> {
-        if buf.remaining() < 12 {
-            return Err(KrafkaError::protocol_kind(
-                ProtocolErrorKind::TruncatedFrame,
-                "not enough bytes for record batch header",
-            ));
-        }
-
-        let base_offset = buf.get_i64();
-        let batch_length_i32 = buf.get_i32();
-
-        if batch_length_i32 < 49 {
-            return Err(KrafkaError::protocol_kind(
-                ProtocolErrorKind::InvalidValue,
-                format!("invalid record batch length: {batch_length_i32}"),
-            ));
-        }
-
-        let batch_length = batch_length_i32 as usize;
-
-        if buf.remaining() < batch_length {
-            return Err(KrafkaError::protocol_kind(
-                ProtocolErrorKind::TruncatedFrame,
-                "not enough bytes for record batch",
-            ));
-        }
-
-        let partition_leader_epoch = buf.get_i32();
-        let magic = buf.get_i8();
-
-        if magic != 2 {
-            return Err(KrafkaError::protocol_kind(
-                ProtocolErrorKind::UnsupportedMagic,
-                format!("unsupported record batch magic: {magic}"),
-            ));
-        }
-
-        let crc = buf.get_u32();
-
-        // Same raw-bytes CRC strategy as `RecordBatch::decode_with_limit`:
-        // capture the CRC-covered region before decoding fields to avoid
-        // re-encoding lossy and to eliminate the per-batch BytesMut allocation.
-        let crc_covered_len = batch_length - 9;
-        let crc_covered = buf.copy_to_bytes(crc_covered_len);
-
-        let computed_crc = crc32c(&crc_covered);
-        if computed_crc != crc {
-            return Err(KrafkaError::protocol_kind(
-                ProtocolErrorKind::CrcMismatch,
-                format!("CRC mismatch: expected {crc:08x}, got {computed_crc:08x}"),
-            ));
-        }
-
-        let mut cbuf = crc_covered;
-        let attributes = RecordBatchAttributes::from_i16(cbuf.get_i16())?;
-        let last_offset_delta = cbuf.get_i32();
-        let base_timestamp = cbuf.get_i64();
-        let max_timestamp = cbuf.get_i64();
-        let producer_id = cbuf.get_i64();
-        let producer_epoch = cbuf.get_i16();
-        let base_sequence = cbuf.get_i32();
-        let records_count = cbuf.get_i32();
-
-        if records_count < 0 {
-            return Err(KrafkaError::protocol_kind(
-                ProtocolErrorKind::InvalidValue,
-                format!("invalid negative records count: {records_count}"),
-            ));
-        }
-        if records_count as usize > super::MAX_DECODE_ARRAY_LEN {
-            return Err(KrafkaError::protocol_kind(
-                ProtocolErrorKind::InvalidLength,
-                format!(
-                    "records count {} exceeds safety limit {}",
-                    records_count,
-                    super::MAX_DECODE_ARRAY_LEN
-                ),
-            ));
-        }
-
-        // Remaining bytes in cbuf are the (possibly compressed) records.
-        let compressed_records = cbuf;
-
-        // Decompress but don't parse records
-        let raw_records = RecordBatch::decompress_records(
-            attributes.compression,
-            &compressed_records,
-            max_decompressed_size,
-        )?;
-
-        Ok(Self {
-            base_offset,
-            partition_leader_epoch,
-            attributes,
-            last_offset_delta,
-            base_timestamp,
-            max_timestamp,
-            producer_id,
-            producer_epoch,
-            base_sequence,
-            records_count,
-            raw_records,
-        })
-    }
-
-    /// Get the number of records in the batch.
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.records_count as usize
-    }
-
-    /// Check if the batch is empty.
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.records_count == 0
-    }
-
-    /// Iterate over records, decoding each on demand.
-    ///
-    /// This returns an iterator that yields `Result<Record>` for each record.
-    #[inline]
-    pub fn records(&self) -> LazyRecordIterator {
-        LazyRecordIterator {
-            buf: self.raw_records.clone(),
-            remaining: self.records_count as usize,
-        }
-    }
-
-    /// Eagerly decode all records into a Vec.
-    ///
-    /// This is equivalent to `records().collect()` but with proper error handling.
-    ///
-    /// Returns [`ProtocolErrorKind::TruncatedFrame`] if the batch header
-    /// declares more records than `raw_records` actually carries.
-    pub fn decode_all(&self) -> Result<Vec<Record>> {
-        // The declared count is attacker-controlled; every record occupies at
-        // least one wire byte, so the raw record bytes bound the allocation.
-        let mut records = Vec::with_capacity(decode_capacity(
-            (self.records_count as usize).min(super::MAX_DECODE_ARRAY_LEN),
-            self.raw_records.len(),
-        ));
-        for result in self.records() {
-            records.push(result?);
-        }
-        Ok(records)
-    }
-
-    /// Convert to an eager `RecordBatch` by decoding all records.
-    pub fn into_record_batch(self) -> Result<RecordBatch> {
-        Ok(RecordBatch {
-            base_offset: self.base_offset,
-            partition_leader_epoch: self.partition_leader_epoch,
-            magic: 2,
-            attributes: self.attributes,
-            last_offset_delta: self.last_offset_delta,
-            base_timestamp: self.base_timestamp,
-            max_timestamp: self.max_timestamp,
-            producer_id: self.producer_id,
-            producer_epoch: self.producer_epoch,
-            base_sequence: self.base_sequence,
-            records: self.decode_all()?,
-            compression_level: None,
-        })
-    }
-}
-
-/// Iterator that decodes records on demand from raw bytes.
-#[must_use = "iterators are lazy and do nothing unless consumed"]
-pub struct LazyRecordIterator {
-    buf: Bytes,
-    remaining: usize,
-}
-
-impl Iterator for LazyRecordIterator {
-    type Item = Result<Record>;
-
-    /// Yields the next record, or `Some(Err(TruncatedFrame))` if the batch
-    /// declared more records than its bytes actually carry.
-    ///
-    /// Silently stopping at the end of the buffer would make this lazy path
-    /// disagree with the eager [`RecordBatch::decode`], which loops exactly
-    /// `records_count` times and errors on truncation. The batch CRC does not
-    /// protect against this: it covers the (possibly compressed) record bytes,
-    /// so a malicious broker can craft a matching CRC for a short batch.
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining == 0 {
-            return None;
-        }
-        if self.buf.is_empty() {
-            // Declared count outlives the available bytes — surface it rather
-            // than silently truncating the batch.
-            self.remaining = 0;
-            return Some(Err(KrafkaError::protocol_kind(
-                ProtocolErrorKind::TruncatedFrame,
-                "record batch declares more records than the buffer contains",
-            )));
-        }
-        self.remaining -= 1;
-        Some(Record::decode(&mut self.buf))
-    }
-
-    /// The declared count is an upper bound only: iteration may end early with
-    /// an error, so the lower bound is `0`.
-    ///
-    /// This deliberately does not implement [`ExactSizeIterator`] — the exact
-    /// length is not knowable without decoding, and claiming otherwise would
-    /// mislead `collect()` preallocation.
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (0, Some(self.remaining))
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -1641,7 +1455,6 @@ mod tests {
     /// reduces to 24 bytes at *every* level — so the assertion compared 24
     /// against 24 and the test failed for a reason that had nothing to do with
     /// the code. Kafka payloads are records, so the fixture is records.
-    #[cfg(any(feature = "zstd", feature = "gzip"))]
     fn compressible_payload() -> Vec<u8> {
         let mut out = String::new();
         let mut x: u64 = 0x2545_F491_4F6C_DD1D;
@@ -1661,11 +1474,8 @@ mod tests {
 
     /// A compression level must change the bytes on the wire.
     ///
-    /// Asserting that the setting survives the builder would prove nothing:
-    /// the defect class this guards against is a knob that is stored,
-    /// documented and never consulted. Comparing the *encoded output* at two
-    /// levels is the only assertion that fails if `compress_with_level` stops
-    /// threading it through.
+    /// Comparing the *encoded output* at two levels is the only assertion
+    /// that fails if `compress_with_level` stops threading the level through.
     #[cfg(feature = "zstd")]
     #[test]
     fn zstd_compression_level_changes_the_encoded_bytes() {
@@ -1701,7 +1511,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "gzip")]
     #[test]
     fn gzip_compression_level_changes_the_encoded_bytes() {
         let payload = compressible_payload();
@@ -1832,7 +1641,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "gzip")]
     fn test_record_batch_compression_gzip() {
         let batch = RecordBatchBuilder::new()
             .compression(Compression::Gzip)
@@ -1848,7 +1656,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "snappy")]
     fn test_record_batch_compression_snappy() {
         let batch = RecordBatchBuilder::new()
             .compression(Compression::Snappy)
@@ -1864,7 +1671,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "lz4")]
     fn test_record_batch_compression_lz4() {
         let batch = RecordBatchBuilder::new()
             .compression(Compression::Lz4)
@@ -1900,47 +1706,21 @@ mod tests {
         // None is always available.
         assert!(Compression::None.is_available());
 
-        // The other codecs depend on their features.
-        assert_eq!(Compression::Gzip.is_available(), cfg!(feature = "gzip"));
-        assert_eq!(Compression::Snappy.is_available(), cfg!(feature = "snappy"));
-        assert_eq!(Compression::Lz4.is_available(), cfg!(feature = "lz4"));
+        assert!(Compression::Gzip.is_available());
+        assert!(Compression::Snappy.is_available());
+        assert!(Compression::Lz4.is_available());
         assert_eq!(Compression::Zstd.is_available(), cfg!(feature = "zstd"));
     }
 
+    #[cfg(not(feature = "zstd"))]
     #[test]
-    fn test_compression_required_feature() {
-        assert_eq!(Compression::None.required_feature(), None);
-        assert_eq!(Compression::Gzip.required_feature(), Some("gzip"));
-        assert_eq!(Compression::Snappy.required_feature(), Some("snappy"));
-        assert_eq!(Compression::Lz4.required_feature(), Some("lz4"));
-        assert_eq!(Compression::Zstd.required_feature(), Some("zstd"));
-    }
-
-    #[test]
-    fn test_disabled_codec_returns_error() {
-        // For every codec whose feature is disabled, verify that encoding
-        // produces a descriptive error mentioning the Cargo feature.
-        for compression in [
-            Compression::Gzip,
-            Compression::Snappy,
-            Compression::Lz4,
-            Compression::Zstd,
-        ] {
-            if compression.is_available() {
-                continue;
-            }
-            let batch = RecordBatchBuilder::new()
-                .compression(compression)
-                .add_record(Some("k"), Some("v"))
-                .build();
-            let err = batch.encode().unwrap_err();
-            let msg = err.to_string();
-            let feature = compression.required_feature().unwrap();
-            assert!(
-                msg.contains(feature),
-                "error for {compression:?} should mention feature `{feature}`, got: {msg}"
-            );
-        }
+    fn test_zstd_without_its_feature_returns_error() {
+        let batch = RecordBatchBuilder::new()
+            .compression(Compression::Zstd)
+            .add_record(Some("k"), Some("v"))
+            .build();
+        let msg = batch.encode().unwrap_err().to_string();
+        assert!(msg.contains("zstd"), "got: {msg}");
     }
 
     #[test]
@@ -1948,11 +1728,8 @@ mod tests {
         #[allow(clippy::single_element_loop)]
         for compression in [
             Compression::None,
-            #[cfg(feature = "gzip")]
             Compression::Gzip,
-            #[cfg(feature = "snappy")]
             Compression::Snappy,
-            #[cfg(feature = "lz4")]
             Compression::Lz4,
             #[cfg(feature = "zstd")]
             Compression::Zstd,
@@ -2007,82 +1784,6 @@ mod tests {
     }
 
     #[test]
-    fn test_lazy_record_batch_decode() {
-        let batch = RecordBatchBuilder::new()
-            .compression(Compression::None)
-            .base_timestamp(1234567890000)
-            .add_record(Some("key1"), Some("value1"))
-            .add_record(Some("key2"), Some("value2"))
-            .add_record(Some("key3"), Some("value3"))
-            .build();
-
-        let encoded = batch.encode().unwrap();
-        let lazy = LazyRecordBatch::decode(&mut encoded.clone()).unwrap();
-
-        assert_eq!(lazy.len(), 3);
-        assert!(!lazy.is_empty());
-        assert_eq!(lazy.base_timestamp, 1234567890000);
-
-        // Iterate and decode on demand
-        let records: Vec<Record> = lazy.records().map(|r| r.unwrap()).collect();
-        assert_eq!(records.len(), 3);
-        assert_eq!(records[0].key, Some(Bytes::from("key1")));
-        assert_eq!(records[1].key, Some(Bytes::from("key2")));
-        assert_eq!(records[2].key, Some(Bytes::from("key3")));
-    }
-
-    #[test]
-    #[cfg(feature = "lz4")]
-    fn test_lazy_record_batch_into_eager() {
-        let batch = RecordBatchBuilder::new()
-            .compression(Compression::Lz4)
-            .base_timestamp(1234567890000)
-            .add_record(Some("key"), Some("value"))
-            .build();
-
-        let encoded = batch.encode().unwrap();
-        let lazy = LazyRecordBatch::decode(&mut encoded.clone()).unwrap();
-        let eager = lazy.into_record_batch().unwrap();
-
-        assert_eq!(eager.records.len(), 1);
-        assert_eq!(eager.records[0].key, Some(Bytes::from("key")));
-        assert_eq!(eager.base_timestamp, 1234567890000);
-    }
-
-    #[test]
-    fn test_lazy_record_batch_with_compression() {
-        #[allow(clippy::single_element_loop)]
-        for compression in [
-            Compression::None,
-            #[cfg(feature = "gzip")]
-            Compression::Gzip,
-            #[cfg(feature = "snappy")]
-            Compression::Snappy,
-            #[cfg(feature = "lz4")]
-            Compression::Lz4,
-            #[cfg(feature = "zstd")]
-            Compression::Zstd,
-        ] {
-            let batch = RecordBatchBuilder::new()
-                .compression(compression)
-                .base_timestamp(1234567890000)
-                .add_record(Some("key1"), Some("value1"))
-                .add_record(Some("key2"), Some("value2"))
-                .build();
-
-            let encoded = batch.encode().unwrap();
-            let lazy = LazyRecordBatch::decode(&mut encoded.clone()).unwrap();
-
-            assert_eq!(lazy.len(), 2, "Failed for compression {compression:?}");
-
-            let records: Result<Vec<_>> = lazy.records().collect();
-            let records = records.unwrap();
-            assert_eq!(records.len(), 2, "Failed for compression {compression:?}");
-        }
-    }
-
-    #[test]
-    #[cfg(feature = "gzip")]
     fn test_decompress_normal_data_within_limit() {
         // A normally compressed batch should be well under the 128 MiB limit
         let batch = RecordBatchBuilder::new()
@@ -2102,7 +1803,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "snappy")]
     fn test_snappy_decompression_bomb_rejected() {
         // Craft a snappy frame with a declared uncompressed length exceeding MAX_DECOMPRESSED_SIZE.
         // The snappy format stores the uncompressed length as a varint at the start.
@@ -2119,7 +1819,7 @@ mod tests {
         // Append some garbage bytes (won't be decompressed)
         fake_snappy.extend_from_slice(&[0u8; 16]);
 
-        let result = RecordBatch::decompress_records(
+        let result = decompress_records(
             Compression::Snappy,
             &Bytes::from(fake_snappy),
             RecordBatch::MAX_DECOMPRESSED_SIZE,
@@ -2235,16 +1935,6 @@ mod tests {
     }
 
     #[test]
-    fn test_lazy_record_batch_decode_rejects_negative_batch_length() {
-        let mut buf = BytesMut::new();
-        buf.put_i64(0); // base_offset
-        buf.put_i32(-100); // batch_length — negative!
-
-        let result = LazyRecordBatch::decode(&mut buf.freeze());
-        assert!(result.is_err(), "negative batch_length should be rejected");
-    }
-
-    #[test]
     fn test_record_batch_decode_rejects_negative_records_count() {
         // F-54: A negative records_count must not wrap to ~4 billion via `as usize`
         // Build a minimal valid batch but with records_count = -1
@@ -2279,28 +1969,6 @@ mod tests {
     }
 
     #[test]
-    fn test_lazy_record_batch_decode_rejects_negative_records_count() {
-        // Same F-54 test for LazyRecordBatch
-        let mut batch = RecordBatch::new();
-        batch
-            .records
-            .push(Record::new(Some(Bytes::from("k")), Some(Bytes::from("v"))));
-        let encoded = batch.encode().unwrap();
-
-        let mut tampered = BytesMut::from(encoded.as_ref());
-        let rc_offset = 57;
-        tampered[rc_offset..rc_offset + 4].copy_from_slice(&(-1i32).to_be_bytes());
-
-        // Fix CRC
-        let crc_data = &tampered[21..];
-        let new_crc = crate::util::crc32c(crc_data);
-        tampered[17..21].copy_from_slice(&new_crc.to_be_bytes());
-
-        let result = LazyRecordBatch::decode(&mut tampered.freeze());
-        assert!(result.is_err(), "negative records_count should be rejected");
-    }
-
-    #[test]
     fn test_kafka_bytes_encode_normal_size() {
         // F-55: Verify KafkaBytes encode works for normal-sized values
         use crate::protocol::primitives::{KafkaBytes, TryEncode};
@@ -2310,123 +1978,282 @@ mod tests {
         assert_eq!(buf.len(), 4 + 3); // 4-byte i32 length + 3 bytes data
     }
 
-    // ── Regression: LazyRecordIterator truncation ──────────────────────
-
-    /// Build a `LazyRecordBatch` whose header over-declares `records_count`
-    /// relative to the record bytes it actually carries.
-    fn short_lazy_batch(declared: i32, actual: usize) -> LazyRecordBatch {
-        let mut raw = BytesMut::new();
-        for i in 0..actual {
-            Record::new(Some(Bytes::from("k")), Some(Bytes::from("v")))
-                .with_offset_delta(i as i32)
-                .encode(&mut raw)
-                .unwrap();
-        }
-        LazyRecordBatch {
-            base_offset: 0,
-            partition_leader_epoch: -1,
-            attributes: RecordBatchAttributes::default(),
-            last_offset_delta: 0,
-            base_timestamp: 0,
-            max_timestamp: 0,
-            producer_id: -1,
-            producer_epoch: -1,
-            base_sequence: -1,
-            records_count: declared,
-            raw_records: raw.freeze(),
-        }
-    }
-
-    /// A batch declaring more records than it carries must surface an error
-    /// rather than silently yielding a short record list.
-    ///
-    /// The batch CRC is no defence here: it covers the (possibly compressed)
-    /// record bytes, so a malicious broker can craft a matching CRC for a
-    /// deliberately short batch.
-    #[test]
-    fn lazy_iterator_errors_on_truncated_records() {
-        let lazy = short_lazy_batch(100, 3);
-        let results: Vec<_> = lazy.records().collect();
-
-        // Three good records, then exactly one error, then the iterator stops.
-        assert_eq!(results.len(), 4, "expected 3 records + 1 error");
-        for r in results.iter().take(3) {
-            assert!(r.is_ok(), "first three records must decode");
-        }
-        let err = results[3].as_ref().unwrap_err();
-        assert!(
-            format!("{err}").contains("more records than"),
-            "expected a truncated-frame error, got: {err}"
-        );
-    }
-
-    /// `decode_all` propagates that error instead of returning a short Vec.
-    #[test]
-    fn lazy_decode_all_errors_on_truncated_records() {
-        assert!(short_lazy_batch(100, 3).decode_all().is_err());
-    }
-
-    /// The lazy and eager paths must agree on identical bytes. Previously the
-    /// eager `RecordBatch::decode` errored while the lazy iterator returned
-    /// `Ok(3 records)`.
-    #[test]
-    fn lazy_and_eager_agree_on_truncated_batch() {
-        let lazy = short_lazy_batch(100, 3);
-        let mut raw = lazy.raw_records.clone();
-
-        // Eager: decode exactly `records_count` records from the same bytes.
-        let mut eager_err = false;
-        for _ in 0..100 {
-            if Record::decode(&mut raw).is_err() {
-                eager_err = true;
-                break;
-            }
-        }
-        assert!(eager_err, "eager path must reject the truncated batch");
-        assert!(
-            lazy.decode_all().is_err(),
-            "lazy path must reject it too — the two must not disagree"
-        );
-    }
-
-    /// `size_hint` must not over-promise: iteration can stop early with an
-    /// error, so the lower bound is 0. `LazyRecordIterator` deliberately does
-    /// not implement `ExactSizeIterator`.
-    #[test]
-    fn lazy_iterator_size_hint_lower_bound_is_zero() {
-        let lazy = short_lazy_batch(100, 3);
-        let it = lazy.records();
-        assert_eq!(it.size_hint(), (0, Some(100)));
-    }
-
-    /// An honest batch still iterates exactly and without error.
-    #[test]
-    fn lazy_iterator_exact_batch_has_no_error() {
-        let lazy = short_lazy_batch(3, 3);
-        let records: Vec<_> = lazy.records().collect();
-        assert_eq!(records.len(), 3);
-        assert!(records.iter().all(|r| r.is_ok()));
-        assert_eq!(lazy.decode_all().unwrap().len(), 3);
-    }
-
-    // ── Regression: uncompressed decompress path is zero-copy ──────────
+    // ── Uncompressed decompress path is zero-copy ──────────────────────
 
     /// For `Compression::None` the returned `Bytes` must share the caller's
     /// allocation rather than being a fresh copy.
     #[test]
     fn decompress_none_is_zero_copy() {
         let src = Bytes::from(vec![7u8; 4096]);
-        let out = RecordBatch::decompress_records(
-            Compression::None,
-            &src,
-            RecordBatch::MAX_DECOMPRESSED_SIZE,
-        )
-        .unwrap();
+        let out = decompress_records(Compression::None, &src, RecordBatch::MAX_DECOMPRESSED_SIZE)
+            .unwrap();
         assert_eq!(out, src);
         assert_eq!(
             out.as_ptr(),
             src.as_ptr(),
             "uncompressed path must not copy the record payload"
         );
+    }
+
+    // ── Snappy as the Java client writes it, zstd without C, byte bounds ──
+
+    /// Re-pack the records of an uncompressed v2 batch under `compression`,
+    /// with `records` as the record section (header kept, length and CRC fixed).
+    fn repack(uncompressed_batch: &[u8], compression: Compression, records: &[u8]) -> Bytes {
+        let mut b = BytesMut::new();
+        b.put_slice(&uncompressed_batch[..21]);
+        let attrs = i16::from_be_bytes([uncompressed_batch[21], uncompressed_batch[22]]);
+        b.put_i16((attrs & !0x07) | compression as i16);
+        b.put_slice(&uncompressed_batch[23..RecordBatchHeader::SIZE]);
+        b.put_slice(records);
+        let batch_length = (b.len() - 12) as i32;
+        b[8..12].copy_from_slice(&batch_length.to_be_bytes());
+        let crc = crc32c(&b[21..]);
+        b[17..21].copy_from_slice(&crc.to_be_bytes());
+        b.freeze()
+    }
+
+    /// snappy-java's stream format, written independently of the encoder
+    /// under test: header, then `[len][raw block]` per 32 KiB.
+    fn xerial(raw: &[u8]) -> Vec<u8> {
+        let mut out = XERIAL_MAGIC.to_vec();
+        out.extend_from_slice(&1i32.to_be_bytes());
+        out.extend_from_slice(&1i32.to_be_bytes());
+        for chunk in raw.chunks(32 * 1024) {
+            let block = snap::raw::Encoder::new().compress_vec(chunk).unwrap();
+            out.extend_from_slice(&(block.len() as u32).to_be_bytes());
+            out.extend_from_slice(&block);
+        }
+        out
+    }
+
+    fn plain_batch(n: usize, value_len: usize) -> Bytes {
+        let mut b = RecordBatchBuilder::new();
+        for i in 0..n {
+            b = b.add_record(Some(format!("k{i}")), Some(vec![b'v'; value_len]));
+        }
+        b.build().encode().unwrap()
+    }
+
+    fn records_of(batch: &Bytes) -> &[u8] {
+        &batch[RecordBatchHeader::SIZE..]
+    }
+
+    #[test]
+    fn xerial_snappy_spanning_several_chunks_decodes() {
+        let plain = plain_batch(200, 1000); // > 32 KiB of records: several chunks
+        let framed = xerial(records_of(&plain));
+        let mut java = repack(&plain, Compression::Snappy, &framed);
+        let decoded = RecordBatch::decode(&mut java).unwrap();
+        assert_eq!(decoded.records.len(), 200);
+        assert_eq!(decoded.records[199].key, Some(Bytes::from("k199")));
+        assert!(java.is_empty(), "the buffer is advanced past the batch");
+    }
+
+    #[test]
+    fn raw_snappy_still_decodes() {
+        let plain = plain_batch(3, 10);
+        let raw = snap::raw::Encoder::new()
+            .compress_vec(records_of(&plain))
+            .unwrap();
+        let mut batch = repack(&plain, Compression::Snappy, &raw);
+        assert_eq!(RecordBatch::decode(&mut batch).unwrap().records.len(), 3);
+    }
+
+    #[test]
+    fn snappy_encode_writes_the_xerial_stream_java_writes() {
+        let payload = compressible_payload(); // > 32 KiB
+        let encoded = Compression::Snappy
+            .compress_with_level(&payload, None)
+            .unwrap();
+        assert_eq!(&encoded[..8], &XERIAL_MAGIC);
+        assert_eq!(&encoded[8..16], &[0, 0, 0, 1, 0, 0, 0, 1]);
+        // Chunk layout: each `[len][block]` decompresses to at most 32 KiB.
+        let mut rest = &encoded[16..];
+        let mut sizes = Vec::new();
+        while !rest.is_empty() {
+            let len = u32::from_be_bytes(rest[..4].try_into().unwrap()) as usize;
+            let block = &rest[4..4 + len];
+            sizes.push(snap::raw::decompress_len(block).unwrap());
+            rest = &rest[4 + len..];
+        }
+        assert!(sizes.len() > 1);
+        assert!(
+            sizes[..sizes.len() - 1]
+                .iter()
+                .all(|&n| n == XERIAL_BLOCK_SIZE)
+        );
+        assert_eq!(sizes.iter().sum::<usize>(), payload.len());
+        assert_eq!(
+            decompress_snappy(&encoded, usize::MAX).unwrap(),
+            payload,
+            "round trip"
+        );
+    }
+
+    #[test]
+    fn xerial_output_is_bounded_across_chunks() {
+        // Every chunk is small; only their sum exceeds the limit.
+        let framed = xerial(&vec![0u8; 100 * 1024]);
+        let err = decompress_snappy(&framed, 64 * 1024)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exceeds maximum"), "{err}");
+        assert_eq!(
+            decompress_snappy(&framed, 100 * 1024).unwrap().len(),
+            100 * 1024
+        );
+    }
+
+    #[test]
+    fn malformed_xerial_streams_fail_with_protocol_errors() {
+        let mut header = XERIAL_MAGIC.to_vec();
+        header.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 1]);
+        let block = snap::raw::Encoder::new().compress_vec(b"hello").unwrap();
+
+        let mut zero_len = header.clone();
+        zero_len.extend_from_slice(&0u32.to_be_bytes());
+        let mut truncated_len = header.clone();
+        truncated_len.extend_from_slice(&[0, 0]);
+        let mut overlong = header.clone();
+        overlong.extend_from_slice(&((block.len() + 1) as u32).to_be_bytes());
+        overlong.extend_from_slice(&block);
+
+        for (name, input) in [
+            ("zero-length chunk", zero_len),
+            ("truncated chunk length", truncated_len),
+            ("chunk longer than the data", overlong),
+        ] {
+            match decompress_snappy(&input, usize::MAX) {
+                Err(KrafkaError::Protocol { .. }) => {}
+                other => panic!("{name}: expected a protocol error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_magic_prefixed_buffer_of_16_bytes_or_less_is_raw_snappy() {
+        let mut header = XERIAL_MAGIC.to_vec();
+        header.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 1]);
+        // Read as raw snappy, which it is not: a codec error, not a panic and
+        // not a xerial parse.
+        assert!(matches!(
+            decompress_snappy(&header, usize::MAX),
+            Err(KrafkaError::Compression { .. })
+        ));
+    }
+
+    #[test]
+    fn zstd_decodes_in_every_build() {
+        let plain = plain_batch(50, 100);
+        let one = ruzstd::encoding::compress_to_vec(
+            records_of(&plain),
+            ruzstd::encoding::CompressionLevel::Fastest,
+        );
+        let mut batch = repack(&plain, Compression::Zstd, &one);
+        assert_eq!(RecordBatch::decode(&mut batch).unwrap().records.len(), 50);
+
+        // Two concatenated frames are one record section.
+        let records = records_of(&plain);
+        let (a, b) = records.split_at(records.len() / 2);
+        let mut two =
+            ruzstd::encoding::compress_to_vec(a, ruzstd::encoding::CompressionLevel::Fastest);
+        two.extend(ruzstd::encoding::compress_to_vec(
+            b,
+            ruzstd::encoding::CompressionLevel::Fastest,
+        ));
+        let mut batch = repack(&plain, Compression::Zstd, &two);
+        assert_eq!(RecordBatch::decode(&mut batch).unwrap().records.len(), 50);
+    }
+
+    #[test]
+    fn zstd_decode_is_bounded() {
+        let frame = ruzstd::encoding::compress_to_vec(
+            &vec![0u8; 1024 * 1024][..],
+            ruzstd::encoding::CompressionLevel::Fastest,
+        );
+        // Decoding stops one byte past the limit instead of inflating it all.
+        assert_eq!(
+            decompress_zstd(&frame, 64 * 1024).unwrap().len(),
+            64 * 1024 + 1
+        );
+        let err = decompress_records(Compression::Zstd, &Bytes::from(frame), 64 * 1024)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exceeds maximum"), "{err}");
+    }
+
+    /// The record count is bounded by the bytes, not by a constant.
+    #[test]
+    fn a_declared_count_the_bytes_cannot_hold_is_rejected_before_allocating() {
+        let plain = plain_batch(3, 1);
+        let mut tampered = BytesMut::from(plain.as_ref());
+        tampered[57..61].copy_from_slice(&1_000_000i32.to_be_bytes());
+        let crc = crc32c(&tampered[21..]);
+        tampered[17..21].copy_from_slice(&crc.to_be_bytes());
+        let err = RecordBatch::decode(&mut tampered.freeze()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                KrafkaError::Protocol {
+                    kind: ProtocolErrorKind::InvalidLength,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+    }
+
+    /// A count the bytes could hold but the records do not fill is truncated.
+    #[test]
+    fn a_batch_with_fewer_records_than_declared_is_rejected() {
+        let plain = plain_batch(3, 20); // ~30 bytes per record
+        let mut tampered = BytesMut::from(plain.as_ref());
+        tampered[57..61].copy_from_slice(&4i32.to_be_bytes());
+        let crc = crc32c(&tampered[21..]);
+        tampered[17..21].copy_from_slice(&crc.to_be_bytes());
+        assert!(RecordBatch::decode(&mut tampered.freeze()).is_err());
+    }
+
+    #[test]
+    fn decoded_records_share_the_input_buffer() {
+        let encoded = plain_batch(10, 100);
+        let base = encoded.as_ptr() as usize;
+        let batch = RecordBatch::decode(&mut encoded.clone()).unwrap();
+        for record in &batch.records {
+            let v = record.value.as_ref().unwrap().as_ptr() as usize;
+            assert!(
+                v >= base && v < base + encoded.len(),
+                "value is a view, not a copy"
+            );
+        }
+    }
+
+    #[test]
+    fn header_peek_reads_the_fixed_fields_without_consuming() {
+        let encoded = RecordBatchBuilder::new()
+            .producer(42, 3, 7)
+            .transactional(true)
+            .add_record(Some("k"), Some("v"))
+            .add_record(Some("k"), Some("v"))
+            .build()
+            .encode()
+            .unwrap();
+        let header = RecordBatchHeader::peek(&encoded).unwrap();
+        assert_eq!(header.total_size(), encoded.len());
+        assert_eq!(header.producer_id, 42);
+        assert!(header.attributes.is_transactional);
+        assert_eq!(header.records_count, 2);
+        assert_eq!(header.last_offset(), 1);
+        assert!(RecordBatchHeader::peek(&encoded[..60]).is_err());
+    }
+
+    #[test]
+    fn a_failed_decode_leaves_the_buffer_untouched() {
+        let encoded = plain_batch(2, 5);
+        let mut short = encoded.slice(..encoded.len() - 1);
+        let before = short.len();
+        assert!(RecordBatch::decode(&mut short).is_err());
+        assert_eq!(short.len(), before);
     }
 }

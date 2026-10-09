@@ -9,11 +9,9 @@ slug_id = "share-consumer"
 
 Share groups ([KIP-932](https://cwiki.apache.org/confluence/display/KAFKA/KIP-932%3A+Queues+for+Kafka)) give Kafka queue-like semantics: records are acknowledged individually and a partition is not owned by one member.
 
-Enabled by the `share-groups` feature, which is on by default. Needs a **Kafka 4.2+** broker — KIP-932 is generally available from 4.2. Against an older broker, or Redpanda, which has no share groups, calls fail with `UnknownApiVersion` rather than degrading silently.
+Always compiled in. Needs a **Kafka 4.2+** broker (as of 2026-10-09, share groups are production ready from Apache Kafka 4.2). Against an older broker, or one without share groups such as Redpanda, calls fail with `UnknownApiVersion`.
 
 ## Overview
-
-Share groups differ from traditional consumer groups in several key ways:
 
 | Feature | Consumer Group | Share Group |
 |---|---|---|
@@ -23,232 +21,192 @@ Share groups differ from traditional consumer groups in several key ways:
 | Record sharing | One consumer per partition | Multiple consumers per partition |
 | Redelivery | Seek / reset offsets | Automatic (release/reject) |
 
-Multiple consumers in the same share group receive **non-overlapping subsets of records** from the same partition — the server handles all assignment and delivery tracking.
+Members of a share group receive **non-overlapping subsets of records** from the same partition; the broker tracks assignment and delivery.
 
 ## Basic Usage
 
-```rust
-use krafka::share_consumer::{ShareConsumer, AcknowledgementMode};
-use std::time::Duration;
+```rust,compile
+use krafka::share_consumer::ShareConsumer;
 
-let consumer = ShareConsumer::builder()
-    .bootstrap_servers("localhost:9092")
-    .group_id("my-share-group")
+let consumer = krafka::Kafka::builder("localhost:9092")
+    .connect()
+    .await?
+    .share_consumer("my-share-group")
     .build()
     .await?;
+consumer.subscribe(["events"]).await?;
 
-consumer.subscribe(&["events"]).await?;
-
-loop {
-    let records = consumer.poll(Duration::from_secs(1)).await?;
-    for record in &records {
-        process(record);
-    }
-    // In Implicit mode (default), records are auto-accepted on next poll()
+// `recv()` returns `Ok(None)` only once the consumer is closed.
+while let Some(record) = consumer.recv().await? {
+    println!("{}-{}@{}", record.topic, record.partition, record.offset);
+    // Implicit mode (default): accepted when the next recv()/poll() starts.
 }
 ```
+
+`subscribe()` joins the share group before it returns. `poll(timeout)`
+returns up to `max_poll_records` records instead of one.
+`stream()` wraps `recv()` as a `Stream` that ends when the consumer closes.
 
 ## Acknowledgement Modes
 
-### Implicit (Default)
+### Implicit (default)
 
-Records fetched by the previous `poll()` are automatically accepted when the next `poll()` is called. This is the simplest mode — no application-level acknowledgement logic is needed. Consecutive offsets for the same partition are coalesced into contiguous ranges to reduce wire overhead.
+The records a `poll()`/`recv()` returned are accepted when the next
+`poll()`/`recv()` starts, and by `commit()` and `close()`. No acknowledgement
+calls are needed.
 
 ### Explicit
 
-The application controls acknowledgement per record. **All records from the previous `poll()` must be acknowledged before calling `poll()` again** — otherwise `poll()` returns an error. `acknowledge()` is one-shot per record: acknowledging the same record twice returns an error instead of sending duplicate broker intent. If a later `commit_sync()` or `commit_async()` flush fails, the consumer restores that batch locally and later `poll()` calls keep returning an error until the commit is retried successfully or the local share-consumer state is cleared.
+The application settles every delivered record with `ack` (accept), `release`
+(redeliver) or `reject` (archive, never redeliver). Every record the previous
+`poll()` returned must be settled before the next `poll()`, which otherwise
+fails with `IllegalState`.
 
-```rust
-use krafka::share_consumer::{ShareConsumer, AcknowledgementMode, AcknowledgeType};
+```rust,compile
+use krafka::share_consumer::{AcknowledgementMode, ShareConsumer};
 
-let consumer = ShareConsumer::builder()
-    .bootstrap_servers("localhost:9092")
-    .group_id("my-share-group")
+let consumer = krafka::Kafka::builder("localhost:9092")
+    .connect()
+    .await?
+    .share_consumer("my-share-group")
     .acknowledgement_mode(AcknowledgementMode::Explicit)
     .build()
     .await?;
+consumer.subscribe(["events"]).await?;
 
-consumer.subscribe(&["events"]).await?;
-
-let records = consumer.poll(Duration::from_secs(1)).await?;
-for record in &records {
-    match try_process(record) {
-        Ok(_) => consumer.acknowledge(record, AcknowledgeType::Accept).await?,
-        Err(_) => consumer.acknowledge(record, AcknowledgeType::Release).await?,
+for record in consumer.poll(Duration::from_secs(1)).await? {
+    if record.value.is_some() {
+        consumer.ack(&record)?;
+    } else {
+        consumer.reject(&record)?;
     }
 }
-consumer.commit_sync().await?;
+for (partition, result) in consumer.commit().await? {
+    if let Err(error) = result {
+        eprintln!("{}-{}: {error}", partition.topic, partition.partition);
+    }
+}
 ```
 
-To acknowledge by topic/partition/offset directly — useful when a record fails to deserialize and you have no `ConsumerRecord` to pass:
+### Where acknowledgements go
 
-```rust
-consumer.acknowledge_by_offset("events", partition, offset, AcknowledgeType::Reject).await?;
+An acknowledgement rides on the next `ShareFetch` to the broker that
+**acquired** the record, or goes in a `ShareAcknowledge` when no fetch is due
+or `commit()` asks for it. It is never sent to another broker: if the
+acquiring broker no longer leads the partition, it fails with
+`NOT_LEADER_OR_FOLLOWER`.
+
+Failed acknowledgements are handled by class:
+
+| Error | Handling |
+|---|---|
+| Network error, timeout, `INVALID_SHARE_SESSION_EPOCH`, `SHARE_SESSION_NOT_FOUND`, `SHARE_SESSION_LIMIT_REACHED` | Resent to the same broker once its share session is re-established, until the `commit()` deadline or, in the background, the acquisition-lock duration |
+| `NOT_LEADER_OR_FOLLOWER`, `FENCED_LEADER_EPOCH`, `UNKNOWN_TOPIC_OR_PARTITION` | Reported; metadata is refreshed |
+| Anything else (e.g. `INVALID_RECORD_STATE` after the lock expired) | Reported and dropped |
+
+### Commit results and the callback
+
+`commit()` sends everything pending and returns `CommitResults`: one
+`Result<(), KrafkaError>` per partition it sent acknowledgements for, and only
+those (empty when nothing was pending). It is bounded by `request_timeout`;
+what is unanswered by then is reported as `Timeout`.
+
+The acknowledgement-commit callback receives the outcome of **every**
+acknowledgement request — implicit, explicit, piggybacked on a fetch, sent by
+`commit()` or `close()` — once per partition per request:
+
+```rust,compile
+use krafka::share_consumer::ShareConsumer;
+
+let consumer = krafka::Kafka::builder("localhost:9092")
+    .connect()
+    .await?
+    .share_consumer("my-share-group")
+    .acknowledgement_commit_callback(|commit| {
+        if let Err(error) = &commit.result {
+            eprintln!("{}-{} {:?}: {error}", commit.topic, commit.partition, commit.offsets);
+        }
+    })
+    .build()
+    .await?;
 ```
 
-For a timeout-bounded flush:
-
-```rust
-consumer.commit_sync_with_timeout(Duration::from_secs(5)).await?;
-```
-
-### Acknowledge Types
-
-| Type | Value | Meaning |
-|---|---|---|
-| `Accept` | 1 | Record processed successfully |
-| `Release` | 2 | Record released for redelivery to another consumer |
-| `Reject` | 3 | Record rejected (moved to dead-letter after max retries) |
-| `Renew` | 4 | Extend the acquisition lock without completing the record (KIP-1222, Kafka 4.2+) |
+It runs on a background task, so keep it short; a panic in it is caught and
+logged.
 
 ### Renewing an acquisition lock
 
-A record you have been given is *acquired*, not consumed: the broker holds a
-lock on it for `group.share.record.lock.duration.ms` and redelivers it to
-another member if that expires. `Renew` extends the lock for work that takes
-longer than the lock lasts.
+A delivered record is *acquired*, not consumed: the broker holds a lock on it
+for `group.share.record.lock.duration.ms` and redelivers it when the lock
+expires. `renew(&record)` extends the lock (KIP-1222, Kafka 4.2+). The record
+stays pending; settle it later with `ack`, `release` or `reject`. The lock
+duration is a broker setting; `acquisition_lock_timeout()` returns what the
+broker last reported.
 
-That requires knowing when the lock expires — and the duration is a
-**broker-side** setting, so it cannot be read from the client's own
-configuration. The broker reports it on every `ShareFetch`, and
-`acquisition_lock_timeout()` is where it surfaces:
+```rust,compile
+use krafka::share_consumer::{AcknowledgementMode, ShareConsumer};
 
-```rust,ignore
-use krafka::share_consumer::AcknowledgeType;
-use std::time::{Duration, Instant};
+let consumer = krafka::Kafka::builder("localhost:9092")
+    .connect()
+    .await?
+    .share_consumer("my-share-group")
+    .acknowledgement_mode(AcknowledgementMode::Explicit)
+    .build()
+    .await?;
+consumer.subscribe(["events"]).await?;
 
-// `None` before the first fetch, and on brokers older than Kafka 4.2.
-let lock = consumer
-    .acquisition_lock_timeout()
-    .unwrap_or(Duration::from_secs(30));
-// Renew once a record is halfway to losing its lock.
-let renew_after = lock / 2;
-
+let lock = consumer.acquisition_lock_timeout().unwrap_or(Duration::from_secs(30));
 for record in consumer.poll(Duration::from_secs(1)).await? {
-    let started = Instant::now();
-    // ... long-running work, renewing as it goes ...
-    if started.elapsed() >= renew_after {
-        consumer.acknowledge(&record, AcknowledgeType::Renew).await?;
-    }
-    consumer.acknowledge(&record, AcknowledgeType::Accept).await?;
-}
-```
-
-The lock starts when the broker *acquires* the record — when it builds the
-fetch response — not when `poll()` returns. Treat the value as an upper bound
-on the time remaining and renew with margin.
-
-Brokers older than Kafka 4.2 reject an entire acknowledgement batch containing
-an unknown type, so krafka drops `Renew` acknowledgements when the negotiated
-`ShareFetch`/`ShareAcknowledge` version is below 2 and logs a warning. The lock
-then simply expires, which is the same outcome as not renewing.
-
-## Delivery Count
-
-Each `ConsumerRecord` includes a `delivery_count` field (populated from the server's acquired-records metadata). This tells you how many times the record has been delivered, which is useful for implementing retry limits:
-
-```rust
-for record in &records {
-    if let Some(count) = record.delivery_count {
-        if count > 5 {
-            consumer.acknowledge(record, AcknowledgeType::Reject).await?;
-            continue;
+    let mut renewed = Instant::now();
+    for _step in 0..10 {
+        // ... a slice of slow work ...
+        if renewed.elapsed() >= lock / 2 {
+            consumer.renew(&record)?;
+            renewed = Instant::now();
         }
     }
-    process(record);
+    consumer.ack(&record)?;
 }
 ```
 
-> **A flush waits for an in-flight poll.** `poll()` holds the pending
-> acknowledgements out of the internal map while its `ShareFetch` is on the
-> wire. `commit_sync()` and `close()` wait for that poll to finish before
-> draining, so neither can flush an empty map and report success while
-> acknowledgements are still in flight. This matters for the usual shutdown —
-> `wakeup()` then `close()` — because `wakeup()` does not wait for the poll it
-> interrupts to unwind.
+The lock starts when the broker builds the fetch response, so the value is an
+upper bound on the time left. Against a broker older than 4.2, `renew`
+fails with an error naming KIP-1222 and the record stays pending.
 
-## Async Commit
+## What a fetch delivers
 
-`commit_async()` returns a handle that resolves to the final commit outcome. This keeps the send off the caller's immediate path while still surfacing transport, decode, and broker errors explicitly. If any failure occurs, the batch is restored locally for the next commit cycle rather than silently dropped:
+- Only records inside the response's acquired ranges are delivered; the rest
+  of a returned batch is skipped.
+- Transaction control records are skipped; their offsets, and acquired
+  offsets with no record (compacted away), are acknowledged as GAP.
+- Offsets in a batch that fails to decode are released for redelivery; the
+  broker archives a record once its delivery count reaches
+  `group.share.delivery.count.limit`.
+- Each record carries `delivery_count` from its acquired range. It is
+  approximate: the broker does not persist it exactly.
 
-```rust
-consumer.commit_async().await?;
-```
+### Acquisition bound
 
-## Streaming API
+Every `ShareFetch` asks for at most `max_poll_records` records, and a broker
+is not fetched from again while records it handed out are still buffered.
+Buffered records hold acquisition locks, so keep `max_poll_records` near what
+the application processes within one lock duration.
 
-The share consumer also supports a `Stream`-based API:
-
-```rust
-use tokio_stream::StreamExt;
-
-let mut stream = consumer.stream();
-while let Some(record) = stream.next().await {
-    let record = record?;
-    process(&record);
-}
-```
-
-## Configuration
-
-Every option below has a builder setter and a matching accessor on
-`ShareConsumerConfig`, asserted in CI by `just config-reachability`.
-
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `bootstrap_servers` | String | (required) | Comma-separated broker addresses |
-| `group_id` | String | (required) | Share group identifier |
-| `client_id` | String | `"krafka"` | Client identifier sent with requests |
-| `acknowledgement_mode` | AcknowledgementMode | `Implicit` | `Implicit` or `Explicit` |
-| `fetch_min_bytes` | i32 | `1` | Minimum bytes a broker must have before answering a `ShareFetch` |
-| `fetch_max_bytes` | i32 | `52_428_800` | Maximum bytes one `ShareFetch` response may carry (50 MiB) |
-| `fetch_max_wait` | Duration | `500ms` | How long a broker may hold a `ShareFetch` waiting for `fetch_min_bytes`. Capped by the `poll()` timeout |
-| `max_poll_records` | i32 | `500` | Maximum records handed to the application per `poll()` (must be ≥ 1) |
-| `max_buffered_records` | i32 | `500` | Soft threshold on the internal receive buffer; `0` disables the cap |
-| `max_records` | i32 | `5000` | Maximum records the broker may **acquire** for this member per `ShareFetch` (KIP-932 `MaxRecords`) |
-| `batch_size` | i32 | `500` | Acquisition batch-size hint sent to the broker (KIP-932 `BatchSize`) |
-| `request_timeout` | Duration | `30s` | Per-request timeout |
-| `connect_timeout` | Duration | `10s` | How long TCP establishment to one broker may take; also the floor on `request_timeout` |
-| `session_timeout` | Duration | `45s` | Session timeout for group membership |
-| `heartbeat_interval` | Duration | `5s` | Heartbeat interval (must be < `session_timeout`) |
-| `metadata_max_age` | Duration | `5min` | Metadata cache TTL |
-| `metadata_topic_cache_ttl` | `Option<Duration>` | `Some(5min)` | How long a topic entry may sit **idle** before a partial refresh evicts it (`metadata.max.idle.ms`); any use resets the timer. `None` disables eviction; use `disable_metadata_topic_cache_ttl()` to opt out |
-| `allow_auto_create_topics` | bool | `false` | Let the broker create a subscribed topic the cluster does not have (`allow.auto.create.topics`) |
-| `metadata_recovery_strategy` | MetadataRecoveryStrategy | `Rebootstrap` | What to do when every known broker becomes unreachable (KIP-899) |
-| `metadata_recovery_rebootstrap_trigger` | Duration | `5min` | How long refreshes may keep failing before re-bootstrapping |
-| `client_rack` | `Option<String>` | `None` | Rack ID for closest-replica fetching (KIP-392) |
-| `max_decompressed_size` | usize | 128 MiB | Decompression-bomb ceiling for record batches |
-| `key_deserializer` / `value_deserializer` | `Arc<dyn Deserializer>` | `None` | Applied to every consumed record — the same hook as the subscription consumer |
-
-### `max_records` is not `max_poll_records`
-
-They bound different things and it matters here more than on a subscription
-consumer:
-
-- **`max_poll_records`** caps what one `poll()` call hands *the application*.
-  Surplus stays in the client's receive buffer.
-- **`max_records`** caps what the broker *acquires* for this member. An acquired
-  record holds an acquisition lock until it is acknowledged or the lock expires,
-  so this bounds how much of the share group's backlog one member can hold
-  hostage — and therefore how much work is stalled if the member dies.
-
-Lower `max_records` for faster failover between members; raise it for
-throughput when members are long-lived.
+With `acquire_mode(AcquireMode::BatchOptimized)` (the default) the broker may
+finish a record batch beyond the limit. `AcquireMode::RecordLimit` (KIP-1206)
+makes the limit exact; it needs `ShareFetch` v2 (Kafka 4.2+), and against an
+older broker the first `poll()` fails with a `Config` error naming KIP-1206.
 
 ### Deserializers
 
-A share consumer hands back the same `ConsumerRecord` as a subscription
-consumer, so it takes the same
+The share consumer takes the same
 [`Deserializer`](https://docs.rs/krafka/latest/krafka/serdes/trait.Deserializer.html)
-hook:
+hook as the consumer:
 
 ```rust,compile
 use bytes::Bytes;
+use krafka::Headers;
 use krafka::serdes::Deserializer;
-use krafka::share_consumer::ShareConsumer;
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
 
 /// Strips a 5-byte Confluent-style framing header.
 struct StripHeader;
@@ -256,249 +214,166 @@ struct StripHeader;
 impl Deserializer for StripHeader {
     fn deserialize(
         &self,
-        payload: Bytes,
         _topic: &str,
+        _headers: &Headers,
+        payload: Bytes,
         _is_key: bool,
-    ) -> Pin<Box<dyn Future<Output = krafka::Result<Bytes>> + Send + '_>> {
-        Box::pin(async move {
-            if payload.len() < 5 {
-                return Err(krafka::KrafkaError::serialization("payload is not framed"));
-            }
-            Ok(payload.slice(5..))
-        })
+    ) -> krafka::Result<Bytes> {
+        if payload.len() < 5 {
+            return Err(krafka::KrafkaError::serialization("payload is not framed"));
+        }
+        Ok(payload.slice(5..))
     }
 }
 
-let consumer = ShareConsumer::builder()
-    .bootstrap_servers("localhost:9092")
-    .group_id("my-share-group")
-    .value_deserializer(Arc::new(StripHeader))
+let consumer = kafka
+    .share_consumer("my-share-group")
+    .value_deserializer(StripHeader)
     .build()
     .await?;
 ```
 
-A record the decoder rejects fails the `poll()` with
-`KrafkaError::RecordDeserialization { topic, partition, offset, .. }`. Unlike a
-subscription consumer there is no `seek()` to skip it — the share-group remedy
-is to reject the offset so the broker stops redelivering it:
+A record the decoder rejects ends the batch: `poll()` returns the records
+before it, the next `poll()` returns
+`KrafkaError::RecordDeserialization { topic, partition, offset, .. }`, and the
+record is released for redelivery. The records after it follow in later polls,
+in both acknowledgement modes. No record is accepted before it was delivered.
 
-```rust
-consumer
-    .acknowledge_by_offset(&topic, partition, offset, AcknowledgeType::Reject)
-    .await?;
-```
+## Membership
 
-That call needs the record to be registered as pending, so deserialization runs
-*after* registration. The consequence is worth knowing: in `Implicit` mode the
-batch has already been queued for `Accept` by the time the failure surfaces,
-because that is what implicit mode means. Use `Explicit` mode when the
-application needs to arbitrate poison records.
+A background task heartbeats at the interval the coordinator returns.
+`subscribe()` retries coordinator-not-ready errors (up to five attempts).
 
-### Metadata Topic Cache TTL
+- **Fenced** (`FENCED_MEMBER_EPOCH`, `UNKNOWN_MEMBER_ID`): the member drops
+  all buffered and delivered records and pending acknowledgements (reported to
+  the callback) and rejoins with its full subscription.
+- **Assignment change**: buffered records of revoked partitions are released
+  and their delivered records forgotten; acknowledgements already queued are
+  still sent.
+- **Leader moved** (`NOT_LEADER_OR_FOLLOWER` on a fetch): the partition backs
+  off (100 ms doubling to 1 s) and fetching resumes on the new leader.
 
-During a partial metadata refresh (where only the subscribed topics are re-fetched rather than the entire cluster), krafka caches each topic's metadata between refreshes. By default, a topic entry is evicted from this cache after **5 minutes** of being **idle** — matching Java's `metadata.max.idle.ms` — to prevent unbounded growth when topics are deleted or subscriptions change.
+## Cancellation and wakeup
 
-Idle means nothing has addressed the topic: fetching from it, resolving a leader for it, or naming it in a metadata refresh all reset the timer. A topic whose metadata is still current survives regardless.
+`poll()`, `recv()`, the stream and `commit()` are cancel safe. A dropped
+`poll()`/`recv()` accepts nothing; its records come with a later call.
+`ack`, `release`, `reject` and `renew` record the acknowledgement at once and
+a background task sends it, so a dropped `poll()` or `commit()` neither loses
+nor duplicates one; a dropped `commit()` only stops waiting for the outcome. `close()` is not cancel safe: dropped, the
+consumer is closed but the final acknowledgements and the group leave may not
+have happened. `poll()`/`recv()` calls on clones are serialized.
+
+`wakeup()` interrupts a waiting `poll()`/`recv()` (or the next one) with
+`KrafkaError::Wakeup`; the consumer stays usable.
+
+## Close
+
+`close()` is `close_with(CloseOptions::new())`, a 30 s budget. Idempotent.
 
 ```rust,compile
-use krafka::share_consumer::ShareConsumer;
+use krafka::CloseOptions;
 use std::time::Duration;
 
-// Use a custom TTL (e.g. 10 minutes):
-let consumer = ShareConsumer::builder()
-    .bootstrap_servers("localhost:9092")
-    .group_id("my-share-group")
-    .metadata_topic_cache_ttl(Duration::from_secs(600))
-    .build()
-    .await?;
-
-// Opt out of TTL eviction entirely (topics persist until the cache is flushed):
-let consumer = ShareConsumer::builder()
-    .bootstrap_servers("localhost:9092")
-    .group_id("my-share-group")
-    .disable_metadata_topic_cache_ttl()
-    .build()
-    .await?;
+let consumer = kafka.share_consumer("my-share-group").build().await?;
+consumer.close_with(CloseOptions::new().timeout(Duration::from_secs(10))).await?;
 ```
 
-> **Note:** TTL eviction only affects the partial-refresh cache. A full metadata refresh (triggered by `metadata_max_age` expiry or an explicit refresh) always replaces the cache unconditionally.
+A share consumer always leaves its group; it ignores
+`CloseOptions::group_membership_operation`.
 
-## Session Management
+It accepts the last `poll()`'s records in implicit mode, sends the remaining
+acknowledgements and closes each share session (the broker then releases
+everything the member still holds; outcomes reach the callback), leaves the
+group, and clears local state.
 
-Share sessions (similar to fetch sessions from KIP-227) track per-broker state with epoch-based sequencing:
+`unsubscribe()` commits (best effort), leaves the group, clears local state and
+takes a fresh member id; the consumer can subscribe again.
 
-- **Epoch 0**: Opens a new session (full fetch)
-- **Epoch 1..N**: Incremental fetches
-- **Epoch -1**: Closes the session
+## Configuration
 
-Sessions are managed automatically. They reset on errors or assignment changes.
+Every option below is a setter on the `kafka.share_consumer(group)` builder.
+Connection settings — client id, security,
+timeouts, metadata — come from the `Kafka` handle; see
+[Configuration](@/docs/configuration.md).
 
-## Concurrent Fetching
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `acknowledgement_mode` | AcknowledgementMode | `Implicit` | `Implicit` or `Explicit` |
+| `acquire_mode` | AcquireMode | `BatchOptimized` | `RecordLimit` makes `max_poll_records` exact (KIP-1206, Kafka 4.2+) |
+| `max_poll_records` | i32 | `500` | Records per `poll()`, and `MaxRecords` of every `ShareFetch` (≥ 1) |
+| `batch_size` | i32 | `500` | Acquisition batch-size hint (`BatchSize`), capped at `max_poll_records` |
+| `fetch_min_bytes` | i32 | `1` | Minimum bytes a broker must have before answering a `ShareFetch` |
+| `fetch_max_bytes` | i32 | `52_428_800` | Maximum bytes one `ShareFetch` response may carry (50 MiB) |
+| `fetch_max_wait` | Duration | `500ms` | How long a broker may hold a `ShareFetch` |
+| `client_rack` | `Option<String>` | `None` | Rack id sent with heartbeats |
+| `max_decompressed_size` | usize | 128 MiB | Decompression-bomb ceiling for record batches |
+| `metrics_push` | bool | `true` | Push KIP-714 client telemetry to brokers that subscribe to it |
 
-Each `poll()` issues ShareFetch requests to all assigned brokers **concurrently** by spawning one Tokio task per broker and awaiting the handles directly. Pending acknowledgements are piggybacked on fetch requests to reduce round trips. If a broker fetch fails, records from other brokers are still returned, the session for the failed broker is reset, and the unsent piggyback acknowledgements are restored for the next commit cycle.
-
-## Coordinator Handling
-
-The share consumer discovers its group coordinator via `FindCoordinator` (key type = GROUP). The coordinator is cached and re-discovered automatically when:
-
-- A heartbeat fails
-- A `NOT_COORDINATOR` error is received
-- `unsubscribe()` or `close()` is called
-
-`subscribe()` retries `NOT_COORDINATOR`, `COORDINATOR_NOT_AVAILABLE` and `COORDINATOR_LOAD_IN_PROGRESS` with backoff (up to five attempts), so a coordinator that is still loading does not fail it.
-
-## Lifecycle
-
-```rust
-// Create
-let consumer = ShareConsumer::builder()
-    .bootstrap_servers("localhost:9092")
-    .group_id("my-group")
-    .build()
-    .await?;
-
-// Subscribe
-consumer.subscribe(&["topic1", "topic2"]).await?;
-
-// Consume (waits up to the timeout, including for the first assignment)
-let records = consumer.poll(Duration::from_secs(1)).await?;
-
-// Unsubscribe (leaves group, generates a new member ID)
-consumer.unsubscribe().await;
-
-// Close (idempotent)
-consumer.close().await?;
-```
-
-### Close Semantics
-
-`close()` is terminal and returns the first cleanup error after local state and connections have still been closed:
-
-1. **Implicit mode**: all pending accept acks are converted to **releases** so acquired records return to the pool for redelivery by other consumers.
-2. **Explicit mode**: pending acks (accept/release/reject) are flushed as-is.
-3. Closes each broker's share session with a final-epoch `ShareAcknowledge` (best-effort, all brokers at once).
-4. Sends and validates a leave-group heartbeat.
-5. Clears all local state and closes connections.
-
-Use `close_with_timeout(duration)` to bound the whole close by `duration`: the ack flush gets `duration / 2`, and session close plus leave-group share the other half, with session close capped at `duration / 4`. A flush or leave that runs out returns `Err(KrafkaError::Timeout)`, but local state and connections are still closed.
-
-### Wakeup & Cancellation
-
-Call `wakeup()` from any thread or task to interrupt an in-progress `poll()` call:
-
-```rust,compile
-// In another task:
-consumer.wakeup();
-
-// poll() returns Err with "wakeup() was called"
-// The consumer remains fully usable for subsequent poll() calls.
-```
-
-`wakeup()` is safe to call concurrently with any other consumer method.
-
-### Unsubscribe Semantics
-
-`unsubscribe()` attempts a best-effort leave-group heartbeat, logs any leave failure internally, clears all partition state (pending acks, sessions, coordinator), and generates a fresh member ID. The consumer can be resubscribed afterwards.
+Builder-only hooks: `key_deserializer` / `value_deserializer` (the same
+`Deserializer` hook as the subscription consumer) and
+`acknowledgement_commit_callback`.
 
 ## Observability
 
-`ShareConsumer::metrics()` returns the same [`ConsumerMetrics`] a classic
-consumer exposes — a share consumer polls, receives, acknowledges and errors in
-the same shapes, so the counters mean the same thing:
-
-```rust,compile
-let m = consumer.metrics();
-println!(
-    "polls={} empty={} records={} bytes={} acks={} errors={}",
-    m.polls.get(),
-    m.empty_polls.get(),
-    m.records_received.get(),
-    m.bytes_received.get(),
-    m.commits.get(),      // acknowledgement flushes
-    m.errors.get(),
-);
-```
-
-`commits` counts successful acknowledgement flushes — the share-group analogue
-of an offset commit. Rebalance, lag and partition gauges stay at zero: the
-coordinator owns assignment, and there is no per-partition position to lag
-behind.
-
-Transport-level counters (connections, requests, throttles) are separate, on
-[`connection_metrics()`](https://docs.rs/krafka/latest/krafka/share_consumer/struct.ShareConsumer.html).
-
-[`ConsumerMetrics`]: https://docs.rs/krafka/latest/krafka/metrics/struct.ConsumerMetrics.html
+`ShareConsumer::metrics()` returns the same `Metrics` snapshot as every
+client. Its `consumer` section counts `polls`, `empty_polls`,
+`records_received`, `bytes_received`, `commits` (a `commit()` whose partitions
+all succeeded) and `errors`; its `connections` section is the shared pool.
+`poll`/`recv` and `commit()` emit the same `poll` and `commit` spans as the
+consumer, and the share consumer pushes KIP-714 telemetry by default — see
+[Metrics](@/docs/metrics.md).
 
 ## Operating a Share Group
 
-A running share group is not the same as an operable one. Reading its
-start offsets, resetting them, and cleaning up after a retired topic are
+Reading, resetting and deleting a share group's start offsets are
 `AdminClient` operations (Kafka 4.2+):
 
 ```rust,compile
 // Lag monitoring — `lag` requires Kafka 4.3 (KIP-1226); older brokers report None.
-let described = admin.describe_share_group_offsets("my-share-group", None).await?;
-for p in &described.partitions {
-    println!("{}-{} start={} lag={:?}", p.topic, p.partition, p.start_offset, p.lag);
+use krafka::admin::TopicPartition;
+
+let described = admin
+    .describe_share_group_offsets("my-share-group", Default::default())
+    .await?;
+for (tp, state) in &described {
+    if let Ok(state) = state {
+        println!("{}-{} start={} lag={:?}", tp.topic, tp.partition, state.start_offset, state.lag);
+    }
 }
 
 // Reset to the beginning. The group must be empty.
 admin
-    .alter_share_group_offsets("my-share-group", &[("my-topic", &[(0, 0)][..])])
+    .alter_share_group_offsets(
+        "my-share-group",
+        [(TopicPartition::new("my-topic", 0), 0)],
+        Default::default(),
+    )
     .await?;
 
 // Drop state for a topic that no longer exists. The group must be empty.
-admin.delete_share_group_offsets("my-share-group", &["retired-topic"]).await?;
+admin
+    .delete_share_group_offsets("my-share-group", ["retired-topic"], Default::default())
+    .await?;
 ```
 
-See [Admin Client → Share Group Offset Administration](@/docs/admin.md) for the full
+See [Admin Client → Share groups](@/docs/admin.md) for the full
 reference.
 
 ## Wire Protocol
 
-The share consumer uses four Kafka APIs (compiled in with the default `share-groups` feature; the wire protocol itself is negotiated on every build):
-
 | API | Key | Versions | Purpose |
 |---|---|---|---|
-| ShareGroupHeartbeat | 76 | v1 | Group membership and assignment |
-| ShareGroupDescribe | 77 | v1 | Describe share group state |
-| ShareFetch | 78 | v1–v2 | Fetch records with acquisition tracking |
-| ShareAcknowledge | 79 | v1–v2 | Acknowledge processed records |
+| ShareGroupHeartbeat | 76 | v1 | Membership and assignment |
+| ShareFetch | 78 | v1–v2 | Fetch records, piggyback acknowledgements; v2 adds `ShareAcquireMode` (KIP-1206) and `IsRenewAck` (KIP-1222) |
+| ShareAcknowledge | 79 | v1–v2 | Acknowledge records; v2 adds `IsRenewAck` |
 
+`AdminClient` describes share groups with ShareGroupDescribe (key 77, v1).
 See the [Protocol Reference](@/docs/protocol.md) for wire format details.
 
 ## Testing a Share Consumer
 
-The `test-broker` feature's in-process broker serves all three share-group data
-APIs at v1, so a share consumer can be tested end to end without a cluster:
-
-```rust
-let broker = FakeBroker::start().await?;
-broker.create_topic("events", 2);
-
-let consumer = ShareConsumer::builder()
-    .bootstrap_servers(broker.bootstrap_servers())
-    .group_id("my-share-group")
-    .acknowledgement_mode(AcknowledgementMode::Explicit)
-    .build()
-    .await?;
-consumer.subscribe(&["events"]).await?;
-
-for record in consumer.poll(Duration::from_millis(200)).await? {
-    consumer.acknowledge(&record, AcknowledgeType::Accept).await?;
-}
-```
-
-It models the share-partition state machine that replaces committed offsets: a
-start offset, an acquisition cursor, and a per-record delivery count. `Accept`
-and `Reject` advance the start offset; `Release` returns the record to the pool
-with a higher delivery count; records left in flight come back when the member
-holding them leaves the group.
-
-It deliberately does **not** model acquisition-lock expiry, the archived state,
-`group.share.delivery.attempts`, or `Renew` (KIP-1222) — which is accepted and
-has no effect, because with no lock timer there is nothing to extend. A test
-that needs any of those needs a real broker. v2 (KIP-1206 `ShareAcquireMode`,
-KIP-1222 renew-ack) is not advertised for the same reason: advertising a version
-whose semantics the fake broker does not implement would make tests pass for the
-wrong reason.
+The `test-broker` feature's in-process broker serves the share-group APIs, so
+a share consumer can be tested without a cluster. It tracks acquired records,
+their holders and delivery counts, and validates share sessions. It does
+**not** model acquisition-lock expiry or `group.share.delivery.count.limit`;
+tests of those need a real broker.

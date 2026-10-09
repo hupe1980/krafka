@@ -1,6 +1,6 @@
 +++
 title = "Metrics"
-description = "Built-in counters, gauges and histograms, and how to export them to Prometheus."
+description = "Each client's metrics snapshot, the Prometheus text format, the spans krafka emits, and KIP-714 client telemetry."
 weight = 100
 
 [extra]
@@ -9,420 +9,300 @@ slug_id = "metrics"
 
 ## Overview
 
-krafka provides built-in metrics collection that is automatically wired into all hot paths:
+krafka reports what its clients do in three ways:
 
-- **Producer metrics**: Records sent, bytes, batches, errors, retries, send latency — recorded in `send()`, `send_to_partition()`, and batch accumulator flush
-- **Consumer metrics**: Records received, polls, fetches, commits, rebalances, seeks, assigned partitions, lag, poll latency — recorded in `poll()`, `commit()`, `seek()`, `seek_many()`, and `close()`
-- **Connection metrics**: Connections created/closed, errors, establishment latency, priority scheduling counters, and broker throttle delays
+- **Metrics.** Every client's `metrics()` returns one owned `Metrics`
+  snapshot. `Kafka::metrics()` sums the clients of a handle, and
+  `Metrics::prometheus_text()` renders a snapshot for a scrape endpoint.
+- **Spans.** The clients emit spans through `tracing`, named and attributed
+  per the OpenTelemetry messaging semantic conventions.
+- **KIP-714 telemetry.** Producers and consumers push their metrics to the
+  brokers when the cluster operator has subscribed to them.
 
-All metrics are lock-free using atomic operations for minimal performance impact. Access metrics via `producer.metrics_handle()`, `consumer.metrics()`, or the connection metric handles exposed by producer, consumer, share-consumer, admin, and connection-pool APIs.
+## Reading a client's metrics
 
-## Pluggable Export
+`metrics()` is synchronous on every client — `Producer`,
+`TransactionalProducer`, `Consumer`, `ShareConsumer` and `AdminClient` — and on
+`Kafka`. It returns the same type everywhere: a `Metrics` value with a
+`producer`, a `consumer` and a `connections` section. The sections a client
+does not use read zero, and `connections` is the pool the client shares with
+every client of its `Kafka` handle.
 
-krafka uses a trait-based export system. Implement `MetricsExporter` to add any
-backend. Built-in exporters:
+```rust,compile
+use krafka::{Kafka, Record};
 
-| Exporter | Format | Dependency |
-|----------|--------|------------|
-| `PrometheusExporter` | Prometheus text exposition | None |
-| `JsonExporter` | JSON array of metric objects | None |
-| `OtlpExporter` | OTLP MetricsData v1 protobuf | `telemetry` feature |
+let kafka = Kafka::builder("localhost:9092").client_id("orders").connect().await?;
+let producer = kafka.producer().build().await?;
+producer.send(Record::new("orders", "v")).await?;
 
-### Custom Exporter
+let metrics = producer.metrics();
+println!(
+    "{} records sent, {} connections opened, mean send latency {:?}",
+    metrics.producer.records_sent,
+    metrics.connections.connections_created,
+    metrics.producer.send_latency.mean(),
+);
+```
 
-```rust
-use krafka::metrics::{MetricsExporter, LatencySnapshot};
+A snapshot is a copy: later activity does not change it. Counters are
+monotonic for a client's lifetime and there is no reset; take two snapshots
+and subtract to get a rate.
 
-struct StatsDExporter { /* ... */ }
+A latency is a `Latency { count, sum, max }`: the number of samples, their
+total and the largest one. `mean()` is `sum / count`, or `None` without
+samples. There are no percentiles; a histogram belongs to the metrics backend
+the snapshot is exported to.
 
-impl MetricsExporter for StatsDExporter {
-    fn export_counter(&mut self, name: &str, _help: &str, value: u64) {
-        // send_udp(format!("{name}:{value}|c"));
+`Kafka::metrics()` adds up the producer and consumer counters of every live
+client built from the handle and counts the shared pool's connections once.
+A dropped client's counters leave the sum. Its `client_id` is `None`.
+
+## Prometheus
+
+`prometheus_text()` renders a snapshot in the Prometheus text exposition
+format under `krafka_*` names. A client's snapshot labels every series with
+`client_id`; the `Kafka` sum carries no client label. Serve the sum. In a web
+framework the handler is `kafka.metrics().prometheus_text()`; with nothing but
+Tokio it is a few lines:
+
+```rust,compile
+use krafka::Kafka;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+
+async fn serve_metrics(kafka: Kafka, addr: &str) -> std::io::Result<()> {
+    let listener = TcpListener::bind(addr).await?;
+    loop {
+        let (mut socket, _) = listener.accept().await?;
+        let body = kafka.metrics().prometheus_text();
+        tokio::spawn(async move {
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/plain; version=0.0.4\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
     }
-    fn export_gauge(&mut self, name: &str, _help: &str, value: u64) {
-        // send_udp(format!("{name}:{value}|g"));
-    }
-    fn export_latency(&mut self, name: &str, _help: &str, snapshot: &LatencySnapshot) {
-        // send_udp(format!("{name}.count:{0}|g", snapshot.count));
-    }
-}
-```
-
-## Basic Usage
-
-Each client type has its own metrics:
-
-```rust,compile
-use krafka::metrics::{ProducerMetrics, ConsumerMetrics, ConnectionMetrics, MetricsVisitable};
-
-let producer_metrics = ProducerMetrics::new();
-let consumer_metrics = ConsumerMetrics::new();
-let connection_metrics = ConnectionMetrics::new();
-
-// Record some metrics
-producer_metrics.record_send(100);
-producer_metrics.send_latency.record(std::time::Duration::from_millis(5));
-
-// Get a snapshot
-let snapshot = producer_metrics.snapshot();
-println!("Records sent: {}", snapshot.records_sent);
-println!("Bytes sent: {}", snapshot.bytes_sent);
-```
-
-## Prometheus Export
-
-```rust,compile
-use krafka::metrics::{ProducerMetrics, MetricsVisitable};
-
-let metrics = ProducerMetrics::new();
-metrics.record_send(100);
-metrics.record_batch(5);
-
-// Export in Prometheus text format (convenience method)
-let prometheus_output = metrics.to_prometheus_text("krafka_producer");
-println!("{}", prometheus_output);
-```
-
-Or use the exporter directly:
-
-```rust,compile
-use krafka::metrics::{ProducerMetrics, PrometheusExporter, MetricsVisitable};
-
-let metrics = ProducerMetrics::new();
-let mut exporter = PrometheusExporter::new();
-metrics.export_metrics("krafka_producer", &mut exporter);
-let output = exporter.finish();
-```
-
-## JSON Export
-
-```rust
-use krafka::metrics::{ProducerMetrics, JsonExporter, MetricsVisitable};
-
-let metrics = ProducerMetrics::new();
-metrics.record_send(100);
-
-let mut exporter = JsonExporter::new();
-metrics.export_metrics("krafka_producer", &mut exporter);
-let json = exporter.finish();
-// [{"name":"krafka_producer_records_sent","type":"counter","help":"Total records sent","value":1}, ...]
-```
-
-## Aggregated Metrics
-
-Use `KrafkaMetrics` to collect and export all metrics from multiple components:
-
-```rust,compile
-use std::sync::Arc;
-use krafka::metrics::KrafkaMetrics;
-
-let metrics = KrafkaMetrics::new();
-
-// Get shared metrics handles for your clients
-let producer_metrics = metrics.producer_metrics();
-let consumer_metrics = metrics.consumer_metrics();
-let connection_metrics = metrics.connection_metrics();
-
-// Record metrics during operations
-producer_metrics.record_send(100);
-consumer_metrics.record_poll(5);
-
-// Export all metrics in a single call
-let all_metrics = metrics.to_prometheus_text();
-println!("{}", all_metrics);
-
-// Export as JSON
-let json = metrics.to_json();
-
-// Use a custom exporter
-use krafka::metrics::PrometheusExporter;
-let mut exporter = PrometheusExporter::new();
-metrics.export_all(&mut exporter);
-let output = exporter.finish();
-
-// Reset all metrics (e.g., after scrape)
-metrics.reset();
-```
-
-## HTTP Metrics Endpoint
-
-For production use, expose metrics via HTTP:
-
-```rust,compile
-use std::sync::Arc;
-use krafka::metrics::KrafkaMetrics;
-
-// Create shared metrics registry
-let metrics = Arc::new(KrafkaMetrics::new());
-
-// In your HTTP server handler (pseudo-code):
-async fn metrics_handler(metrics: Arc<KrafkaMetrics>) -> String {
-    metrics.to_prometheus_text()
-}
-```
-
-Example with Axum:
-
-```rust
-use axum::{routing::get, Router, Extension};
-use std::sync::Arc;
-use krafka::metrics::KrafkaMetrics;
-
-async fn metrics_handler(Extension(metrics): Extension<Arc<KrafkaMetrics>>) -> String {
-    metrics.to_prometheus_text()
 }
 
-#[tokio::main]
-async fn main() {
-    let metrics = Arc::new(KrafkaMetrics::new());
-    
-    let app = Router::new()
-        .route("/metrics", get(metrics_handler))
-        .layer(Extension(metrics.clone()));
-    
-    // Use metrics.producer_metrics() etc. with your Kafka clients
-}
+// Scrape http://<host>:9464/metrics.
+tokio::spawn(serve_metrics(kafka.clone(), "0.0.0.0:9464"));
 ```
 
-## Available Metrics
+Every client of one handle shares its `client_id`, so rendering two clients
+of one handle into one scrape produces duplicate series. Scrape
+`Kafka::metrics()`, or give separate handles distinct `client_id`s.
 
-### Producer Metrics
+The snapshot's fields are public, so any other format — StatsD, JSON, an
+OpenTelemetry meter — is a function of the snapshot in the application.
 
-| Metric | Type | Description |
-|--------|------|-------------|
-| `records_sent_total` | Counter | Total records sent successfully |
-| `bytes_sent_total` | Counter | Total bytes sent (record values) |
-| `batches_sent_total` | Counter | Total batches sent |
-| `errors_total` | Counter | Total send errors |
-| `retries_total` | Counter | Total retry attempts |
-| `compressed_bytes_total` | Counter | Total compressed bytes written for compressed batches |
-| `uncompressed_bytes_total` | Counter | Total uncompressed bytes for the same compressed batches |
-| `connections` | Gauge | Current active connections |
-| `buffered_records` | Gauge | Producer records currently admitted under the memory budget |
-| `send_latency_seconds` | Summary | Send latency statistics |
-| `topic_records_sent_total{topic="<name>"}` | Counter | Records sent to a specific topic (per-topic label) |
-| `topic_bytes_sent_total{topic="<name>"}` | Counter | Bytes sent to a specific topic (per-topic label) |
-| `topic_errors_total{topic="<name>"}` | Counter | Send errors for a specific topic (per-topic label) |
-
-Per-topic metrics use Prometheus labels. Example PromQL queries:
+Latencies are summaries (`_seconds_sum`, `_seconds_count`) with a `_max_seconds`
+gauge beside each:
 
 ```promql
-# Records sent per topic (rate over 5 min)
-rate(krafka_producer_topic_records_sent_total[5m])
-
-# Errors for a specific topic
-krafka_producer_topic_errors_total{topic="orders"}
+# Mean send latency over 5 minutes
+rate(krafka_producer_send_latency_seconds_sum[5m])
+  / rate(krafka_producer_send_latency_seconds_count[5m])
 ```
 
-`compression_ratio_avg` is available as a derived field in `ProducerMetricsSnapshot` (computed as `compressed_bytes / uncompressed_bytes`). A value of 0.3 means the codec reduced data to 30% of original size. The field is `None` when no compressed batches have been sent.
+### Producer
 
-### Consumer Metrics
+| Prometheus name | KIP-714 name (`org.apache.kafka.producer.`…) | Type | Description |
+|---|---|---|---|
+| `krafka_producer_records_sent_total` | `record.send.total` | counter | Records the broker acknowledged |
+| `krafka_producer_bytes_sent_total` | `record.byte.total` | counter | Estimated bytes of the acknowledged records |
+| `krafka_producer_batches_sent_total` | `batch.send.total` | counter | Batches the broker acknowledged |
+| `krafka_producer_errors_total` | `batch.error.total` | counter | Batches that failed with a terminal error |
+| `krafka_producer_retries_total` | `batch.retry.total` | counter | Batch retries |
+| `krafka_producer_data_loss_detected_total` | `data.loss.detected.total` | counter | Batches the broker reported lost |
+| `krafka_producer_compressed_bytes_total` | `batch.compressed.byte.total` | counter | Estimated encoded bytes of compressed batches |
+| `krafka_producer_uncompressed_bytes_total` | `batch.uncompressed.byte.total` | counter | The same batches before compression |
+| `krafka_producer_buffered_records` | `buffered.records` | gauge | Records held under `buffer_memory` |
+| `krafka_producer_send_latency_seconds` | `record.send.latency.avg`/`.max` (ms) | summary | First record of a batch to its acknowledgement |
+| `krafka_producer_topic_records_sent_total{topic}` | — | counter | Per topic |
+| `krafka_producer_topic_bytes_sent_total{topic}` | — | counter | Per topic |
+| `krafka_producer_topic_errors_total{topic}` | — | counter | Per topic |
 
-| Metric | Type | Description |
-|--------|------|-------------|
-| `records_received_total` | Counter | Total records received |
-| `bytes_received_total` | Counter | Total bytes received |
-| `fetches_total` | Counter | Total fetch requests |
-| `polls_total` | Counter | Total poll operations |
-| `empty_polls_total` | Counter | Polls that returned no records |
-| `commits_total` | Counter | Total offset commits |
-| `errors_total` | Counter | Total errors |
-| `rebalances_total` | Counter | Total rebalance operations |
-| `seeks_total` | Counter | Total seek operations (seek + seek_many partition count) |
-| `batch_decode_errors_total` | Counter | Corrupt record batches (CRC mismatch, bad magic, out-of-range field) |
-| `lag` | Gauge | Total consumer lag across all assigned partitions |
-| `lag_max` | Gauge | Maximum per-partition consumer lag |
-| `assigned_partitions` | Gauge | Currently assigned partitions |
-| `paused_partitions` | Gauge | Currently paused partitions |
-| `buffered_records` | Gauge | Currently buffered records in recv() buffer |
-| `poll_latency_seconds` | Summary | Poll latency statistics |
-| `fetch_latency_seconds` | Summary | Fetch latency statistics |
+At most 1000 topics get their own series; the rest are folded into
+`topic="__other__"`. `ProducerMetrics::compression_ratio()` is
+`compressed / uncompressed`.
 
-**Alert on `batch_decode_errors_total`.** It counts record batches that failed
-to decode because the bytes were corrupt — not batches cut short by the fetch
-size limit, which are expected and re-requested on the next fetch. A partition
-whose batch at the current position will not decode cannot advance, so `poll()`
-returns the decode error rather than stalling silently; every increment is
-accompanied by a `warn!` naming the topic, partition and offset.
+### Consumer and share consumer
 
-### Connection Metrics
+| Prometheus name | KIP-714 name (`org.apache.kafka.consumer.`…) | Type | Description |
+|---|---|---|---|
+| `krafka_consumer_records_received_total` | `fetch.manager.records.consumed.total` | counter | Records handed to the application |
+| `krafka_consumer_bytes_received_total` | `fetch.manager.bytes.consumed.total` | counter | Value bytes handed to the application |
+| `krafka_consumer_fetches_total` | `fetch.manager.fetch.total` | counter | Fetch requests |
+| `krafka_consumer_polls_total` | `poll.total` | counter | `poll`/`recv` rounds |
+| `krafka_consumer_empty_polls_total` | `poll.empty.total` | counter | Rounds that returned nothing |
+| `krafka_consumer_commits_total` | `coordinator.commit.total` | counter | Offset or acknowledgement commits |
+| `krafka_consumer_errors_total` | `error.total` | counter | Errors returned from `poll`/`recv` |
+| `krafka_consumer_rebalances_total` | `coordinator.rebalance.total` | counter | Assignment changes applied |
+| `krafka_consumer_seeks_total` | `seek.total` | counter | Partitions repositioned |
+| `krafka_consumer_batch_decode_errors_total` | `fetch.manager.batch.decode.error.total` | counter | Corrupt record batches |
+| `krafka_consumer_lag` | `fetch.manager.records.lag.total` | gauge | Records behind, summed over assigned partitions |
+| `krafka_consumer_lag_max` | `fetch.manager.records.lag.max` | gauge | Largest per-partition lag |
+| `krafka_consumer_assigned_partitions` | `coordinator.assigned.partitions` | gauge | Assigned partitions |
+| `krafka_consumer_paused_partitions` | `paused.partitions` | gauge | Paused partitions |
+| `krafka_consumer_buffered_records` | `buffered.records` | gauge | Fetched, not yet handed out |
+| `krafka_consumer_poll_latency_seconds` | `poll.latency.avg`/`.max` (ms) | summary | `poll` rounds |
+| `krafka_consumer_fetch_latency_seconds` | `fetch.manager.fetch.latency.avg`/`.max` (ms) | summary | Fetch round trips |
 
-| Metric | Type | Description |
-|--------|------|-------------|
-| `connections_created_total` | Counter | Total connections created |
-| `connections_closed_total` | Counter | Total connections closed |
-| `connection_errors_total` | Counter | Connection errors |
-| `high_priority_requests_total` | Counter | High-priority requests sent |
-| `normal_priority_requests_total` | Counter | Normal-priority requests sent |
-| `high_priority_bypasses_total` | Counter | High-priority requests processed ahead of normal-priority work |
-| `high_priority_bypass_yields_total` | Counter | Forced normal-priority drain steps after exhausting the high-priority bypass budget |
-| `throttle_delays_total` | Counter | Normal-priority requests delayed due to broker throttling |
-| `throttle_delay_ms_total` | Counter | Total broker-throttle delay applied to normal-priority requests, in milliseconds |
-| `stalled_connections_total` | Counter | Connections closed because a timed-out request was never answered |
-| `active_connections` | Gauge | Current active connections |
-| `connect_latency_seconds` | Summary | Connection establishment latency |
-| `tls_handshake_latency_seconds` | Summary | TLS handshake latency (populated for TLS connections only) |
-| `oauth_token_fetches_total` | Counter | SASL/OAUTHBEARER token fetches attempted |
-| `oauth_token_fetch_failures_total` | Counter | SASL/OAUTHBEARER token fetches that returned an error |
-| `oauth_token_fetch_latency_seconds` | Summary | Token fetch latency (successful fetches only) |
-| `oauth_token_expiry_epoch_ms` | Gauge | Expiry of the cached token, ms since the Unix epoch (`0` = unknown) |
+**Alert on `krafka_consumer_batch_decode_errors_total`.** It counts batches
+whose bytes are corrupt — not batches cut short by the fetch size, which are
+re-requested. A partition whose batch will not decode cannot advance; `poll()`
+returns the error, and every increment logs a `warn!` naming the topic,
+partition and offset.
 
-#### OAUTHBEARER token lifecycle
+Under `read_committed`, lag is measured against the last stable offset.
 
-The four `oauth_*` metrics are populated only when the client authenticates with
-an OAUTHBEARER **provider** — a static token is never fetched. They cover both
-the on-connect resolution and the background proactive refresh; the cached reads
-in between are not fetches and are not counted.
+### Connections
 
-They exist because a misconfigured `token_endpoint` is otherwise
-indistinguishable from an unreachable broker: the provider is called per
-connection, so the OAuth round trip fails, the connection fails, and nothing
-names the identity provider as the cause. Every failed fetch also emits a
-`tracing` event at `WARN`, so the signal is available without a metrics
-pipeline.
+| Prometheus name | KIP-714 name (`org.apache.kafka.<client>.`…) | Type | Description |
+|---|---|---|---|
+| `krafka_connections_created_total` | `connection.creation.total` | counter | Connections opened |
+| `krafka_connections_closed_total` | `connection.close.total` | counter | Connections closed |
+| `krafka_connection_errors_total` | `connection.error.total` | counter | Connections that failed |
+| `krafka_connections_active` | `connection.count` | gauge | Connections open now |
+| `krafka_throttle_delays_total` | `throttle.delay.total` | counter | Requests held back by a broker throttle (KIP-219) |
+| `krafka_throttle_delay_ms_total` | `throttle.delay.ms.total` | counter | Milliseconds held back |
+| `krafka_connections_stalled_total` | `connection.stalled.total` | counter | Connections closed on a request timeout |
+| `krafka_coordination_fallbacks_total` | `coordination.fallback.total` | counter | Coordination requests sent on the data connection at the connection cap |
+| `krafka_tls_handshake_latency_seconds` | `tls.handshake.latency.avg`/`.max` (ms) | summary | TLS handshakes |
+| `krafka_oauth_token_fetches_total` | `oauth.token.fetch.total` | counter | OAUTHBEARER token fetches |
+| `krafka_oauth_token_fetch_failures_total` | `oauth.token.fetch.failure.total` | counter | Fetches that failed |
+| `krafka_oauth_token_fetch_latency_seconds` | `oauth.token.fetch.latency.avg`/`.max` (ms) | summary | Successful fetches |
+| `krafka_oauth_token_expiry_epoch_ms` | `oauth.token.expiry.epoch.ms` | gauge | Cached token expiry; `0` when unknown |
+
+The `oauth_*` metrics are populated only with an OAUTHBEARER token
+**provider**. They make a misconfigured `token_endpoint` visible: without them
+it looks like an unreachable broker. A failed fetch counts in both
+`oauth_token_fetches_total` and `oauth_token_fetch_failures_total` and leaves
+the expiry alone.
 
 ```promql
-# Is the identity provider healthy?
-rate(krafka_connection_oauth_token_fetch_failures_total[5m]) > 0
-
-# How long until the cached token expires?
-(krafka_connection_oauth_token_expiry_epoch_ms / 1000) - time()
+rate(krafka_oauth_token_fetch_failures_total[5m]) > 0
+(krafka_oauth_token_expiry_epoch_ms / 1000) - time()
 ```
 
-A failed fetch increments `oauth_token_fetches_total` **and**
-`oauth_token_fetch_failures_total`, and leaves `oauth_token_expiry_epoch_ms`
-alone — the previously fetched token may still be valid, and zeroing it would
-make one transient blip look like a total loss of credentials.
+## Spans
 
-## Latency Tracking
+The clients emit spans through `tracing`, following OpenTelemetry semantic
+conventions **v1.44.0** (`krafka::OTEL_SEMCONV_VERSION`). The messaging
+conventions are still marked *Development* there; krafka follows one named
+version and moves to a newer one as a breaking change.
 
-The `LatencyTracker` provides detailed latency statistics:
+| Span | When | `otel.kind` | `messaging.operation.type` |
+|---|---|---|---|
+| `send {topic}` | One per record, from `send`/`enqueue` to the record's outcome, across retries | `producer` | `send` |
+| `poll {topic}` | One per `poll`/`recv` of a consumer or share consumer | `client` | `receive` |
+| `commit {topic}` | One per offset commit (auto-commit included) or share `commit()` | `client` | `settle` |
+| `rebalance {group}` | One per assignment change, classic or KIP-848 | `internal` | — |
 
-> **Accuracy note — percentile estimates:** `LatencyTracker` uses a 512-bucket
-> histogram (8 equal sub-buckets per power-of-2 band). The percentile estimate is
-> the midpoint of the matching sub-bucket, giving a **maximum relative error of
-> ≤ 6.25 %** per sub-bucket. In practice:
->
-> | True p99        | Sub-bucket width | Max error |
-> |-----------------|-----------------|----------|
-> | 1 ms – 2 ms     | 125 µs          | 6.25 %   |
-> | 8 ms – 16 ms    | 1 ms            | 6.25 %   |
-> | 64 ms – 128 ms  | 8 ms            | 6.25 %   |
->
-> This is suitable for p99 SLO alerting with a threshold tolerance of ≥ 8 %.
-> For sub-millisecond or tighter requirements, use the OTLP exporter
-> and aggregate into an HDR histogram or T-Digest in your observability backend.
+The topic is left out of a `poll` or `commit` name when more than one topic
+applies. There is no `process` span: krafka hands records to the application
+and does not run its processing.
 
-```rust
-use krafka::metrics::LatencyTracker;
+Attributes: `messaging.system` (`kafka`), `messaging.operation.name`,
+`messaging.operation.type`, `messaging.destination.name`,
+`messaging.destination.partition.id` (a string), `messaging.kafka.offset`
+(once acknowledged), `messaging.kafka.message.tombstone` (tombstones only),
+`messaging.consumer.group.name`, `messaging.client.id`,
+`messaging.batch.message_count` (records a `poll` returned), and `error.type`
+with `otel.status_code = error` on failure. `error.type` is the Kafka error
+name where the broker sent one (`INVALID_RECORD`), otherwise krafka's error
+kind (`delivery_timeout`, `closed`). krafka's own attributes are under
+`krafka.*`: `krafka.message.key.size`, and on `rebalance` the protocol,
+generation, and the partitions assigned, revoked and held.
+
+Record keys and values are never recorded, and neither is anything derived
+from a key but its size.
+
+The span name and kind travel in the `otel.name` and `otel.kind` fields, which
+the `tracing-opentelemetry` bridge reads. krafka depends on no OpenTelemetry
+crate (`just no-otel` checks the dependency graph); the subscriber, the bridge
+and the SDK belong to the application. Without a subscriber interested in the
+`krafka` targets no span is constructed, so the cost is one callsite check per
+operation. To drop krafka's spans, filter its targets in the subscriber — for
+example `EnvFilter::new("info,krafka=warn")` with `tracing-subscriber`.
+
+The spans are at `INFO` level, under the targets `krafka::producer` and
+`krafka::consumer`. To see them without an OpenTelemetry pipeline, log each
+one when it closes:
+
+```rust,compile
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::format::FmtSpan;
+
+let filter = EnvFilter::new("warn,krafka=info");
+tracing_subscriber::fmt().with_env_filter(filter).with_span_events(FmtSpan::CLOSE).init();
+```
+
+To export them, add the `tracing-opentelemetry` layer to the subscriber with
+the application's OpenTelemetry tracer.
+
+## KIP-714 client telemetry
+
+Every client can push its metrics to the brokers, as Java clients do with
+`enable.metrics.push`. A client asks a broker for its subscription
+(`GetTelemetrySubscriptions`), pushes the subscribed metrics of its `Metrics`
+snapshot as OTLP at the interval the broker sets (`PushTelemetry`), and sends
+one last push marked `terminating` when it closes, within the close timeout.
+
+| Client | Default |
+|---|---|
+| `Producer`, `TransactionalProducer` | on |
+| `Consumer`, `ShareConsumer` | on |
+| `AdminClient` | off |
+
+The switch is `metrics_push` on every role builder:
+
+```rust,compile
+use krafka::Kafka;
+
+let kafka = Kafka::builder("localhost:9092").connect().await?;
+let producer = kafka.producer().metrics_push(false).build().await?;
+let consumer = kafka.consumer("my-group").metrics_push(false).build().await?;
+let admin = kafka.admin().metrics_push(true);
+```
+
+With the switch off a client never sends API key 71 or 72. With it on,
+nothing is sent to a cluster without a client-telemetry plugin: such a broker
+does not advertise the two APIs, and the reporter stops at once, logging only
+at `debug`. A subscription that requests no metrics is re-polled once per push
+interval and never pushed to.
+
+Pushed names are `org.apache.kafka.<client type>.<metric>` with
+`producer`, `consumer` (the share consumer too) or `admin` as the client type —
+the KIP-714 names in the tables above, Java's where Java has the same metric.
+A subscription prefix such as `org.apache.kafka.producer.` selects them.
+Latencies are pushed as `.avg` and `.max` in milliseconds.
+
+The broker-assigned client instance id lets an operator find a client's
+metrics:
+
+```rust,compile
 use std::time::Duration;
+use krafka::Kafka;
 
-let tracker = LatencyTracker::new();
-
-// Manual recording
-tracker.record(Duration::from_millis(50));
-tracker.record(Duration::from_millis(100));
-
-// Or use guard for automatic timing
-{
-    let _guard = tracker.start();
-    // ... operation being timed ...
-} // Guard records latency when dropped
-
-// Get statistics
-println!("Count: {}", tracker.count());
-println!("Min: {:?}", tracker.min());
-println!("Max: {:?}", tracker.max());
-println!("Avg: {:?}", tracker.avg());
-println!("Sum: {:?}", tracker.sum());
-
-// Get immutable snapshot
-let snapshot = tracker.snapshot();
-```
-
-## Integration with OpenTelemetry
-
-### Built-in OTLP Export (feature `telemetry`)
-
-Enable the `telemetry` feature for native OTLP protobuf export and KIP-714 broker telemetry:
-
-```sh
-cargo add krafka --features telemetry
-```
-
-Export metrics as OTLP protobuf bytes for ingestion by any OTLP-compatible backend:
-
-```rust
-use krafka::telemetry::otlp::OtlpExporter;
-use krafka::metrics::{KrafkaMetrics, MetricsVisitable};
-
-let metrics = KrafkaMetrics::new();
-// ... record metrics ...
-
-let mut exporter = OtlpExporter::new(true, 0); // delta temporality
-exporter.add_resource_attribute("service.name", "my-service");
-metrics.export_all(&mut exporter);
-let otlp_bytes: Vec<u8> = exporter.finish();
-// Send otlp_bytes to your OTLP receiver via gRPC or HTTP
-```
-
-### KIP-714 Automatic Telemetry
-
-The `TelemetryReporter` implements KIP-714 client telemetry — it subscribes to the
-broker's telemetry endpoint and pushes metric snapshots on the broker-specified interval:
-
-```rust
-use krafka::telemetry::reporter::{TelemetryReporter, TelemetryConfig};
-
-let config = TelemetryConfig {
-    enabled: true,
-    metrics_prefix: "krafka".into(),
-    resource_attributes: vec![
-        ("service.name".into(), "my-app".into()),
-    ],
-};
-
-let reporter = TelemetryReporter::new(connection, krafka_metrics, config, shutdown_rx);
-tokio::spawn(reporter.run());
-```
-
-The reporter handles subscription polling, push interval jitter, local OTLP payload
-chunking under the broker's `TelemetryMaxBytes` limit, re-subscription on
-`UNKNOWN_SUBSCRIPTION_ID` or unsplittable oversized metrics, and a graceful terminating
-push on shutdown. When the broker advertises accepted compression codecs, the reporter
-tries them in broker preference order, skips locally unavailable codecs after the first
-failure, and only uses uncompressed payloads when the broker explicitly advertises
-`Compression::None`; otherwise the reporter stops if none of the advertised codecs is
-locally usable. If a multi-chunk push is only partially accepted, the reporter commits
-delta baselines for the accepted chunks and retries the exact remaining chunk slice on the
-next interval.
-
-### Manual Bridge to External OTel SDKs
-
-You can also bridge metrics to an external OpenTelemetry SDK using snapshots or a custom exporter:
-
-```rust,compile
-use krafka::metrics::{KrafkaMetrics, ProducerMetricsSnapshot};
-
-fn export_to_otel(snapshot: &ProducerMetricsSnapshot) {
-    // Use your OpenTelemetry SDK to record metrics
-    // meter.create_counter("krafka.records_sent").add(snapshot.records_sent);
+let kafka = Kafka::builder("localhost:9092").connect().await?;
+let producer = kafka.producer().build().await?;
+match producer.client_instance_id(Duration::from_secs(5)).await? {
+    Some(id) => println!("client instance id {id}"),
+    None => println!("the cluster does not support client telemetry"),
 }
 ```
 
-## Performance Considerations
-
-- All metrics use atomic operations (lock-free)
-- Counter increments use `Ordering::Relaxed` for minimal overhead
-- Latency tracking uses compare-and-swap for min/max updates
-- Gauge updates are immediate (no aggregation)
-- Gauge `dec()` saturates at zero (will not underflow below 0), ensuring correctness for connection and partition counting. Every underflow emits a `warn!` log with a cumulative `underflow_count` field so that miscounted inc/dec pairs surface immediately rather than silently inflating counters
-- Prometheus and JSON export only happen on request (pull-based)
-- OTLP protobuf encoding is zero-copy where possible; no external protobuf dependency
-- KIP-714 telemetry push runs on a background task with broker-controlled intervals
+It fails with `KrafkaError::IllegalState` when `metrics_push` is off and with
+`KrafkaError::Timeout` when no broker answers in time.
 
 ## Next Steps
 
-- [Producer Guide](@/docs/producer.md) - Configure producer metrics
-- [Consumer Guide](@/docs/consumer.md) - Configure consumer metrics
-- [Configuration Reference](@/docs/configuration.md) - All configuration options
+- [Producer Guide](@/docs/producer.md)
+- [Consumer Guide](@/docs/consumer.md)
+- [Interceptors](@/docs/interceptors.md) — per-record context from `on_send` to its outcome
+- [Configuration Reference](@/docs/configuration.md)

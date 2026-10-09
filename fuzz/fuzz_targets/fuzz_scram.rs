@@ -2,24 +2,21 @@
 
 use libfuzzer_sys::fuzz_target;
 
-use krafka::auth::scram::{ChannelBinding, ScramClient, ScramMechanism};
+use krafka::__private::scram::{ScramClient, ScramMechanism};
 
 fuzz_target!(|data: &[u8]| {
-    if data.is_empty() {
+    let [selector, server_first @ ..] = data else {
         return;
-    }
-
-    // Use the first byte to pick mechanism and channel binding variant.
-    let mechanism = if data[0] & 1 == 0 {
+    };
+    let mechanism = if selector & 1 == 0 {
         ScramMechanism::Sha256
     } else {
         ScramMechanism::Sha512
     };
 
-    // Build a client and exercise `process_server_first` with arbitrary input.
-    // The client-first message is deterministic (uses a fixed nonce-like username)
-    // so we only need to fuzz the server-first parsing path.
-    let mut client = ScramClient::new("u", "p", mechanism, ChannelBinding::None);
+    // The server-first message is parsed before authentication completes, so
+    // it is untrusted input from whatever answered the connection.
+    let mut client = ScramClient::new("u", "p", mechanism);
     let _ = client.client_first_message();
-    let _ = client.process_server_first(&data[1..]);
+    let _ = client.process_server_first(server_first);
 });

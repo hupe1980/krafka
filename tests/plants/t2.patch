@@ -1,0 +1,12 @@
+diff -ruN a/src/producer/transaction.rs b/src/producer/transaction.rs
+--- a/src/producer/transaction.rs
++++ b/src/producer/transaction.rs
+@@ -1941,7 +1941,7 @@
+                 ending.disarm();
+                 if self.state() == TransactionState::Fatal {
+                     warn!("Transaction commit failed (fatal): {error}");
+-                } else if unanswered || entered == TransactionState::CommitUnknown {
++                } else if entered == TransactionState::CommitUnknown {
+                     let _ = self.gate.transition(
+                         &[TransactionState::Committing],
+                         TransactionState::CommitUnknown,

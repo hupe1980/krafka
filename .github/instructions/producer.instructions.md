@@ -49,9 +49,9 @@ Adding state to `Producer` → verify it is drained or cleaned up in steps 1–4
 - Sequence numbers wrap at `i32::MAX` → 0; guarantees hold only within one PID epoch
 - `PendingAddGuard` prevents race in `AddPartitionsToTxn`; don't drop it before the RPC completes
 
-## Partitioner Atomics
+## Partitioner
 
-`StickyPartitioner::next_partition` uses `fetch_add` (not load+store) to avoid races under concurrent sends.
+The default (keyed murmur2, sticky keyless) is internal. A custom `Partitioner`'s answer is range-checked in `resolve_partition` before the record is accepted.
 
 ## Idempotent Producer
 

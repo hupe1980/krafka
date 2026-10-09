@@ -15,20 +15,25 @@ type RecvFuture<'a> = Pin<Box<dyn Future<Output = Result<Option<ConsumerRecord>>
 
 /// An async `Stream` that yields individual records from a [`ShareConsumer`].
 ///
-/// Created by [`ShareConsumer::stream()`]. Each call to `poll_next` drives
-/// the consumer's `recv()` method, which internally calls `poll()` when the
-/// internal buffer is empty.
+/// Created by [`ShareConsumer::stream()`]. Each item is one
+/// [`recv()`](ShareConsumer::recv).
 ///
 /// The stream ends **only** when the consumer is closed. An idle topic makes
 /// the stream pend rather than terminate, so a
 /// `while let Some(record) = stream.next().await` loop keeps running across
 /// quiet periods.
 ///
-/// Dropping the stream mid-poll is safe: acknowledgements drained by the
-/// in-flight `poll()` are re-queued rather than lost.
+/// Dropping the stream mid-poll loses nothing: buffered records stay
+/// buffered for the next `recv()`.
 ///
 /// This type also implements [`FusedStream`], so stream combinators such as
 /// `futures::stream::select` can detect termination without an extra poll.
+///
+/// # Cancel safety
+///
+/// This type is cancel safe. Each item comes from [`ShareConsumer::recv`]:
+/// dropping the stream, or a pending `next()`, returns nothing and accepts
+/// nothing.
 pub struct ShareConsumerStream<'a> {
     consumer: &'a ShareConsumer,
     fut: Option<RecvFuture<'a>>,

@@ -1,6 +1,15 @@
 //! Error types for Krafka.
 //!
-//! This module provides structured error types for all Krafka operations.
+//! Every fallible operation returns [`KrafkaError`]. Three predicates answer
+//! what to do next without matching on variants:
+//!
+//! | Predicate | Meaning |
+//! |-----------|---------|
+//! | [`is_retriable`](KrafkaError::is_retriable) | The same operation may succeed if tried again. |
+//! | [`requires_abort`](KrafkaError::requires_abort) | The open transaction must be aborted; the producer stays usable. |
+//! | [`is_fatal`](KrafkaError::is_fatal) | The client cannot continue; build a new one. |
+//!
+//! `requires_abort` and `is_fatal` are never both true.
 
 use std::fmt;
 use std::io;
@@ -41,9 +50,10 @@ impl std::error::Error for ArcError {
 
 /// The main error type for Krafka operations.
 #[non_exhaustive]
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum KrafkaError {
-    /// Network-related errors (connection, I/O).
+    /// Network-related errors: connecting, I/O, a broker that is not
+    /// reachable or not known. Retriable.
     ///
     /// Wrapped in `Arc` so that cloning preserves the full error chain
     /// (including `raw_os_error()` and `source()`).
@@ -63,18 +73,35 @@ pub enum KrafkaError {
         message: String,
     },
 
-    /// Authentication errors.
+    /// Authentication failed: SASL, a TLS certificate the client rejected or
+    /// that rejected the client, or the OIDC token endpoint. Fatal.
     #[error("authentication error: {message}")]
     Auth {
         /// Error message describing the authentication failure.
         message: String,
+        /// Underlying cause, if any (TLS error, token-endpoint response, …).
+        #[source]
+        source: Option<ArcError>,
     },
 
-    /// Timeout errors.
+    /// An operation did not complete within its time bound. Retriable.
     #[error("operation timed out: {operation}")]
     Timeout {
         /// The operation that timed out.
         operation: String,
+    },
+
+    /// A record was not acknowledged within `delivery_timeout`.
+    ///
+    /// `possibly_written` is `true` when a produce request carrying the record
+    /// reached the wire: the broker may have appended it, so resending can
+    /// duplicate it. When `false`, the record never left the client.
+    #[error("delivery timed out (possibly written: {possibly_written}): {message}")]
+    DeliveryTimeout {
+        /// Whether the broker may have appended the record.
+        possibly_written: bool,
+        /// Human-readable detail, including the last error seen.
+        message: String,
     },
 
     /// Broker errors returned by Kafka.
@@ -97,13 +124,6 @@ pub enum KrafkaError {
     #[error("compression error: {message}")]
     Compression {
         /// Error message describing the compression failure.
-        message: String,
-    },
-
-    /// Invalid state errors.
-    #[error("invalid state: {message}")]
-    InvalidState {
-        /// Error message describing the invalid state.
         message: String,
     },
 
@@ -150,70 +170,76 @@ pub enum KrafkaError {
         message: String,
     },
 
-    /// Schema registry errors.
-    ///
-    /// The `source` field preserves the underlying transport or decode error
-    /// chain so callers can distinguish a connection timeout from a 404 or a
-    /// 5xx without parsing the message string.
-    #[error("http error: {message}")]
-    Http {
-        /// Human-readable error message.
+    /// The client, or the component the call needed, has been closed. Fatal.
+    #[error("closed: {message}")]
+    Closed {
+        /// What was closed.
         message: String,
-        /// Underlying cause, if any (connection error, HTTP decode failure, etc.).
-        #[source]
-        source: Option<ArcError>,
+    },
+
+    /// A blocking consumer call was interrupted by `wakeup()`.
+    #[error("wakeup() was called")]
+    Wakeup,
+
+    /// Another producer with the same identity took over; this one is
+    /// fenced. Fatal: build a new producer.
+    #[error("fenced: {message}")]
+    Fenced {
+        /// Human-readable detail.
+        message: String,
+    },
+
+    /// The open transaction cannot commit and must be aborted. The producer
+    /// stays usable after `abort()`.
+    #[error("transaction must be aborted: {message}")]
+    TransactionAbortable {
+        /// Human-readable detail.
+        message: String,
+    },
+
+    /// Partitions have no committed offset and the reset policy is `None`.
+    ///
+    /// Equivalent to the Java client's `NoOffsetForPartitionException`.
+    #[error("no offset and no reset policy for {}", format_partitions(partitions))]
+    NoOffset {
+        /// The partitions without a position.
+        partitions: Vec<(String, crate::PartitionId)>,
+    },
+
+    /// The topic does not exist, or the client has no metadata for it.
+    #[error("unknown topic: {topic}")]
+    UnknownTopic {
+        /// The topic name.
+        topic: String,
+    },
+
+    /// The broker rejected a batch's sequence number: an earlier batch of the
+    /// same partition was lost.
+    #[error("out-of-order sequence on {topic}-{partition}: {message}")]
+    OutOfOrderSequence {
+        /// Topic of the rejected batch.
+        topic: String,
+        /// Partition of the rejected batch.
+        partition: crate::PartitionId,
+        /// Human-readable detail.
+        message: String,
+    },
+
+    /// The call is not valid in the client's current state (for example
+    /// `send` before `begin`), or an internal invariant broke.
+    #[error("illegal state: {message}")]
+    IllegalState {
+        /// Human-readable detail.
+        message: String,
     },
 }
 
-impl Clone for KrafkaError {
-    fn clone(&self) -> Self {
-        match self {
-            Self::Network(err) => Self::Network(Arc::clone(err)),
-            Self::Protocol { kind, message } => Self::Protocol {
-                kind: *kind,
-                message: message.clone(),
-            },
-            Self::Auth { message } => Self::Auth {
-                message: message.clone(),
-            },
-            Self::Timeout { operation } => Self::Timeout {
-                operation: operation.clone(),
-            },
-            Self::Broker { code, message } => Self::Broker {
-                code: *code,
-                message: message.clone(),
-            },
-            Self::Config { message } => Self::Config {
-                message: message.clone(),
-            },
-            Self::Compression { message } => Self::Compression {
-                message: message.clone(),
-            },
-            Self::InvalidState { message } => Self::InvalidState {
-                message: message.clone(),
-            },
-            Self::Serialization { message } => Self::Serialization {
-                message: message.clone(),
-            },
-            Self::RecordDeserialization {
-                topic,
-                partition,
-                offset,
-                part,
-                message,
-            } => Self::RecordDeserialization {
-                topic: topic.clone(),
-                partition: *partition,
-                offset: *offset,
-                part,
-                message: message.clone(),
-            },
-            Self::Http { message, source } => Self::Http {
-                message: message.clone(),
-                source: source.clone(),
-            },
-        }
-    }
+fn format_partitions(partitions: &[(String, crate::PartitionId)]) -> String {
+    partitions
+        .iter()
+        .map(|(topic, partition)| format!("{topic}-{partition}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 impl From<io::Error> for KrafkaError {
@@ -237,6 +263,13 @@ impl KrafkaError {
         Self::Network(Arc::new(err))
     }
 
+    /// A network error for a broker, leader or address the client cannot
+    /// currently reach or resolve. Retriable.
+    #[cold]
+    pub(crate) fn unavailable(message: impl Into<String>) -> Self {
+        Self::network(io::Error::new(io::ErrorKind::NotConnected, message.into()))
+    }
+
     /// Create a new protocol error with an explicit [`ProtocolErrorKind`].
     #[cold]
     pub fn protocol_kind(kind: ProtocolErrorKind, message: impl Into<String>) -> Self {
@@ -251,6 +284,20 @@ impl KrafkaError {
     pub fn auth(message: impl Into<String>) -> Self {
         Self::Auth {
             message: message.into(),
+            source: None,
+        }
+    }
+
+    /// Create a new authentication error with an underlying cause, kept in
+    /// `std::error::Error::source()`.
+    #[cold]
+    pub fn auth_with_source<E>(message: impl Into<String>, source: E) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Self::Auth {
+            message: message.into(),
+            source: Some(ArcError::new(source)),
         }
     }
 
@@ -259,6 +306,15 @@ impl KrafkaError {
     pub fn timeout(operation: impl Into<String>) -> Self {
         Self::Timeout {
             operation: operation.into(),
+        }
+    }
+
+    /// Create a new delivery-timeout error.
+    #[cold]
+    pub fn delivery_timeout(possibly_written: bool, message: impl Into<String>) -> Self {
+        Self::DeliveryTimeout {
+            possibly_written,
+            message: message.into(),
         }
     }
 
@@ -283,14 +339,6 @@ impl KrafkaError {
     #[cold]
     pub fn compression(message: impl Into<String>) -> Self {
         Self::Compression {
-            message: message.into(),
-        }
-    }
-
-    /// Create a new invalid state error.
-    #[cold]
-    pub fn invalid_state(message: impl Into<String>) -> Self {
-        Self::InvalidState {
             message: message.into(),
         }
     }
@@ -324,43 +372,187 @@ impl KrafkaError {
         }
     }
 
-    /// Create a new HTTP error.
-    ///
-    /// Raised by the built-in HTTP/1.1 client, which serves the OIDC token
-    /// provider (`oauth-oidc`).
+    /// Create a new closed error.
     #[cold]
-    pub fn http(message: impl Into<String>) -> Self {
-        Self::Http {
+    pub fn closed(message: impl Into<String>) -> Self {
+        Self::Closed {
             message: message.into(),
-            source: None,
         }
     }
 
-    /// Create a new HTTP error with an underlying cause.
-    ///
-    /// The source is preserved in `std::error::Error::source()` and can be
-    /// downcast by callers who need to distinguish transport errors from
-    /// API-level failures.
+    /// Create a new fenced error.
     #[cold]
-    pub fn http_with_source<E>(message: impl Into<String>, source: E) -> Self
-    where
-        E: std::error::Error + Send + Sync + 'static,
-    {
-        Self::Http {
+    pub fn fenced(message: impl Into<String>) -> Self {
+        Self::Fenced {
             message: message.into(),
-            source: Some(ArcError::new(source)),
         }
     }
 
-    /// Returns true if this is a retriable error.
+    /// Create a new transaction-abortable error.
+    #[cold]
+    pub fn transaction_abortable(message: impl Into<String>) -> Self {
+        Self::TransactionAbortable {
+            message: message.into(),
+        }
+    }
+
+    /// Create a new no-offset error for `partitions`.
+    #[cold]
+    pub fn no_offset(partitions: Vec<(String, crate::PartitionId)>) -> Self {
+        Self::NoOffset { partitions }
+    }
+
+    /// Create a new unknown-topic error.
+    #[cold]
+    pub fn unknown_topic(topic: impl Into<String>) -> Self {
+        Self::UnknownTopic {
+            topic: topic.into(),
+        }
+    }
+
+    /// Create a new out-of-order-sequence error.
+    #[cold]
+    pub fn out_of_order_sequence(
+        topic: impl Into<String>,
+        partition: crate::PartitionId,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::OutOfOrderSequence {
+            topic: topic.into(),
+            partition,
+            message: message.into(),
+        }
+    }
+
+    /// Create a new illegal-state error.
+    #[cold]
+    pub fn illegal_state(message: impl Into<String>) -> Self {
+        Self::IllegalState {
+            message: message.into(),
+        }
+    }
+
+    // Errors for a cluster that lacks a feature. Each names the feature and
+    // the client setting that avoids it, where one exists.
+
+    /// The broker cannot serve `ConsumerGroupHeartbeat` (KIP-848).
+    #[cold]
+    pub(crate) fn kip848_unsupported() -> Self {
+        Self::protocol_kind(
+            ProtocolErrorKind::UnknownApiVersion,
+            "this cluster does not provide KIP-848 consumer groups: the broker does not support \
+             ConsumerGroupHeartbeat. Use the classic protocol: \
+             `.group_protocol(GroupProtocol::Classic)`",
+        )
+    }
+
+    /// The broker cannot serve one of the share-group APIs (KIP-932).
+    #[cold]
+    pub(crate) fn share_groups_unsupported(api: crate::protocol::ApiKey) -> Self {
+        Self::protocol_kind(
+            ProtocolErrorKind::UnknownApiVersion,
+            format!(
+                "this cluster does not provide share groups (KIP-932): the broker does not \
+                 support {api:?}. Share groups need Apache Kafka 4.2 or later"
+            ),
+        )
+    }
+
+    /// The broker cannot serve one of the transaction APIs.
+    #[cold]
+    pub(crate) fn transactions_unsupported(api: crate::protocol::ApiKey) -> Self {
+        Self::protocol_kind(
+            ProtocolErrorKind::UnknownApiVersion,
+            format!(
+                "this cluster does not provide transactions: the broker does not support {api:?}"
+            ),
+        )
+    }
+
+    /// An idempotent producer could not get a producer id: `cause` is the
+    /// broker's code, or `None` when the broker has no usable
+    /// `InitProducerId`.
+    #[cold]
+    pub(crate) fn idempotence_unavailable(cause: Option<ErrorCode>) -> Self {
+        const HINT: &str = "the producer is idempotent by default; on a cluster without \
+                            idempotent producers, build it with `.idempotent(false)`";
+        match cause {
+            Some(code) => Self::broker(
+                code,
+                format!("InitProducerId for the idempotent producer failed; {HINT}"),
+            ),
+            None => Self::protocol_kind(
+                ProtocolErrorKind::UnknownApiVersion,
+                format!("this cluster does not provide InitProducerId; {HINT}"),
+            ),
+        }
+    }
+
+    /// The broker rejected a batch's compression codec.
+    #[cold]
+    pub(crate) fn compression_unsupported(
+        codec: crate::protocol::Compression,
+        topic: &str,
+        partition: crate::PartitionId,
+    ) -> Self {
+        Self::broker(
+            ErrorCode::UnsupportedCompressionType,
+            format!(
+                "the broker rejected {codec:?} compression for {topic}-{partition}. Choose a codec \
+                 the cluster accepts with `.compression(..)` or `.topic_compression(..)`, or \
+                 `Compression::None`"
+            ),
+        )
+    }
+
+    /// Whether the same operation may succeed if tried again.
+    ///
+    /// True for network errors, timeouts, retriable broker codes and
+    /// retriable protocol errors. A [`DeliveryTimeout`](Self::DeliveryTimeout)
+    /// is not: the producer has already retried for the whole delivery budget.
     pub fn is_retriable(&self) -> bool {
         match self {
-            Self::Network(_) => true,
-            Self::Timeout { .. } => true,
+            Self::Network(_) | Self::Timeout { .. } => true,
             Self::Broker { code, .. } => code.is_retriable(),
             Self::Protocol { kind, .. } => kind.is_retriable(),
             _ => false,
         }
+    }
+
+    /// Whether the client cannot continue and must be rebuilt.
+    ///
+    /// True for [`Fenced`](Self::Fenced), [`Auth`](Self::Auth),
+    /// [`Closed`](Self::Closed), and the broker codes that mean the same:
+    /// a fenced producer or coordinator, an invalid transaction state, and a
+    /// denied transactional id, cluster or SASL authentication.
+    pub fn is_fatal(&self) -> bool {
+        match self {
+            Self::Fenced { .. } | Self::Auth { .. } | Self::Closed { .. } => true,
+            Self::Broker { code, .. } => matches!(
+                code,
+                ErrorCode::ProducerFenced
+                    | ErrorCode::InvalidProducerEpoch
+                    | ErrorCode::TransactionCoordinatorFenced
+                    | ErrorCode::TransactionalIdAuthorizationFailed
+                    | ErrorCode::InvalidTxnState
+                    | ErrorCode::ClusterAuthorizationFailed
+                    | ErrorCode::SaslAuthenticationFailed
+            ),
+            _ => false,
+        }
+    }
+
+    /// Whether the open transaction must be aborted before the producer can
+    /// continue. The producer itself stays usable.
+    pub fn requires_abort(&self) -> bool {
+        matches!(
+            self,
+            Self::TransactionAbortable { .. }
+                | Self::Broker {
+                    code: ErrorCode::TransactionAbortable,
+                    ..
+                }
+        )
     }
 
     /// Returns the structured classification for a protocol error.
@@ -711,7 +903,7 @@ pub enum ErrorCode {
     StaleMemberEpoch = 113,
     /// The request was sent to an endpoint of the wrong type.
     MismatchedEndpointType = 114,
-    /// This endpoint type is not supported yet.
+    /// The broker does not support this endpoint type.
     UnsupportedEndpointType = 115,
     /// This controller ID is not known.
     UnknownControllerId = 116,
@@ -1046,10 +1238,9 @@ impl ErrorCode {
     ///
     /// # Reconciliation with Kafka's `Errors.java`
     ///
-    /// This classification was audited code-by-code over the range `0..=133`
-    /// against Apache Kafka trunk's
-    /// `org.apache.kafka.common.protocol.Errors`, resolving each entry's
-    /// exception superclass chain. An error is retriable in Java when its
+    /// For codes `0..=133` this classification follows the exception
+    /// superclass chain of each entry in Apache Kafka's
+    /// `org.apache.kafka.common.protocol.Errors`. An error is retriable in Java when its
     /// exception extends `RetriableException`, either directly or via
     /// `InvalidMetadataException` / `RefreshRetriableException`.
     ///
@@ -1156,34 +1347,6 @@ impl From<ErrorCode> for i16 {
 /// A specialized Result type for Krafka operations.
 pub type Result<T> = std::result::Result<T, KrafkaError>;
 
-/// Error returned by [`Consumer::recv()`](crate::consumer::Consumer::recv).
-///
-/// This mirrors the pattern of `tokio::sync::broadcast::error::RecvError` — the
-/// `Closed` variant signals that the consumer has been shut down, while
-/// `Error` wraps any poll-time [`KrafkaError`] (broker, network, metadata,
-/// authentication, serialization, and related failures).
-///
-/// # Example
-///
-/// ```ignore
-/// match consumer.recv().await {
-///     Ok(record)                          => process(record),
-///     Err(RecvError::Closed)              => break,
-///     Err(RecvError::Error(e))            => return Err(e),
-///     _                                   => break,
-/// }
-/// ```
-#[non_exhaustive]
-#[derive(Debug, Error)]
-pub enum RecvError {
-    /// The consumer was closed and no more records will be delivered.
-    #[error("consumer closed")]
-    Closed,
-    /// A poll-time Krafka error occurred while polling for records.
-    #[error(transparent)]
-    Error(#[from] KrafkaError),
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -1243,6 +1406,121 @@ mod tests {
         );
     }
 
+    /// One value of every kind, with what `is_fatal`, `requires_abort` and
+    /// `is_retriable` must answer for it.
+    fn one_of_each() -> Vec<(KrafkaError, bool, bool, bool)> {
+        let reset = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "x");
+        vec![
+            (KrafkaError::network(reset), false, false, true),
+            (
+                KrafkaError::protocol_kind(ProtocolErrorKind::Malformed, "x"),
+                false,
+                false,
+                true,
+            ),
+            (KrafkaError::auth("x"), true, false, false),
+            (KrafkaError::timeout("x"), false, false, true),
+            (
+                KrafkaError::delivery_timeout(true, "x"),
+                false,
+                false,
+                false,
+            ),
+            (
+                KrafkaError::broker(ErrorCode::NotLeaderForPartition, "x"),
+                false,
+                false,
+                true,
+            ),
+            (
+                KrafkaError::broker(ErrorCode::ProducerFenced, "x"),
+                true,
+                false,
+                false,
+            ),
+            (
+                KrafkaError::broker(ErrorCode::TransactionAbortable, "x"),
+                false,
+                true,
+                false,
+            ),
+            (KrafkaError::config("x"), false, false, false),
+            (KrafkaError::compression("x"), false, false, false),
+            (KrafkaError::serialization("x"), false, false, false),
+            (
+                KrafkaError::record_deserialization("t", 0, 0, "value", "x"),
+                false,
+                false,
+                false,
+            ),
+            (KrafkaError::closed("x"), true, false, false),
+            (KrafkaError::Wakeup, false, false, false),
+            (KrafkaError::fenced("x"), true, false, false),
+            (KrafkaError::transaction_abortable("x"), false, true, false),
+            (
+                KrafkaError::no_offset(vec![("t".to_string(), 0)]),
+                false,
+                false,
+                false,
+            ),
+            (KrafkaError::unknown_topic("t"), false, false, false),
+            (
+                KrafkaError::out_of_order_sequence("t", 0, "x"),
+                false,
+                false,
+                false,
+            ),
+            (KrafkaError::illegal_state("x"), false, false, false),
+        ]
+    }
+
+    #[test]
+    fn the_predicates_classify_each_kind() {
+        for (error, fatal, abort, retriable) in one_of_each() {
+            assert_eq!(error.is_fatal(), fatal, "is_fatal for {error:?}");
+            assert_eq!(
+                error.requires_abort(),
+                abort,
+                "requires_abort for {error:?}"
+            );
+            assert_eq!(
+                error.is_retriable(),
+                retriable,
+                "is_retriable for {error:?}"
+            );
+        }
+    }
+
+    /// An error that requires an abort leaves the producer usable; a fatal
+    /// one does not. No error may claim both.
+    #[test]
+    fn requires_abort_and_is_fatal_are_exclusive() {
+        for (error, ..) in one_of_each() {
+            assert!(
+                !(error.requires_abort() && error.is_fatal()),
+                "{error:?} claims both"
+            );
+        }
+    }
+
+    /// An authentication error built with a cause keeps it reachable.
+    #[test]
+    fn auth_errors_keep_their_cause() {
+        use std::error::Error;
+        let io = std::io::Error::new(std::io::ErrorKind::InvalidData, "bad cert");
+        let error = KrafkaError::auth_with_source("TLS handshake failed", io);
+        let source = error.source().expect("the cause must be kept");
+        assert!(source.to_string().contains("bad cert"));
+        assert!(error.clone().source().is_some(), "clones keep it too");
+    }
+
+    #[test]
+    fn no_offset_names_every_partition() {
+        let error = KrafkaError::no_offset(vec![("a".to_string(), 0), ("b".to_string(), 3)]);
+        let text = error.to_string();
+        assert!(text.contains("a-0") && text.contains("b-3"), "got: {text}");
+    }
+
     #[test]
     fn test_network_error_source_preserved_through_arc() {
         use std::error::Error;
@@ -1268,7 +1546,7 @@ mod tests {
         );
     }
 
-    // ── R9.10: ErrorCode 56–88 from_i16 / to_i16 round-trip ──
+    // ── ErrorCode 56–88 from_i16 / to_i16 round-trip ──
 
     #[test]
     fn test_error_code_from_i16_codes_56_to_88() {
@@ -1365,7 +1643,7 @@ mod tests {
         assert_eq!(ErrorCode::UnstableOffsetCommit.to_i16(), 88);
     }
 
-    // ── R9.10: new retriable codes ──
+    // ── retriable codes ──
 
     #[test]
     fn test_r9_10_new_retriable_error_codes() {
@@ -1522,7 +1800,7 @@ mod tests {
         assert!(!ErrorCode::UnknownControllerId.is_retriable());
     }
 
-    // ── R9.10: round-trip through From<i16> / From<ErrorCode> traits ──
+    // ── round-trip through From<i16> / From<ErrorCode> traits ──
 
     #[test]
     fn test_error_code_round_trip_56_to_88() {

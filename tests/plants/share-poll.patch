@@ -1,0 +1,11 @@
+diff -ruN a/src/share_consumer/mod.rs b/src/share_consumer/mod.rs
+--- a/src/share_consumer/mod.rs
++++ b/src/share_consumer/mod.rs
+@@ -250,6 +250,7 @@
+             ready.as_mut().enable();
+ 
+             if let Some(records) = inner.take_records(max)? {
++                tokio::task::yield_now().await;
+                 return Ok(Some(records));
+             }
+             self.check_usable()?;

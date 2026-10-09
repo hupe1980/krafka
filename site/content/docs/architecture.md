@@ -9,39 +9,26 @@ slug_id = "architecture"
 
 ## Design Principles
 
-### 1. Pure Rust
-- No C bindings or FFI
-- Full control over all code paths
-- No FFI overhead or complexity
+### 1. No C library
+- No C library to install and no system dependency: TLS is rustls, every
+  codec decodes in Rust
+- The default build compiles C only inside `ring`, rustls' crypto backend;
+  the `zstd` (encoding), `rustls-aws-lc-rs` and `aws-msk` features compile more
+- `just no-c` checks the dependency graph
 
-### 2. Async-Native
-- Built on Tokio from the ground up
-- Non-blocking I/O everywhere
-- Efficient connection multiplexing
+### 2. Tokio
+- Built on Tokio; krafka is not runtime-agnostic. The connection loop, the
+  send engine, the timers and the idle evictor use Tokio primitives directly,
+  and cancellation safety is reasoned about in Tokio's semantics
+- Requests are pipelined on one connection per broker
 
-**Tokio is a hard dependency, deliberately.** krafka is not runtime-agnostic and
-does not intend to be. Supporting `smol`, `async-std` or `glommio` would mean
-abstracting timers, TCP and task spawning behind traits that every hot path
-would then go through — the connection event loop, the accumulator's
-per-partition pipeline, the `DelayQueue` timer wheel and the idle evictor all
-use Tokio primitives directly, and several correctness properties (cancellation
-safety at specific await points, `DelayQueue` ordering) are reasoned about in
-Tokio's semantics.
+### 3. No unsafe code
+- `#![deny(unsafe_code)]` on the crate; memory safety comes from the type system
 
-The cost of that abstraction is paid by every user; the benefit accrues to the
-minority not already on Tokio, which is the ecosystem default and what the vast
-majority of Kafka-adjacent Rust services run. If you need a different runtime,
-this is the wrong client.
-
-### 3. Zero Unsafe
-- Memory safety guaranteed by Rust's type system
-- No undefined behavior risks
-- Security by design
-
-### 4. Zero-Copy Where Possible
-- Uses `bytes` crate for buffer management
-- Avoids unnecessary copies in hot paths
-- Efficient protocol parsing
+### 4. Shared Buffers
+- Uses the `bytes` crate for buffer management
+- Decoded records are slices of the fetched response
+- Each response frame is read into one allocation
 
 ### 5. Security Hardened
 - Secrets zeroized on drop (SCRAM passwords, AWS credentials)
@@ -53,46 +40,62 @@ this is the wrong client.
 
 ## Module Architecture
 
+Public modules are the API; `client`, `protocol`, `network`, `metadata` and
+`telemetry` are private. Their types reach users only through re-exports at the
+crate root (`Kafka`, `KafkaBuilder`, `Compression`, `TopicInfo`, …).
+
 ```
-krafka/
-├── protocol/          # Kafka wire protocol
-│   ├── primitives.rs  # Basic types (strings, arrays, varints)
+krafka/src/
+├── client.rs          # Kafka handle and KafkaBuilder: the pool, the metadata cache, the role builders
+├── protocol/          # (private) Kafka wire protocol
+│   ├── primitives.rs  # Strings, arrays, varints, tagged fields
 │   ├── record.rs      # Record batches and compression
-│   ├── messages.rs    # API request/response types (incl. ACL messages)
-│   ├── api.rs         # API keys and versions
+│   ├── messages/      # One file per API's request/response types
+│   ├── api.rs         # API keys, ApiVersions
 │   ├── header.rs      # Request/response headers
-│   └── codec.rs       # Framing encoder/decoder
-├── network/           # Networking layer
-│   ├── connection.rs  # Async TCP connections
-│   ├── secure.rs      # TLS/SASL authentication
-│   └── pool.rs        # Connection pooling
-├── metadata.rs        # Cluster metadata management
-├── producer/          # Producer implementation
-│   ├── mod.rs         # Producer API
+│   └── codec.rs       # Framing
+├── network/           # (private) Connections
+│   ├── connection.rs  # One broker connection: request channel, I/O loop, correlation
+│   ├── connector.rs   # TCP, SOCKS5, TLS and SASL setup
+│   ├── happy_eyeballs.rs # RFC 8305 address racing
+│   ├── secure.rs      # SASL handshake
+│   ├── transport.rs   # Socket options
+│   └── pool.rs        # ConnectionPool, keyed by (address, ConnectionPurpose)
+├── metadata.rs        # (private) ClusterMetadata: the cache and its single writer task
+├── producer/          # Producer
+│   ├── mod.rs         # Producer API, ProducerBuilder
 │   ├── config.rs      # Producer configuration
-│   ├── partitioner.rs # Partitioning strategies
-│   ├── batch.rs       # Record batching
-│   ├── accumulator.rs # Record accumulator: the one send path (batching,
-│   │                  # per-partition dispatch FIFO, retries, DLQ)
-│   ├── record.rs      # Producer records
-│   ├── retry.rs       # Retry policy with exponential backoff
-│   └── idempotent.rs  # Idempotent producer (PID, sequence tracking)
-├── consumer/          # Consumer implementation
+│   ├── partitioner.rs # Built-in (KIP-794, KIP-1123) and custom partitioning
+│   ├── accumulator.rs # Byte budget, admission, DeliveryHandle
+│   ├── engine.rs      # The send engine: per-broker drain, deadlines, retries
+│   ├── batch.rs       # Batches and their encoding
+│   ├── identity.rs    # Producer id, epoch, sequence stamps, error classification
+│   ├── gate.rs        # Transaction gate: state, pending sends, first failure
+│   ├── transaction.rs # TransactionalProducer
+│   ├── typed.rs       # TypedProducer
+│   ├── record.rs      # Record
+│   └── retry.rs       # The retry backoff (capped at 1 s)
+├── consumer/          # Consumer
 │   ├── mod.rs         # Consumer API
-│   ├── config.rs      # Consumer configuration
-│   ├── group.rs       # Consumer group coordination (rebalance listeners, heartbeat)
-│   ├── offset.rs      # Offset management
-│   └── record.rs      # Consumer records
-├── admin.rs           # Admin client (topics, partitions, configs, ACLs, delegation tokens, quotas)
-├── auth/              # Authentication
-│   ├── mod.rs         # Auth module (SASL mechanisms)
-│   ├── scram.rs       # SCRAM-SHA-256/512 implementation
-│   ├── msk_iam.rs     # AWS MSK IAM authentication (Signature v4)
-│   └── tls.rs         # TLS/SSL connections with rustls
-├── error.rs           # Error types
-├── metrics.rs         # Metrics (counters, gauges, latency tracking)
-├── tracing_ext.rs     # Tracing (OpenTelemetry-compatible spans)
-└── util.rs            # Utilities (CRC, varints)
+│   ├── builder.rs     # ConsumerBuilder
+│   ├── fetcher/       # Fetch planning, per-broker Fetch requests, decoding
+│   ├── fetch_session.rs # KIP-227 fetch sessions
+│   ├── group/         # Classic and KIP-848 group membership, heartbeats
+│   ├── assignor/      # Range, RoundRobin, CooperativeSticky
+│   ├── rebalance/     # Applying assignments, rebalance listeners
+│   ├── offsets/       # Commit, reset, validation (KIP-320)
+│   └── compacted.rs   # Compacted-topic table
+├── share_consumer/    # KIP-932 share consumer
+├── admin/             # AdminClient: one file per area, driver.rs routes and retries
+├── auth/              # AuthConfig, TLS, SCRAM, OAUTHBEARER/OIDC, AWS MSK IAM
+├── interceptor.rs     # Producer and consumer interceptors
+├── serdes.rs          # Serializers and consumer byte transforms
+├── dlq.rs             # Dead-letter record helper
+├── error.rs           # KrafkaError
+├── metrics.rs         # The Metrics snapshot and Prometheus text
+├── telemetry/         # (private) KIP-714 reporter and OTLP encoding
+├── testing/           # In-process fake broker (feature `test-broker`)
+└── util.rs            # CRC, varints
 ```
 
 ## Protocol Layer
@@ -127,170 +130,127 @@ krafka implements the Kafka binary protocol:
 
 ### Compression
 
-All four Kafka compression codecs are supported when their features are enabled.
-The default `compression` feature keeps the dependency stack pure-Rust by
-enabling gzip, snappy, and LZ4; zstd is available through the explicit `zstd`
-or `compression-all` feature.
+All four Kafka compression codecs decode in pure Rust in every build. Gzip,
+Snappy and LZ4 also encode in every build; zstd encoding needs the `zstd`
+feature.
 
 | Codec | Implementation | Characteristics |
 |-------|---------------|-----------------|
 | Gzip | `flate2` | Best ratio, slowest |
-| Snappy | `snap` | Good balance |
+| Snappy | `snap`, snappy-java stream format (as the Java client writes it); raw snappy also decodes | Good balance |
 | LZ4 | `lz4_flex` | Fastest |
-| Zstd | `zstd` | Best modern choice |
+| Zstd | `ruzstd` (decode), `zstd` (encode, feature) | High ratio, fast decode |
 
 ## Network Layer
 
-### Shared Transport: `KrafkaClient`
+### Shared Transport: the `Kafka` handle
 
-By default every `Producer`, `Consumer`, and `AdminClient` creates its own `ConnectionPool`
-and `ClusterMetadata`. An application with one producer and two consumers against a 5-broker
-cluster therefore opens **15** TCP connections (3 clients × 5 brokers).
-
-`KrafkaClient` solves this by wrapping a single `Arc<ConnectionPool>` + `Arc<ClusterMetadata>`
-that is shared across all clients:
+`Kafka::builder(..).connect()` creates one connection pool and one metadata
+cache. Every client built from the handle shares both, so an application with
+one producer and two consumers against a 5-broker cluster opens 5 data
+connections, not 15:
 
 ```rust,compile
 // One pool + one metadata cache for the whole process.
-let client = KrafkaClient::builder("broker1:9092,broker2:9092")
-    .build()
+let kafka = krafka::Kafka::builder("broker1:9092,broker2:9092")
+    .connect()
     .await?;
 
-let producer = Producer::builder().with_client(&client).build().await?;
-let consumer = Consumer::builder().with_client(&client).group_id("g1").build().await?;
-let admin    = AdminClient::builder().with_client(&client).build().await?;
-// Connection count: 2 brokers × 1 pool = 2 connections, not 6.
+let producer = kafka.producer().build().await?;
+let consumer = kafka.consumer("g1").build().await?;
+let admin = kafka.admin();
+// Data connections: one per broker, shared by all three clients.
 ```
 
-The idle-connection evictor and (when configured) the OAUTHBEARER proactive-refresh task are
-started once inside `KrafkaClient::build()` and shared by all attached clients.
+The idle-connection evictor and (when configured) the OAUTHBEARER
+proactive-refresh task are started once by `connect()` and shared by every
+client of the handle. A second identity or separate pool is a second handle.
 
 ### Connection Architecture
 
-One TCP connection per broker, shared by every client attached to the pool.
-Concurrency comes from request pipelining on that connection, not from extra
-sockets: responses are demultiplexed by correlation ID, and up to
-`max_in_flight_requests` requests may be outstanding at once.
+The pool keys connections by address and `ConnectionPurpose`: one `Data`
+connection per broker, shared by every client of the handle, plus one
+`Coordination` connection per group coordinator. Concurrency comes from
+request pipelining, not from extra sockets: responses are demultiplexed by
+correlation ID, and up to `max_in_flight_requests` requests may be outstanding
+at once.
 
 ```
   ┌───────────────────────────────────────────────────────────────┐
-  │                       ConnectionPool                          │
+  │                 ConnectionPool  (address, purpose)            │
   │  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────┐ │
-  │  │ BrokerConn(1)    │  │ BrokerConn(2)    │  │ BrokerConn   │ │
-  │  │  in-flight ≤ N   │  │  in-flight ≤ N   │  │   (N...)     │ │
-  │  │  correlation-id  │  │  correlation-id  │  │              │ │
-  │  │  demultiplexing  │  │  demultiplexing  │  │              │ │
+  │  │ broker 1, Data   │  │ broker 2, Data   │  │ broker 2,    │ │
+  │  │  in-flight ≤ N   │  │  in-flight ≤ N   │  │ Coordination │ │
+  │  │  FIFO, one loop  │  │  FIFO, one loop  │  │  (heartbeats)│ │
   │  └──────────────────┘  └──────────────────┘  └──────────────┘ │
   └───────────────────────────────────────────────────────────────┘
 ```
 
-This mirrors the Apache Kafka Java client. Multiple connections per broker are
-deliberately not offered: the idempotent producer's ordering guarantee bounds
-reordering *per connection*, so a partition's in-flight batches must all travel
-the same socket.
+Each connection has one FIFO request channel, drained by one I/O loop; there
+are no request priorities. Data connections mirror the Apache Kafka Java client: one per broker, so a
+partition's in-flight batches travel one socket in dispatch order. The broker
+reads one request per connection at a time, so coordination requests
+(`JoinGroup`, `SyncGroup`, `Heartbeat`, `LeaveGroup`, the KIP-848 and share
+heartbeats, `OffsetCommit`, `OffsetFetch`) get their own connection to the
+coordinator, as the Java client does with its separate coordinator node. The
+consumer and the share consumer take it from the pool for every request, so a
+dead or session-expired one is replaced like any other. A transport error on it
+makes the member find the coordinator again; it keeps its assignment and
+rejoins only if the coordinator has moved to another broker. `FindCoordinator` and the transactional producer's
+coordinator requests use data connections. At the `max_connections` cap a
+coordination request falls back to the broker's data connection, counted in
+`Metrics::connections.coordination_fallbacks`.
 
-A request that times out fails its caller, but the connection stays open and a
-late response is discarded. Because responses arrive in request order, a request
-still unanswered one further `request_timeout` after its deadline blocks
-everything behind it: the connection is then closed, pending requests fail with
-a retriable network error, and the next request reconnects.
+**Request timeout.** A request's timeout starts when it is written. The first
+request to time out fails with `Timeout`, the connection is closed, and every
+other request pending on it fails with a retriable `Network` error: responses
+arrive in order, so nothing behind it can be answered. The next request gets a
+new connection.
 
-### Priority Channels
-
-Each connection maintains two request channels to prevent consumer group ejection during backpressure:
-
-```
-  ┌─────────────────────────────────────────────────────┐
-  │                   BrokerConnection                   │
-  │  ┌───────────────────┐  ┌─────────────────────────┐ │
-  │  │ High-Priority Ch  │  │   Normal-Priority Ch    │ │
-  │  │ (Heartbeat, Meta, │  │ (Produce, Fetch, etc.)  │ │
-  │  │  GroupHeartbeat,  │  │                         │ │
-  │  │  JoinGroup, etc.) │  │                         │ │
-  │  └─────────┬─────────┘  └───────────┬─────────────┘ │
-  │            │   biased select!       │               │
-  │            └─────────►◄─────────────┘               │
-  │                       │                             │
-  │                       ▼                             │
-  │                   TCP Stream                        │
-  └─────────────────────────────────────────────────────┘
-```
-
-High-priority requests (Heartbeat, ConsumerGroupHeartbeat, ShareGroupHeartbeat,
-JoinGroup, SyncGroup, LeaveGroup, OffsetCommit, Metadata, FindCoordinator,
-LeaderAndIsr, ApiVersions) are always processed
-first, ensuring consumer group membership is maintained even under heavy produce/fetch load.
+**Cancellation.** A request whose caller drops the future before it is written
+is never written. One already written is processed by the broker; its response
+is discarded and the connection stays usable.
 
 ### KIP-219: Client-Side Throttle Compliance
 
-When a broker returns `throttle_time_ms > 0` in a response, the client voluntarily delays
-subsequent normal-priority requests by the indicated duration. High-priority requests (heartbeats,
-metadata) are never delayed, preserving group membership. Throttle state is tracked per
-`BrokerConnection` using a `parking_lot::Mutex<Instant>` deadline.
+When a response carries `throttle_time_ms > 0`, the connection is muted for
+that time (capped at five minutes): nothing is written on it until the mute
+ends. Waiting requests keep their full request timeout, which starts at the
+write, so a written request is never reported as timed out because of a
+throttle. A caller whose own deadline passes during the mute gets an error and
+its request is not sent. A mute on one connection does not delay another, so a
+throttled data connection does not hold back the coordination connection.
 
-### Automatic Reconnection
+### Connecting and Reconnecting
 
-When connections fail, krafka automatically attempts to reconnect with exponential backoff:
+The pool makes at most one connection attempt per lookup, bounded by
+`connect_timeout` (TCP, TLS, SASL and the `ApiVersions` handshake together).
+Concurrent callers for the same connection share the attempt, and a caller's
+own deadline applies by dropping its future. After a failed attempt the
+address is in **reconnect backoff** — 50 ms, doubling to 1 s, with 20 % jitter,
+as the Java client's `reconnect.backoff.ms` / `reconnect.backoff.max.ms`: a call
+inside the window fails immediately with a retriable error (or the original
+error, if that was not retriable). A successful attempt resets the backoff.
+Retrying is the caller's job, inside the caller's deadline: the producer's
+`delivery_timeout`, the consumer's poll loop, the admin call's `timeout`.
 
-- **Max Retries**: 3 (configurable)
-- **Initial Backoff**: 100ms
-- **Max Backoff**: 10 seconds
-- **Backoff Multiplier**: 2.0x
-
-```
-  Connection Failure
-          │
-          ▼
-  ┌───────────────┐
-  │ Wait 100ms    │───► Retry 1
-  └───────────────┘
-          │ fail
-          ▼
-  ┌───────────────┐
-  │ Wait 200ms    │───► Retry 2
-  └───────────────┘
-          │ fail
-          ▼
-  ┌───────────────┐
-  │ Wait 400ms    │───► Retry 3
-  └───────────────┘
-          │ fail
-          ▼
-    Return Error
-```
-
-The reconnection logic checks `is_retriable()` on errors to avoid retrying non-transient failures
-(e.g., authentication errors, configuration errors).
+A connection past its SASL re-authentication point (KIP-368) is replaced on
+the next lookup; the old one closes once its pending requests complete.
+Replacing a dead or expired connection never counts against
+`max_connections`.
 
 ### Request/Response Flow
 
-1. Caller creates request struct
-2. Request is encoded via `VersionedEncode::encode_versioned(version, buf)` — dispatches to the correct `encode_vN` method
-3. Correlation ID is assigned
-4. Request is sent over TCP
-5. Response is received and framed
-6. Response is decoded via `VersionedDecode::decode_versioned(version, buf)` — dispatches to the correct `decode_vN` method
-
-The core protocol request/response type pairs in `protocol::messages` implement the `VersionedEncode`/`VersionedDecode` traits, providing unified version dispatch with unsupported-version error handling.
-
-```rust
-// Internal flow
-async fn send_request<R>(&self, request: R) -> Result<Response>
-where
-    R: Into<Bytes>,
-{
-    let correlation_id = self.correlation_id_gen.next();
-    let header = RequestHeader::new(api_key, version, correlation_id);
-    
-    // Encode and send
-    let encoded = encode_request(header, request);
-    self.writer.write_all(&encoded).await?;
-    
-    // Receive and decode
-    let response_bytes = self.read_response().await?;
-    decode_response(response_bytes)
-}
-```
+1. The caller builds a request and the connection negotiates its version within
+   the client's `[MIN, MAX]` and the broker's advertised range
+2. The request is encoded for that version, given a correlation ID and queued
+   on the connection's channel, waiting if `max_in_flight_requests` are
+   outstanding
+3. The I/O loop writes it; its request timeout starts then
+4. The loop reads each response frame into one buffer, matches it to its
+   request by correlation ID and hands it back
+5. The caller decodes it for the same version; an unsupported version is a
+   `KrafkaError::Protocol` error
 
 ## Metadata Management
 
@@ -298,7 +258,7 @@ where
 
 ```
   ┌─────────────────────────────────────────────────────┐
-  │                   ClusterMetadata                    │
+  │          ClusterMetadata (one writer task)           │
   │  ┌──────────────────────────────────────────────┐   │
   │  │               Broker Cache                    │   │
   │  │  { broker_id -> (host, port, rack) }         │   │
@@ -316,70 +276,83 @@ where
 
 ### Metadata Refresh
 
-- Automatic refresh when cache is stale (configurable TTL)
-- Forced refresh on NotLeaderForPartition errors
-- Topic-specific refresh when subscribing
-- API version negotiation: negotiates the highest mutually supported Metadata version (v1-v13); versions are cumulative (rack since v1, cluster_id since v2, offline replicas since v5, leader_epoch since v7, topic UUIDs since v10)
+- One writer task per metadata cache fetches and applies metadata. Callers ask
+  it for topics — forcing a fetch when a broker said the cache is wrong — and
+  wait for the fetch that covers them; requests arriving together become one
+  `Metadata` request, spaced by an exponential, jittered backoff
+- Leader hints from Fetch/Produce responses (KIP-951) and rebootstraps go
+  through the same serialized write path, so no update overwrites one it did
+  not see; readers load the current snapshot without locking
+- Within one topic ID a cached leader epoch is never replaced by an older one
+  (KIP-320); a topic re-created under the same name (new topic ID) takes the
+  new partitions as they are
+- Every response replaces the broker map; a topic reported unknown leaves the
+  cache
+- A partition without a leader, or whose leader is not in the broker map, is a
+  retriable `LEADER_NOT_AVAILABLE`: a send waits the election out inside
+  `delivery_timeout`
+- API version negotiation: the highest mutually supported Metadata version (v1-v13)
 
 ### Metadata Recovery (Rebootstrap)
 
-Clients default to `MetadataRecoveryStrategy::Rebootstrap`. When no broker is
-reachable for longer than the rebootstrap trigger (default 5 min), the client
-automatically closes all connections, clears the metadata cache, and falls back
-to bootstrap servers to re-discover the cluster. This handles scenarios like
-full-cluster rolling restarts where every cached broker IP becomes stale.
+Clients default to `MetadataRecoveryStrategy::Rebootstrap`. The client drops
+its view of the cluster and rediscovers it from the bootstrap servers when no
+known broker is reachable, when no metadata fetch has succeeded for the
+rebootstrap trigger (default 5 min), or when a broker returns
+`REBOOTSTRAP_REQUIRED` (error code **129**) in a Metadata v13+ response.
+In-flight requests are not aborted; a fetch that was in flight is discarded.
+Seed addresses are resolved at dial time, so brokers that moved to new IPs
+behind the same names are found. `update_seed_brokers()` replaces the seed list
+at runtime.
 
-A broker can also request a rebootstrap directly by returning
-`REBOOTSTRAP_REQUIRED` (error code **129**) in the top-level `error_code` of a
-Metadata v13+ response. Against older brokers only the local timeout trigger
-applies. Runtime seed-broker updates are supported via `update_seed_brokers()`.
+A failed bootstrap names every address it tried and keeps the last failure as
+the error's source.
 
-The strategy itself comes from KIP-899 (Kafka 3.8); the timeout trigger, the
-`REBOOTSTRAP_REQUIRED` error code, and defaulting to `Rebootstrap` come from
-KIP-1102 (Kafka 4.0).
+Rebootstrap follows KIP-899 and KIP-1102.
 
 ## Producer Architecture
 
 ### Send Path
 
 ```
-  User Code                     Producer                     Broker
-      │                            │                            │
-      │  send(topic, key, value)   │                            │
-      │ ─────────────────────────> │                            │
-      │                            │                            │
-      │                 ┌──────────┴──────────┐                 │
-      │                 │ 1. Partition        │                 │
-      │                 │    (murmur2 hash)   │                 │
-      │                 └──────────┬──────────┘                 │
-      │                            │                            │
-      │                 ┌──────────┴──────────┐                 │
-      │                 │ 2. Build RecordBatch│                 │
-      │                 │    (compression)    │                 │
-      │                 └──────────┬──────────┘                 │
-      │                            │                            │
-      │                 ┌──────────┴──────────┐                 │
-      │                 │ 3. Get Leader Conn  │                 │
-      │                 └──────────┬──────────┘                 │
-      │                            │                            │
-      │                            │    ProduceRequest          │
-      │                            │ ─────────────────────────> │
-      │                            │                            │
-      │                            │    ProduceResponse         │
-      │                            │ <───────────────────────── │
-      │  RecordMetadata            │                            │
-      │ <───────────────────────── │                            │
+  send / enqueue                 engine task (one per producer)          brokers
+       │                                   │                                │
+  interceptors, validation                 │                                │
+  partition (murmur2 / sticky by bytes)    │                                │
+  reserve buffer_memory ──── record ─────► │ per-partition queues           │
+       │                                   │ seal: batch_size, linger,      │
+       │                                   │       flush, commit            │
+       │                                   │ per broker: one Produce with   │
+       │                                   │ the head batch of every ready  │
+       │                                   │ partition (≤ 5 in flight,      │
+       │                                   │ one batch per partition) ────► │
+       │                                   │ ◄──────── per-partition answers│
+  DeliveryHandle ◄──── outcome ─────────── │ ack / retry (same stamp) /     │
+                                           │ fail + epoch bump / split      │
 ```
+
+The engine owns every piece of send state — queues, producer identity,
+in-flight requests — and polls its requests inline, so a producer runs one task
+however many partitions it writes to. Each batch resolves by
+`created + delivery_timeout`, checked before every attempt and by the engine's
+timer; a flush only seals, it never blocks the engine.
 
 ### Partitioning
 
-```rust
-// DefaultPartitioner (murmur2, Java-compatible)
-fn partition(key: &[u8], partition_count: usize) -> i32 {
-    let hash = murmur2(key);
-    (hash as usize % partition_count) as i32
+A keyed record goes where the Java client sends it — murmur2 of the key:
+
+```rust,compile
+use krafka::producer::murmur2;
+
+fn partition_for(key: &[u8], partition_count: u32) -> i32 {
+    ((murmur2(key) & 0x7fff_ffff) % partition_count) as i32
 }
 ```
+
+A keyless record sticks to one partition until `batch_size` bytes have gone
+to it, then a partition is chosen at random (KIP-794, partly: the choice is
+not weighted by broker queue sizes). With `partitioner_rack_aware` only
+partitions led in `client_rack` are chosen (KIP-1123).
 
 ## Consumer Architecture
 
@@ -392,8 +365,8 @@ fn partition(key: &[u8], partition_count: usize) -> i32 {
       │ ─────────────────────────> │                            │
       │                            │                            │
       │                 ┌──────────┴──────────┐                 │
-      │                 │ For each assigned   │                 │
-      │                 │ partition:          │                 │
+      │                 │ One Fetch per leader│                 │
+      │                 │ broker, concurrently│                 │
       │                 └──────────┬──────────┘                 │
       │                            │    FetchRequest            │
       │                            │ ─────────────────────────> │
@@ -410,8 +383,7 @@ fn partition(key: &[u8], partition_count: usize) -> i32 {
 
 ### Fetch Sessions (KIP-227)
 
-When the broker supports Fetch API v7+, krafka uses incremental fetch sessions to reduce request
-sizes. A per-broker `FetchSessionState` tracks the partitions registered with the broker's session.
+With Fetch v7+, the consumer uses incremental fetch sessions. A per-broker `FetchSessionState` tracks the partitions registered with the broker's session.
 On each `poll()`, the consumer computes a diff against the previous state:
 
 - **New/changed partitions** go in the `topics` field (only offset and `max_bytes` changes)
@@ -444,85 +416,37 @@ is closed on its broker with a final-epoch fetch carrying the consumer's fetch s
 
 ## Performance Optimizations
 
-### Hot Path Inlining
+### Hot and cold paths
 
-`#[inline]` annotations on critical paths:
-- **Protocol primitives**: varint/varlong encoding and decoding
-- **Protocol primitives**: i8, i16, i32, u32, i64, bool  
-- **Request/response headers**: encode_v0/v1/v2, decode_v0/v1
-- **Record encoding/decoding**: Record::encode, Record::decode, RecordHeader encode/decode
-- **Hash functions**: murmur2 for partition assignment
-- **Accessor methods**: Consumer/Producer record getters
-- **Enum conversions**: ApiKey, Compression, TimestampType, RecordBatchAttributes
-- **Error handling**: ErrorCode to/from i16 conversions
-- **Utilities**: CRC32C checksum, correlation ID generation
-- **Partitioners**: All 4 partitioner implementations
-- **Batch operations**: try_add, would_fit, track, size checking methods
-- **Metadata lookups**: partition_count, partition, leader lookups
-- **Predicates**: is_empty, is_null, is_closed, is_retriable, is_ok, is_leader, is_alive
-- **Retry policy**: calculate_backoff, should_retry, max_retries_reached
-- **Heartbeat controller**: interval, session_timeout, is_running accessors
+`#[inline]` sits on the protocol primitives (varints, fixed-width integers),
+request and response headers, record encode and decode, murmur2, CRC32C and
+the partitioners. Every `KrafkaError` constructor is `#[cold]`, so error paths
+stay out of the hot code's layout.
 
-### Cold Path Optimization
+### Buffers
 
-`#[cold]` annotations on error creation paths:
-- **Error constructors**: protocol, auth, timeout, broker, config, compression, invalid_state, serialization
-- Tells the compiler these paths are unlikely, improving branch prediction on hot paths
+- **Shared buffers**: `Bytes` for shared ownership. Decoded record keys,
+  values and header values are slices of the response buffer (uncompressed) or
+  of the decompressed buffer.
+- **One allocation per frame**: the reader reserves each response frame once,
+  at the size its length prefix declares.
+- **Owned on the way in**: `Record::new` and its builders take
+  `impl Into<Bytes>`, so a `Vec<u8>`, `String` or `Bytes` value moves into the
+  record without a copy; it is copied once, into the batch.
 
-### Zero-Copy Design
+### Header-first decoding
 
-1. **Zero-copy buffers**: `Bytes` for shared ownership without copying
-2. **Pre-allocated buffers**: Capacity hints for vectors
-3. **Efficient hashing**: murmur2 for partitioning (Java-compatible)
+A record batch's 61-byte header is parsed before anything else. The consumer
+skips aborted transactional batches from the header alone, without
+decompressing them; other batches are CRC-checked, decompressed and decoded
+into records that slice the buffer.
 
-### Memory Model
+### Allocation caps
 
-```
-  Producer Record Journey
-  
-  User Data (owned)      Producer (borrowed)     Wire (owned)
-       │                       │                      │
-       ▼                       ▼                      ▼
-  ┌─────────┐             ┌─────────┐           ┌─────────┐
-  │ Vec<u8> │  ─borrow─>  │  &[u8]  │  ─copy─>  │  Bytes  │
-  └─────────┘             └─────────┘           └─────────┘
-```
-
-### Lazy Deserialization
-
-`LazyRecordBatch` defers individual record parsing until access:
-
-```rust
-use krafka::protocol::LazyRecordBatch;
-
-// Decode batch header but not records
-let lazy = LazyRecordBatch::decode(&mut buf)?;
-
-// Iterate and decode on demand
-for result in lazy.records() {
-    let record = result?;
-    if should_process(&record) {
-        process(record);
-    }
-}
-
-// Or convert to eager batch if needed
-let batch = lazy.into_record_batch()?;
-```
-
-Benefits:
-- Avoids parsing records that will be filtered out
-- Reduced memory allocation for streaming consumers
-- Useful when filtering by offset before accessing key/value
-
-### Pre-allocation
-
-`Vec::with_capacity` used throughout for known-size collections, capped at 10,000 elements to protect against malicious broker responses:
-- Record batch building
-- Response decoding
-- Header collection
-
-All protocol decoding paths cap `Vec::with_capacity(len.min(10_000))` to prevent OOM from broker-supplied lengths.
+A length decoded from the wire is checked against `MAX_DECODE_ARRAY_LEN`
+(100,000) before it is used, and a `Vec` is pre-sized to at most the bytes
+left in the buffer — every element takes at least one byte — so a hostile
+length cannot reserve memory the response does not contain.
 
 ## Error Handling
 
@@ -530,83 +454,64 @@ All protocol decoding paths cap `Vec::with_capacity(len.min(10_000))` to prevent
 
 ```rust
 pub enum KrafkaError {
-    Protocol { kind: ProtocolErrorKind, message: String }, // Wire protocol errors; kind drives retry policy
+    Network(Arc<io::Error>),                // Connecting, I/O, unreachable broker
+    Protocol { kind, message },             // Wire protocol errors; kind drives retry policy
     Broker { code: ErrorCode, message },    // Kafka error codes
-    Auth { message: String },               // Authentication failures
-    Timeout { operation: String },          // Operation timeouts
-    Compression { codec, source },          // Compression errors
-    Config { message: String },             // Configuration errors
-    InvalidState { message: String },       // State machine errors
-    Serialization { message, source },      // Encoding/decoding errors
+    Auth { message, source },               // SASL, TLS certificate, OIDC endpoint
+    Timeout { operation },                  // Operation timeouts
+    DeliveryTimeout { possibly_written, message },
+    Config { message },                     // Configuration errors
+    Closed { message },                     // The client was closed
+    Fenced { message },                     // Another producer took over
+    TransactionAbortable { message },       // Abort the open transaction
+    NoOffset { partitions },                // No offset and no reset policy
+    UnknownTopic { topic },
+    OutOfOrderSequence { topic, partition, message },
+    IllegalState { message },               // Call not valid in this state
+    // … and Compression, Serialization, RecordDeserialization, Wakeup
 }
 ```
 
+`is_retriable()`, `requires_abort()` and `is_fatal()` classify any of them; see
+[Error Handling](@/docs/errors.md).
+
 ### Retriable Errors
 
-Some errors are automatically retriable:
-- `NotLeaderForPartition` - Triggers metadata refresh
-- `LeaderNotAvailable` - Wait and retry
-- Network timeouts - Retry with backoff
+`is_retriable()` is true for transport failures and for broker codes Kafka
+marks retriable. The clients retry them inside their deadline, refreshing
+the leader or coordinator first when the code says the cached one is wrong
+(`NOT_LEADER_OR_FOLLOWER`, `LEADER_NOT_AVAILABLE`, `NOT_COORDINATOR`).
 
 ## Thread Safety
 
-All krafka types are designed for concurrent use:
+The client types are `Send + Sync`:
 
 - `Producer`: `Send + Sync` - can be shared across tasks
 - `Consumer`: `Send + Sync` - can be shared across tasks
-- `ShareConsumer`: `Send + Sync` - can be shared across tasks (`share-groups` feature, on by default)
+- `ShareConsumer`: `Send + Sync` - can be shared across tasks (needs a Kafka 4.2+ broker)
 - `AdminClient`: `Send + Sync` - can be shared across tasks
 
-Internal state is protected by:
-- `RwLock<T>` for read-heavy data (metadata, offsets)
-- `AtomicBool` for flags (closed state)
-- `AtomicU8` with `compare_exchange` for transaction state machine
-- `Arc<T>` for shared ownership (coordinator state shared with heartbeat task)
-
-Connection pool uses a read-lock fast path for hot-path lookups, dropping all locks before network I/O during reconnection.
+Shared state sits behind locks, atomics for flags such as the closed state, and `Arc` for what background tasks
+share with the client (the group coordinator with its heartbeat task, the
+producer with its engine). The connection pool's lookups take a read lock;
+dials run in their own task with no lock held.
 
 ## Benchmarks
 
-krafka includes comprehensive Criterion benchmarks in `benches/`:
+Criterion benchmarks in `benches/`:
 
-### Producer Benchmarks (`benches/producer.rs`)
-- **Record batch encoding**: 1, 10, 100, 1000 records
-- **Compression codecs**: None, Gzip, Snappy, LZ4, Zstd
-- **murmur2 hashing**: Various key sizes (8, 32, 128, 512 bytes)
-- **Varint encoding**: Signed and unsigned values
-- **Roundtrip latency**: Single record encode/decode
-- **Partitioners**: Default, RoundRobin, Sticky, Hash strategies
+- **`producer.rs`**: record batch encoding (1–1000 records), every codec,
+  murmur2, varints, encode/decode round trip, keyed and round-robin
+  partitioning
+- **`consumer.rs`**: record batch decoding, decompression per codec, record
+  iteration, and full decode against a header-only peek
+- **`protocol.rs`**: primitives, varints, CRC32C, request headers, error-code
+  and API-key conversions
+- **`send_path.rs`**, **`consume_path.rs`** (feature `test-broker`): the whole
+  send and consume paths against the in-process fake broker. They are a
+  regression gate (`just bench-check`), not a source of absolute numbers.
 
-### Consumer Benchmarks (`benches/consumer.rs`)
-- **Record batch decoding**: 1, 10, 100, 500 records
-- **Decompression**: All 4 compression codecs
-- **Record iteration**: Iteration overhead for various batch sizes
-- **Lazy vs eager**: Comparison showing 7.5x speedup for streaming
-
-### Protocol Benchmarks (`benches/protocol.rs`)
-- **Primitive encode/decode**: i32, i64, bool operations
-- **Varint detailed**: 1-5 byte encoding/decoding performance
-- **CRC32C checksum**: 64B to 16KB data sizes
-- **Request headers**: v0, v1, v2 encoding
-- **Error code conversions**: from_i16, to_i16, is_retriable
-- **API key conversions**: from_i16, to_i16
-
-Run benchmarks with:
 ```bash
 cargo bench
+cargo bench --bench send_path --features test-broker
 ```
-
-## Implemented Features
-
-krafka includes the following production-ready features:
-
-- ✅ **Transactional Producer**: Exactly-once semantics with `TransactionalProducer`
-- ✅ **Incremental Fetch Sessions**: KIP-227 — bandwidth-efficient incremental fetches with per-broker session tracking
-- ✅ **TLS/SSL encryption**: Secure connections with rustls and mTLS support
-- ✅ **AWS MSK IAM authentication**: Native support with optional SDK integration
-- ✅ **SASL/SCRAM Authentication**: SHA-256 and SHA-512 mechanisms
-- ✅ **Session Reauthentication (KIP-368)**: Proactive session lifetime tracking with automatic connection replacement before SASL session expiry
-- ✅ **Metrics and Observability**: Producer, consumer, and connection metrics
-- ✅ **ACL Management**: Create, describe, and delete ACLs
-- ✅ **Security Hardening**: Secret zeroization, constant-time auth, PBKDF2 validation, decompression limits, allocation caps
-- ✅ **SOCKS5 Proxy**: Route all broker connections through a SOCKS5 proxy (VPN/bastion setups)

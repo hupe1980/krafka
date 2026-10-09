@@ -6,94 +6,160 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
 
-# Every job below runs a `just` recipe rather than an inline cargo command.
-# The justfile is the single source of truth for what the checks are, so
-# `just ci` locally runs exactly what CI runs and the two cannot drift.
-# Feature strings in particular live in one place (justfile variables) instead
-# of being duplicated across YAML.
+# Every job runs a `just` recipe; the justfile is the single source of truth
+# for what the checks are, so `just ci` locally runs what CI runs. Lists that
+# drive a matrix (fuzz targets, SASL broker versions) come from recipes too,
+# through the `matrices` job.
 #
-# `ring` and `rustls-aws-lc-rs` are additive: when both are enabled,
-# `rustls-aws-lc-rs` wins (see `auth::tls::resolve_crypto_provider`), so
-# `--all-features` is valid and needs no hand-maintained exclusion list.
+# `ci-success` (named `CI`) is the single required check. Every job is in its
+# `needs:` except the ones `xtask/ci_job_parity.py` declares non-blocking.
 
 jobs:
+  matrices:
+    name: Matrices
+    runs-on: ubuntu-latest
+    outputs:
+      fuzz-targets: ${{ steps.lists.outputs.fuzz-targets }}
+      sasl-versions: ${{ steps.lists.outputs.sasl-versions }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: "1.58.0"
+      - id: lists
+        run: |
+          echo "fuzz-targets=$(just fuzz-matrix)" >> "$GITHUB_OUTPUT"
+          echo "sasl-versions=$(just sasl-matrix)" >> "$GITHUB_OUTPUT"
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
           components: rustfmt
-      - uses: extractions/setup-just@v3
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: "1.58.0"
       - run: just fmt-check
 
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - uses: extractions/setup-just@v3
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: "1.58.0"
       - run: just clippy
 
   check:
     name: Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: extractions/setup-just@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: "1.58.0"
       - run: just check
 
   test:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: extractions/setup-just@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: "1.58.0"
       - run: just test
 
-  # `ring` is the DEFAULT backend, so it is what most downstream users compile.
-  # It must be *tested*, not merely type-checked: the
-  # `cfg(not(feature = "rustls-aws-lc-rs"))` arms in `auth/tls.rs` and
-  # `schema_registry/http.rs` only run here.
+  # `ring` is the default backend: the `cfg(not(feature = "rustls-aws-lc-rs"))`
+  # arms run only here.
   test-ring:
     name: Test (ring backend)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: extractions/setup-just@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: "1.58.0"
       - run: just test-ring
 
-  # Guards the minimum viable configuration. A missing crypto backend used to
-  # fail deep inside rustls; the `compile_error!` in lib.rs plus this job keep
-  # that diagnostic honest, and the second command pins feature additivity.
+  # The aws-lc-rs backend without `--all-features`, which would let `aws-msk`'s
+  # dependencies turn on post-quantum key exchange for krafka.
+  test-aws-lc:
+    name: Test (aws-lc-rs backend)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: "1.58.0"
+      - run: just test-aws-lc
+
+  # The minimum viable configuration, and both TLS backends together.
   minimal-features:
     name: Minimal features
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: extractions/setup-just@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: "1.58.0"
       - run: just minimal-features
 
-  # A network client's socket options, dual-stack connection racing and
-  # filesystem handling are platform-sensitive. Without these jobs non-Linux
-  # targets were never compiled at all.
+  # Socket options, dual-stack connection racing and filesystem handling are
+  # platform-sensitive.
   cross-platform:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -102,132 +168,429 @@ jobs:
       matrix:
         os: [macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: extractions/setup-just@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: "1.58.0"
       - run: just test-cross-platform
+
+  # The share consumer is always compiled; this builds and tests it under the
+  # default `ring` backend on every desktop OS.
+  share-consumer:
+    name: Share consumer (${{ matrix.os }}, ring)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: "1.58.0"
+      - run: just test-share-consumer
 
   protocol-parity:
     name: Protocol version parity
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: extractions/setup-just@v3
-      # Reads the vendored `xtask/kafka_protocol_snapshot.json`, so this job
-      # needs no network and cannot flake on a GitHub API rate limit. Refresh
-      # the snapshot deliberately with `just refresh-protocol-snapshot <tag>`.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: "1.58.0"
       - run: just protocol-parity
+
+  claims-check:
+    name: Generated capability claims
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: "1.58.0"
+      - run: just claims-check
+
+  fuzz-coverage:
+    name: Fuzz coverage of the version table
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: "1.58.0"
+      - run: just fuzz-coverage
 
   secret-debug:
     name: No secrets in Debug
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: extractions/setup-just@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: "1.58.0"
       - run: just secret-debug
+
+  advisory-floors:
+    name: No dependency floor admits an advised version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: "1.58.0"
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-deny@0.20.2
+      - run: cargo deny fetch
+      - run: just advisory-floors
 
   version-check:
     name: Version consistency
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: extractions/setup-just@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: "1.58.0"
       - run: just version-check
 
   test-reachability:
     name: No tests that cannot fail
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: extractions/setup-just@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: "1.58.0"
       - run: just test-reachability
 
   config-reachability:
     name: No config field that cannot be set
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: extractions/setup-just@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: "1.58.0"
       - run: just config-reachability
 
   protocol-reachability:
     name: No decoded field that is never read
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: extractions/setup-just@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: "1.58.0"
       - run: just protocol-reachability
+
+  ci-job-parity:
+    name: CI job parity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: "1.58.0"
+      - run: just ci-job-parity
+
+  # zizmor plus the repository's own rules (SHA pins, no workflow-level
+  # writes, no registry token).
+  workflow-lint:
+    name: Workflow lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: "1.58.0"
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: zizmor@1.30.1
+      - run: just workflow-lint
+
+  # The default graph compiles no C except `ring`'s, on every target, and no
+  # feature set brings in an OpenTelemetry crate.
+  no-c:
+    name: Dependency graph (no C outside ring, no OpenTelemetry)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: "1.58.0"
+      - run: just no-c
+      - run: just no-otel
+
+  # Every data-path method documents what dropping it does; every "cancel
+  # safe" claim is a case of the cancel-safety harness.
+  cancel-safety:
+    name: Cancel-safety sections
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: "1.58.0"
+      - run: just cancel-safety
+
+  # The deterministic simulation's per-PR seed budget and determinism check,
+  # the paused-clock timer tests and the cancel-safety harness, built with
+  # Tokio's RNG seedable. A failure prints the seed and `just sim-replay`.
+  sim:
+    name: Simulation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: "1.58.0"
+      - run: just sim
+
+  # The default feature set builds for musl and windows-gnu with nothing but a
+  # C compiler for `ring`.
+  cross-build:
+    name: Cross build (default features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl,x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: "1.58.0"
+      - name: Install C cross compilers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools gcc-aarch64-linux-gnu libc6-dev-arm64-cross gcc-mingw-w64-x86-64
+      - run: just cross-build
+        env:
+          CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_musl: aarch64-linux-gnu-ar
 
   doc:
     name: Documentation
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: extractions/setup-just@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: "1.58.0"
       - run: just doc
-
-  # The gate behind every ```rust,compile block in README.md and
-  # site/content/docs/. It was in `just ci` — and therefore in the release
-  # recipe — for its whole life without ever running in a workflow, so a pull
-  # request could break every documented sample and stay green. That is the
-  # same shape as the SASL suite, which was runnable locally long before
-  # anyone noticed it had never run in CI.
-  #
-  # `doc_api.py` checks that names resolve; it cannot check that a call has
-  # the right shape. This compiles the snippets instead.
-  # Asserts that every recipe in `just ci` has a job here, that the
-  # `ci-success` aggregator needs every job, and that it carries
-  # `if: always()`. Closes the class that `docs-test` and `integration-sasl`
-  # were both instances of.
-  ci-job-parity:
-    name: CI job parity
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: extractions/setup-just@v3
-      - run: just ci-job-parity
 
   docs-test:
     name: Documentation snippets
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: extractions/setup-just@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: "1.58.0"
       - run: just docs-test
 
-  # Classifies API changes against the last published release. Pre-1.0 this
-  # reports rather than blocks (D1 allows a minor bump to break), but the
-  # output is what the CHANGELOG's Breaking section owes the reader — and
-  # until now nothing checked that list was complete.
+  # Site structure (README links included) and the Zola build, whose
+  # broken-internal-link check fails the job.
+  site:
+    name: Documentation site
+    runs-on: ubuntu-latest
+    env:
+      ZOLA_VERSION: '0.22.1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: "1.58.0"
+      - name: Install Zola
+        run: |
+          curl -sSfL \
+            "https://github.com/getzola/zola/releases/download/v${ZOLA_VERSION}/zola-v${ZOLA_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin zola
+      - run: just site-check
+      - run: just site-build
+
+  # Fails on a detected API break unless CHANGELOG.md's Unreleased section
+  # lists it under Breaking (pre-1.0); from 1.0 a break in a non-major bump
+  # fails regardless.
   semver:
-    name: SemVer classification
+    name: SemVer
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: extractions/setup-just@v3
-      # A prebuilt binary rather than `cargo install`, which takes minutes.
-      # The check itself runs through the justfile so CI and a developer's
-      # machine cannot drift (D22).
-      - uses: taiki-e/install-action@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          tool: cargo-semver-checks
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: "1.58.0"
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-semver-checks@0.50.0
       - run: just semver-check
+
+  # Every direct dependency resolved to the floor Cargo.toml declares.
+  minimal-versions:
+    name: Minimal dependency versions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: nightly
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: "1.58.0"
+      - run: just minimal-versions
 
   supply-chain:
     name: Supply chain (cargo-deny)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          command: check advisories bans licenses sources
+          persist-credentials: false
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: "1.58.0"
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-deny@0.20.2
+      - run: just deny
+
+  # Every fuzz target for 60 s from its committed seeds; a crash, timeout or
+  # out-of-memory fails the job and uploads the reproducer.
+  fuzz:
+    name: Fuzz (${{ matrix.target }})
+    needs: matrices
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.matrices.outputs.fuzz-targets) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: fuzz
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: "1.58.0"
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-fuzz@0.13.2
+      - run: just fuzz "$TARGET" 60
+        env:
+          TARGET: ${{ matrix.target }}
+      - if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-reproducer-${{ matrix.target }}
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+
+  # Non-blocking (declared in xtask/ci_job_parity.py): mutation-tests the
+  # mutants a pull request's diff touches and reports survivors in the job
+  # summary. It is absent from `ci-success`'s needs, so it cannot fail `CI`.
+  mutants:
+    name: Mutants in diff (report)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: "1.58.0"
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-mutants@27.1.0
+      - run: just mutants-diff "origin/$BASE_REF"
+        env:
+          BASE_REF: ${{ github.base_ref }}
 
   integration:
     name: Integration Tests (Kafka ${{ matrix.kafka-version }})
@@ -236,16 +599,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # apache/kafka-native (GraalVM) is fast but segfaults on getpwuid in
-          # some CI environments; use it only where it is known to be stable.
+          # apache/kafka-native (GraalVM) is used only at 3.9; the 4.x native
+          # images segfault on GitHub Actions (GraalVM Pwd.getpwuid).
           - kafka-version: "3.9.0"
             kafka-image: "apache/kafka-native"
-          # Kafka 4.x native images consistently segfault on GitHub Actions
-          # (GraalVM Pwd.getpwuid bug); use the JVM image instead.
-          #
-          # 3.9 is the supported floor and 4.3 the protocol-parity target;
-          # every minor between them runs so a version-specific regression
-          # names the exact broker line that broke.
           - kafka-version: "4.0.0"
             kafka-image: "apache/kafka"
           - kafka-version: "4.1.0"
@@ -255,140 +612,142 @@ jobs:
           - kafka-version: "4.3.0"
             kafka-image: "apache/kafka"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: extractions/setup-just@v3
-      - name: Pre-pull Kafka image
-        run: |
-          for i in 1 2 3; do
-            docker pull ${{ matrix.kafka-image }}:${{ matrix.kafka-version }} && break
-            echo "Retry $i failed, waiting..."
-            sleep 10
-          done
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: "1.58.0"
       - run: just integration
         timeout-minutes: 45
         env:
           KAFKA_VERSION: ${{ matrix.kafka-version }}
           KAFKA_IMAGE: ${{ matrix.kafka-image }}
 
-  # The SASL suite existed before this job did — it was runnable locally via
-  # `just integration-sasl` but never ran in CI, so a SASL handshake
-  # regression could only be caught by hand. Its harness uses the Confluent
-  # image (the apache images do not ship the JAAS entrypoint hooks it needs).
+  # PLAIN, SCRAM-SHA-256, SCRAM-SHA-512 and OAUTHBEARER over SASL_PLAINTEXT
+  # and SASL_SSL, at every broker version `just sasl-matrix` lists.
   integration-sasl:
-    name: Integration Tests (SASL)
+    name: Integration Tests (SASL, Kafka ${{ matrix.kafka-version }})
+    needs: matrices
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        kafka-version: ${{ fromJSON(needs.matrices.outputs.sasl-versions) }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: extractions/setup-just@v3
-      - name: Pre-pull Kafka image
-        run: |
-          for i in 1 2 3; do
-            docker pull confluentinc/cp-kafka:7.5.0 && break
-            echo "Retry $i failed, waiting..."
-            sleep 10
-          done
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: "1.58.0"
       - run: just integration-sasl
-        timeout-minutes: 45
+        timeout-minutes: 15
+        env:
+          KAFKA_VERSION: ${{ matrix.kafka-version }}
 
-  # Redpanda speaks the Kafka wire protocol; krafka negotiates every API
-  # version, so this suite pins the compatibility that negotiation is supposed
-  # to buy — including the KIP-890 TV1 fallback (Redpanda has no server-side
-  # TV2). `latest` rather than a pinned tag: the claim under test is "current
-  # Redpanda works", and a pin would quietly narrow it to "one old Redpanda
-  # once worked".
+  # The pinned Redpanda release (tests/redpanda/Dockerfile): a red result here
+  # means krafka changed. Current `latest` is tracked by redpanda-latest.yml
+  # without gating.
   integration-redpanda:
-    name: Integration Tests (Redpanda)
+    name: Integration Tests (Redpanda, pinned)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: extractions/setup-just@v3
-      - name: Pre-pull Redpanda image
-        run: |
-          for i in 1 2 3; do
-            docker pull redpandadata/redpanda:latest && break
-            echo "Retry $i failed, waiting..."
-            sleep 10
-          done
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: "1.58.0"
       - run: just integration-redpanda
         timeout-minutes: 30
 
+  # The MSRV toolchain is the job's toolchain, so a plain `cargo check` is the
+  # check; `just msrv` is the local equivalent that switches toolchains.
   msrv:
     name: MSRV (1.95)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: "1.95"
-      - uses: Swatinem/rust-cache@v2
-      # Not `just msrv`: that recipe shells out to `rustup run 1.95` so a
-      # developer can check the MSRV without switching their default toolchain.
-      # Here the job's toolchain already *is* 1.95, so the plain command is
-      # both simpler and a genuine check that the pinned toolchain builds.
-      - run: cargo check
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo check --locked
 
   # ── The single required status check ────────────────────────────────────────
   #
-  # Branch protection names THIS job and nothing else. Without it, every job
-  # above has to be listed by hand in the repository settings, and a newly
-  # added job is not required by default — it runs, it can fail, and the merge
-  # button stays green until somebody remembers to go and add it.
-  #
-  # Two GitHub behaviours make the obvious implementation wrong, and both are
-  # guarded against here:
-  #
-  #   1. A required check whose job never runs stays *pending* forever, so the
-  #      pull request can never merge. `if: always()` makes this job run even
-  #      when a dependency failed or was skipped.
-  #   2. GitHub reads a *skipped* required check as **success**. So this job
-  #      must not simply skip on failure — it has to run and then fail
-  #      explicitly, which is what the `contains(needs.*.result, ...)` test
-  #      below does. Checking `success()` would not be enough either, because
-  #      a skipped dependency does not make `success()` false.
-  #
-  # `needs` is exhaustive on purpose. `just ci-job-parity` asserts that this
-  # list matches the jobs actually defined in this file, so adding a job
-  # without wiring it here fails the build rather than silently going
-  # unrequired.
+  # Branch protection names this job only. `if: always()` makes it run when a
+  # dependency failed or was skipped (a required check that never runs stays
+  # pending, and GitHub reads a skipped required check as success), and the
+  # step fails on any `failure`, `cancelled` or `skipped` result.
+  # `just ci-job-parity` asserts that `needs:` lists every job except the
+  # declared non-blocking ones.
   ci-success:
     name: CI
     if: always()
     runs-on: ubuntu-latest
     needs:
+      - matrices
       - fmt
       - clippy
       - check
       - test
       - test-ring
+      - test-aws-lc
       - minimal-features
       - cross-platform
+      - share-consumer
       - protocol-parity
+      - claims-check
+      - fuzz-coverage
       - secret-debug
+      - advisory-floors
       - version-check
       - test-reachability
       - config-reachability
       - protocol-reachability
       - ci-job-parity
+      - workflow-lint
+      - no-c
+      - cancel-safety
+      - sim
+      - cross-build
       - doc
       - docs-test
+      - site
       - semver
+      - minimal-versions
       - supply-chain
+      - fuzz
       - integration
       - integration-sasl
       - integration-redpanda
       - msrv
     steps:
       - name: Verify every job succeeded
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
         run: |
-          echo "Results: ${{ join(needs.*.result, ', ') }}"
-          if ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped') }}; then
-            echo "::error::At least one CI job did not succeed."
-            exit 1
-          fi
+          echo "Results: $RESULTS"
+          for r in $RESULTS; do
+            if [ "$r" != "success" ]; then
+              echo "::error::At least one CI job did not succeed ($r)."
+              exit 1
+            fi
+          done
           echo "All CI jobs succeeded."

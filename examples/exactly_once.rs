@@ -1,24 +1,21 @@
-//! Exactly-once read-process-write with a transactional producer.
+//! Exactly-once consume-transform-produce with a transactional producer.
 //!
-//! This is the pattern behind "exactly-once stream processing": consume from an
-//! input topic, transform, produce to an output topic, and commit the consumer's
-//! offsets *inside the same transaction* as the output records. Either both land
-//! or neither does.
+//! Each batch read from `example-orders` is transformed and written to
+//! `example-orders-upper`, and the consumer's offsets are committed inside the
+//! same transaction: the output records and the input positions become
+//! visible together, or not at all.
 //!
-//! # The part people get wrong
+//! - The consumer reads `read_committed` and never commits on its own.
+//! - `send_offsets` takes the consumer's `ConsumerGroupMetadata`, read again
+//!   for every transaction: its generation and member id let the group
+//!   coordinator refuse the commit of an instance that has lost its
+//!   partitions to a rebalance.
+//! - A failed send or offset commit aborts the transaction, and the batch is
+//!   read again after the consumer seeks back to its committed offsets.
 //!
-//! [`TransactionalProducer::send_offsets_to_transaction`] takes a
-//! [`ConsumerGroupMetadata`], not a bare group ID. That metadata is what lets
-//! the group coordinator fence a **zombie**: an instance that was partitioned
-//! away, lost its partitions to a rebalance, and then came back still holding a
-//! transaction. Without the generation and member ID, the coordinator accepts
-//! the zombie's commit unconditionally and it overwrites the position of the
-//! member that now owns the partition — so the new owner skips records nobody
-//! processed, or reprocesses records that were already handled.
-//!
-//! Re-read the metadata for **every** transaction. The generation changes on
-//! every rebalance, so a value captured once and cached stops fencing correctly
-//! at exactly the moment it matters.
+//! Stops after ten seconds without input. Needs a broker at
+//! `KAFKA_BOOTSTRAP_SERVERS` (default `localhost:9092`) and records in
+//! `example-orders`, for instance from the `producer` example.
 //!
 //! Run with:
 //! ```sh
@@ -27,103 +24,116 @@
 
 use std::time::Duration;
 
-use krafka::consumer::{AutoOffsetReset, Consumer, IsolationLevel};
+use krafka::consumer::{AutoOffsetReset, Consumer, ConsumerRecord, IsolationLevel};
 use krafka::producer::{TopicPartitionOffset, TransactionalProducer};
+use krafka::{Kafka, Record};
 
-const INPUT_TOPIC: &str = "input-events";
-const OUTPUT_TOPIC: &str = "output-events";
-const GROUP_ID: &str = "exactly-once-processor";
+const INPUT_TOPIC: &str = "example-orders";
+const OUTPUT_TOPIC: &str = "example-orders-upper";
+const GROUP_ID: &str = "krafka-exactly-once-example";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // The consumer MUST read committed data only. With read_uncommitted a
-    // failed upstream transaction's records would be processed and forwarded,
-    // which defeats the whole exercise.
-    let consumer = Consumer::builder()
-        .bootstrap_servers("localhost:9092")
-        .group_id(GROUP_ID)
+    let bootstrap =
+        std::env::var("KAFKA_BOOTSTRAP_SERVERS").unwrap_or_else(|_| "localhost:9092".into());
+    let kafka = Kafka::builder(bootstrap)
+        .client_id("krafka-exactly-once-example")
+        .connect()
+        .await?;
+
+    let consumer = kafka
+        .consumer(GROUP_ID)
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .isolation_level(IsolationLevel::ReadCommitted)
-        // Offsets are committed by the producer inside the transaction, so the
-        // consumer must never commit them on its own timer.
         .enable_auto_commit(false)
         .build()
         .await?;
 
-    let producer = TransactionalProducer::builder()
-        .bootstrap_servers("localhost:9092")
-        .transactional_id("exactly-once-processor-0")
-        .build()
+    // Building registers the transactional id: it fences any earlier
+    // instance with the same id and aborts the transaction it left open.
+    // Keep delivery_timeout at or below transaction_timeout.
+    let producer = kafka
+        .producer()
+        .transaction_timeout(Duration::from_secs(60))
+        .delivery_timeout(Duration::from_secs(45))
+        .build_transactional("krafka-exactly-once-example-0")
         .await?;
 
-    // Fences any previous incarnation of this transactional ID and aborts the
-    // transactions it left open. Call once per producer.
-    producer.init_transactions().await?;
+    consumer.subscribe([INPUT_TOPIC]).await?;
+    println!("{INPUT_TOPIC} -> {OUTPUT_TOPIC}");
 
-    consumer.subscribe(&[INPUT_TOPIC]).await?;
-    println!("Processing {INPUT_TOPIC} -> {OUTPUT_TOPIC} with exactly-once semantics");
-
-    loop {
+    let mut idle = Duration::ZERO;
+    while idle < Duration::from_secs(10) {
         let records = consumer.poll(Duration::from_secs(1)).await?;
         if records.is_empty() {
+            idle += Duration::from_secs(1);
             continue;
         }
+        idle = Duration::ZERO;
 
-        producer.begin_transaction()?;
-
-        let mut offsets: Vec<TopicPartitionOffset> = Vec::new();
-        for record in &records {
-            let Some(value) = &record.value else {
-                continue; // tombstone
-            };
-
-            let transformed = transform(value);
-            // The per-record metadata is not needed here: the transaction, not
-            // the individual send, is what determines whether this record is
-            // visible to a read_committed consumer.
-            let _ = producer
-                .send(OUTPUT_TOPIC, record.key.as_deref(), Some(&transformed))
-                .await?;
-
-            // Commit the offset of the NEXT record to consume, not this one.
-            offsets.push(TopicPartitionOffset::new(
-                &record.topic,
-                record.partition,
-                record.offset + 1,
-            ));
-        }
-
-        // Re-read on every transaction: the generation changes on every
-        // rebalance, and a stale snapshot silently stops fencing zombies.
-        let group_metadata = match consumer.group_metadata().await {
-            Some(m) => m,
-            None => {
-                // Not currently a live group member (mid-rebalance, or never
-                // joined). A commit now could not be fenced, so abort rather
-                // than write offsets the coordinator would accept blindly.
-                producer.abort_transaction().await?;
-                continue;
-            }
-        };
-
-        match producer
-            .send_offsets_to_transaction(&offsets, &group_metadata)
-            .await
-        {
+        producer.begin()?;
+        match process(&consumer, &producer, &records).await {
             Ok(()) => {
-                producer.commit_transaction().await?;
-                println!("Committed {} records", records.len());
+                producer.commit().await?;
+                println!("committed {} records", records.len());
             }
-            Err(e) => {
-                // A fenced or otherwise failed offset commit must not be
-                // committed alongside the output records.
-                eprintln!("Offset commit failed, aborting transaction: {e}");
-                producer.abort_transaction().await?;
+            Err(error) => {
+                eprintln!("aborting: {error}");
+                producer.abort().await?;
+                rewind(&consumer, &records).await?;
             }
         }
     }
+
+    producer.close().await?;
+    consumer.close().await?;
+    Ok(())
 }
 
-fn transform(value: &[u8]) -> Vec<u8> {
-    value.to_ascii_uppercase()
+/// Write the transformed batch and stage the consumer's offsets in the open
+/// transaction.
+async fn process(
+    consumer: &Consumer,
+    producer: &TransactionalProducer,
+    records: &[ConsumerRecord],
+) -> krafka::Result<()> {
+    let mut offsets = Vec::new();
+    for record in records {
+        if let Some(value) = &record.value {
+            let mut output = Record::new(OUTPUT_TOPIC, value.to_ascii_uppercase());
+            output.key = record.key.clone();
+            // The transaction, not the send, decides visibility.
+            let _ = producer.send(output).await?;
+        }
+        // The offset to commit is the next one to read.
+        offsets.push(TopicPartitionOffset::new(
+            &*record.topic,
+            record.partition,
+            record.offset + 1,
+        ));
+    }
+
+    // Not a group member right now (mid-rebalance): the commit could not be
+    // fenced, so give the batch up.
+    let Some(group_metadata) = consumer.group_metadata().await else {
+        return Err(krafka::KrafkaError::transaction_abortable(
+            "not a group member",
+        ));
+    };
+    producer.send_offsets(&offsets, &group_metadata).await
+}
+
+/// Seek every partition in the aborted batch back to its first record, so it
+/// is read and processed again.
+async fn rewind(consumer: &Consumer, records: &[ConsumerRecord]) -> krafka::Result<()> {
+    let mut first = std::collections::HashMap::new();
+    for record in records {
+        first
+            .entry((record.topic.clone(), record.partition))
+            .or_insert(record.offset);
+    }
+    for ((topic, partition), offset) in first {
+        consumer.seek(&topic, partition, offset).await?;
+    }
+    Ok(())
 }

@@ -1,365 +1,377 @@
-//! AdminClient operation group: group_offsets.
+//! Consumer group offsets: list, alter, delete, lag.
 
-use tracing::{debug, info, warn};
+use std::collections::{BTreeMap, HashMap};
 
-use crate::error::{KrafkaError, ProtocolErrorKind, Result};
+use crate::consumer::TopicPartition;
+use crate::error::{KrafkaError, Result};
 use crate::protocol::{
     ApiKey, OffsetCommitRequest, OffsetCommitRequestPartition, OffsetCommitRequestTopic,
     OffsetCommitResponse, OffsetDeletePartitionRequest, OffsetDeleteRequest, OffsetDeleteResponse,
     OffsetDeleteTopicRequest, OffsetFetchRequest, OffsetFetchRequestTopic, OffsetFetchResponse,
-    VersionedDecode, VersionedEncode, versions,
+    versions,
 };
 
-#[allow(clippy::wildcard_imports)]
-use super::*;
+use super::driver::{Mode, Target, answer, exchange, negotiate};
+use super::offsets::{ListOffsetsOptions, OffsetSpec};
+use super::{AdminClient, validate_topics};
 
-/// What to do about a committed offset that a transaction has staged but not
-/// yet committed (KIP-447).
-///
-/// The distinction only exists on groups fed by a transactional producer using
-/// `sendOffsetsToTransaction`. On every other group the two are identical,
-/// because nothing can stage an offset.
+/// A committed offset.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OffsetVisibility {
-    /// Report the latest offset written to `__consumer_offsets`, including one
-    /// staged by a transaction that has not resolved.
-    ///
-    /// The right answer for a lag dashboard that wants the freshest number and
-    /// can tolerate it moving backwards if the transaction aborts.
-    IncludeUnstable,
-    /// Report only offsets no in-flight transaction can retract.
-    ///
-    /// The right answer for anything that *acts* on the value — a tool that
-    /// resets or reasons about a group's position must not read an offset an
-    /// abort is about to take back. Partitions with an unresolved offset are
-    /// reported as an error rather than omitted.
-    StableOnly,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupOffset {
+    /// Committed offset; `None` when the group has no commit for the
+    /// partition.
+    pub offset: Option<i64>,
+    /// Leader epoch of the committed record, when known (KIP-320).
+    pub leader_epoch: Option<i32>,
+    /// Metadata attached to the commit.
+    pub metadata: Option<String>,
+}
+
+/// A partition's consumer lag from [`AdminClient::consumer_group_lag`].
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsumerGroupLag {
+    /// Committed offset; `None` when the group has no commit.
+    pub committed_offset: Option<i64>,
+    /// End offset (high watermark).
+    pub end_offset: i64,
+    /// `end_offset − committed_offset`, clamped at zero; `None` without a
+    /// committed offset.
+    pub lag: Option<i64>,
+}
+
+admin_options! {
+    /// Options for [`AdminClient::list_consumer_group_offsets`].
+    ListConsumerGroupOffsetsOptions {
+        /// Report only offsets no in-flight transaction can retract
+        /// (KIP-447). A partition with an unresolved transactional commit is
+        /// retried until it resolves or the deadline passes, then reported as
+        /// `UNSTABLE_OFFSET_COMMIT`.
+        require_stable: bool,
+    }
+    optional {
+        /// Only these partitions. Default: every partition the group has
+        /// committed.
+        partitions: Vec<TopicPartition>,
+    }
+}
+
+admin_options! {
+    /// Options for [`AdminClient::alter_consumer_group_offsets`].
+    AlterConsumerGroupOffsetsOptions {}
+}
+
+admin_options! {
+    /// Options for [`AdminClient::delete_consumer_group_offsets`].
+    DeleteConsumerGroupOffsetsOptions {}
+}
+
+admin_options! {
+    /// Options for [`AdminClient::consumer_group_lag`].
+    ConsumerGroupLagOptions {
+        /// As [`ListConsumerGroupOffsetsOptions::require_stable`].
+        require_stable: bool,
+    }
+    optional {
+        /// Only these partitions. Default: every partition the group has
+        /// committed.
+        partitions: Vec<TopicPartition>,
+    }
+}
+
+/// Group partitions by topic, sorted, for a request body.
+fn by_topic<'a>(
+    partitions: impl IntoIterator<Item = &'a TopicPartition>,
+) -> BTreeMap<&'a str, Vec<i32>> {
+    let mut topics: BTreeMap<&str, Vec<i32>> = BTreeMap::new();
+    for tp in partitions {
+        topics
+            .entry(tp.topic.as_str())
+            .or_default()
+            .push(tp.partition);
+    }
+    for partitions in topics.values_mut() {
+        partitions.sort_unstable();
+        partitions.dedup();
+    }
+    topics
 }
 
 impl AdminClient {
-    /// Delete committed offsets for a consumer group.
+    /// Fetch a consumer group's committed offsets from its coordinator.
     ///
-    /// **This is a destructive operation** — deleted offsets cannot be
-    /// recovered. The consumer group must be in the `Empty` state.
-    ///
-    /// The request is sent to the group coordinator.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let results = admin.delete_offsets(
-    ///     "my-group",
-    ///     &[("my-topic", &[0, 1, 2])],
-    /// ).await?;
-    /// ```
-    pub async fn delete_consumer_group_offsets(
-        &self,
-        group_id: &str,
-        topic_partitions: &[(&str, &[i32])],
-    ) -> Result<OffsetDeleteResult> {
-        self.check_not_closed()?;
-
-        // Find the group coordinator.
-        let coordinator = self.find_group_coordinator(group_id).await?;
-
-        let topics = topic_partitions
-            .iter()
-            .map(|(name, partitions)| OffsetDeleteTopicRequest {
-                name: (*name).to_string(),
-                partitions: partitions
-                    .iter()
-                    .map(|&p| OffsetDeletePartitionRequest { partition_index: p })
-                    .collect(),
-            })
-            .collect();
-
-        let request = OffsetDeleteRequest {
-            group_id: group_id.to_string(),
-            topics,
-        };
-
-        let version = coordinator
-            .negotiate_api_version(
-                ApiKey::OffsetDelete,
-                versions::OFFSET_DELETE_MAX,
-                versions::OFFSET_DELETE_MIN,
-            )
-            .ok_or_else(|| {
-                KrafkaError::protocol_kind(
-                    ProtocolErrorKind::UnknownApiVersion,
-                    "no mutually supported OffsetDelete API version",
-                )
-            })?;
-
-        let response_bytes = coordinator
-            .send_request(ApiKey::OffsetDelete, version, |buf| {
-                request.encode_versioned(version, buf)
-            })
-            .await?;
-
-        let mut buf = response_bytes;
-        let response = OffsetDeleteResponse::decode_versioned(version, &mut buf)?;
-
-        if !response.error_code.is_ok() {
-            warn!("OffsetDelete top-level error: {:?}", response.error_code);
-        }
-
-        let topics = response
-            .topics
-            .into_iter()
-            .map(|t| OffsetDeleteTopicResult {
-                name: t.name,
-                partitions: t
-                    .partitions
-                    .into_iter()
-                    .map(|p| OffsetDeletePartitionResult {
-                        partition_index: p.partition_index,
-                        error: if p.error_code.is_ok() {
-                            None
-                        } else {
-                            Some(format!("{:?}", p.error_code))
-                        },
-                    })
-                    .collect(),
-            })
-            .collect::<Vec<_>>();
-
-        info!("OffsetDelete completed for group {group_id}");
-
-        Ok(OffsetDeleteResult {
-            error: if response.error_code.is_ok() {
-                None
-            } else {
-                Some(format!("{:?}", response.error_code))
-            },
-            topics,
-        })
-    }
-
-    // ════════════════════════════════════════════════════════════════════
-    // DescribeUserScramCredentials (API key 50)
-    // ════════════════════════════════════════════════════════════════════
-
-    /// Fetch committed offsets for a consumer group.
-    ///
-    /// Pass `topic_partitions` to fetch offsets for specific partitions,
-    /// or `None` to fetch all committed offsets for the group.
-    ///
-    /// The request is sent to the group coordinator.
-    ///
-    /// `visibility` decides what to do about an offset a transaction has
-    /// staged but not yet committed — see [`OffsetVisibility`]. It is an
-    /// explicit argument rather than a default because the two answers differ
-    /// on exactly the pipelines where the difference matters, and a lag
-    /// dashboard silently reading the unstable value reports progress that an
-    /// abort can take back.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let offsets = admin
-    ///     .describe_consumer_group_offsets("my-group", None, OffsetVisibility::IncludeUnstable)
-    ///     .await?;
-    /// for entry in &offsets {
-    ///     println!("{}/{}: {}", entry.topic, entry.partition, entry.committed_offset);
-    /// }
-    /// ```
+    /// Returns a result per partition.
     ///
     /// # Errors
     ///
-    /// With [`OffsetVisibility::StableOnly`], a partition whose offset is
-    /// staged inside an unresolved transaction is reported by the broker as
-    /// `UNSTABLE_OFFSET_COMMIT`; it is surfaced rather than omitted, since an
-    /// omitted partition is indistinguishable from one the group never
-    /// committed.
-    pub async fn describe_consumer_group_offsets(
+    /// A group-level error from the broker — for example
+    /// `GROUP_AUTHORIZATION_FAILED`, or `COORDINATOR_LOAD_IN_PROGRESS` that
+    /// outlasted the deadline — keeps its code as a
+    /// [`KrafkaError::Broker`]. Also fails for a closed client.
+    pub async fn list_consumer_group_offsets(
         &self,
-        group_id: &str,
-        topic_partitions: Option<&[(&str, &[i32])]>,
-        visibility: OffsetVisibility,
-    ) -> Result<Vec<GroupOffsetEntry>> {
-        self.check_not_closed()?;
-
-        let coordinator = self.find_group_coordinator(group_id).await?;
-
-        let topics = topic_partitions.map(|tps| {
-            tps.iter()
-                .map(|(name, partitions)| OffsetFetchRequestTopic {
-                    name: (*name).to_string(),
-                    topic_id: None,
-                    partition_indexes: partitions.to_vec(),
-                })
-                .collect::<Vec<_>>()
-        });
-
-        let request = OffsetFetchRequest {
-            group_id: group_id.to_string(),
-            topics,
-            require_stable: visibility == OffsetVisibility::StableOnly,
-            member_id: None,
-            member_epoch: -1,
-        };
-
-        let version = coordinator
-            .negotiate_api_version(
-                ApiKey::OffsetFetch,
-                versions::OFFSET_FETCH_MAX,
-                versions::OFFSET_FETCH_MIN,
-            )
-            .ok_or_else(|| {
-                KrafkaError::protocol_kind(
-                    ProtocolErrorKind::UnknownApiVersion,
-                    "no mutually supported OffsetFetch API version",
-                )
-            })?;
-
-        let response_bytes = coordinator
-            .send_request(ApiKey::OffsetFetch, version, |buf| {
-                request.encode_versioned(version, buf)
-            })
-            .await?;
-
-        let mut buf = response_bytes;
-        let response = OffsetFetchResponse::decode_versioned(version, &mut buf)?;
-
-        if !response.error_code.is_ok() {
-            return Err(KrafkaError::protocol_kind(
-                ProtocolErrorKind::Other,
-                format!("OffsetFetch top-level error: {:?}", response.error_code),
-            ));
+        group_id: impl Into<String>,
+        options: ListConsumerGroupOffsetsOptions,
+    ) -> Result<HashMap<TopicPartition, Result<GroupOffset>>> {
+        let group_id = group_id.into();
+        if let Some(partitions) = &options.partitions {
+            validate_topics(partitions.iter().map(|tp| tp.topic.as_str()))?;
         }
+        let call = self.call("ListConsumerGroupOffsets", Mode::Read, options.timeout)?;
+        let group = &group_id;
+        let options = &options;
+        call.single(
+            Target::GroupCoordinator(group_id.clone()),
+            |conn| async move {
+                let request = OffsetFetchRequest {
+                    group_id: group.clone(),
+                    topics: options.partitions.as_ref().map(|partitions| {
+                        by_topic(partitions)
+                            .into_iter()
+                            .map(|(name, partition_indexes)| OffsetFetchRequestTopic {
+                                name: name.to_string(),
+                                topic_id: None,
+                                partition_indexes,
+                            })
+                            .collect()
+                    }),
+                    require_stable: options.require_stable,
+                    member_id: None,
+                    member_epoch: -1,
+                };
+                let version = negotiate(
+                    &conn,
+                    ApiKey::OffsetFetch,
+                    versions::OFFSET_FETCH_MIN,
+                    versions::OFFSET_FETCH_MAX,
+                )?;
+                let response: OffsetFetchResponse =
+                    exchange(&conn, ApiKey::OffsetFetch, version, &request).await?;
+                answer(response.error_code, None)?;
 
-        let mut entries = Vec::new();
-        for topic in response.topics {
-            for partition in topic.partitions {
-                entries.push(GroupOffsetEntry {
-                    topic: topic.name.clone(),
-                    partition: partition.partition_index,
-                    committed_offset: partition.committed_offset,
-                    metadata: partition.metadata,
-                    error: if partition.error_code.is_ok() {
-                        None
-                    } else {
-                        Some(format!("{:?}", partition.error_code))
-                    },
-                });
-            }
-        }
-
-        debug!(
-            "OffsetFetch for group {group_id}: {} entries",
-            entries.len()
-        );
-        Ok(entries)
+                let mut offsets = HashMap::new();
+                for topic in response.topics {
+                    for p in topic.partitions {
+                        let tp = TopicPartition::new(topic.name.clone(), p.partition_index);
+                        // UNSTABLE_OFFSET_COMMIT and the coordinator codes apply
+                        // to the whole fetch: fail it so the driver retries.
+                        if matches!(
+                            p.error_code,
+                            crate::error::ErrorCode::UnstableOffsetCommit
+                                | crate::error::ErrorCode::CoordinatorLoadInProgress
+                                | crate::error::ErrorCode::NotCoordinator
+                        ) {
+                            answer(p.error_code, None)?;
+                        }
+                        let result = answer(p.error_code, None).map(|()| GroupOffset {
+                            offset: (p.committed_offset >= 0).then_some(p.committed_offset),
+                            leader_epoch: (p.committed_leader_epoch >= 0)
+                                .then_some(p.committed_leader_epoch),
+                            metadata: p.metadata,
+                        });
+                        offsets.insert(tp, result);
+                    }
+                }
+                Ok(offsets)
+            },
+        )
+        .await
     }
 
-    /// Alter committed offsets for a consumer group.
+    /// Set a consumer group's committed offsets at its coordinator. The group
+    /// must have no active members. Returns a result per partition.
     ///
-    /// Sets each specified partition's committed offset. The consumer group
-    /// must be in the `Empty` state (no active members).
+    /// # Errors
     ///
-    /// The request is sent to the group coordinator.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// admin
-    ///     .alter_consumer_group_offsets(
-    ///         "my-group",
-    ///         &[("my-topic", &[(0, 100), (1, 200)])],
-    ///     )
-    ///     .await?;
-    /// ```
+    /// The call fails for a closed client or an invalid topic name.
     pub async fn alter_consumer_group_offsets(
         &self,
-        group_id: &str,
-        topic_offsets: &[(&str, &[(i32, i64)])],
-    ) -> Result<Vec<AlterGroupOffsetResult>> {
-        self.check_not_closed()?;
-
-        let coordinator = self.find_group_coordinator(group_id).await?;
-
-        let topics = topic_offsets
-            .iter()
-            .map(|(name, partitions)| OffsetCommitRequestTopic {
-                name: (*name).to_string(),
-                topic_id: None,
-                partitions: partitions
-                    .iter()
-                    .map(|&(partition, offset)| OffsetCommitRequestPartition {
-                        partition_index: partition,
-                        committed_offset: offset,
-                        // `-1` is correct here, unlike on the consumer's own
-                        // commit path. An administratively set offset is not
-                        // derived from a record this client consumed, so there
-                        // is no leader epoch it can honestly vouch for;
-                        // inventing one would defeat the KIP-320 check it is
-                        // supposed to feed.
-                        committed_leader_epoch: -1,
-                        commit_timestamp: -1,
-                        committed_metadata: None,
-                    })
-                    .collect(),
-            })
-            .collect();
-
-        let request = OffsetCommitRequest {
-            group_id: group_id.to_string(),
-            generation_id: -1,
-            member_id: String::new(),
-            group_instance_id: None,
-            retention_time_ms: -1,
-            topics,
-        };
-
-        let version = coordinator
-            .negotiate_api_version(
-                ApiKey::OffsetCommit,
-                versions::OFFSET_COMMIT_MAX,
-                versions::OFFSET_COMMIT_MIN,
+        group_id: impl Into<String>,
+        offsets: impl IntoIterator<Item = (TopicPartition, i64)>,
+        options: AlterConsumerGroupOffsetsOptions,
+    ) -> Result<HashMap<TopicPartition, Result<()>>> {
+        let group_id = group_id.into();
+        let offsets: HashMap<TopicPartition, i64> = offsets.into_iter().collect();
+        validate_topics(offsets.keys().map(|tp| tp.topic.as_str()))?;
+        let call = self.call("AlterConsumerGroupOffsets", Mode::Write, options.timeout)?;
+        let group = &group_id;
+        let offsets_ref = &offsets;
+        Ok(call
+            .fan_out(
+                offsets.keys().cloned().collect(),
+                |_| Target::GroupCoordinator(group_id.clone()),
+                |conn, partitions| async move {
+                    let request = OffsetCommitRequest {
+                        group_id: group.clone(),
+                        generation_id: -1,
+                        member_id: String::new(),
+                        group_instance_id: None,
+                        retention_time_ms: -1,
+                        topics: by_topic(&partitions)
+                            .into_iter()
+                            .map(|(name, indexes)| OffsetCommitRequestTopic {
+                                name: name.to_string(),
+                                topic_id: None,
+                                partitions: indexes
+                                    .into_iter()
+                                    .map(|partition| OffsetCommitRequestPartition {
+                                        partition_index: partition,
+                                        committed_offset: offsets_ref
+                                            [&TopicPartition::new(name, partition)],
+                                        // An administratively set offset has no
+                                        // record behind it, so no leader epoch.
+                                        committed_leader_epoch: -1,
+                                        commit_timestamp: -1,
+                                        committed_metadata: None,
+                                    })
+                                    .collect(),
+                            })
+                            .collect(),
+                    };
+                    let version = negotiate(
+                        &conn,
+                        ApiKey::OffsetCommit,
+                        versions::OFFSET_COMMIT_MIN,
+                        versions::OFFSET_COMMIT_MAX,
+                    )?;
+                    let response: OffsetCommitResponse =
+                        exchange(&conn, ApiKey::OffsetCommit, version, &request).await?;
+                    Ok(response
+                        .topics
+                        .into_iter()
+                        .flat_map(|t| {
+                            let name = t.name;
+                            t.partitions.into_iter().map(move |p| {
+                                (
+                                    TopicPartition::new(name.clone(), p.partition_index),
+                                    answer(p.error_code, None),
+                                )
+                            })
+                        })
+                        .collect())
+                },
             )
-            .ok_or_else(|| {
-                KrafkaError::protocol_kind(
-                    ProtocolErrorKind::UnknownApiVersion,
-                    "no mutually supported OffsetCommit API version",
-                )
-            })?;
-
-        let response_bytes = coordinator
-            .send_request(ApiKey::OffsetCommit, version, |buf| {
-                request.encode_versioned(version, buf)
-            })
-            .await?;
-
-        let mut buf = response_bytes;
-        let response = OffsetCommitResponse::decode_versioned(version, &mut buf)?;
-
-        let mut results = Vec::new();
-        for topic in response.topics {
-            for partition in topic.partitions {
-                results.push(AlterGroupOffsetResult {
-                    topic: topic.name.clone(),
-                    partition: partition.partition_index,
-                    error: if partition.error_code.is_ok() {
-                        None
-                    } else {
-                        Some(format!("{:?}", partition.error_code))
-                    },
-                });
-            }
-        }
-
-        info!(
-            "OffsetCommit for group {group_id}: {} partitions updated",
-            results.len()
-        );
-        Ok(results)
+            .await)
     }
 
-    // ════════════════════════════════════════════════════════════════════
-    // DescribeUserScramCredentials (API key 50)
-    // ════════════════════════════════════════════════════════════════════
+    /// Delete a consumer group's committed offsets at its coordinator. The
+    /// group must not be subscribed to the topics. Returns a result per
+    /// partition; a group-level error applies to every partition.
+    ///
+    /// # Errors
+    ///
+    /// The call fails for a closed client or an invalid topic name.
+    pub async fn delete_consumer_group_offsets(
+        &self,
+        group_id: impl Into<String>,
+        partitions: impl IntoIterator<Item = TopicPartition>,
+        options: DeleteConsumerGroupOffsetsOptions,
+    ) -> Result<HashMap<TopicPartition, Result<()>>> {
+        let group_id = group_id.into();
+        let mut partitions: Vec<TopicPartition> = partitions.into_iter().collect();
+        validate_topics(partitions.iter().map(|tp| tp.topic.as_str()))?;
+        partitions.dedup();
+        let call = self.call("DeleteConsumerGroupOffsets", Mode::Write, options.timeout)?;
+        let group = &group_id;
+        Ok(call
+            .fan_out(
+                partitions,
+                |_| Target::GroupCoordinator(group_id.clone()),
+                |conn, partitions| async move {
+                    let request = OffsetDeleteRequest {
+                        group_id: group.clone(),
+                        topics: by_topic(&partitions)
+                            .into_iter()
+                            .map(|(name, indexes)| OffsetDeleteTopicRequest {
+                                name: name.to_string(),
+                                partitions: indexes
+                                    .into_iter()
+                                    .map(|p| OffsetDeletePartitionRequest { partition_index: p })
+                                    .collect(),
+                            })
+                            .collect(),
+                    };
+                    let version = negotiate(
+                        &conn,
+                        ApiKey::OffsetDelete,
+                        versions::OFFSET_DELETE_MIN,
+                        versions::OFFSET_DELETE_MAX,
+                    )?;
+                    let response: OffsetDeleteResponse =
+                        exchange(&conn, ApiKey::OffsetDelete, version, &request).await?;
+                    if let Err(e) = answer(response.error_code, None) {
+                        return Ok(partitions
+                            .into_iter()
+                            .map(|tp| (tp, Err(e.clone())))
+                            .collect());
+                    }
+                    Ok(response
+                        .topics
+                        .into_iter()
+                        .flat_map(|t| {
+                            let name = t.name;
+                            t.partitions.into_iter().map(move |p| {
+                                (
+                                    TopicPartition::new(name.clone(), p.partition_index),
+                                    answer(p.error_code, None),
+                                )
+                            })
+                        })
+                        .collect())
+                },
+            )
+            .await)
+    }
+
+    /// A consumer group's lag per partition: the end offset minus the
+    /// committed offset.
+    ///
+    /// A partition whose end offset could not be fetched is an `Err` with the
+    /// `ListOffsets` error, never a lag of zero that would hide a stalled
+    /// consumer.
+    ///
+    /// # Errors
+    ///
+    /// As [`list_consumer_group_offsets`](Self::list_consumer_group_offsets).
+    pub async fn consumer_group_lag(
+        &self,
+        group_id: impl Into<String>,
+        options: ConsumerGroupLagOptions,
+    ) -> Result<HashMap<TopicPartition, Result<ConsumerGroupLag>>> {
+        let call = self.call("ConsumerGroupLag", Mode::Read, options.timeout)?;
+        let mut fetch = ListConsumerGroupOffsetsOptions::default()
+            .require_stable(options.require_stable)
+            .timeout(call.remaining());
+        if let Some(partitions) = options.partitions {
+            fetch = fetch.partitions(partitions);
+        }
+        let committed = self.list_consumer_group_offsets(group_id, fetch).await?;
+
+        let end_offsets = self
+            .list_offsets(
+                committed.keys().map(|tp| (tp.clone(), OffsetSpec::Latest)),
+                ListOffsetsOptions::default().timeout(call.remaining()),
+            )
+            .await?;
+
+        Ok(committed
+            .into_iter()
+            .map(|(tp, committed)| {
+                let lag = committed.and_then(|committed| {
+                    let end = end_offsets.get(&tp).cloned().unwrap_or_else(|| {
+                        Err(KrafkaError::timeout("ListOffsets returned no end offset"))
+                    })?;
+                    Ok(ConsumerGroupLag {
+                        committed_offset: committed.offset,
+                        end_offset: end.offset,
+                        lag: committed.offset.map(|c| (end.offset - c).max(0)),
+                    })
+                });
+                (tp, lag)
+            })
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -368,130 +380,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_offset_delete_request_maps_topic_partitions() {
-        let request = OffsetDeleteRequest {
-            group_id: "my-group".into(),
-            topics: vec![OffsetDeleteTopicRequest {
-                name: "orders".into(),
-                partitions: [0, 1, 2]
-                    .iter()
-                    .map(|&p| OffsetDeletePartitionRequest { partition_index: p })
-                    .collect(),
-            }],
-        };
-
-        assert_eq!(request.group_id, "my-group");
-        assert_eq!(request.topics[0].partitions.len(), 3);
-
-        let mut buf = Vec::new();
-        request
-            .encode_versioned(versions::OFFSET_DELETE_MAX, &mut buf)
-            .expect("OffsetDelete must encode");
-        assert!(!buf.is_empty());
-    }
-
-    /// `topics: None` fetches every committed offset for the group; an empty
-    /// vec would fetch none. The two must not be conflated.
-    #[test]
-    fn test_offset_fetch_request_none_means_all_partitions() {
-        let all = OffsetFetchRequest {
-            group_id: "g".into(),
-            topics: None,
-            require_stable: false,
-            member_id: None,
-            member_epoch: -1,
-        };
-        assert!(all.topics.is_none());
-
-        let specific = OffsetFetchRequest {
-            group_id: "g".into(),
-            topics: Some(vec![OffsetFetchRequestTopic {
-                name: "orders".into(),
-                topic_id: None,
-                partition_indexes: vec![0, 1],
-            }]),
-            require_stable: false,
-            member_id: None,
-            member_epoch: -1,
-        };
+    fn partitions_are_grouped_by_topic_sorted_and_deduplicated() {
+        let partitions = [
+            TopicPartition::new("b", 1),
+            TopicPartition::new("a", 2),
+            TopicPartition::new("a", 0),
+            TopicPartition::new("a", 2),
+        ];
+        let grouped = by_topic(&partitions);
         assert_eq!(
-            specific.topics.as_ref().unwrap()[0].partition_indexes.len(),
-            2
-        );
-
-        let mut buf = Vec::new();
-        specific
-            .encode_versioned(versions::OFFSET_FETCH_MAX, &mut buf)
-            .expect("OffsetFetch must encode");
-        assert!(!buf.is_empty());
-    }
-
-    /// An admin offset reset acts outside any group membership, so it must send
-    /// the "no member" sentinels — a real generation/member ID would be fenced.
-    #[test]
-    fn test_admin_offset_commit_uses_no_member_sentinels() {
-        let request = OffsetCommitRequest {
-            group_id: "g".into(),
-            generation_id: -1,
-            member_id: String::new(),
-            group_instance_id: None,
-            retention_time_ms: -1,
-            topics: vec![OffsetCommitRequestTopic {
-                name: "orders".into(),
-                topic_id: None,
-                partitions: vec![OffsetCommitRequestPartition {
-                    partition_index: 0,
-                    committed_offset: 100,
-                    committed_leader_epoch: -1,
-                    commit_timestamp: -1,
-                    committed_metadata: None,
-                }],
-            }],
-        };
-
-        assert_eq!(request.generation_id, -1);
-        assert!(request.member_id.is_empty());
-        assert_eq!(request.topics[0].partitions[0].committed_offset, 100);
-
-        let mut buf = Vec::new();
-        request
-            .encode_versioned(versions::OFFSET_COMMIT_MAX, &mut buf)
-            .expect("OffsetCommit must encode");
-        assert!(!buf.is_empty());
-    }
-
-    /// `-1` is Kafka's "no offset committed" sentinel and must not be read as
-    /// a real offset of -1.
-    #[test]
-    fn test_committed_offset_sentinel_is_distinguished_from_a_real_offset() {
-        let none = GroupOffsetEntry {
-            topic: "orders".into(),
-            partition: 0,
-            committed_offset: -1,
-            metadata: None,
-            error: None,
-        };
-        let real = GroupOffsetEntry {
-            topic: "orders".into(),
-            partition: 1,
-            committed_offset: 0,
-            metadata: None,
-            error: None,
-        };
-
-        let interpret = |e: &GroupOffsetEntry| {
-            if e.committed_offset == -1 {
-                None
-            } else {
-                Some(e.committed_offset)
-            }
-        };
-
-        assert_eq!(interpret(&none), None);
-        assert_eq!(
-            interpret(&real),
-            Some(0),
-            "offset 0 is a real committed position, not 'no commit'"
+            grouped.into_iter().collect::<Vec<_>>(),
+            vec![("a", vec![0, 2]), ("b", vec![1])]
         );
     }
 }
