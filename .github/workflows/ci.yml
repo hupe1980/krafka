@@ -629,8 +629,7 @@ jobs:
           KAFKA_VERSION: ${{ matrix.kafka-version }}
 
   # The pinned Redpanda release (tests/redpanda/Dockerfile): a red result here
-  # means krafka changed. Current `latest` is tracked by redpanda-latest.yml
-  # without gating.
+  # means krafka changed.
   integration-redpanda:
     name: Integration Tests (Redpanda, pinned)
     runs-on: ubuntu-latest

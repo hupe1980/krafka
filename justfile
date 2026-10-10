@@ -313,10 +313,10 @@ sim-replay test seed:
         RUSTFLAGS="${RUSTFLAGS:-} --cfg tokio_unstable" \
         cargo test --features test-broker --test simulation -- --exact {{test}} --nocapture
 
-# The nightly budget: 5000 seeds per workload, disjoint from the per-PR ones,
+# The long budget: 5000 seeds per workload, disjoint from the per-PR ones,
 # then every planted defect in tests/plants/ must be caught again.
-[doc("Simulation nightly budget and planted-defect controls")]
-sim-nightly:
+[doc("Simulation long budget and planted-defect controls")]
+sim-long:
     KRAFKA_SIM_SEEDS=1000..6000 CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}/sim" \
         RUSTFLAGS="${RUSTFLAGS:-} --cfg tokio_unstable" \
         cargo test --features test-broker --test simulation
@@ -343,8 +343,8 @@ site-check:
     python3 xtask/doc_api.py
 
 # Mutation-test the scoped files (`mutants_files`) and print the survivor
-# count. Not part of `ci`: the full set takes hours; CI runs it weekly
-# (mutants-weekly.yml). `mutants-diff` is for local runs on a branch.
+# count. Not part of `ci`: the full set takes hours. `mutants-diff` is for
+# local runs on a branch.
 [doc("Mutation-test the invariant-dense modules")]
 mutants *ARGS:
     #!/usr/bin/env bash

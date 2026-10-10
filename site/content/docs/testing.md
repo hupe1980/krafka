@@ -603,14 +603,14 @@ For contributors. `just ci` is the local gate; each of its recipes is a job in
 | `just test` | Unit tests, doc tests and the fake-broker integration tests | yes |
 | `just sim` | The deterministic simulation (`tests/simulation.rs`): seeded faults on an in-memory cluster with a paused clock, judged against six invariants (no lost acknowledged write, no duplicate, no aborted read, no partial commit, flush/close completeness, at-least-once). `xtask/determinism.py` keeps the library inside what a seed controls | yes |
 | `just sim-replay <workload> <seed>` | Replays one seed and prints its trace | — |
-| `just sim-nightly` | 5 000 seeds per workload, then the planted defects in `tests/plants/` (`xtask/plants.py`), each of which must be caught | no (nightly) |
+| `just sim-long` | 5 000 seeds per workload, then the planted defects in `tests/plants/` (`xtask/plants.py`), each of which must be caught | local only |
 | `just cancel-safety` | Every data-path method has a well-formed `# Cancel safety` section; `tests/cancel_safety.rs` tests each claim by dropping the future at every pending poll | yes |
 | `just no-c` | The default build compiles no C beyond `ring` and links no system library | yes |
-| `just fuzz` | The fuzz targets, 60 s each per pull request; a longer nightly run does not block | yes |
+| `just fuzz` | The fuzz targets, 60 s each per pull request | yes |
 | `just semver-check`, `just minimal-versions`, `just cross-build` | API compatibility, minimal dependency versions, musl and windows-gnu builds | yes |
 | `just integration`, `just integration-matrix` | Apache Kafka in Docker (`apache/kafka-native:3.9.0` by default), every supported minor 3.9 → 4.3 | yes |
 | `just integration-sasl`, `just integration-sasl-matrix` | PLAIN, SCRAM-SHA-256/512 and OAUTHBEARER over `SASL_PLAINTEXT` and `SASL_SSL`, Kafka 3.9.0 and 4.3.1. AWS MSK IAM is covered by unit tests only | yes |
-| `just integration-redpanda` | The Redpanda release pinned in `tests/redpanda/Dockerfile`; `REDPANDA_VERSION=latest` runs the current one weekly | pinned: yes; `latest`: no |
-| `just mutants`, `just mutants-diff origin/main` | cargo-mutants over sequence arithmetic, the in-flight barrier, varint codecs and fetch sessions; weekly in CI, `mutants-diff` locally for a branch's changes. `--re <fn>` scopes a run to one function | no |
+| `just integration-redpanda` | The Redpanda release pinned in `tests/redpanda/Dockerfile`; `REDPANDA_VERSION=latest` runs the current one | pinned: yes; `latest`: local only |
+| `just mutants`, `just mutants-diff origin/main` | cargo-mutants over sequence arithmetic, the in-flight barrier, varint codecs and fetch sessions; `mutants-diff` for a branch's changes. `--re <fn>` scopes a run to one function | local only |
 | `just bench-check` | Send- and consume-path regression against a saved baseline | local only |
 | `just ci-job-parity` | Every workflow job is inside `CI` or declared non-blocking | yes |

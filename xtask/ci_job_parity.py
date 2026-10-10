@@ -53,22 +53,12 @@ MUST_BLOCK = {
     "fuzz": "a panic on broker input violates the untrusted-input guarantee",
 }
 
-# Every other workflow, classed as a non-blocking check (scheduled or
-# event-driven evidence whose failure is a reason to look, not to refuse a
+# Every other workflow, classed as a non-blocking check (event-driven
+# evidence whose failure is a reason to look, not to refuse a
 # merge) or as not a check (release, deploy, report).
 WORKFLOWS = {
     "publish.yml": ("not-a-check", "release: packages, attests and publishes a tagged commit whose CI passed"),
     "pages.yml": ("not-a-check", "deploy: publishes the site from main; CI's `site` job builds and checks it"),
-    "fuzz-nightly.yml": ("non-blocking", "nightly 30-minute fuzz campaign that grows the corpus"),
-    "sim-nightly.yml": (
-        "non-blocking",
-        "nightly simulation seed budget and planted-defect controls; the per-PR budget gates in `sim`",
-    ),
-    "mutants-weekly.yml": ("non-blocking", "weekly full mutation run over the scoped files; records the survivor count"),
-    "redpanda-latest.yml": (
-        "non-blocking",
-        "third-party latest image; its changes must not block a krafka merge",
-    ),
 }
 CLASSES = {"non-blocking", "not-a-check"}
 
@@ -270,7 +260,7 @@ def self_test() -> int:
             None, ("extra.yml", "name: x\non: push\njobs: {}\n"), None, "workflow `extra.yml` is not declared",
         ),
         "declared workflow missing": (
-            None, ("-mutants-weekly.yml", ""), None, "`mutants-weekly.yml`, which does not exist",
+            None, ("-pages.yml", ""), None, "`pages.yml`, which does not exist",
         ),
         "recipe in `just ci` with no job": (
             lambda y: y.replace("      - run: just no-c\n", "", 1), None, None, "`just no-c` is in `just ci`",

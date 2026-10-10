@@ -55,8 +55,8 @@ required check, which depends on every CI job, passes. `just ci` runs:
 | `version-check`, `ci-job-parity`, `workflow-lint` | versions out of step; a recipe with no CI job; an unsafe workflow pattern |
 
 Beyond `just ci`, CI runs the Docker integration suites against several Kafka
-versions and Redpanda, `just deny` for licences and advisories, fuzzing on
-each pull request and nightly, and mutation testing. Releases are published
+versions and Redpanda, `just deny` for licences and advisories, and fuzzing on
+each pull request. Releases are published
 only from the release workflow, with an attested crate and SBOM.
 
 ## AI-assisted development

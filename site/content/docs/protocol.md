@@ -363,7 +363,7 @@ Limits on what a malicious or corrupted broker response can make the client do:
 - **Record batch bounds**: A record batch has no record-count limit; it is bounded by its bytes. A declared count larger than the record bytes can hold (7 bytes per record at least) is rejected before anything is allocated for it, and decompressed output is bounded by the size limit below.
 - **Decompression limits**: Decompressed record data is limited to 128 MiB (configurable) via streaming `.take()` limits and post-decompression size checks
 - **Encode validation**: The `TryEncode` trait provides fallible encoding for protocol primitives (`KafkaString`, `KafkaBytes`, `KafkaArray<T>` where `T: TryEncode`, `TaggedFields`), returning an error on oversized data. `Record::validate()` checks wire-format limits at the API boundary before encoding
-- **Fuzz testing**: The `fuzz/` directory provides [cargo-fuzz](https://rust-fuzz.github.io/book/cargo-fuzz.html) targets for the framing header and primitives, `KafkaArray` decode, `RecordBatch` decode, every response decoder at every version in the table above, request encode, the SCRAM exchange, the OIDC token client's HTTP response parser, and record-batch decompression under a small cap in every codec. `just fuzz-coverage` fails when a version in the table has no fuzz path. Every pull request runs each target for 60 seconds from committed seeds, and a nightly run fuzzes each for 30 minutes. See `fuzz/README.md` for usage.
+- **Fuzz testing**: The `fuzz/` directory provides [cargo-fuzz](https://rust-fuzz.github.io/book/cargo-fuzz.html) targets for the framing header and primitives, `KafkaArray` decode, `RecordBatch` decode, every response decoder at every version in the table above, request encode, the SCRAM exchange, the OIDC token client's HTTP response parser, and record-batch decompression under a small cap in every codec. `just fuzz-coverage` fails when a version in the table has no fuzz path. Every pull request runs each target for 60 seconds from committed seeds. See `fuzz/README.md` for usage.
 
 ## Wire Protocol
 
@@ -449,8 +449,8 @@ Redpanda needs no configuration and no feature flag:
 The Redpanda suite covers a produce/consume round trip, the admin topic
 lifecycle, the TV1 transaction fallback with `read_committed` visibility, and
 closing a consumer without wedging a shared connection. CI gates every merge on
-the Redpanda release pinned in `tests/redpanda/Dockerfile`, and runs the same
-suite against `latest` weekly without gating:
+the Redpanda release pinned in `tests/redpanda/Dockerfile`; the same suite runs
+locally against `latest`:
 
 ```sh
 just integration-redpanda                           # the pinned release

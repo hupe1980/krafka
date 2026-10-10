@@ -46,7 +46,7 @@ committed.
 `just fuzz-coverage` (part of `just ci`) fails when an API in `api_versions!`
 has no arm in `fuzz_response_decode`, when a (API, version) pair has no seed,
 or when a target has no `[[bin]]` or no seeds. CI runs every target for 60 s
-on each pull request, and `fuzz-nightly.yml` for 30 minutes per target.
+on each pull request.
 
 ## Crashes
 

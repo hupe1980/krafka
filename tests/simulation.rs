@@ -2,8 +2,8 @@
 //! cluster under a paused clock, with faults chosen from a seed, judged by
 //! six invariants over the history.
 //!
-//! Every test runs a seed budget: `KRAFKA_SIM_SEEDS=<a>..<b>` widens it (the
-//! nightly job), `KRAFKA_SIM_SEED=<n>` replays one seed. A failure prints its
+//! Every test runs a seed budget: `KRAFKA_SIM_SEEDS=<a>..<b>` widens it (`just
+//! sim-long`), `KRAFKA_SIM_SEED=<n>` replays one seed. A failure prints its
 //! seed and the command that replays it. Build with
 //! `RUSTFLAGS='--cfg tokio_unstable'` (`just sim`) so Tokio's own RNG, which
 //! orders `select!` branches, is seeded too.
