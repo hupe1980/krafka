@@ -726,3 +726,98 @@ async fn a_permanently_fenced_partition_backs_off() {
     assert_eq!(healthy, 200, "the healthy partition is delivered in full");
     let _ = consumer.close().await;
 }
+
+// ── A join round the coordinator holds past request_timeout ─────────────
+
+/// Which request of a cooperative member's background rejoin the
+/// coordinator holds for longer than `request_timeout`.
+#[derive(Clone, Copy)]
+enum Held {
+    /// The `JoinGroup`, parked until the group's last member rejoins.
+    Join,
+    /// The `SyncGroup`, parked until the leader's arrives.
+    Sync,
+}
+
+/// Run one background rejoin whose `held` request the fake coordinator
+/// answers after three request timeouts, and check the member finished
+/// that one round: one `JoinGroup`, one `SyncGroup`, no connection closed
+/// for a timed-out request, nothing revoked or lost.
+async fn a_held_round_completes(held: Held, group: &str) {
+    let broker = Arc::new(FakeBroker::start().await.unwrap());
+    broker.create_topic("events", 1);
+    let events = Events(Arc::default());
+    let kafka = krafka::Kafka::builder(broker.bootstrap_servers())
+        .request_timeout(T)
+        .connect_timeout(T)
+        .connect()
+        .await
+        .unwrap();
+    let consumer = kafka
+        .consumer(group)
+        .partition_assignment_strategy(
+            krafka::consumer::PartitionAssignmentStrategy::CooperativeSticky,
+        )
+        .heartbeat_interval(Duration::from_millis(100))
+        .rebalance_listener(Events(events.0.clone()))
+        .build()
+        .await
+        .unwrap();
+    consumer.subscribe(&["events"]).await.unwrap();
+    wait_assigned(&consumer).await;
+    let joins = broker.request_count(ApiKey::JoinGroup);
+    let syncs = broker.request_count(ApiKey::SyncGroup);
+
+    let api = match held {
+        Held::Join => ApiKey::JoinGroup,
+        Held::Sync => ApiKey::SyncGroup,
+    };
+    broker.on_once(api, |_| Control::Delay(T * 3));
+    broker.on_once(ApiKey::Heartbeat, |_| {
+        Control::Error(ErrorCode::RebalanceInProgress)
+    });
+    // The round has ended once its SyncGroup was answered: the heartbeats
+    // after it are written after the answer.
+    let deadline = Instant::now() + T * 10;
+    while broker.request_count(ApiKey::SyncGroup) == syncs {
+        assert!(Instant::now() < deadline, "the round never synced");
+        let _ = consumer.poll(Duration::from_millis(200)).await;
+    }
+    let heartbeats = broker.request_count(ApiKey::Heartbeat);
+    while broker.request_count(ApiKey::Heartbeat) < heartbeats + 3 {
+        assert!(Instant::now() < deadline, "heartbeats never resumed");
+        let _ = consumer.poll(Duration::from_millis(200)).await;
+    }
+
+    assert_eq!(kafka.metrics().connections.stalled_connections, 0);
+    assert_eq!(
+        broker.request_count(ApiKey::JoinGroup),
+        joins + 1,
+        "one join"
+    );
+    assert_eq!(
+        broker.request_count(ApiKey::SyncGroup),
+        syncs + 1,
+        "one sync"
+    );
+    assert_eq!(events.count("lost"), 0, "{:?}", events.kinds());
+    assert_eq!(events.count("revoked"), 0, "{:?}", events.kinds());
+    assert!(!consumer.assignment().await.is_empty());
+    let _ = consumer.close().await;
+}
+
+/// No heartbeat is written behind a `JoinGroup` the coordinator holds: it
+/// would time out and close the connection, failing the round, or be
+/// answered after the join with the old generation (`ILLEGAL_GENERATION`)
+/// and drop the assignment the round just gave.
+#[tokio::test]
+async fn no_heartbeat_is_sent_while_a_held_join_is_in_flight() {
+    a_held_round_completes(Held::Join, "g-held-join").await;
+}
+
+/// A `SyncGroup` the coordinator holds until the leader syncs has the
+/// join's budget (the rebalance timeout), not `request_timeout`.
+#[tokio::test]
+async fn a_held_sync_has_the_join_budget() {
+    a_held_round_completes(Held::Sync, "g-held-sync").await;
+}

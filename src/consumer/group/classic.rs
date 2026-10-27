@@ -54,9 +54,9 @@ pub(crate) fn warn_classic_protocol_deprecated() {
 }
 
 impl GroupCoordinator {
-    /// Client-side budget for one `JoinGroup`: the coordinator answers only
-    /// once the rebalance converged, so the group's rebalance timeout, not
-    /// `request.timeout.ms`, bounds it.
+    /// Client-side budget for one `JoinGroup` or `SyncGroup`: the
+    /// coordinator answers only once the rebalance converged, so the group's
+    /// rebalance timeout, not `request.timeout.ms`, bounds it.
     pub(crate) fn join_group_timeout(&self) -> Duration {
         self.rebalance_timeout
             .saturating_add(JOIN_GROUP_TIMEOUT_SLACK)
@@ -350,10 +350,15 @@ impl GroupCoordinator {
                     ),
                 )
             })?;
+        // The coordinator holds a follower's SyncGroup until the leader's
+        // arrives: it has the join's budget, not `request_timeout`.
         let response = conn
-            .send_request(ApiKey::SyncGroup, sg_version, |buf| {
-                request.encode_versioned(sg_version, buf)
-            })
+            .send_request_with_timeout(
+                ApiKey::SyncGroup,
+                sg_version,
+                self.join_group_timeout(),
+                |buf| request.encode_versioned(sg_version, buf),
+            )
             .await;
         let response = match response {
             Ok(r) => r,
@@ -571,6 +576,21 @@ impl GroupCoordinator {
                                 );
                             }
                             break;
+                        }
+
+                        // No heartbeat while a join round is in flight, as in
+                        // the Java client. The coordinator holds a JoinGroup
+                        // (and a follower's SyncGroup) until the rebalance
+                        // converges and answers a connection's requests in
+                        // order, so a heartbeat written behind the held
+                        // request waits with it: past `request_timeout` it
+                        // closes the connection and fails the round, and
+                        // answered after the join it carries the old
+                        // generation, draws ILLEGAL_GENERATION and drops the
+                        // assignment the round just gave. The coordinator
+                        // does not expire a member awaiting its join or sync.
+                        if coordinator.rejoin_in_flight() {
+                            continue;
                         }
 
                         match coordinator.send_heartbeat().await {

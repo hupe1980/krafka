@@ -13,6 +13,19 @@ not a complete record.
 
 ## [Unreleased]
 
+### Fixed
+
+- A classic-protocol member sends no heartbeat while its join round is in
+  flight. A heartbeat written behind a `JoinGroup` the coordinator holds
+  timed out and closed the coordination connection, failing the round
+  (`connection closed: request N timed out ... responses behind it cannot
+  arrive`), or was answered after the join with `ILLEGAL_GENERATION` and
+  dropped the assignment the round had just given; a cooperative group whose
+  rebalance outlasted `request_timeout` rejoined without end.
+- `SyncGroup` has the join's budget (the rebalance timeout) instead of
+  `request_timeout`: the coordinator holds a follower's `SyncGroup` until the
+  leader's arrives.
+
 ## [0.28.1] — 2026-10-28
 
 ### Fixed
