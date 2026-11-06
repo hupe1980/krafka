@@ -742,8 +742,9 @@ enum Held {
 /// Run one background rejoin whose `held` request the fake coordinator
 /// answers after three request timeouts, and check the member finished
 /// that one round: one `JoinGroup`, one `SyncGroup`, no connection closed
-/// for a timed-out request, nothing revoked or lost.
-async fn a_held_round_completes(held: Held, group: &str) {
+/// for a timed-out request, nothing revoked or lost. With `commit`, a commit
+/// made while the round is held is refused without an `OffsetCommit`.
+async fn a_held_round_completes(held: Held, commit: bool, group: &str) {
     let broker = Arc::new(FakeBroker::start().await.unwrap());
     broker.create_topic("events", 1);
     let events = Events(Arc::default());
@@ -765,8 +766,13 @@ async fn a_held_round_completes(held: Held, group: &str) {
         .unwrap();
     consumer.subscribe(&["events"]).await.unwrap();
     wait_assigned(&consumer).await;
+    if commit {
+        produce(&broker, "events", 3).await;
+        assert_eq!(drain(&consumer, 10).await.len(), 3);
+    }
     let joins = broker.request_count(ApiKey::JoinGroup);
     let syncs = broker.request_count(ApiKey::SyncGroup);
+    let commits = broker.request_count(ApiKey::OffsetCommit);
 
     let api = match held {
         Held::Join => ApiKey::JoinGroup,
@@ -779,6 +785,24 @@ async fn a_held_round_completes(held: Held, group: &str) {
     // The round has ended once its SyncGroup was answered: the heartbeats
     // after it are written after the answer.
     let deadline = Instant::now() + T * 10;
+    if commit {
+        while broker.request_count(ApiKey::JoinGroup) == joins {
+            assert!(Instant::now() < deadline, "the round never started");
+            let _ = consumer.poll(Duration::from_millis(200)).await;
+        }
+        let refused = consumer.commit().await;
+        assert!(
+            matches!(
+                refused,
+                Err(krafka::KrafkaError::Broker {
+                    code: ErrorCode::RebalanceInProgress,
+                    ..
+                })
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(broker.request_count(ApiKey::OffsetCommit), commits);
+    }
     while broker.request_count(ApiKey::SyncGroup) == syncs {
         assert!(Instant::now() < deadline, "the round never synced");
         let _ = consumer.poll(Duration::from_millis(200)).await;
@@ -803,6 +827,9 @@ async fn a_held_round_completes(held: Held, group: &str) {
     assert_eq!(events.count("lost"), 0, "{:?}", events.kinds());
     assert_eq!(events.count("revoked"), 0, "{:?}", events.kinds());
     assert!(!consumer.assignment().await.is_empty());
+    if commit {
+        consumer.commit().await.unwrap();
+    }
     let _ = consumer.close().await;
 }
 
@@ -812,12 +839,21 @@ async fn a_held_round_completes(held: Held, group: &str) {
 /// and drop the assignment the round just gave.
 #[tokio::test]
 async fn no_heartbeat_is_sent_while_a_held_join_is_in_flight() {
-    a_held_round_completes(Held::Join, "g-held-join").await;
+    a_held_round_completes(Held::Join, false, "g-held-join").await;
 }
 
 /// A `SyncGroup` the coordinator holds until the leader syncs has the
 /// join's budget (the rebalance timeout), not `request_timeout`.
 #[tokio::test]
 async fn a_held_sync_has_the_join_budget() {
-    a_held_round_completes(Held::Sync, "g-held-sync").await;
+    a_held_round_completes(Held::Sync, false, "g-held-sync").await;
+}
+
+/// No commit is written behind a held `JoinGroup` either: it would close the
+/// connection the same way, or draw `ILLEGAL_GENERATION` and start another
+/// round. The commit fails with `REBALANCE_IN_PROGRESS` instead, and
+/// auto-commit waits for the round to end.
+#[tokio::test]
+async fn a_commit_during_a_held_join_is_refused() {
+    a_held_round_completes(Held::Join, true, "g-held-commit").await;
 }

@@ -25,6 +25,10 @@ not a complete record.
 - `SyncGroup` has the join's budget (the rebalance timeout) instead of
   `request_timeout`: the coordinator holds a follower's `SyncGroup` until the
   leader's arrives.
+- A commit while a classic-protocol join round is in flight fails at once
+  with `REBALANCE_IN_PROGRESS` instead of being written behind the held
+  `JoinGroup`, where it failed the round the same way; auto-commit waits for
+  the round to end.
 
 ## [0.28.1] — 2026-10-28
 
