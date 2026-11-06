@@ -144,6 +144,8 @@ the interval has elapsed, before partitions are revoked in a rebalance, and in
 `close()`. `close()` returns a commit error, except one that only says the
 member already left the group (`UNKNOWN_MEMBER_ID`, `ILLEGAL_GENERATION`,
 `REBALANCE_IN_PROGRESS`, `FENCED_MEMBER_EPOCH`, `STALE_MEMBER_EPOCH`).
+While a classic join round is in flight, a commit fails with
+`REBALANCE_IN_PROGRESS` and auto-commit waits for the round to end.
 
 ```rust,compile
 use krafka::consumer::Consumer;

@@ -696,12 +696,9 @@ impl GroupCoordinator {
                 "cannot commit offsets: no valid generation (group state is {state:?})",
             )));
         }
-        // No commit while a classic join round is in flight, as in the Java
-        // client. The coordinator holds the round's JoinGroup or SyncGroup
-        // and answers a connection's requests in order, so a commit written
-        // behind it waits with it: past `request_timeout` it closes the
-        // connection and fails the round, and answered after the join it
-        // carries the old generation and draws ILLEGAL_GENERATION.
+        // No commit while a classic join round is in flight, as in Java:
+        // queued behind the held JoinGroup/SyncGroup it would time out and
+        // fail the round, or draw ILLEGAL_GENERATION after it.
         if !self.is_consumer_protocol() && self.rejoin_in_flight() {
             return Err(KrafkaError::broker(
                 ErrorCode::RebalanceInProgress,

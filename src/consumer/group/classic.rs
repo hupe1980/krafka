@@ -99,7 +99,7 @@ impl GroupCoordinator {
     ///
     /// `restart_heartbeat` (re)starts the heartbeat task after a successful
     /// round; the heartbeat task itself passes `false` for the cooperative
-    /// background round it starts, and keeps heartbeating.
+    /// background round it starts, and skips its ticks until the round ends.
     pub(crate) fn spawn_rejoin(self: &Arc<Self>, restart_heartbeat: bool) {
         if self.rejoin_in_flight.send_replace(true) {
             return;
@@ -579,16 +579,9 @@ impl GroupCoordinator {
                         }
 
                         // No heartbeat while a join round is in flight, as in
-                        // the Java client. The coordinator holds a JoinGroup
-                        // (and a follower's SyncGroup) until the rebalance
-                        // converges and answers a connection's requests in
-                        // order, so a heartbeat written behind the held
-                        // request waits with it: past `request_timeout` it
-                        // closes the connection and fails the round, and
-                        // answered after the join it carries the old
-                        // generation, draws ILLEGAL_GENERATION and drops the
-                        // assignment the round just gave. The coordinator
-                        // does not expire a member awaiting its join or sync.
+                        // Java: queued behind the held JoinGroup/SyncGroup it
+                        // would time out and fail the round, or draw
+                        // ILLEGAL_GENERATION after it.
                         if coordinator.rejoin_in_flight() {
                             continue;
                         }
