@@ -74,7 +74,9 @@ yanked = "deny"
 #
 # which must produce no output. Re-audit this list whenever dev-dependencies
 # change; anything reachable via `-e normal` must be fixed, not ignored.
-ignore = []
+ignore = [
+    { id = "RUSTSEC-2026-0440", reason = "astral-tokio-tar, unmaintained: dev-only via testcontainers, which has no release without it" },
+]
 
 # ---------------------------------------------------------------------------
 # Source allowlist
