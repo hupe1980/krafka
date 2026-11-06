@@ -284,7 +284,15 @@ impl Consumer {
 
     /// Commit when `auto_commit_interval` has elapsed since the last attempt.
     async fn maybe_auto_commit(&self) {
-        if !self.config.enable_auto_commit || self.group_coordinator.is_none() {
+        let Some(coordinator) = self.group_coordinator.as_ref() else {
+            return;
+        };
+        if !self.config.enable_auto_commit {
+            return;
+        }
+        // A classic round in flight refuses commits; the tick waits for the
+        // round to end.
+        if !coordinator.is_consumer_protocol() && coordinator.rejoin_in_flight() {
             return;
         }
         let due = {

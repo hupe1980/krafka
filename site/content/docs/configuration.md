@@ -60,7 +60,7 @@ table.
 | `bootstrap_servers` | String | Required | The argument of `Kafka::builder`: comma-separated `host:port` pairs |
 | `client_id` | String | `"krafka"` | Client identifier sent with every request of every client (`client.id`) |
 | `security` | `AuthConfig` | plaintext | TLS and SASL; see [Authentication](@/docs/authentication.md) |
-| `request_timeout` | Duration | `30s` | How long one request may wait for its response (`request.timeout.ms`). Must be ≥ `connect_timeout` |
+| `request_timeout` | Duration | `30s` | How long one request may wait for its response (`request.timeout.ms`); a consumer's `JoinGroup` and `SyncGroup` wait up to the rebalance timeout instead. Must be ≥ `connect_timeout` |
 | `connect_timeout` | Duration | `10s` | Budget for one connection attempt to one broker: TCP, then the TLS and SASL handshakes. The floor on `request_timeout` |
 | `metadata_max_age` | Duration | `5m` | Max age before a metadata refresh (`metadata.max.age.ms`) |
 | `metadata_topic_cache_ttl` | `Option<Duration>` | `Some(5m)` | How long a topic entry may sit **idle** before a partial refresh evicts it (`metadata.max.idle.ms`). Any use resets the timer. `None` disables eviction |

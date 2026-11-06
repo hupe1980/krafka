@@ -54,9 +54,9 @@ pub(crate) fn warn_classic_protocol_deprecated() {
 }
 
 impl GroupCoordinator {
-    /// Client-side budget for one `JoinGroup`: the coordinator answers only
-    /// once the rebalance converged, so the group's rebalance timeout, not
-    /// `request.timeout.ms`, bounds it.
+    /// Client-side budget for one `JoinGroup` or `SyncGroup`: the
+    /// coordinator answers only once the rebalance converged, so the group's
+    /// rebalance timeout, not `request.timeout.ms`, bounds it.
     pub(crate) fn join_group_timeout(&self) -> Duration {
         self.rebalance_timeout
             .saturating_add(JOIN_GROUP_TIMEOUT_SLACK)
@@ -99,7 +99,7 @@ impl GroupCoordinator {
     ///
     /// `restart_heartbeat` (re)starts the heartbeat task after a successful
     /// round; the heartbeat task itself passes `false` for the cooperative
-    /// background round it starts, and keeps heartbeating.
+    /// background round it starts, and skips its ticks until the round ends.
     pub(crate) fn spawn_rejoin(self: &Arc<Self>, restart_heartbeat: bool) {
         if self.rejoin_in_flight.send_replace(true) {
             return;
@@ -350,10 +350,15 @@ impl GroupCoordinator {
                     ),
                 )
             })?;
+        // The coordinator holds a follower's SyncGroup until the leader's
+        // arrives: it has the join's budget, not `request_timeout`.
         let response = conn
-            .send_request(ApiKey::SyncGroup, sg_version, |buf| {
-                request.encode_versioned(sg_version, buf)
-            })
+            .send_request_with_timeout(
+                ApiKey::SyncGroup,
+                sg_version,
+                self.join_group_timeout(),
+                |buf| request.encode_versioned(sg_version, buf),
+            )
             .await;
         let response = match response {
             Ok(r) => r,
@@ -571,6 +576,14 @@ impl GroupCoordinator {
                                 );
                             }
                             break;
+                        }
+
+                        // No heartbeat while a join round is in flight, as in
+                        // Java: queued behind the held JoinGroup/SyncGroup it
+                        // would time out and fail the round, or draw
+                        // ILLEGAL_GENERATION after it.
+                        if coordinator.rejoin_in_flight() {
+                            continue;
                         }
 
                         match coordinator.send_heartbeat().await {

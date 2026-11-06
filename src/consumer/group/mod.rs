@@ -696,6 +696,18 @@ impl GroupCoordinator {
                 "cannot commit offsets: no valid generation (group state is {state:?})",
             )));
         }
+        // No commit while a classic join round is in flight, as in Java:
+        // queued behind the held JoinGroup/SyncGroup it would time out and
+        // fail the round, or draw ILLEGAL_GENERATION after it.
+        if !self.is_consumer_protocol() && self.rejoin_in_flight() {
+            return Err(KrafkaError::broker(
+                ErrorCode::RebalanceInProgress,
+                format!(
+                    "cannot commit offsets for group '{}': a rebalance is in progress",
+                    self.group_id
+                ),
+            ));
+        }
 
         let conn = self.get_coordinator_connection().await?;
         let oc_version = conn

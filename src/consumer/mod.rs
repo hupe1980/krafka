@@ -797,6 +797,10 @@ impl Consumer {
     /// and auto-commit alike), so a retried older commit never lands after a
     /// newer one. Committing does not move any position.
     ///
+    /// While a classic-protocol join round is in flight, a commit fails at
+    /// once with [`ErrorCode::RebalanceInProgress`](crate::error::ErrorCode::RebalanceInProgress);
+    /// retry after the next `poll`.
+    ///
     /// # Cancel safety
     ///
     /// This method is not cancel safe. A dropped commit may or may not have
@@ -808,7 +812,8 @@ impl Consumer {
 
     /// Commit the given offsets as given — offset, leader epoch and
     /// metadata — whether or not the partitions are still assigned; the
-    /// coordinator decides. No position moves.
+    /// coordinator decides. No position moves. It fails like
+    /// [`commit`](Self::commit) while a classic join round is in flight.
     ///
     /// ```rust,no_run
     /// use std::collections::HashMap;
