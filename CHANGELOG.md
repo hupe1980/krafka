@@ -13,22 +13,14 @@ not a complete record.
 
 ## [Unreleased]
 
+## [0.28.2] — 2026-11-06
+
 ### Fixed
 
-- A classic-protocol member sends no heartbeat while its join round is in
-  flight. A heartbeat written behind a `JoinGroup` the coordinator holds
-  timed out and closed the coordination connection, failing the round
-  (`connection closed: request N timed out ... responses behind it cannot
-  arrive`), or was answered after the join with `ILLEGAL_GENERATION` and
-  dropped the assignment the round had just given; a cooperative group whose
-  rebalance outlasted `request_timeout` rejoined without end.
-- `SyncGroup` has the join's budget (the rebalance timeout) instead of
-  `request_timeout`: the coordinator holds a follower's `SyncGroup` until the
-  leader's arrives.
-- A commit while a classic-protocol join round is in flight fails at once
-  with `REBALANCE_IN_PROGRESS` instead of being written behind the held
-  `JoinGroup`, where it failed the round the same way; auto-commit waits for
-  the round to end.
+- A classic-protocol group whose rebalance outlasted `request_timeout` no
+  longer rejoins without end (#30). While a join round is in flight the member
+  sends no heartbeat, a commit fails with `REBALANCE_IN_PROGRESS` (auto-commit
+  waits for the round), and `SyncGroup` waits up to the rebalance timeout.
 
 ## [0.28.1] — 2026-10-28
 
@@ -1740,7 +1732,8 @@ Initial development: wire protocol, producer, consumer, admin client,
 authentication (SASL PLAIN / SCRAM / OAUTHBEARER / AWS MSK IAM), TLS,
 compression codecs, schema registry integration and the metrics layer.
 
-[Unreleased]: https://github.com/hupe1980/krafka/compare/v0.28.1...HEAD
+[Unreleased]: https://github.com/hupe1980/krafka/compare/v0.28.2...HEAD
+[0.28.2]: https://github.com/hupe1980/krafka/compare/v0.28.1...v0.28.2
 [0.28.1]: https://github.com/hupe1980/krafka/compare/v0.28.0...v0.28.1
 [0.28.0]: https://github.com/hupe1980/krafka/compare/v0.27.1...v0.28.0
 [0.27.1]: https://github.com/hupe1980/krafka/compare/v0.27.0...v0.27.1
