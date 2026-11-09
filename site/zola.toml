@@ -37,7 +37,7 @@ repo = "https://github.com/hupe1980/krafka"
 crate = "https://crates.io/crates/krafka"
 api_docs = "https://docs.rs/krafka"
 # Footer and JSON-LD version; checked by just version-check.
-version = "0.28.2"
+version = "0.29.0"
 license = "MIT OR Apache-2.0"
 # Social preview card. Referenced by og:image and twitter:image.
 og_image = "og.png"

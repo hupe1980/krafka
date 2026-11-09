@@ -13,18 +13,19 @@ not a complete record.
 
 ## [Unreleased]
 
+## [0.29.0] — 2026-11-09
+
 ### Breaking
 
-- `AclPatternType` discriminants changed: `Literal` 2 → 3, `Prefixed` 3 → 4,
-  new `Match` = 2. Code that casts it with `as` sees the new numbers.
+- `AclPatternType` uses Kafka's wire values: `Literal` 2 → 3, `Prefixed`
+  3 → 4, new filter-only `Match` = 2. Code that casts it with `as` sees the
+  new numbers.
 
 ### Fixed
 
-- `AclPatternType` now matches Kafka's wire values: `Literal` is 3 and
-  `Prefixed` is 4, and the filter-only `Match` (2) variant is new. Before,
-  `Literal` went out as `MATCH`, which the controller rejects on
-  `CreateAcls`, and a `LITERAL` resource in a `DescribeAcls` response decoded
-  as `Prefixed`.
+- `CreateAcls` with a `Literal` pattern is no longer rejected (it went out as
+  `MATCH`), and a `LITERAL` ACL from `DescribeAcls` or `DeleteAcls` no longer
+  decodes as `Prefixed` (#74).
 
 ## [0.28.2] — 2026-11-06
 
@@ -1745,7 +1746,8 @@ Initial development: wire protocol, producer, consumer, admin client,
 authentication (SASL PLAIN / SCRAM / OAUTHBEARER / AWS MSK IAM), TLS,
 compression codecs, schema registry integration and the metrics layer.
 
-[Unreleased]: https://github.com/hupe1980/krafka/compare/v0.28.2...HEAD
+[Unreleased]: https://github.com/hupe1980/krafka/compare/v0.29.0...HEAD
+[0.29.0]: https://github.com/hupe1980/krafka/compare/v0.28.2...v0.29.0
 [0.28.2]: https://github.com/hupe1980/krafka/compare/v0.28.1...v0.28.2
 [0.28.1]: https://github.com/hupe1980/krafka/compare/v0.28.0...v0.28.1
 [0.28.0]: https://github.com/hupe1980/krafka/compare/v0.27.1...v0.28.0
