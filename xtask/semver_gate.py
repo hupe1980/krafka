@@ -13,6 +13,10 @@ baseline and the current crate — and then:
     non-major bump fails whatever the CHANGELOG says)
   * the tool could not complete            -> fail
 
+With SEMVER_GATE_ADVISORY=true (CI sets it on pull requests) an undeclared
+break is a warning, not a failure: declaring it is the maintainer's call before
+release, and pushes to `main` still enforce it.
+
 Before 1.0 the comparison runs as a patch release, so a break is reported even
 when Cargo.toml already carries the next minor version.
 
@@ -23,6 +27,7 @@ Run: python3 xtask/semver_gate.py
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -82,20 +87,55 @@ def release_breaking(changelog: str, version: str) -> list[str]:
     return entries
 
 
-def decide(code: int, version: str, changelog: str) -> tuple[bool, str]:
+REMEDY = (
+    "add a bullet under `### Breaking` in `## [Unreleased]` in CHANGELOG.md naming the change; "
+    "do not bump the version, the release does that"
+)
+
+
+def decide(code: int, version: str, changelog: str, advisory: bool = False) -> tuple[bool, str]:
+    """(passes, why). An undeclared break passes in advisory mode; `why` then starts with `warning:`."""
     major = int(version.split(".")[0])
     if code == 0:
         return True, "no API break against the baseline"
     if code != BREAK:
         return False, f"cargo-semver-checks could not complete (exit {code})"
     if major >= 1:
-        return False, f"API break in a non-major release of {version}"
-    entries = release_breaking(changelog, version)
-    if not entries:
-        return False, (
-            f"API break with no `### Breaking` entries under `## [Unreleased]` or `## [{version}]` in CHANGELOG.md"
-        )
-    return True, f"API break declared: {len(entries)} Breaking entries for {version}"
+        why = f"API break in a non-major release of {version}; the next release must be major"
+    else:
+        entries = release_breaking(changelog, version)
+        if entries:
+            return True, f"API break declared: {len(entries)} Breaking entries for {version}"
+        why = f"API break not declared in CHANGELOG.md: {REMEDY}"
+    return (True, f"warning: {why}") if advisory else (False, why)
+
+
+def failed_lints(output: str) -> list[str]:
+    """The `--- failure <lint>` headings and the `Failed in:` lines under them."""
+    lines, take = [], False
+    for line in re.sub(r"\x1b\[[0-9;]*m", "", output).splitlines():
+        if line.startswith("--- failure "):
+            lines.append(line.strip("- ").removeprefix("failure "))
+        elif line.startswith("Failed in:"):
+            take = True
+        elif take and line.startswith("  ") and not line.startswith("   "):
+            lines.append("  " + line.strip())
+        else:
+            take = False
+    return lines
+
+
+def report_warning(why: str, lints: list[str]) -> None:
+    """A GitHub annotation and a job-summary section; plain output outside Actions."""
+    message = why.removeprefix("warning: ")
+    print(f"::warning title=Undeclared API break::{message}")
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a", encoding="utf-8") as f:
+            f.write("### API break against the last release\n\n")
+            f.write(f"{message}\n\n")
+            if lints:
+                f.write("```\n" + "\n".join(lints) + "\n```\n")
 
 
 def semver_command(current: list[str], base: list[str], version: str) -> list[str]:
@@ -122,9 +162,19 @@ def main() -> int:
     cmd = semver_command(current, base, version)
     print(f"▶ {CRATE} {version} against {base_version}; features {','.join(current) or '(none)'}")
     print(f"  {' '.join(cmd)}", flush=True)
-    code = subprocess.run(cmd, cwd=ROOT).returncode
+    run = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
+    sys.stdout.write(run.stdout)
+    sys.stdout.flush()
+    sys.stderr.write(run.stderr)
+    sys.stderr.flush()
 
-    ok, why = decide(code, version, (ROOT / "CHANGELOG.md").read_text())
+    advisory = os.environ.get("SEMVER_GATE_ADVISORY", "").lower() == "true"
+    ok, why = decide(run.returncode, version, (ROOT / "CHANGELOG.md").read_text(), advisory)
+    lints = failed_lints(run.stdout + run.stderr)
+    if ok and why.startswith("warning: "):
+        report_warning(why, lints)
+        print("⚠ semver-check: " + why.removeprefix("warning: "))
+        return 0
     print(("✓ semver-check: " if ok else "✗ semver-check: ") + why, file=sys.stdout if ok else sys.stderr)
     return 0 if ok else 1
 
@@ -160,9 +210,31 @@ def self_test() -> int:
         ("(d) tool could not complete", (INCOMPLETE, "0.27.0", CHANGELOG_WITH), False),
         ("(e) break at 1.0.1 with Breaking entry", (BREAK, "1.0.1", CHANGELOG_WITH), False),
         ("no break", (0, "0.27.0", CHANGELOG_WITHOUT), True),
+        ("(i) advisory: break, no Breaking entry", (BREAK, "0.27.0", CHANGELOG_WITHOUT, True), True),
+        ("(j) advisory: tool could not complete", (INCOMPLETE, "0.27.0", CHANGELOG_WITH, True), False),
+        ("(k) advisory: break at 1.0.1", (BREAK, "1.0.1", CHANGELOG_WITH, True), True),
     ]:
         ok, why = decide(*args)
         expect(name, ok, want, why)
+    advisory_why = decide(BREAK, "0.27.0", CHANGELOG_WITHOUT, True)[1]
+    expect("(l) advisory pass is reported as a warning", advisory_why.startswith("warning: "), True, advisory_why)
+
+    sample = (
+        "--- failure enum_no_repr_variant_discriminant_changed: enum variant had its discriminant change value ---\n"
+        "\nDescription:\nThe enum's variant ...\n\n\x1b[1mFailed in:\x1b[0m\n"
+        "  variant AclPatternType::Literal 2 -> 3 in src/protocol/messages/acl.rs:73\n"
+        "    Finished [  81.007s] krafka\n"
+    )
+    lints = failed_lints(sample)
+    expect(
+        "(m) failed lints are extracted",
+        lints == [
+            "enum_no_repr_variant_discriminant_changed: enum variant had its discriminant change value",
+            "  variant AclPatternType::Literal 2 -> 3 in src/protocol/messages/acl.rs:73",
+        ],
+        True,
+        repr(lints),
+    )
 
     # The scope: a removal confined to an excluded feature is not reported,
     # and the same removal in the stable surface is. The baseline is a copy of

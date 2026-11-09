@@ -607,7 +607,7 @@ For contributors. `just ci` is the local gate; each of its recipes is a job in
 | `just cancel-safety` | Every data-path method has a well-formed `# Cancel safety` section; `tests/cancel_safety.rs` tests each claim by dropping the future at every pending poll | yes |
 | `just no-c` | The default build compiles no C beyond `ring` and links no system library | yes |
 | `just fuzz` | The fuzz targets, 60 s each per pull request | yes |
-| `just semver-check`, `just minimal-versions`, `just cross-build` | API compatibility, minimal dependency versions, musl and windows-gnu builds | yes |
+| `just semver-check`, `just minimal-versions`, `just cross-build` | API compatibility (an undeclared break warns on a pull request and fails on `main`), minimal dependency versions, musl and windows-gnu builds | yes |
 | `just integration`, `just integration-matrix` | Apache Kafka in Docker (`apache/kafka-native:3.9.0` by default), every supported minor 3.9 → 4.3 | yes |
 | `just integration-sasl`, `just integration-sasl-matrix` | PLAIN, SCRAM-SHA-256/512 and OAUTHBEARER over `SASL_PLAINTEXT` and `SASL_SSL`, Kafka 3.9.0 and 4.3.1. AWS MSK IAM is covered by unit tests only | yes |
 | `just integration-redpanda` | The Redpanda release pinned in `tests/redpanda/Dockerfile`; `REDPANDA_VERSION=latest` runs the current one | pinned: yes; `latest`: local only |
