@@ -476,7 +476,8 @@ jobs:
 
   # Fails on a detected API break unless CHANGELOG.md's Unreleased section
   # lists it under Breaking (pre-1.0); from 1.0 a break in a non-major bump
-  # fails regardless.
+  # fails regardless. On pull requests a break is a warning: declaring it is
+  # the maintainer's call, and the push to main enforces it.
   semver:
     name: SemVer
     runs-on: ubuntu-latest
@@ -495,6 +496,8 @@ jobs:
         with:
           tool: cargo-semver-checks@0.50.0
       - run: just semver-check
+        env:
+          SEMVER_GATE_ADVISORY: ${{ github.event_name == 'pull_request' }}
 
   # Every direct dependency resolved to the floor Cargo.toml declares.
   minimal-versions:
