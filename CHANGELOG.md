@@ -13,6 +13,11 @@ not a complete record.
 
 ## [Unreleased]
 
+### Breaking
+
+- `AclPatternType` discriminants changed: `Literal` 2 → 3, `Prefixed` 3 → 4,
+  new `Match` = 2. Code that casts it with `as` sees the new numbers.
+
 ### Fixed
 
 - `AclPatternType` now matches Kafka's wire values: `Literal` is 3 and
