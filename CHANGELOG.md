@@ -13,6 +13,12 @@ not a complete record.
 
 ## [Unreleased]
 
+### Breaking
+
+- `AclPatternType::Literal as i8` is now 3 and `AclPatternType::Prefixed as
+  i8` is 4 (were 2 and 3). Only code that cast the variants to a number is
+  affected; code that passes the enum to the admin API sees the fix below.
+
 ### Fixed
 
 - `AclPatternType` now matches Kafka's wire values
