@@ -31,6 +31,12 @@ Against the vendored snapshot of `apache/kafka`'s message schemas:
 5. **Flexible-version boundary matches.** `ApiKey::flexible_version()` decides
    header v1-vs-v2 and compact-vs-standard encoding for every field. Off by one
    and the broker cannot parse the request at all.
+6. **ACL enum bytes match.** `ResourceType`, `PatternType`, `AclOperation` and
+   `AclPermissionType` are `INT8` fields whose meaning lives in Kafka's Java
+   enums, not in the message schemas. krafka once numbered `Literal` 2 and
+   `Prefixed` 3 with no `Match` — Kafka says 3, 4 and 2 — so every literal ACL
+   went out as `MATCH` and came back as `Prefixed`. Nothing in the schemas can
+   see that; this diff against the vendored Java sources can.
 
 # Hermetic by default
 
@@ -59,9 +65,23 @@ SNAPSHOT = Path(__file__).resolve().parent / "kafka_protocol_snapshot.json"
 
 VERSIONS_RS = ROOT / "src/protocol/mod.rs"
 API_RS = ROOT / "src/protocol/api.rs"
+ACL_RS = ROOT / "src/protocol/messages/acl.rs"
 
 GITHUB_API = "https://api.github.com/repos/apache/kafka/contents/clients/src/main/resources/common/message"
 GITHUB_RAW = "https://raw.githubusercontent.com/apache/kafka/{ref}/clients/src/main/resources/common/message/{name}"
+GITHUB_JAVA = "https://raw.githubusercontent.com/apache/kafka/{ref}/clients/src/main/java/org/apache/kafka/common/{path}.java"
+
+# krafka enum → the Kafka Java enum that defines its wire byte.
+#
+# These are `INT8` fields in the ACL messages; the schemas only say "int8", so
+# the values are read from the enum sources instead. The krafka variant name in
+# UpperCamelCase must equal the Kafka constant in UPPER_SNAKE_CASE.
+ACL_ENUMS: dict[str, str] = {
+    "AclResourceType": "resource/ResourceType",
+    "AclPatternType": "resource/PatternType",
+    "AclOperation": "acl/AclOperation",
+    "AclPermissionType": "acl/AclPermissionType",
+}
 
 # APIs krafka deliberately does not carry to Kafka's stable ceiling.
 #
@@ -144,10 +164,23 @@ def refresh_snapshot(ref: str) -> None:
             "flexible_from": schema["flexible_from"],
         }
 
+    acl_enums: dict[str, dict[str, int]] = {}
+    for rust_name, path in ACL_ENUMS.items():
+        raw = _get(GITHUB_JAVA.format(ref=ref, path=path)).decode("utf-8")
+        acl_enums[rust_name] = _parse_java_enum(raw, path)
+
     SNAPSHOT.write_text(
-        json.dumps({"kafka_ref": ref, "apis": apis}, indent=2, sort_keys=True) + "\n"
+        json.dumps(
+            {"kafka_ref": ref, "apis": apis, "acl_enums": acl_enums},
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
     )
-    print(f"wrote {SNAPSHOT.relative_to(ROOT)} — {len(apis)} APIs", file=sys.stderr)
+    print(
+        f"wrote {SNAPSHOT.relative_to(ROOT)} — {len(apis)} APIs, {len(acl_enums)} ACL enums",
+        file=sys.stderr,
+    )
 
 
 def _get(url: str) -> bytes:
@@ -192,6 +225,18 @@ def _parse_schema(raw: str) -> dict[str, object]:
         "latest_version_unstable": '"latestVersionUnstable": true' in raw,
         "flexible_from": flexible_from,
     }
+
+
+# `    LITERAL((byte) 3),` — one constant of a Kafka byte-coded enum.
+JAVA_CONSTANT = re.compile(r"^\s+([A-Z][A-Z0-9_]*)\(\(byte\)\s*(\d+)\)\s*[,;]", re.MULTILINE)
+
+
+def _parse_java_enum(raw: str, path: str) -> dict[str, int]:
+    """`{CONSTANT: byte}` from a Kafka enum whose constructor takes `(byte) n`."""
+    values = {name: int(code) for name, code in JAVA_CONSTANT.findall(raw)}
+    if not values:
+        raise SystemExit(f"could not parse any constants from {path}.java")
+    return values
 
 
 # ── krafka's side ------------------------------------------------------------
@@ -265,6 +310,64 @@ def krafka_flexible_versions() -> dict[str, int]:
         else:
             pending.extend(variants)
     return out
+
+
+# `    Literal = 3,` — one explicit-discriminant variant.
+RUST_VARIANT = re.compile(r"^\s+([A-Z]\w*)\s*=\s*(\d+)\s*,", re.MULTILINE)
+
+
+def krafka_enum(name: str) -> dict[str, int]:
+    """`{UPPER_SNAKE: discriminant}` of `pub enum <name>` in acl.rs."""
+    source = ACL_RS.read_text()
+    start = source.index(f"pub enum {name} {{")
+    end = source.index("\n}\n", start)
+    body = source[start:end]
+    values: dict[str, int] = {}
+    for variant, value in RUST_VARIANT.findall(body):
+        snake = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", variant).upper()
+        values[snake] = int(value)
+    if not values:
+        raise SystemExit(f"could not parse any variants from {name}")
+    return values
+
+
+def check_acl_enums(kafka_enums: dict[str, dict[str, int]], kafka_ref: str) -> list[str]:
+    """Check 6: every ACL enum byte agrees with Kafka's Java enum."""
+    errors: list[str] = []
+    for rust_name in ACL_ENUMS:
+        expected = kafka_enums.get(rust_name)
+        if expected is None:
+            errors.append(
+                f"{rust_name}: the snapshot has no Kafka values for it; run "
+                f"`--refresh --ref {kafka_ref}`"
+            )
+            continue
+        actual = krafka_enum(rust_name)
+        for constant, byte in sorted(expected.items(), key=lambda kv: kv[1]):
+            have = actual.get(constant)
+            if have is None:
+                errors.append(
+                    f"{rust_name}: Kafka {kafka_ref} has {constant} = {byte} but krafka has "
+                    f"no such variant — a broker sending it decodes as Unknown"
+                )
+            elif have != byte:
+                errors.append(
+                    f"{rust_name}::{constant}: krafka encodes {have}, Kafka {kafka_ref} "
+                    f"says {byte} — every ACL with it goes out as "
+                    f"{_name_of(expected, have)} and comes back as "
+                    f"{_name_of(actual, byte)}"
+                )
+        for constant, byte in sorted(actual.items(), key=lambda kv: kv[1]):
+            if constant not in expected:
+                errors.append(
+                    f"{rust_name}: krafka has {constant} = {byte} but Kafka {kafka_ref} "
+                    f"has no such constant"
+                )
+    return errors
+
+
+def _name_of(values: dict[str, int], byte: int) -> str:
+    return next((name for name, code in values.items() if code == byte), f"byte {byte}")
 
 
 # ── Checks -------------------------------------------------------------------
@@ -418,6 +521,8 @@ def main() -> int:
             f"row in krafka's api_versions! table, and is not listed in DELIBERATE_GAPS"
         )
 
+    errors.extend(check_acl_enums(snapshot.get("acl_enums", {}), kafka_ref))
+
     if errors:
         print(f"Protocol parity check FAILED against Kafka {kafka_ref}\n", file=sys.stderr)
         for error in errors:
@@ -432,8 +537,8 @@ def main() -> int:
         return 1
 
     print(
-        f"✓ Protocol parity: {len(merged)} APIs match Kafka {kafka_ref} "
-        f"(+{len(DELIBERATE_GAPS)} deliberate omissions)"
+        f"✓ Protocol parity: {len(merged)} APIs and {len(ACL_ENUMS)} ACL enums match "
+        f"Kafka {kafka_ref} (+{len(DELIBERATE_GAPS)} deliberate omissions)"
     )
     return 0
 

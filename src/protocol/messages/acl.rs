@@ -13,6 +13,11 @@ use crate::protocol::{
 // ============================================================================
 
 /// ACL resource type.
+///
+/// Wire values follow Kafka's [`ResourceType`][kafka] and are checked by
+/// `just protocol-parity`.
+///
+/// [kafka]: https://github.com/apache/kafka/blob/trunk/clients/src/main/java/org/apache/kafka/common/resource/ResourceType.java
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AclResourceType {
@@ -31,6 +36,8 @@ pub enum AclResourceType {
     TransactionalId = 5,
     /// Delegation token resource.
     DelegationToken = 6,
+    /// User resource (SCRAM credentials, KIP-554).
+    User = 7,
 }
 
 impl AclResourceType {
@@ -44,6 +51,7 @@ impl AclResourceType {
             4 => Self::Cluster,
             5 => Self::TransactionalId,
             6 => Self::DelegationToken,
+            7 => Self::User,
             _ => Self::Unknown,
         }
     }
@@ -55,7 +63,15 @@ impl AclResourceType {
     }
 }
 
-/// ACL pattern type.
+/// ACL resource pattern type.
+///
+/// Wire values follow Kafka's [`PatternType`][kafka] and are checked by
+/// `just protocol-parity`. The byte is carried in the `PatternType` field of
+/// `CreateAcls`, `DescribeAcls` and `DeleteAcls` (v1 and later) in the
+/// [Kafka protocol guide][protocol].
+///
+/// [kafka]: https://github.com/apache/kafka/blob/trunk/clients/src/main/java/org/apache/kafka/common/resource/PatternType.java
+/// [protocol]: https://kafka.apache.org/protocol#The_Messages_CreateAcls
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AclPatternType {
@@ -96,6 +112,11 @@ impl AclPatternType {
 }
 
 /// ACL operation.
+///
+/// Wire values follow Kafka's [`AclOperation`][kafka] and are checked by
+/// `just protocol-parity`.
+///
+/// [kafka]: https://github.com/apache/kafka/blob/trunk/clients/src/main/java/org/apache/kafka/common/acl/AclOperation.java
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AclOperation {
@@ -126,6 +147,12 @@ pub enum AclOperation {
     AlterConfigs = 11,
     /// Idempotent write.
     IdempotentWrite = 12,
+    /// Create delegation tokens (KIP-373).
+    CreateTokens = 13,
+    /// Describe delegation tokens (KIP-373).
+    DescribeTokens = 14,
+    /// Two-phase commit (KIP-939).
+    TwoPhaseCommit = 15,
 }
 
 impl AclOperation {
@@ -145,6 +172,9 @@ impl AclOperation {
             10 => Self::DescribeConfigs,
             11 => Self::AlterConfigs,
             12 => Self::IdempotentWrite,
+            13 => Self::CreateTokens,
+            14 => Self::DescribeTokens,
+            15 => Self::TwoPhaseCommit,
             _ => Self::Unknown,
         }
     }
@@ -157,6 +187,11 @@ impl AclOperation {
 }
 
 /// ACL permission type.
+///
+/// Wire values follow Kafka's [`AclPermissionType`][kafka] and are checked by
+/// `just protocol-parity`.
+///
+/// [kafka]: https://github.com/apache/kafka/blob/trunk/clients/src/main/java/org/apache/kafka/common/acl/AclPermissionType.java
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AclPermissionType {

@@ -27,6 +27,13 @@ not a complete record.
   `MATCH`), and a `LITERAL` ACL from `DescribeAcls` or `DeleteAcls` no longer
   decodes as `Prefixed` (#74).
 
+### Added
+
+- `AclResourceType::User` and `AclOperation::{CreateTokens, DescribeTokens,
+  TwoPhaseCommit}`, which krafka decoded as `Unknown` (#77).
+- `just protocol-parity` checks the four ACL enums byte for byte against
+  Kafka's Java sources (#77).
+
 ## [0.28.2] — 2026-11-06
 
 ### Fixed

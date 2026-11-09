@@ -1,4 +1,47 @@
 {
+  "acl_enums": {
+    "AclOperation": {
+      "ALL": 2,
+      "ALTER": 7,
+      "ALTER_CONFIGS": 11,
+      "ANY": 1,
+      "CLUSTER_ACTION": 9,
+      "CREATE": 5,
+      "CREATE_TOKENS": 13,
+      "DELETE": 6,
+      "DESCRIBE": 8,
+      "DESCRIBE_CONFIGS": 10,
+      "DESCRIBE_TOKENS": 14,
+      "IDEMPOTENT_WRITE": 12,
+      "READ": 3,
+      "TWO_PHASE_COMMIT": 15,
+      "UNKNOWN": 0,
+      "WRITE": 4
+    },
+    "AclPatternType": {
+      "ANY": 1,
+      "LITERAL": 3,
+      "MATCH": 2,
+      "PREFIXED": 4,
+      "UNKNOWN": 0
+    },
+    "AclPermissionType": {
+      "ALLOW": 3,
+      "ANY": 1,
+      "DENY": 2,
+      "UNKNOWN": 0
+    },
+    "AclResourceType": {
+      "ANY": 1,
+      "CLUSTER": 4,
+      "DELEGATION_TOKEN": 6,
+      "GROUP": 3,
+      "TOPIC": 2,
+      "TRANSACTIONAL_ID": 5,
+      "UNKNOWN": 0,
+      "USER": 7
+    }
+  },
   "apis": {
     "AddOffsetsToTxn": {
       "flexible_from": 3,
