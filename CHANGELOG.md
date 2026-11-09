@@ -15,11 +15,20 @@ not a complete record.
 
 ### Fixed
 
-- `AclPatternType` now matches Kafka's wire values: `Literal` is 3 and
-  `Prefixed` is 4, and the filter-only `Match` (2) variant is new. Before,
-  `Literal` went out as `MATCH`, which the controller rejects on
-  `CreateAcls`, and a `LITERAL` resource in a `DescribeAcls` response decoded
-  as `Prefixed`.
+- `AclPatternType` now matches Kafka's wire values
+  ([`PatternType`](https://github.com/apache/kafka/blob/trunk/clients/src/main/java/org/apache/kafka/common/resource/PatternType.java)):
+  `Literal` is 3 and `Prefixed` is 4, and the filter-only `Match` (2) variant
+  is new. Before, `Literal` went out as `MATCH`, which the controller rejects
+  on `CreateAcls`, and a `LITERAL` resource in a `DescribeAcls` response
+  decoded as `Prefixed`.
+
+### Added
+
+- `AclResourceType::User` and `AclOperation::{CreateTokens, DescribeTokens,
+  TwoPhaseCommit}`, which Kafka has had since 3.x / 4.0 and krafka decoded as
+  `Unknown`.
+- `just protocol-parity` now also checks the four ACL enums byte for byte
+  against Kafka's Java sources, vendored in the protocol snapshot.
 
 ## [0.28.2] — 2026-11-06
 

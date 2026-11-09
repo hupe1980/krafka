@@ -79,6 +79,16 @@ impl ApacheKafka {
         );
         env_vars.insert("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR".into(), "1".into());
         env_vars.insert("KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS".into(), "0".into());
+        // The ACL tests need an authorizer so CreateAcls and DescribeAcls are
+        // served. Every client is the PLAINTEXT principal `User:ANONYMOUS`;
+        // making it a super user means ACLs are stored and listed but never
+        // enforced, so the other tests see no change.
+        env_vars.insert(
+            "KAFKA_AUTHORIZER_CLASS_NAME".into(),
+            "org.apache.kafka.metadata.authorizer.StandardAuthorizer".into(),
+        );
+        env_vars.insert("KAFKA_SUPER_USERS".into(), "User:ANONYMOUS".into());
+        env_vars.insert("KAFKA_ALLOW_EVERYONE_IF_NO_ACL_FOUND".into(), "true".into());
         env_vars.insert(
             "KAFKA_LOG_FLUSH_INTERVAL_MESSAGES".into(),
             i64::MAX.to_string(),
@@ -3868,4 +3878,144 @@ async fn test_transactional_send_offsets() {
 
     resumed_consumer.close().await.expect("consumer close");
     src_consumer.close().await.expect("consumer close");
+}
+
+/// A literal ACL must come back from the broker as `Literal` and a prefixed one
+/// as `Prefixed`, and the pattern type in a filter must select accordingly.
+///
+/// Kafka numbers the pattern-type byte UNKNOWN 0, ANY 1, MATCH 2, LITERAL 3,
+/// PREFIXED 4. The unit tests pin the bytes; this test pins them against a
+/// real broker, which is the only place a wrong-but-self-consistent table
+/// would show.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_admin_acls_pattern_type_round_trip() {
+    use krafka::admin::{
+        AclBinding, AclFilter, AclOperation, AclPatternType, AclPermissionType, AclResourceType,
+    };
+
+    let bootstrap_servers = kafka();
+    let admin = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("Failed to create admin client")
+        .admin();
+
+    let id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let principal = format!("User:acl-test-{id}");
+    let literal_topic = format!("acl-literal-{id}");
+    let prefix = format!("acl-prefix-{id}-");
+
+    let literal = AclBinding::new(
+        AclResourceType::Topic,
+        &literal_topic,
+        &principal,
+        "*",
+        AclOperation::Read,
+        AclPermissionType::Allow,
+    );
+    let prefixed = AclBinding::new(
+        AclResourceType::Topic,
+        &prefix,
+        &principal,
+        "*",
+        AclOperation::Write,
+        AclPermissionType::Allow,
+    )
+    .with_pattern_type(AclPatternType::Prefixed);
+    assert_eq!(literal.pattern_type, AclPatternType::Literal);
+
+    // Create: a LITERAL encoded as MATCH is rejected by the controller.
+    let created = admin
+        .create_acls(vec![literal.clone(), prefixed.clone()], Default::default())
+        .await
+        .expect("CreateAcls failed");
+    assert_eq!(created.len(), 2);
+    for (binding, result) in &created {
+        result
+            .as_ref()
+            .unwrap_or_else(|e| panic!("create {binding:?} failed: {e}"));
+    }
+
+    let for_principal = || AclFilter::for_principal(&principal);
+    let describe = |filter: AclFilter| {
+        let admin = &admin;
+        async move {
+            admin
+                .describe_acls(filter, Default::default())
+                .await
+                .expect("DescribeAcls failed")
+        }
+    };
+
+    // Describe everything for the principal: both bindings, each with the
+    // pattern type it was created with.
+    let mut all = describe(for_principal()).await;
+    all.sort_by(|a, b| a.resource_name.cmp(&b.resource_name));
+    assert_eq!(all.len(), 2, "expected both ACLs, got {all:?}");
+    assert_eq!(all[0].resource_name, literal_topic);
+    assert_eq!(all[0].pattern_type, AclPatternType::Literal);
+    assert_eq!(all[0].operation, AclOperation::Read);
+    assert_eq!(all[1].resource_name, prefix);
+    assert_eq!(all[1].pattern_type, AclPatternType::Prefixed);
+    assert_eq!(all[1].operation, AclOperation::Write);
+
+    // A LITERAL filter selects only the literal binding ...
+    let literal_only = describe(for_principal().pattern_type(AclPatternType::Literal)).await;
+    assert_eq!(literal_only.len(), 1, "{literal_only:?}");
+    assert_eq!(literal_only[0].resource_name, literal_topic);
+    assert_eq!(literal_only[0].pattern_type, AclPatternType::Literal);
+
+    // ... and a PREFIXED filter only the prefixed one.
+    let prefixed_only = describe(for_principal().pattern_type(AclPatternType::Prefixed)).await;
+    assert_eq!(prefixed_only.len(), 1, "{prefixed_only:?}");
+    assert_eq!(prefixed_only[0].resource_name, prefix);
+    assert_eq!(prefixed_only[0].pattern_type, AclPatternType::Prefixed);
+
+    // MATCH with a concrete topic name returns every binding that applies to
+    // it: the prefixed one for a name under the prefix, not the literal one.
+    let under_prefix = format!("{prefix}orders");
+    let matched = describe(
+        for_principal()
+            .resource_type(AclResourceType::Topic)
+            .resource_name(&under_prefix)
+            .pattern_type(AclPatternType::Match),
+    )
+    .await;
+    assert_eq!(matched.len(), 1, "{matched:?}");
+    assert_eq!(matched[0].resource_name, prefix);
+    assert_eq!(matched[0].pattern_type, AclPatternType::Prefixed);
+
+    // Delete by pattern type: each filter removes exactly its own binding.
+    let deleted = admin
+        .delete_acls(
+            vec![
+                for_principal().pattern_type(AclPatternType::Literal),
+                for_principal().pattern_type(AclPatternType::Prefixed),
+            ],
+            Default::default(),
+        )
+        .await
+        .expect("DeleteAcls failed");
+    assert_eq!(deleted.len(), 2);
+    let literal_deleted = deleted[0].1.as_ref().expect("delete literal");
+    assert_eq!(literal_deleted.deleted.len(), 1, "{literal_deleted:?}");
+    assert_eq!(literal_deleted.deleted[0].resource_name, literal_topic);
+    assert_eq!(
+        literal_deleted.deleted[0].pattern_type,
+        AclPatternType::Literal
+    );
+    let prefixed_deleted = deleted[1].1.as_ref().expect("delete prefixed");
+    assert_eq!(prefixed_deleted.deleted.len(), 1, "{prefixed_deleted:?}");
+    assert_eq!(prefixed_deleted.deleted[0].resource_name, prefix);
+    assert_eq!(
+        prefixed_deleted.deleted[0].pattern_type,
+        AclPatternType::Prefixed
+    );
+
+    let remaining = describe(for_principal()).await;
+    assert!(remaining.is_empty(), "ACLs left behind: {remaining:?}");
 }

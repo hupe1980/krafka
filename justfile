@@ -191,12 +191,14 @@ minimal-features:
     cargo check --no-default-features --features "ring"
     cargo check --no-default-features --features "ring,rustls-aws-lc-rs"
 
-# Check the API version table against Apache Kafka's own message schemas.
+# Check the API version table against Apache Kafka's own message schemas, and
+# the ACL enum bytes (resource type, pattern type, operation, permission type)
+# against Kafka's Java enums.
 #
 # Reads a vendored snapshot, so it needs no network and cannot flake. Fails on
-# an API pinned below its stable Kafka ceiling or a version gate missing from
-# the table.
-[doc("API version table must match the vendored Kafka schema snapshot")]
+# an API pinned below its stable Kafka ceiling, a version gate missing from
+# the table, or an ACL enum variant whose byte differs from Kafka's.
+[doc("API versions and ACL enum bytes must match the vendored Kafka snapshot")]
 protocol-parity:
     python3 xtask/protocol_parity.py
 
