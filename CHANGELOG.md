@@ -13,6 +13,14 @@ not a complete record.
 
 ## [Unreleased]
 
+### Fixed
+
+- `AclPatternType` now matches Kafka's wire values: `Literal` is 3 and
+  `Prefixed` is 4, and the filter-only `Match` (2) variant is new. Before,
+  `Literal` went out as `MATCH`, which the controller rejects on
+  `CreateAcls`, and a `LITERAL` resource in a `DescribeAcls` response decoded
+  as `Prefixed`.
+
 ## [0.28.2] — 2026-11-06
 
 ### Fixed
