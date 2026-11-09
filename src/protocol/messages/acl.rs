@@ -64,10 +64,15 @@ pub enum AclPatternType {
     /// Any pattern (for filtering).
     #[default]
     Any = 1,
+    /// Filter-only: matches literal, prefixed and wildcard patterns.
+    ///
+    /// Only valid in `DescribeAcls` and `DeleteAcls` filters; the broker
+    /// rejects it in `CreateAcls`.
+    Match = 2,
     /// Exact match pattern.
-    Literal = 2,
+    Literal = 3,
     /// Prefix match pattern.
-    Prefixed = 3,
+    Prefixed = 4,
 }
 
 impl AclPatternType {
@@ -76,8 +81,9 @@ impl AclPatternType {
     pub fn from_i8(value: i8) -> Self {
         match value {
             1 => Self::Any,
-            2 => Self::Literal,
-            3 => Self::Prefixed,
+            2 => Self::Match,
+            3 => Self::Literal,
+            4 => Self::Prefixed,
             _ => Self::Unknown,
         }
     }
@@ -946,6 +952,69 @@ mod tests {
     }
 
     #[test]
+    fn test_acl_pattern_type() {
+        // Wire values follow org.apache.kafka.common.resource.PatternType.
+        assert_eq!(AclPatternType::from_i8(0), AclPatternType::Unknown);
+        assert_eq!(AclPatternType::from_i8(1), AclPatternType::Any);
+        assert_eq!(AclPatternType::from_i8(2), AclPatternType::Match);
+        assert_eq!(AclPatternType::from_i8(3), AclPatternType::Literal);
+        assert_eq!(AclPatternType::from_i8(4), AclPatternType::Prefixed);
+        assert_eq!(AclPatternType::from_i8(99), AclPatternType::Unknown);
+        assert_eq!(AclPatternType::from_i8(-1), AclPatternType::Unknown);
+
+        assert_eq!(AclPatternType::Unknown.to_i8(), 0);
+        assert_eq!(AclPatternType::Any.to_i8(), 1);
+        assert_eq!(AclPatternType::Match.to_i8(), 2);
+        assert_eq!(AclPatternType::Literal.to_i8(), 3);
+        assert_eq!(AclPatternType::Prefixed.to_i8(), 4);
+
+        for value in 0..=4i8 {
+            assert_eq!(AclPatternType::from_i8(value).to_i8(), value);
+        }
+    }
+
+    #[test]
+    fn test_create_acls_literal_pattern_type_byte() {
+        // Byte offsets in CreateAcls v1: array len (i32) + resource_type (i8)
+        // + resource_name (i16 len + bytes) + pattern_type (i8).
+        let request =
+            CreateAclsRequest::new(vec![AclBinding::allow_read_topic("topic", "User:alice")]);
+        let mut buf = BytesMut::new();
+        request.encode_v1(&mut buf).unwrap();
+        let pattern_type_offset = 4 + 1 + 2 + "topic".len();
+        assert_eq!(
+            buf[pattern_type_offset] as i8, 3,
+            "LITERAL must encode as 3"
+        );
+
+        let prefixed = CreateAclsRequest::new(vec![
+            AclBinding::allow_read_topic("topic", "User:alice")
+                .with_pattern_type(AclPatternType::Prefixed),
+        ]);
+        let mut buf = BytesMut::new();
+        prefixed.encode_v1(&mut buf).unwrap();
+        assert_eq!(
+            buf[pattern_type_offset] as i8, 4,
+            "PREFIXED must encode as 4"
+        );
+    }
+
+    #[test]
+    fn test_describe_acls_literal_pattern_type_byte() {
+        // DescribeAcls v1: resource_type (i8) + resource_name (i16 len + bytes)
+        // + pattern_type (i8).
+        let mut request = DescribeAclsRequest::for_topic("topic");
+        request.pattern_type = AclPatternType::Literal;
+        let mut buf = BytesMut::new();
+        request.encode_v1(&mut buf).unwrap();
+        let pattern_type_offset = 1 + 2 + "topic".len();
+        assert_eq!(
+            buf[pattern_type_offset] as i8, 3,
+            "LITERAL must encode as 3"
+        );
+    }
+
+    #[test]
     fn test_acl_binding() {
         let binding = AclBinding::allow_read_topic("my-topic", "User:alice");
         assert_eq!(binding.resource_type, AclResourceType::Topic);
@@ -1019,7 +1088,7 @@ mod tests {
         buf.put_i8(2); // resource_type = TOPIC
         buf.put_u8(6); // resource_name: compact string len=5+1=6
         buf.put_slice(b"test1");
-        buf.put_i8(2); // pattern_type = LITERAL
+        buf.put_i8(3); // pattern_type = LITERAL (2 is MATCH)
         buf.put_u8(2); // acls: compact array count = 1+1 = 2
         // acl 0
         buf.put_u8(6); // principal: compact string len=5+1=6
