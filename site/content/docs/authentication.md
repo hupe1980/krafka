@@ -826,6 +826,10 @@ Setting only one half of the client-certificate pair, or a key passphrase
 without a key, is an error. No environment variable disables certificate
 verification; that takes `TlsConfig::insecure()` in code.
 
+`Kafka::builder_from_env()` calls it for you and also reads
+`KAFKA_BOOTSTRAP_SERVERS` and `KAFKA_CLIENT_ID`; see
+[Configuration](@/docs/configuration.md#environment-variables).
+
 ## Client Authentication
 
 Security is a connection setting: it is set once on the `Kafka` handle, and

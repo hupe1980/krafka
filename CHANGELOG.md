@@ -13,6 +13,11 @@ not a complete record.
 
 ## [Unreleased]
 
+### Added
+
+- `Kafka::builder_from_env()`: a builder from `KAFKA_BOOTSTRAP_SERVERS`, the
+  optional `KAFKA_CLIENT_ID` and `AuthConfig::from_env()`.
+
 ## [0.29.0] — 2026-11-09
 
 ### Breaking
