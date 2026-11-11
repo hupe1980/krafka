@@ -90,6 +90,54 @@ impl Kafka {
         }
     }
 
+    /// Start configuring a connection from the environment.
+    ///
+    /// | Variable | Effect |
+    /// |---|---|
+    /// | `KAFKA_BOOTSTRAP_SERVERS` | the bootstrap list, as for [`builder`](Self::builder); required |
+    /// | `KAFKA_CLIENT_ID` | [`client_id`](KafkaBuilder::client_id); default `"krafka"` |
+    ///
+    /// Security comes from [`AuthConfig::from_env`] and its
+    /// `KAFKA_SECURITY_PROTOCOL`, `KAFKA_SASL_*` and `KAFKA_SSL_*` variables.
+    /// An empty variable counts as unset.
+    ///
+    /// The result is an ordinary builder, so any setting can still be
+    /// overridden in code before [`connect`](KafkaBuilder::connect).
+    ///
+    /// ```rust,no_run
+    /// # async fn example() -> krafka::Result<()> {
+    /// let kafka = krafka::Kafka::builder_from_env()?.connect().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`KrafkaError::Config`] when `KAFKA_BOOTSTRAP_SERVERS` is unset, plus
+    /// every error of [`AuthConfig::from_env`].
+    pub fn builder_from_env() -> Result<KafkaBuilder> {
+        let var = |name| std::env::var(name).ok();
+        let builder =
+            Self::builder_from_env_parts(var("KAFKA_BOOTSTRAP_SERVERS"), var("KAFKA_CLIENT_ID"))?;
+        Ok(builder.security(AuthConfig::from_env()?))
+    }
+
+    /// [`builder_from_env`](Self::builder_from_env) without the environment
+    /// reads or the security settings.
+    fn builder_from_env_parts(
+        bootstrap_servers: Option<String>,
+        client_id: Option<String>,
+    ) -> Result<KafkaBuilder> {
+        let set = |value: Option<String>| value.filter(|v| !v.trim().is_empty());
+        let builder = set(bootstrap_servers)
+            .map(Self::builder)
+            .ok_or_else(|| KrafkaError::config("KAFKA_BOOTSTRAP_SERVERS not set"))?;
+        Ok(match set(client_id) {
+            Some(client_id) => builder.client_id(client_id),
+            None => builder,
+        })
+    }
+
     /// Start a producer.
     pub fn producer(&self) -> crate::producer::ProducerBuilder {
         crate::producer::ProducerBuilder::new(self.clone())
@@ -542,6 +590,32 @@ impl KafkaBuilder {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    // Environment mutation is `unsafe` in the 2024 edition, so these drive
+    // the pure helper `builder_from_env` delegates to.
+    #[test]
+    fn builder_from_env_requires_bootstrap_servers() {
+        for unset in [None, Some(String::new()), Some("  ".to_string())] {
+            let err = Kafka::builder_from_env_parts(unset, None).unwrap_err();
+            assert!(matches!(err, KrafkaError::Config { .. }), "{err:?}");
+            assert!(err.to_string().contains("KAFKA_BOOTSTRAP_SERVERS"), "{err}");
+        }
+    }
+
+    #[test]
+    fn builder_from_env_takes_bootstrap_servers_and_client_id() {
+        let bootstrap = || Some("b1:9092,b2:9092".to_string());
+
+        let builder =
+            Kafka::builder_from_env_parts(bootstrap(), Some("orders".to_string())).unwrap();
+        assert_eq!(builder.bootstrap_servers, "b1:9092,b2:9092");
+        assert_eq!(builder.client_id, "orders");
+
+        for unset in [None, Some(String::new())] {
+            let builder = Kafka::builder_from_env_parts(bootstrap(), unset).unwrap();
+            assert_eq!(builder.client_id, "krafka");
+        }
+    }
 
     #[tokio::test]
     async fn an_empty_bootstrap_list_is_a_config_error() {

@@ -418,10 +418,24 @@ let topic = NewTopic::new("my-topic", 12, 3)?
 
 ## Environment Variables
 
-`AuthConfig::from_env()` builds the security settings from the standard
-`KAFKA_SECURITY_PROTOCOL`, `KAFKA_SASL_*` and `KAFKA_SSL_*` variables; see
-[Authentication](@/docs/authentication.md). Everything else is read by your
-application and passed to the builders.
+`Kafka::builder_from_env()` returns a `Kafka::builder` filled from the
+environment, which can still be changed in code before `connect()`:
+
+| Variable | Effect |
+|---|---|
+| `KAFKA_BOOTSTRAP_SERVERS` | the bootstrap list; required |
+| `KAFKA_CLIENT_ID` | `client_id`; default `krafka` |
+
+It takes the security settings from `AuthConfig::from_env()`, which reads the
+standard `KAFKA_SECURITY_PROTOCOL`, `KAFKA_SASL_*` and `KAFKA_SSL_*` variables;
+see [Authentication](@/docs/authentication.md). An empty variable counts as
+unset. Everything else is read by your application and passed to the builders.
+
+```rust,compile
+use krafka::Kafka;
+
+let kafka = Kafka::builder_from_env()?.connect().await?;
+```
 
 ## Performance Tuning Profiles
 
