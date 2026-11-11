@@ -13,10 +13,12 @@ not a complete record.
 
 ## [Unreleased]
 
+## [0.30.0] — 2026-11-11
+
 ### Added
 
 - `Kafka::builder_from_env()`: a builder from `KAFKA_BOOTSTRAP_SERVERS`, the
-  optional `KAFKA_CLIENT_ID` and `AuthConfig::from_env()`.
+  optional `KAFKA_CLIENT_ID` and `AuthConfig::from_env()` (#78).
 
 ## [0.29.0] — 2026-11-09
 
@@ -1758,7 +1760,8 @@ Initial development: wire protocol, producer, consumer, admin client,
 authentication (SASL PLAIN / SCRAM / OAUTHBEARER / AWS MSK IAM), TLS,
 compression codecs, schema registry integration and the metrics layer.
 
-[Unreleased]: https://github.com/hupe1980/krafka/compare/v0.29.0...HEAD
+[Unreleased]: https://github.com/hupe1980/krafka/compare/v0.30.0...HEAD
+[0.30.0]: https://github.com/hupe1980/krafka/compare/v0.29.0...v0.30.0
 [0.29.0]: https://github.com/hupe1980/krafka/compare/v0.28.2...v0.29.0
 [0.28.2]: https://github.com/hupe1980/krafka/compare/v0.28.1...v0.28.2
 [0.28.1]: https://github.com/hupe1980/krafka/compare/v0.28.0...v0.28.1
