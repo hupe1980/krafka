@@ -97,9 +97,10 @@ impl Kafka {
     /// | `KAFKA_BOOTSTRAP_SERVERS` | the bootstrap list, as for [`builder`](Self::builder); required |
     /// | `KAFKA_CLIENT_ID` | [`client_id`](KafkaBuilder::client_id); default `"krafka"` |
     ///
+    /// An empty `KAFKA_BOOTSTRAP_SERVERS` or `KAFKA_CLIENT_ID` counts as unset.
+    ///
     /// Security comes from [`AuthConfig::from_env`] and its
     /// `KAFKA_SECURITY_PROTOCOL`, `KAFKA_SASL_*` and `KAFKA_SSL_*` variables.
-    /// An empty variable counts as unset.
     ///
     /// The result is an ordinary builder, so any setting can still be
     /// overridden in code before [`connect`](KafkaBuilder::connect).

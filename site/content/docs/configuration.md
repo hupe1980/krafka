@@ -426,10 +426,12 @@ environment, which can still be changed in code before `connect()`:
 | `KAFKA_BOOTSTRAP_SERVERS` | the bootstrap list; required |
 | `KAFKA_CLIENT_ID` | `client_id`; default `krafka` |
 
+An empty `KAFKA_BOOTSTRAP_SERVERS` or `KAFKA_CLIENT_ID` counts as unset.
+
 It takes the security settings from `AuthConfig::from_env()`, which reads the
 standard `KAFKA_SECURITY_PROTOCOL`, `KAFKA_SASL_*` and `KAFKA_SSL_*` variables;
-see [Authentication](@/docs/authentication.md). An empty variable counts as
-unset. Everything else is read by your application and passed to the builders.
+see [Authentication](@/docs/authentication.md). Everything else is read by your
+application and passed to the builders.
 
 ```rust,compile
 use krafka::Kafka;
