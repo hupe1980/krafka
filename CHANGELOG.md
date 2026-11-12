@@ -15,6 +15,10 @@ not a complete record.
 
 ### Changed
 
+- Sending a record takes its buffer memory without setting up a timer when the
+  memory is free; the `max_block` timer is built only when the buffer is full.
+  Against a local broker this raised throughput for 100-byte records by 11%,
+  at 10% less CPU time.
 - The consumer keeps the part of a fetch response that one poll's record
   budget does not cover and decodes it in later polls. It used to drop it and
   fetch it again, so with the default `max_poll_records` most of every large
