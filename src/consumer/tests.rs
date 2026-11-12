@@ -218,3 +218,35 @@ fn a_benign_close_commit_error_yields_to_the_leave_result() {
     );
     assert!(commit.unwrap_err().to_string().contains("commit"));
 }
+
+/// A pattern evaluation that read the subscription before a subscribe call
+/// replaced it must not install its stale matched set over the new one.
+#[tokio::test]
+async fn a_stale_pattern_evaluation_does_not_overwrite_a_newer_subscribe() {
+    let consumer = test_consumer();
+    let stale = consumer
+        .state
+        .lock()
+        .begin_subscription(SubscriptionKind::ClientPattern(
+            crate::consumer::TopicPattern::new("pat-.*").unwrap(),
+        ));
+    {
+        // A concurrent `subscribe(["x"])` wins the race.
+        let mut state = consumer.state.lock();
+        state.begin_subscription(SubscriptionKind::Names);
+        state.subscription = ["x".to_string()].into_iter().collect();
+    }
+
+    let applied = consumer
+        .apply_topic_subscription_at(vec!["pat-a".to_string()], None, Some(stale))
+        .await
+        .unwrap();
+
+    assert!(!applied, "a stale evaluation was applied");
+    let state = consumer.state.lock();
+    assert_eq!(state.kind, SubscriptionKind::Names);
+    assert_eq!(
+        state.subscription.iter().cloned().collect::<Vec<_>>(),
+        vec!["x".to_string()]
+    );
+}

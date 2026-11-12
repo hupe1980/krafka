@@ -18,7 +18,9 @@ use tracing::{debug, trace, warn};
 
 use crate::consumer::Consumer;
 use crate::consumer::fetch_session::FetchSessionClose;
-use crate::consumer::state::{CompletedFetch, FetchTarget, OffsetReset, PartitionKey};
+use crate::consumer::state::{
+    CompletedFetch, FetchTarget, OffsetReset, PartitionKey, SubscriptionKind,
+};
 use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
 use crate::metadata::broker_info_for_node;
 use crate::protocol::{
@@ -280,6 +282,16 @@ impl Consumer {
                 if !p.error_code.is_ok() {
                     if p.target.preferred_replica.is_some() {
                         state.set_preferred_replica(key, None);
+                    }
+                    // A matched topic may have been deleted: evaluate the
+                    // pattern on the next poll rather than at its next
+                    // scheduled time.
+                    if matches!(
+                        p.error_code,
+                        ErrorCode::UnknownTopicOrPartition | ErrorCode::UnknownTopicId
+                    ) && matches!(state.kind, SubscriptionKind::ClientPattern(_))
+                    {
+                        state.rematch_requested = true;
                     }
                     match p.error_code {
                         ErrorCode::OffsetOutOfRange => match reset {

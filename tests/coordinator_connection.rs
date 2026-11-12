@@ -361,3 +361,71 @@ async fn a_moved_coordinator_takes_the_coordination_connection_along() {
     assert_purposes_disjoint(&broker);
     close_all(&broker, consumer).await;
 }
+
+/// Two consumers of different groups on one `Kafka` handle: while the
+/// coordinator holds one group's `JoinGroup` (its rebalance), the other
+/// group's commit is answered at once. With one coordination connection per
+/// handle the commit queued behind the parked join for the whole rebalance.
+#[tokio::test]
+async fn a_parked_join_does_not_stall_another_member_on_the_same_handle() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("a", 1);
+    broker.create_topic("b", 1);
+    let producer = krafka::Kafka::builder(broker.bootstrap_servers())
+        .connect()
+        .await
+        .unwrap()
+        .producer()
+        .build()
+        .await
+        .unwrap();
+    let _ = producer
+        .send(krafka::Record::new("b", b"v".to_vec()))
+        .await
+        .unwrap();
+    let _ = producer.close().await;
+
+    let kafka = krafka::Kafka::builder(broker.bootstrap_servers())
+        .request_timeout(T)
+        .connect_timeout(T)
+        .connect()
+        .await
+        .unwrap();
+    let member = |group: &'static str| {
+        kafka
+            .consumer(group)
+            .group_protocol(GroupProtocol::Classic)
+            .auto_offset_reset(AutoOffsetReset::Earliest)
+            .heartbeat_interval(Duration::from_millis(200))
+            .build()
+    };
+    let b = member("group-b").await.unwrap();
+    b.subscribe(["b"]).await.unwrap();
+    let deadline = std::time::Instant::now() + T;
+    while b.poll(Duration::from_millis(200)).await.unwrap().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "b never received its record"
+        );
+    }
+
+    // Group A's join is held for longer than the commit may take.
+    let joins = broker.request_count(ApiKey::JoinGroup);
+    broker.on_once(ApiKey::JoinGroup, |_| Control::Delay(HOLD));
+    let a = member("group-a").await.unwrap();
+    a.subscribe(["a"]).await.unwrap();
+    assert!(
+        broker
+            .wait_for_requests(ApiKey::JoinGroup, joins + 1, T)
+            .await,
+        "group A's join never reached the coordinator"
+    );
+
+    let started = std::time::Instant::now();
+    b.commit().await.unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "group B's commit waited {:?} behind group A's parked join",
+        started.elapsed()
+    );
+}

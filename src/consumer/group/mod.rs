@@ -175,6 +175,9 @@ impl GroupInner {
 pub(crate) struct GroupCoordinator {
     group_id: String,
     pool: Arc<ConnectionPool>,
+    /// This member's own coordination connections: never shared with
+    /// another member of this or any other group on the same handle.
+    coordination_slot: crate::network::CoordinationSlot,
     metadata: Arc<ClusterMetadata>,
     session_timeout: Duration,
     heartbeat_interval: Duration,
@@ -210,6 +213,16 @@ pub(crate) struct GroupCoordinator {
     /// round started before that discards its result.
     membership_epoch: AtomicU64,
     subscribed_topics: RwLock<Vec<String>>,
+    /// The topics the coordinator was last told (classic `JoinGroup`, KIP-848
+    /// full heartbeat). A subscription changed while that request was in
+    /// flight differs from it, and `needs_rejoin` sends it again.
+    joined_topics: RwLock<Option<Vec<String>>>,
+    /// A broker-side (KIP-848) subscription pattern, sent in
+    /// `SubscribedTopicRegex`.
+    subscribed_regex: RwLock<Option<String>>,
+    /// The pattern the coordinator last accepted from this member; a full
+    /// heartbeat clears it with `""` once it is no longer wanted.
+    sent_regex: Mutex<Option<String>>,
     /// Advertised in JoinGroup in preference order.
     assignment_strategies: Vec<PartitionAssignmentStrategy>,
     /// The strategy the coordinator selected, latched from
@@ -253,6 +266,7 @@ impl GroupCoordinator {
     ) -> Self {
         Self {
             group_id: group_id.into(),
+            coordination_slot: pool.coordination_slot(),
             pool,
             metadata,
             session_timeout,
@@ -271,6 +285,9 @@ impl GroupCoordinator {
             heartbeat_epoch: Arc::new(AtomicU64::new(0)),
             membership_epoch: AtomicU64::new(0),
             subscribed_topics: RwLock::new(Vec::new()),
+            joined_topics: RwLock::new(None),
+            subscribed_regex: RwLock::new(None),
+            sent_regex: Mutex::new(None),
             assignment_strategies: vec![PartitionAssignmentStrategy::Range],
             negotiated_strategy: RwLock::new(PartitionAssignmentStrategy::Range),
             group_instance_id: None,
@@ -371,6 +388,14 @@ impl GroupCoordinator {
         self.subscribed_topics.read().clone()
     }
 
+    /// The subscription to send the coordinator now, recorded as the one it
+    /// was last told.
+    pub(crate) fn topics_for_join(&self) -> Vec<String> {
+        let topics = self.subscribed_topics();
+        *self.joined_topics.write() = Some(topics.clone());
+        topics
+    }
+
     // ── liveness ────────────────────────────────────────────────────────
 
     /// Record that the application polled.
@@ -444,6 +469,50 @@ impl GroupCoordinator {
         }
     }
 
+    /// Record the broker-side subscription pattern (KIP-848). A change while
+    /// the member is in the group sends a full heartbeat on the next poll.
+    pub(crate) fn set_subscription_regex(&self, regex: Option<String>) {
+        let changed = {
+            let mut current = self.subscribed_regex.write();
+            let changed = *current != regex;
+            *current = regex;
+            changed
+        };
+        if changed && self.state() == GroupState::Stable && self.is_consumer_protocol() {
+            self.stop_heartbeat_task();
+            self.inner.write().state = GroupState::PreparingRebalance;
+        }
+    }
+
+    /// The broker-side subscription pattern, if any.
+    pub(crate) fn subscribed_regex(&self) -> Option<String> {
+        self.subscribed_regex.read().clone()
+    }
+
+    /// `SubscribedTopicRegex` for a join or full heartbeat at
+    /// `member_epoch`: the pattern; `""` to clear one the coordinator still
+    /// holds; else null. A member joining at epoch 0 holds nothing.
+    pub(crate) fn regex_for_join(&self, member_epoch: i32) -> Option<String> {
+        let wanted = self.subscribed_regex();
+        let held = if member_epoch == 0 {
+            None
+        } else {
+            self.sent_regex.lock().clone()
+        };
+        match (wanted, held) {
+            (Some(pattern), _) => Some(pattern),
+            (None, Some(_)) => Some(String::new()),
+            (None, None) => None,
+        }
+    }
+
+    /// Record that the coordinator accepted `regex` (`""` clears).
+    pub(crate) fn note_regex_sent(&self, regex: Option<&str>) {
+        if let Some(regex) = regex {
+            *self.sent_regex.lock() = (!regex.is_empty()).then(|| regex.to_string());
+        }
+    }
+
     /// Ask for a rejoin on the next poll, keeping the heartbeat task running.
     pub(crate) fn request_rejoin(&self) {
         self.inner.write().state = GroupState::PreparingRebalance;
@@ -452,6 +521,21 @@ impl GroupCoordinator {
     /// Whether this member has to (re)join the group.
     pub(crate) fn needs_rejoin(&self) -> bool {
         if self.heartbeat.take_rebalance_needed() && !self.is_consumer_protocol() {
+            self.inner.write().state = GroupState::PreparingRebalance;
+        }
+        // The subscription changed while the last join was in flight: that
+        // join carried the old topics, so the coordinator must be told again.
+        let stale = self
+            .joined_topics
+            .read()
+            .as_ref()
+            .is_some_and(|joined| *joined != *self.subscribed_topics.read())
+            || (self.is_consumer_protocol()
+                && *self.sent_regex.lock() != *self.subscribed_regex.read());
+        if stale && self.state() == GroupState::Stable {
+            if self.is_consumer_protocol() {
+                self.stop_heartbeat_task();
+            }
             self.inner.write().state = GroupState::PreparingRebalance;
         }
         matches!(
@@ -627,7 +711,7 @@ impl GroupCoordinator {
             }
         };
         self.pool
-            .get_coordinator_connection(&address)
+            .get_coordinator_connection(&address, &self.coordination_slot)
             .await
             .inspect_err(|_| self.drop_coordinator())
     }

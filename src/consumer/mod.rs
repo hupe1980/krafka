@@ -33,6 +33,7 @@ mod group;
 mod group_metadata;
 mod offset;
 mod offsets;
+mod pattern;
 mod rebalance;
 mod record;
 mod state;
@@ -50,6 +51,7 @@ pub use config::{AutoOffsetReset, GroupProtocol, IsolationLevel, PartitionAssign
 pub(crate) use group::{COORDINATOR_REDISCOVERY_MAX_ATTEMPTS, is_coordinator_retriable};
 pub use group_metadata::ConsumerGroupMetadata;
 pub use offset::OffsetAndMetadata;
+pub use pattern::{SubscriptionPattern, TopicPattern};
 pub use rebalance::{ConsumerRebalanceListener, NoOpRebalanceListener};
 pub(crate) use record::headers_from_wire;
 pub use record::{ConsumerRecord, TimestampType, TopicPartition};
@@ -79,7 +81,7 @@ use crate::{Offset, PartitionId};
 use group::GroupCoordinator;
 use offsets::CommitRequestOffsets;
 use rebalance::ErasedRebalanceListener;
-use state::{DeliveryGuard, OffsetReset, PartitionKey, SubscriptionState};
+use state::{DeliveryGuard, OffsetReset, PartitionKey, SubscriptionKind, SubscriptionState};
 
 /// Cluster metadata snapshot returned by [`Consumer::fetch_metadata`].
 #[non_exhaustive]
@@ -251,15 +253,155 @@ impl Consumer {
     pub async fn subscribe(&self, topics: impl IntoIterator<Item = impl AsRef<str>>) -> Result<()> {
         let topics: Vec<String> = topics.into_iter().map(|t| t.as_ref().to_string()).collect();
         validate_topic_names(topics.iter().map(String::as_str))?;
+        self.apply_topic_subscription(topics, Some(SubscriptionKind::Names))
+            .await?;
+        Ok(())
+    }
+
+    /// Subscribe to every topic whose whole name matches `pattern`,
+    /// replacing the current subscription.
+    ///
+    /// The consumer matches the pattern itself against the cluster's topic
+    /// list, so this works with and without a `group_id`, under either group
+    /// protocol, on every supported broker. Internal topics
+    /// (`__consumer_offsets`, `__transaction_state`) never match.
+    ///
+    /// The pattern is evaluated before this returns, then again once per
+    /// `metadata_max_age` and as soon as a fetch finds a matched topic gone.
+    /// A topic created later that matches is added; a deleted one is
+    /// dropped. A group member rejoins (classic) or sends its new topic list
+    /// (KIP-848) when the matched set changes, without leaving the group;
+    /// partitions of topics the old and the new subscription both cover are
+    /// kept under cooperative and KIP-848 assignment.
+    ///
+    /// ```rust,no_run
+    /// # async fn example(consumer: &krafka::consumer::Consumer) -> krafka::Result<()> {
+    /// use krafka::consumer::TopicPattern;
+    ///
+    /// consumer.subscribe_pattern(TopicPattern::new("orders-.*")?).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// The error of the first metadata fetch, if it fails; the pattern stays
+    /// subscribed and is evaluated again on the next poll.
+    pub async fn subscribe_pattern(&self, pattern: TopicPattern) -> Result<()> {
+        debug!(pattern = pattern.as_str(), "Subscribing to topic pattern");
+        // Only the kind changes here; the forced evaluation installs the
+        // matched set through the one subscription path, so the group never
+        // sees an empty interim subscription.
+        self.state
+            .lock()
+            .begin_subscription(SubscriptionKind::ClientPattern(pattern));
+        self.refresh_pattern_subscription(true).await
+    }
+
+    /// Subscribe to the topics the group coordinator matches with `pattern`,
+    /// replacing the current subscription.
+    ///
+    /// The broker evaluates the pattern (RE2J syntax, whole topic names),
+    /// including against topics created later, and assigns what matches; the
+    /// client sends it and never parses it. Needs a `group_id`,
+    /// [`GroupProtocol::Consumer`] and a broker that supports
+    /// `ConsumerGroupHeartbeat` v1 (Kafka 4.0+). The switch happens without
+    /// leaving the group.
+    ///
+    /// ```rust,no_run
+    /// # async fn example(consumer: &krafka::consumer::Consumer) -> krafka::Result<()> {
+    /// use krafka::consumer::SubscriptionPattern;
+    ///
+    /// consumer
+    ///     .subscribe_broker_pattern(SubscriptionPattern::new("orders-.*")?)
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`KrafkaError::IllegalState`] without a `group_id` or under the classic
+    /// protocol; nothing changes. A pattern the coordinator rejects, or a
+    /// coordinator without `ConsumerGroupHeartbeat` v1, fails the next
+    /// [`poll`](Self::poll).
+    pub async fn subscribe_broker_pattern(&self, pattern: SubscriptionPattern) -> Result<()> {
+        let Some(coordinator) = self
+            .group_coordinator
+            .as_ref()
+            .filter(|c| c.is_consumer_protocol())
+        else {
+            return Err(KrafkaError::illegal_state(
+                "a broker-side subscription pattern needs a consumer group on the KIP-848 \
+                 protocol (`group_protocol(GroupProtocol::Consumer)`); use `subscribe_pattern` \
+                 for client-side matching",
+            ));
+        };
         {
             let mut state = self.state.lock();
-            state.subscription = topics.iter().cloned().collect();
+            state.begin_subscription(SubscriptionKind::BrokerPattern(pattern.clone()));
+            state.subscription.clear();
         }
-        let names: Vec<&str> = topics.iter().map(String::as_str).collect();
-        self.metadata.refresh_for_topics(Some(&names)).await?;
+        coordinator.note_poll();
+        coordinator.set_subscription(Vec::new());
+        coordinator.set_subscription_regex(Some(pattern.as_str().to_string()));
+        debug!(
+            pattern = pattern.as_str(),
+            "Subscribed to broker-side topic pattern"
+        );
+        Ok(())
+    }
+
+    /// The one path that installs a topic-name subscription.
+    ///
+    /// `new_kind` is `Some` for a subscribe call: it starts a new
+    /// subscription (a new generation). `None` re-applies the current kind
+    /// with a new matched set, and is dropped when `expected_generation`
+    /// no longer matches, so a pattern re-evaluation never overwrites a
+    /// subscribe that raced it. Returns whether it was applied.
+    async fn apply_topic_subscription_at(
+        &self,
+        topics: Vec<String>,
+        new_kind: Option<SubscriptionKind>,
+        expected_generation: Option<u64>,
+    ) -> Result<bool> {
+        let group_less = self.group_coordinator.is_none();
+        {
+            let mut state = self.state.lock();
+            match (new_kind, expected_generation) {
+                (Some(kind), _) => {
+                    state.begin_subscription(kind);
+                }
+                (None, Some(generation)) if state.generation != generation => return Ok(false),
+                (None, _) => {}
+            }
+            state.subscription = topics.iter().cloned().collect();
+            if group_less {
+                let standalone: HashSet<String> = if state.kind == SubscriptionKind::Names {
+                    // An explicit subscribe takes the topic back from `assign`.
+                    for topic in &topics {
+                        state.manual_topics.remove(topic);
+                    }
+                    topics.iter().cloned().collect()
+                } else {
+                    topics
+                        .iter()
+                        .filter(|t| !state.manual_topics.contains(*t))
+                        .cloned()
+                        .collect()
+                };
+                state.standalone_topics = standalone;
+                state.standalone_resolved = None;
+            }
+        }
+        if !topics.is_empty() {
+            let names: Vec<&str> = topics.iter().map(String::as_str).collect();
+            self.metadata.refresh_for_topics(Some(&names)).await?;
+        }
 
         if let Some(ref coordinator) = self.group_coordinator {
             coordinator.note_poll();
+            coordinator.set_subscription_regex(None);
             coordinator.set_subscription(topics.clone());
             // A classic member that owns nothing has nothing to revoke first,
             // so its join can start now, on its own task; poll applies it.
@@ -270,15 +412,20 @@ impl Consumer {
                 coordinator.spawn_rejoin(true);
             }
         } else {
-            {
-                let mut state = self.state.lock();
-                state.standalone_topics = topics.iter().cloned().collect();
-                state.standalone_resolved = None;
-            }
             self.resolve_standalone_subscription(true).await?;
         }
         debug!("Subscribed to topics: {:?}", topics);
-        Ok(())
+        Ok(true)
+    }
+
+    /// [`apply_topic_subscription_at`](Self::apply_topic_subscription_at)
+    /// for a subscribe call.
+    async fn apply_topic_subscription(
+        &self,
+        topics: Vec<String>,
+        kind: Option<SubscriptionKind>,
+    ) -> Result<bool> {
+        self.apply_topic_subscription_at(topics, kind, None).await
     }
 
     /// Assign partitions of one topic manually, replacing that topic's
@@ -306,8 +453,10 @@ impl Consumer {
             state.add_partitions(partitions.iter().map(|&p| (topic.to_string(), p)));
             state.subscription.insert(topic.to_string());
             // The caller owns this topic's partition list from here on; the
-            // metadata-driven resolver must not widen it again.
+            // metadata-driven resolver must not widen it again, and a
+            // pattern must not add it back.
             state.standalone_topics.remove(topic);
+            state.manual_topics.insert(topic.to_string());
         }
         self.update_gauges();
         debug!("Assigned partitions for {}: {:?}", topic, partitions);
@@ -895,9 +1044,15 @@ impl Consumer {
         self.state.lock().assignment().into_iter().collect()
     }
 
-    /// The subscribed (or manually assigned) topics.
+    /// The subscribed (or manually assigned) topics. Under a client-side
+    /// pattern, the topics it currently matches; under a broker-side pattern,
+    /// the topics the coordinator assigned.
     pub async fn subscription(&self) -> StdHashSet<String> {
-        self.state.lock().subscription.iter().cloned().collect()
+        let state = self.state.lock();
+        if matches!(state.kind, SubscriptionKind::BrokerPattern(_)) {
+            return state.assignment().into_keys().collect();
+        }
+        state.subscription.iter().cloned().collect()
     }
 
     /// Position, cached watermarks and lag of every assigned partition. No
@@ -1089,8 +1244,7 @@ impl Consumer {
     async fn clear_state(&self) {
         {
             let mut state = self.state.lock();
-            state.subscription.clear();
-            state.standalone_topics.clear();
+            state.clear_subscription();
             state.clear_assignment();
         }
         self.close_fetch_sessions().await;

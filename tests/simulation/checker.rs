@@ -1,4 +1,4 @@
-//! The six invariants, judged over a history and the cluster's final state.
+//! The seven invariants, judged over a history and the cluster's final state.
 //!
 //! This extends the send-history checker in `tests/support` (an acknowledged
 //! record is in the log exactly once; a failed one only when its error said it
@@ -35,7 +35,7 @@ use krafka::error::{KrafkaError, Result};
 use krafka::producer::RecordMetadata;
 use krafka::testing::FakeBroker;
 
-/// Which of the six invariants a violation breaks.
+/// Which of the seven invariants a violation breaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Invariant {
     LostWrite,
@@ -44,6 +44,7 @@ pub enum Invariant {
     PartialCommit,
     Incomplete,
     AtLeastOnce,
+    OnlyMatchingTopics,
 }
 
 impl fmt::Display for Invariant {
@@ -55,6 +56,7 @@ impl fmt::Display for Invariant {
             Self::PartialCommit => "partial commit",
             Self::Incomplete => "flush/close completeness",
             Self::AtLeastOnce => "at-least-once",
+            Self::OnlyMatchingTopics => "only matching topics",
         })
     }
 }
@@ -137,6 +139,11 @@ struct Inner {
     not_terminated: Option<Duration>,
     /// The consumer group whose reads the at-least-once invariant judges.
     group: Option<String>,
+    /// Topics created during the run whose logs are judged too.
+    created_topics: Vec<String>,
+    /// Topics the group must never read: values written there start with
+    /// `<topic>/`.
+    forbidden_topics: Vec<String>,
 }
 
 impl Default for Inner {
@@ -148,6 +155,8 @@ impl Default for Inner {
             ops: Vec::new(),
             not_terminated: None,
             group: None,
+            created_topics: Vec::new(),
+            forbidden_topics: Vec::new(),
         }
     }
 }
@@ -218,6 +227,17 @@ impl History {
         self.0.lock().group = Some(group.to_owned());
     }
 
+    /// Judge `topic`, created during the run, like the run's own topics.
+    pub fn judge_topic(&self, topic: &str) {
+        self.0.lock().created_topics.push(topic.to_owned());
+    }
+
+    /// Invariant 7: the group never processes a value written to `topic`
+    /// (values written there start with `<topic>/`).
+    pub fn forbid_topic(&self, topic: &str) {
+        self.0.lock().forbidden_topics.push(topic.to_owned());
+    }
+
     /// The run hit the harness limit before the workload returned.
     pub fn not_terminated(&self, limit: Duration) {
         self.0.lock().not_terminated = Some(limit);
@@ -246,6 +266,13 @@ impl History {
 
     /// Judge the history against the cluster's final state of `topics`.
     pub fn check(&self, broker: &FakeBroker, topics: &[&str]) -> Vec<Violation> {
+        let created = self.0.lock().created_topics.clone();
+        let topics: Vec<&str> = topics
+            .iter()
+            .copied()
+            .chain(created.iter().map(String::as_str))
+            .collect();
+        let topics = topics.as_slice();
         let mut log: HashMap<String, usize> = HashMap::new();
         let mut committed: HashSet<String> = HashSet::new();
         for topic in topics {
@@ -277,6 +304,7 @@ impl History {
             }
             violations.extend(check_at_least_once(&inner.ops, &records, &offsets));
         }
+        violations.extend(check_only_matching(&inner.ops, &inner.forbidden_topics));
         violations
     }
 }
@@ -327,6 +355,27 @@ pub fn check_at_least_once(
         });
     }
     violations
+}
+
+/// Invariant 7: no processed value came from a topic the subscription does
+/// not cover.
+pub fn check_only_matching(ops: &[Op], forbidden: &[String]) -> Vec<Violation> {
+    ops.iter()
+        .filter_map(|op| match &op.kind {
+            Kind::Consume { member, values } => Some((member, values)),
+            _ => None,
+        })
+        .flat_map(|(member, values)| values.iter().map(move |v| (member, v)))
+        .filter_map(|(member, value)| {
+            let topic = forbidden
+                .iter()
+                .find(|t| value.strip_prefix(t.as_str()).is_some_and(|r| r.starts_with('/')))?;
+            Some(Violation {
+                invariant: Invariant::OnlyMatchingTopics,
+                detail: format!("member {member} processed {value} from {topic}, which the subscription does not cover"),
+            })
+        })
+        .collect()
 }
 
 fn value_of(bytes: Option<&[u8]>) -> String {

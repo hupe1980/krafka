@@ -188,7 +188,8 @@ async fn growth_beyond_the_cap_fails_retriably_naming_the_cap() {
 }
 
 // ---------------------------------------------------------------------------
-// A coordinator gets its own connection, and shares the data one at the cap.
+// Each member gets its own coordination connection, and shares the data one
+// at the cap.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -197,12 +198,13 @@ async fn the_coordinator_gets_its_own_connection() {
     let addr = broker.bootstrap_servers();
     let pool = ConnectionPool::new(ConnectionConfig::default());
 
+    let slot = pool.coordination_slot();
     let data = pool.get_connection(&addr).await.unwrap();
-    let coordination = pool.get_coordinator_connection(&addr).await.unwrap();
+    let coordination = pool.get_coordinator_connection(&addr, &slot).await.unwrap();
     assert!(!Arc::ptr_eq(&data, &coordination), "a separate socket");
     assert!(Arc::ptr_eq(
         &coordination,
-        &pool.get_coordinator_connection(&addr).await.unwrap()
+        &pool.get_coordinator_connection(&addr, &slot).await.unwrap()
     ));
     assert_eq!(pool.metrics().connections_created, 2);
 
@@ -218,19 +220,43 @@ async fn the_coordinator_gets_its_own_connection() {
     assert_eq!(pool.metrics().active_connections, 0);
 }
 
+/// Two members never share a coordination connection: the broker would park
+/// one member's `JoinGroup` in front of the other's heartbeats. A member's
+/// connection closes once its slot is dropped.
+#[tokio::test]
+async fn each_member_gets_its_own_coordination_connection() {
+    let broker = FakeBroker::start().await.unwrap();
+    let addr = broker.bootstrap_servers();
+    let pool = ConnectionPool::new(ConnectionConfig::default());
+
+    let (a, b) = (pool.coordination_slot(), pool.coordination_slot());
+    let conn_a = pool.get_coordinator_connection(&addr, &a).await.unwrap();
+    let conn_b = pool.get_coordinator_connection(&addr, &b).await.unwrap();
+    assert!(!Arc::ptr_eq(&conn_a, &conn_b), "two members share a socket");
+
+    drop(a);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while conn_a.is_alive() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!conn_a.is_alive(), "a dropped slot's connection stays open");
+    assert!(conn_b.is_alive(), "another member's connection was closed");
+}
+
 #[tokio::test]
 async fn at_the_cap_coordination_falls_back_to_the_data_connection() {
     let broker = FakeBroker::start().await.unwrap();
     let addr = broker.bootstrap_servers();
     let pool = ConnectionPool::new(ConnectionConfig::default()).with_max_total_connections(1);
 
+    let slot = pool.coordination_slot();
     let data = pool.get_connection(&addr).await.unwrap();
-    let coordination = pool.get_coordinator_connection(&addr).await.unwrap();
+    let coordination = pool.get_coordinator_connection(&addr, &slot).await.unwrap();
     assert!(
         Arc::ptr_eq(&data, &coordination),
         "shares the data connection"
     );
-    pool.get_coordinator_connection(&addr).await.unwrap();
+    pool.get_coordinator_connection(&addr, &slot).await.unwrap();
     assert_eq!(pool.metrics().coordination_fallbacks, 2);
     assert_eq!(pool.metrics().connections_created, 1);
 }

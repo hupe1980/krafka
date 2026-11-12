@@ -28,11 +28,13 @@ published hardware and configuration. This documentation publishes none.
 
 A broker reads one request per connection at a time, so a heartbeat written
 behind a long-polling fetch on the same socket waits for that fetch. The
-connection pool keeps a separate **coordination connection** to a group
-coordinator next to the data connection to the same broker. Group heartbeats,
-`JoinGroup`, `SyncGroup`, `LeaveGroup`, `OffsetCommit`, `OffsetFetch` and
-share-group heartbeats use it. Requests on each connection are written in
-submission order.
+connection pool gives each group member its own **coordination connection** to
+its coordinator, next to the data connection to the same broker. Group
+heartbeats, `JoinGroup`, `SyncGroup`, `LeaveGroup`, `OffsetCommit`,
+`OffsetFetch` and share-group heartbeats use it. Because it is the member's own,
+another member's `JoinGroup`, which the broker holds for a whole rebalance,
+never delays it, even when both members are clients of one `Kafka` handle.
+Requests on each connection are written in submission order.
 
 At the `max_connections` cap, coordination requests fall back to the data
 connection; `krafka_coordination_fallbacks_total` (`coordination_fallbacks` in

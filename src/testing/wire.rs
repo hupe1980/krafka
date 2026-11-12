@@ -520,8 +520,7 @@ pub(crate) struct ConsumerGroupHeartbeatReq {
     pub rebalance_timeout_ms: i32,
     /// Subscribed topics, or `None` when unchanged since the last heartbeat.
     pub subscribed_topic_names: Option<Vec<String>>,
-    /// Regex subscription, or `None`.
-    #[allow(dead_code)]
+    /// Regex subscription: `None` when unchanged, `""` to remove it.
     pub subscribed_topic_regex: Option<String>,
     /// Requested server-side assignor, or `None`.
     pub server_assignor: Option<String>,

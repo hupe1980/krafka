@@ -264,7 +264,7 @@ impl TopicInfo {
 
 /// Default ceiling for the metadata retry backoff, mirroring Java's
 /// `retry.backoff.max.ms`.
-const DEFAULT_RETRY_BACKOFF_MAX: Duration = Duration::from_millis(1000);
+pub(crate) const DEFAULT_RETRY_BACKOFF_MAX: Duration = Duration::from_millis(1000);
 
 /// Default base delay for the metadata retry backoff, mirroring Java's
 /// `retry.backoff.ms`.

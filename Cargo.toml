@@ -51,6 +51,9 @@ parking_lot = "0.12"
 # Fast non-cryptographic hasher for hot-path HashMap lookups.
 ahash = "0.8"
 
+# Topic-pattern subscription matcher (pure Rust, no dependencies).
+regex-lite = "0.1.9"
+
 # TCP keepalive configuration
 socket2 = "0.5"
 

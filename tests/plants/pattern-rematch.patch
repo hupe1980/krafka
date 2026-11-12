@@ -1,0 +1,10 @@
+--- a/src/consumer/rebalance/apply.rs
++++ b/src/consumer/rebalance/apply.rs
+@@ -43,7 +43,6 @@
+     /// is nothing to fetch mid-rebalance, so the poll returns empty and the
+     /// round's outcome is applied by a later poll.
+     pub(in crate::consumer) async fn maintain_group(&self, budget: Duration) -> Result<bool> {
+-        self.refresh_pattern_subscription(false).await?;
+         let Some(coordinator) = self.group_coordinator.clone() else {
+             self.resolve_standalone_subscription(false).await?;
+             return Ok(false);

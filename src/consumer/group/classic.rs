@@ -179,7 +179,7 @@ impl GroupCoordinator {
             let inner = self.inner.read();
             (inner.member_id.clone(), inner.generation_id)
         };
-        let topics = self.subscribed_topics();
+        let topics = self.topics_for_join();
         let owned = if self.is_cooperative() {
             self.owned.lock().clone()
         } else {

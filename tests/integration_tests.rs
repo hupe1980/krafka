@@ -4019,3 +4019,234 @@ async fn test_admin_acls_pattern_type_round_trip() {
     let remaining = describe(for_principal()).await;
     assert!(remaining.is_empty(), "ACLs left behind: {remaining:?}");
 }
+
+/// Produce `values` to `topic`, waiting for each acknowledgement.
+async fn produce_values(bootstrap_servers: &str, topic: &str, values: &[String]) {
+    let producer = krafka::Kafka::builder(bootstrap_servers)
+        .connect()
+        .await
+        .expect("connects")
+        .producer()
+        .build()
+        .await
+        .expect("producer builds");
+    for value in values {
+        let _ = producer
+            .send(krafka::Record::new(topic, value.clone().into_bytes()))
+            .await
+            .expect("send acknowledged");
+    }
+    producer.close().await.expect("producer closes");
+}
+
+/// Poll `consumers` round-robin until every value in `want` was received,
+/// failing on any `poll()` error. Returns what each consumer received.
+async fn poll_until_all(
+    consumers: &[&krafka::consumer::Consumer],
+    want: &std::collections::HashSet<String>,
+    limit: Duration,
+) -> Vec<std::collections::HashSet<String>> {
+    let mut seen = vec![std::collections::HashSet::new(); consumers.len()];
+    let deadline = std::time::Instant::now() + limit;
+    while std::time::Instant::now() < deadline {
+        for (i, consumer) in consumers.iter().enumerate() {
+            for record in consumer
+                .poll(Duration::from_millis(500))
+                .await
+                .expect("poll")
+            {
+                seen[i].insert(
+                    String::from_utf8_lossy(record.value.as_deref().unwrap_or_default())
+                        .into_owned(),
+                );
+            }
+        }
+        if want.iter().all(|v| seen.iter().any(|s| s.contains(v))) {
+            return seen;
+        }
+    }
+    panic!("not every value arrived within {limit:?}: {seen:?}");
+}
+
+/// A topic created after a client-side pattern subscription is consumed, and
+/// its partitions are split across a two-member classic group.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_pattern_subscription_shares_a_new_topic_across_a_classic_group() {
+    use krafka::consumer::{AutoOffsetReset, TopicPattern};
+
+    let bootstrap_servers = kafka();
+    let id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let prefix = format!("pattern-classic-{id}");
+    create_topic(&bootstrap_servers, &format!("{prefix}-a"), 1).await;
+    create_topic(&bootstrap_servers, &format!("{prefix}x-other"), 1).await;
+
+    // Both members on one handle: each still gets its own coordination
+    // connection, so one member's parked `JoinGroup` never holds up the
+    // other's `SyncGroup` and heartbeats.
+    let kafka = krafka::Kafka::builder(&bootstrap_servers)
+        .metadata_max_age(Duration::from_secs(2))
+        .connect()
+        .await
+        .expect("connects");
+    let member = || async {
+        kafka
+            .consumer(format!("{prefix}-group"))
+            .auto_offset_reset(AutoOffsetReset::Earliest)
+            .build()
+            .await
+            .expect("consumer builds")
+    };
+    let (a, b) = (member().await, member().await);
+    let pattern = TopicPattern::new(&format!("{prefix}-.*")).unwrap();
+    a.subscribe_pattern(pattern.clone())
+        .await
+        .expect("subscribes");
+    b.subscribe_pattern(pattern).await.expect("subscribes");
+
+    let topic = format!("{prefix}-b");
+    create_topic(&bootstrap_servers, &topic, 4).await;
+    let values: Vec<String> = (0..40).map(|i| format!("v{i}")).collect();
+    produce_values(&bootstrap_servers, &topic, &values).await;
+    produce_values(
+        &bootstrap_servers,
+        &format!("{prefix}x-other"),
+        &["other".to_string()],
+    )
+    .await;
+
+    let seen = poll_until_all(
+        &[&a, &b],
+        &values.iter().cloned().collect(),
+        Duration::from_secs(60),
+    )
+    .await;
+    assert!(
+        seen.iter().all(|s| !s.contains("other")),
+        "a non-matching topic was consumed"
+    );
+    // Each member evaluates the pattern on its own schedule, so the member
+    // that saw the topic first may hold all of it until the other rejoins.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let partitions = loop {
+        let mut partitions = Vec::new();
+        for consumer in [&a, &b] {
+            consumer
+                .poll(Duration::from_millis(500))
+                .await
+                .expect("poll");
+            partitions.push(consumer.assignment().await.get(&topic).map_or(0, Vec::len));
+        }
+        if partitions.iter().all(|&n| n > 0) || std::time::Instant::now() > deadline {
+            break partitions;
+        }
+    };
+    assert_eq!(partitions.iter().sum::<usize>(), 4, "{partitions:?}");
+    assert!(
+        partitions.iter().all(|&n| n > 0),
+        "not split across the group: {partitions:?}"
+    );
+
+    a.close().await.expect("closes");
+    b.close().await.expect("closes");
+}
+
+/// A group-less consumer on a client-side pattern consumes a topic created
+/// after it subscribed.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_pattern_subscription_group_less_picks_up_a_new_topic() {
+    use krafka::consumer::{AutoOffsetReset, TopicPattern};
+
+    let bootstrap_servers = kafka();
+    let id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let prefix = format!("pattern-groupless-{id}");
+    let consumer = krafka::Kafka::builder(&bootstrap_servers)
+        .metadata_max_age(Duration::from_secs(2))
+        .connect()
+        .await
+        .expect("connects")
+        .consumer_without_group()
+        .auto_offset_reset(AutoOffsetReset::Earliest)
+        .build()
+        .await
+        .expect("consumer builds");
+    consumer
+        .subscribe_pattern(TopicPattern::new(&format!("{prefix}-.*")).unwrap())
+        .await
+        .expect("subscribes");
+
+    let topic = format!("{prefix}-a");
+    create_topic(&bootstrap_servers, &topic, 2).await;
+    let values: Vec<String> = (0..10).map(|i| format!("v{i}")).collect();
+    produce_values(&bootstrap_servers, &topic, &values).await;
+    poll_until_all(
+        &[&consumer],
+        &values.iter().cloned().collect(),
+        Duration::from_secs(60),
+    )
+    .await;
+    consumer.close().await.expect("closes");
+}
+
+/// A KIP-848 member on a broker-side pattern consumes a topic created after
+/// it subscribed. Needs Kafka 4.0+ (`ConsumerGroupHeartbeat` v1); skipped
+/// below that.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_broker_pattern_subscription_picks_up_a_new_topic() {
+    use krafka::consumer::{AutoOffsetReset, GroupProtocol, SubscriptionPattern};
+
+    let version = std::env::var("KAFKA_VERSION").unwrap_or_else(|_| "3.9.0".to_string());
+    let major: u32 = version
+        .split('.')
+        .next()
+        .and_then(|m| m.parse().ok())
+        .unwrap_or(0);
+    if major < 4 {
+        eprintln!("skipped: broker-side patterns need Kafka 4.0+, running {version}");
+        return;
+    }
+
+    let bootstrap_servers = kafka();
+    let id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let prefix = format!("pattern-broker-{id}");
+    let consumer = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .expect("connects")
+        .consumer(format!("{prefix}-group"))
+        .group_protocol(GroupProtocol::Consumer)
+        .auto_offset_reset(AutoOffsetReset::Earliest)
+        .build()
+        .await
+        .expect("consumer builds");
+    consumer
+        .subscribe_broker_pattern(SubscriptionPattern::new(format!("{prefix}-.*")).unwrap())
+        .await
+        .expect("subscribes");
+    // Join before the topic exists, so the coordinator finds it by pattern.
+    consumer.poll(Duration::from_secs(1)).await.expect("poll");
+
+    let topic = format!("{prefix}-a");
+    create_topic(&bootstrap_servers, &topic, 2).await;
+    let values: Vec<String> = (0..10).map(|i| format!("v{i}")).collect();
+    produce_values(&bootstrap_servers, &topic, &values).await;
+    poll_until_all(
+        &[&consumer],
+        &values.iter().cloned().collect(),
+        Duration::from_secs(90),
+    )
+    .await;
+    assert!(consumer.subscription().await.contains(&topic));
+    consumer.close().await.expect("closes");
+}

@@ -527,8 +527,13 @@ pub struct ConsumerGroupMemberState {
     pub member_epoch: i32,
     /// Static membership ID, if the member supplied one.
     pub instance_id: Option<String>,
-    /// Topics the member last told the coordinator it subscribes to.
+    /// Topics the member subscribes to: its names plus the topics its
+    /// pattern matches now.
     pub subscribed_topics: Vec<String>,
+    /// Topic names the member last sent.
+    pub subscribed_names: Vec<String>,
+    /// The broker-side pattern the member last sent, if any.
+    pub subscribed_regex: Option<String>,
     /// Partitions the coordinator has assigned, keyed by topic name.
     pub assignment: HashMap<String, Vec<i32>>,
     /// Partitions the member last *reported* owning.
@@ -645,6 +650,10 @@ pub struct ConsumerGroupHeartbeatSeen {
     pub server_assignor: Option<String>,
     /// Whether the heartbeat carried the subscription.
     pub full: bool,
+    /// `SubscribedTopicNames` as sent (`None`: unchanged).
+    pub subscribed_topic_names: Option<Vec<String>>,
+    /// `SubscribedTopicRegex` as sent (`None`: unchanged, `""`: removed).
+    pub subscribed_topic_regex: Option<String>,
 }
 
 /// One open share session on one broker (KIP-932).

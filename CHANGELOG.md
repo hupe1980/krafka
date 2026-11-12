@@ -13,6 +13,31 @@ not a complete record.
 
 ## [Unreleased]
 
+### Added
+
+- Subscribing by topic pattern (#81): `Consumer::subscribe_pattern` with a
+  `TopicPattern` the consumer matches itself (with or without a group, either
+  protocol, every broker), and `Consumer::subscribe_broker_pattern` with a
+  `SubscriptionPattern` the KIP-848 coordinator matches (Kafka 4.0+). Any
+  subscribe replaces the current subscription without leaving the group.
+
+### Fixed
+
+- A subscription changed while a classic join was in flight reaches the
+  coordinator; the member used to stay on the old topics until the next
+  rebalance.
+- A KIP-848 member fenced on the heartbeat that carries a subscription change
+  reports its partitions lost and rejoins; `poll()` used to return the
+  `FENCED_MEMBER_EPOCH` error.
+- A group-less consumer drops the partitions of a topic it no longer
+  subscribes to when `subscribe()` replaces the topic list.
+- Consumers and share consumers built from one `Kafka` handle no longer stall
+  each other: each group member has its own coordination connection. A
+  `JoinGroup` the coordinator held for a rebalance used to delay every other
+  member's heartbeats, `SyncGroup` and commits on the same handle whose
+  coordinator was on the same broker, in any group, up to the session or
+  request timeout.
+
 ## [0.30.0] — 2026-11-11
 
 ### Added
