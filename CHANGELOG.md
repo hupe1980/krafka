@@ -13,6 +13,8 @@ not a complete record.
 
 ## [Unreleased]
 
+## [0.31.0] — 2026-11-12
+
 ### Added
 
 - Subscribing by topic pattern (#81): `Consumer::subscribe_pattern` with a
@@ -1785,7 +1787,8 @@ Initial development: wire protocol, producer, consumer, admin client,
 authentication (SASL PLAIN / SCRAM / OAUTHBEARER / AWS MSK IAM), TLS,
 compression codecs, schema registry integration and the metrics layer.
 
-[Unreleased]: https://github.com/hupe1980/krafka/compare/v0.30.0...HEAD
+[Unreleased]: https://github.com/hupe1980/krafka/compare/v0.31.0...HEAD
+[0.31.0]: https://github.com/hupe1980/krafka/compare/v0.30.0...v0.31.0
 [0.30.0]: https://github.com/hupe1980/krafka/compare/v0.29.0...v0.30.0
 [0.29.0]: https://github.com/hupe1980/krafka/compare/v0.28.2...v0.29.0
 [0.28.2]: https://github.com/hupe1980/krafka/compare/v0.28.1...v0.28.2

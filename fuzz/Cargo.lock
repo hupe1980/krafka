@@ -287,7 +287,7 @@ dependencies = [
 
 [[package]]
 name = "krafka"
-version = "0.30.0"
+version = "0.31.0"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -302,6 +302,7 @@ dependencies = [
  "parking_lot",
  "pbkdf2",
  "rand",
+ "regex-lite",
  "rustls",
  "ruzstd",
  "serde",
@@ -518,6 +519,12 @@ checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
 dependencies = [
  "bitflags",
 ]
+
+[[package]]
+name = "regex-lite"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cab834c73d247e67f4fae452806d17d3c7501756d98c8808d7c9c7aa7d18f973"
 
 [[package]]
 name = "ring"
