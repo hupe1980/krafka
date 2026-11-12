@@ -894,3 +894,92 @@ async fn a_group_less_resubscribe_drops_the_replaced_topic() {
         HashSet::from(["b".to_string()])
     );
 }
+
+// ── Two KIP-848 members share a new matching topic ───────────────────────
+
+/// Two KIP-848 members on one pattern: a topic created later is split
+/// between them, no partition is held by both, and every record is
+/// processed. (The fake's classic coordinator holds one member at a time;
+/// the classic split is checked against a real broker in
+/// `integration_tests`.)
+async fn kip848_members_share_a_new_topic(broker_side: bool) {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("pat-a", 1);
+    let events = Events::default();
+    let a = group_member(
+        &broker,
+        "g",
+        GroupProtocol::Consumer,
+        PartitionAssignmentStrategy::CooperativeSticky,
+        &events,
+    )
+    .await;
+    let b = group_member(
+        &broker,
+        "g",
+        GroupProtocol::Consumer,
+        PartitionAssignmentStrategy::CooperativeSticky,
+        &events,
+    )
+    .await;
+    for consumer in [&a, &b] {
+        if broker_side {
+            consumer
+                .subscribe_broker_pattern(broker_pattern("pat-.*"))
+                .await
+                .unwrap();
+        } else {
+            consumer
+                .subscribe_pattern(TopicPattern::new("pat-.*").unwrap())
+                .await
+                .unwrap();
+        }
+    }
+
+    broker.create_topic("pat-b", 4);
+    let values: Vec<String> = (0..20).map(|i| format!("b{i}")).collect();
+    let refs: Vec<&str> = values.iter().map(String::as_str).collect();
+    produce(&broker, "pat-b", &refs).await;
+    poll_until(
+        &[&a, &b],
+        async |seen| values.iter().all(|v| all(seen).contains(v)),
+        "every pat-b record",
+    )
+    .await;
+
+    // Each member re-evaluates on its own schedule, so the split settles
+    // after the slower one has joined with the topic.
+    poll_until(
+        &[&a, &b],
+        async |_| {
+            let (pa, pb) = (a.assignment().await, b.assignment().await);
+            let (na, nb) = (
+                pa.get("pat-b").map_or(0, Vec::len),
+                pb.get("pat-b").map_or(0, Vec::len),
+            );
+            na > 0 && nb > 0 && na + nb == 4
+        },
+        "pat-b split across both members",
+    )
+    .await;
+    let (pa, pb) = (a.assignment().await, b.assignment().await);
+    let shared: Vec<&i32> = pa["pat-b"]
+        .iter()
+        .filter(|p| pb["pat-b"].contains(p))
+        .collect();
+    assert!(
+        shared.is_empty(),
+        "partitions {shared:?} held by both members"
+    );
+    assert_eq!(events.count("lost"), 0);
+}
+
+#[tokio::test]
+async fn kip848_members_share_a_new_topic_on_a_client_side_pattern() {
+    kip848_members_share_a_new_topic(false).await;
+}
+
+#[tokio::test]
+async fn kip848_members_share_a_new_topic_on_a_broker_side_pattern() {
+    kip848_members_share_a_new_topic(true).await;
+}
