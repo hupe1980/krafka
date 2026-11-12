@@ -303,6 +303,62 @@ async fn a_response_larger_than_one_poll_is_fetched_once() {
     let _ = consumer.close().await;
 }
 
+/// A partition that has run dry is fetched again while another one is still
+/// handing out a large response.
+#[tokio::test]
+async fn a_drained_partition_is_fetched_while_another_holds_a_response() {
+    const BACKLOG: usize = 5000;
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("events", 2);
+    let kafka = krafka::Kafka::builder(broker.bootstrap_servers())
+        .request_timeout(T)
+        .connect_timeout(T)
+        .connect()
+        .await
+        .unwrap();
+    let producer = kafka.producer().build().await.unwrap();
+    let mut handles = Vec::with_capacity(BACKLOG);
+    for _ in 0..BACKLOG {
+        handles.push(
+            producer
+                .enqueue(krafka::Record::new("events", "v").partition(0))
+                .await
+                .unwrap(),
+        );
+    }
+    for handle in handles {
+        let _ = handle.await.unwrap();
+    }
+
+    let consumer = kafka.consumer_without_group().build().await.unwrap();
+    consumer.assign("events", vec![0, 1]).await.unwrap();
+    consumer.seek("events", 0, 0).await.unwrap();
+    consumer.seek("events", 1, 0).await.unwrap();
+    let first = consumer.poll(T).await.unwrap();
+    assert!(first.iter().all(|r| r.partition == 0));
+
+    let _ = producer
+        .send(krafka::Record::new("events", "live").partition(1))
+        .await
+        .unwrap();
+    let mut backlog_seen = first.len();
+    loop {
+        let records = consumer.poll(T).await.unwrap();
+        assert!(!records.is_empty(), "stalled");
+        if records.iter().any(|r| r.partition == 1) {
+            break;
+        }
+        backlog_seen += records.len();
+    }
+
+    assert!(
+        backlog_seen < BACKLOG,
+        "partition 1 waited for the whole backlog of partition 0"
+    );
+    let _ = producer.close().await;
+    let _ = consumer.close().await;
+}
+
 #[tokio::test]
 async fn seek_on_an_unowned_partition_is_rejected_and_not_stored() {
     let broker = FakeBroker::start().await.unwrap();

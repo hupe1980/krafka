@@ -13,17 +13,17 @@ not a complete record.
 
 ## [Unreleased]
 
+## [0.31.1] — 2026-11-12
+
 ### Changed
 
-- Sending a record takes its buffer memory without setting up a timer when the
-  memory is free; the `max_block` timer is built only when the buffer is full.
-  Against a local broker this raised throughput for 100-byte records by 11%,
-  at 10% less CPU time.
 - The consumer keeps the part of a fetch response that one poll's record
-  budget does not cover and decodes it in later polls. It used to drop it and
-  fetch it again, so with the default `max_poll_records` most of every large
-  response was downloaded several times (#80). Up to one response per broker
-  now stays in memory until it is read through.
+  budget does not cover and decodes it in later polls, instead of fetching it
+  again (#80). Partitions that run dry are fetched meanwhile without waiting
+  for new data. A response stays in memory until every partition in it has
+  been read through.
+- Sending a record no longer sets up the `max_block` timer when buffer memory
+  is free, about 11% more throughput for small records.
 
 ## [0.31.0] — 2026-11-12
 
@@ -1799,7 +1799,8 @@ Initial development: wire protocol, producer, consumer, admin client,
 authentication (SASL PLAIN / SCRAM / OAUTHBEARER / AWS MSK IAM), TLS,
 compression codecs, schema registry integration and the metrics layer.
 
-[Unreleased]: https://github.com/hupe1980/krafka/compare/v0.31.0...HEAD
+[Unreleased]: https://github.com/hupe1980/krafka/compare/v0.31.1...HEAD
+[0.31.1]: https://github.com/hupe1980/krafka/compare/v0.31.0...v0.31.1
 [0.31.0]: https://github.com/hupe1980/krafka/compare/v0.30.0...v0.31.0
 [0.30.0]: https://github.com/hupe1980/krafka/compare/v0.29.0...v0.30.0
 [0.29.0]: https://github.com/hupe1980/krafka/compare/v0.28.2...v0.29.0

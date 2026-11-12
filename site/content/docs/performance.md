@@ -183,8 +183,9 @@ poll 3   kept bytes → decode 1000 → deliver 500, park 500   (no network)
 ```
 
 A partition is fetched again only once its response is used up, so nothing is
-fetched twice and nothing is dropped. The price is memory: up to one response
-per broker stays resident until the application has read through it. Lower
+fetched twice and nothing is dropped; partitions that run dry meanwhile are
+fetched without waiting for the others. The price is memory: a response stays
+resident until the application has read through every partition in it. Lower
 `fetch_max_bytes` or `max_partition_fetch_bytes` to bound that.
 
 Read-ahead depth is `max_buffered_records` (default 500). Raise it to pipeline

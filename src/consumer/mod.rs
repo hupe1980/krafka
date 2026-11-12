@@ -760,7 +760,7 @@ impl Consumer {
             // Decode one delivery's worth plus what the buffer has room for,
             // so the next poll is often served without a round trip. The
             // rest of a large response stays undecoded until it is wanted.
-            let budget = (max != usize::MAX).then(|| {
+            let mut budget = (max != usize::MAX).then(|| {
                 let headroom = if cap > 0 {
                     (cap as usize).saturating_sub(buffered)
                 } else {
@@ -768,19 +768,22 @@ impl Consumer {
                 };
                 max.saturating_add(headroom)
             });
-            // Bytes an earlier fetch left undecoded come before a new fetch.
-            if let Some(fault) = self.decode_held(budget).into_iter().next() {
+            // Bytes an earlier fetch left undecoded are decoded first, from
+            // the same budget as the fetch.
+            if let Some(fault) = self.decode_held(budget.as_mut()).into_iter().next() {
                 self.metrics.record_error();
                 return Err(fault.into_error(1));
             }
-            if self.state.lock().has_deliverable() {
-                continue;
-            }
+            // Partitions with nothing left are fetched even while others
+            // still hold bytes; with records ready, the fetch does not wait
+            // for new data.
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let round = match self
-                .fetch_round(self.config.fetch_max_wait.min(remaining), budget)
-                .await
-            {
+            let max_wait = if self.state.lock().has_deliverable() {
+                Duration::ZERO
+            } else {
+                self.config.fetch_max_wait.min(remaining)
+            };
+            let round = match self.fetch_round(max_wait, budget).await {
                 Err(KrafkaError::Wakeup) => {
                     self.wakeup_flag.store(false, Ordering::Release);
                     return Err(KrafkaError::Wakeup);

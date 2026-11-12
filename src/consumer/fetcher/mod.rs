@@ -191,10 +191,10 @@ impl Consumer {
     /// Decode more of the bytes earlier fetches left undecoded, for the
     /// partitions that have run out of decoded records. No request is sent.
     ///
-    /// `budget` bounds how many records are decoded; `None` is unlimited.
-    /// Returns the partitions whose bytes cannot be decoded at their
-    /// position.
-    pub(super) fn decode_held(&self, mut budget: Option<usize>) -> Vec<FetchFault> {
+    /// `budget` bounds how many records are decoded and is decremented by
+    /// them; `None` is unlimited. Returns the partitions whose bytes cannot be
+    /// decoded at their position.
+    pub(super) fn decode_held(&self, mut budget: Option<&mut usize>) -> Vec<FetchFault> {
         let held = self.state.lock().take_undecoded();
         if held.is_empty() {
             return Vec::new();
@@ -205,7 +205,7 @@ impl Consumer {
             .into_iter()
             .map(|mut held| {
                 let mut records = Vec::new();
-                let outcome = held.decoder.decode(budget.as_mut(), &mut records);
+                let outcome = held.decoder.decode(budget.as_deref_mut(), &mut records);
                 if outcome.corrupt {
                     self.metrics.record_batch_decode_error();
                 }

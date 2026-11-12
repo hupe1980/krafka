@@ -297,6 +297,9 @@ pub(super) struct SubscriptionState {
     pub(super) fetch_sessions: FetchSessionCache,
     /// Round-robin cursor over the fetchable partitions, advanced per fetch.
     rotation: usize,
+    /// Head of [`take_undecoded`](Self::take_undecoded), rotated by one per
+    /// call so a shared record budget reaches every partition in turn.
+    undecoded_rotation: usize,
     /// When the last auto-commit was attempted.
     pub(super) last_auto_commit: Instant,
 }
@@ -317,6 +320,7 @@ impl Default for SubscriptionState {
             next_version: 0,
             fetch_sessions: FetchSessionCache::new(),
             rotation: 0,
+            undecoded_rotation: 0,
             last_auto_commit: Instant::now(),
         }
     }
@@ -733,9 +737,11 @@ impl SubscriptionState {
     /// goes back through [`install_decoded`](Self::install_decoded).
     ///
     /// The partition keeps its (empty) buffered fetch meanwhile, so it is
-    /// neither fetched nor delivered from.
+    /// neither fetched nor delivered from. The order rotates from call to
+    /// call, as the record budget is consumed in it.
     pub(super) fn take_undecoded(&mut self) -> Vec<HeldBytes> {
-        self.partitions
+        let mut held: Vec<HeldBytes> = self
+            .partitions
             .iter_mut()
             .filter(|(_, r)| !r.paused && !r.delivering)
             .filter_map(|(key, r)| {
@@ -746,7 +752,13 @@ impl SubscriptionState {
                     decoder: fetch.undecoded.take()?,
                 })
             })
-            .collect()
+            .collect();
+        if !held.is_empty() {
+            let turn = self.undecoded_rotation % held.len();
+            held.rotate_left(turn);
+            self.undecoded_rotation = self.undecoded_rotation.wrapping_add(1);
+        }
+        held
     }
 
     /// Put back what [`take_undecoded`](Self::take_undecoded) took, with the
