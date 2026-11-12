@@ -14,8 +14,9 @@
 //! [`SubscriptionState::complete_delivery`], after deserialization — never
 //! when they are fetched and never when an offset is committed. Records that
 //! have been fetched but not handed out sit in the partition's
-//! [`CompletedFetch`], and a partition is fetched again only once that buffer
-//! is empty, so the next fetch offset is always the buffered fetch's
+//! [`CompletedFetch`], decoded or still as the bytes the broker sent, and a
+//! partition is fetched again only once that buffer is empty, so the next
+//! fetch offset is always the buffered fetch's
 //! [`next_offset`](CompletedFetch::next_offset) or, with nothing buffered, the
 //! position.
 
@@ -28,6 +29,7 @@ use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use super::PartitionLag;
 use super::config::{AutoOffsetReset, IsolationLevel};
 use super::fetch_session::FetchSessionCache;
+use super::fetcher::{PartitionDecodeOutcome, PartitionDecoder};
 use super::pattern::{SubscriptionPattern, TopicPattern};
 use super::record::{ConsumerRecord, TopicPartition};
 use crate::error::{KrafkaError, Result};
@@ -85,12 +87,36 @@ impl OffsetReset {
 pub(super) struct CompletedFetch {
     /// Decoded records, in offset order.
     pub(super) records: VecDeque<ConsumerRecord>,
-    /// Where the next fetch starts once `records` is empty. It can lie beyond
-    /// the last record: control batches, aborted transactions and batches the
-    /// log cleaner emptied are walked through without producing records.
+    /// The offset just past everything decoded so far, where the next fetch
+    /// starts once the whole response is used up. It can lie beyond the last
+    /// record: control batches, aborted transactions and batches the log
+    /// cleaner emptied are walked through without producing records.
     pub(super) next_offset: Offset,
     /// Leader epoch of the batch `next_offset` sits just past.
     pub(super) next_epoch: Option<i32>,
+    /// The part of the response not decoded yet, when one poll's record
+    /// budget did not cover all of it. Decoded once `records` is empty.
+    pub(super) undecoded: Option<PartitionDecoder>,
+}
+
+impl CompletedFetch {
+    /// Take in what a further [`PartitionDecoder::decode`] call produced.
+    fn extend(&mut self, records: Vec<ConsumerRecord>, outcome: &PartitionDecodeOutcome) {
+        self.records.extend(records);
+        if let Some(last) = outcome.last_offset {
+            self.next_offset = last.saturating_add(1);
+            self.next_epoch = (outcome.last_epoch >= 0).then_some(outcome.last_epoch);
+        }
+    }
+}
+
+/// A partition's undecoded bytes, taken out of the state to be decoded
+/// outside the lock.
+#[derive(Debug)]
+pub(super) struct HeldBytes {
+    pub(super) key: PartitionKey,
+    version: u64,
+    pub(super) decoder: PartitionDecoder,
 }
 
 /// Everything the consumer tracks for one assigned partition.
@@ -144,6 +170,27 @@ impl PartitionRecord {
         match isolation_level {
             IsolationLevel::ReadCommitted => self.last_stable_offset.or(self.high_watermark),
             IsolationLevel::ReadUncommitted => self.high_watermark,
+        }
+    }
+
+    /// Bring the position up to date once the buffered records are all handed
+    /// out: it moves past everything decoded so far, and a fetch with nothing
+    /// left to decode is dropped, which makes the partition fetchable again.
+    fn settle_buffer(&mut self) {
+        let Some(fetch) = self.buffered.as_ref() else {
+            return;
+        };
+        if !fetch.records.is_empty() {
+            return;
+        }
+        if self.position.is_none_or(|p| fetch.next_offset > p) {
+            self.position = Some(fetch.next_offset);
+            if fetch.next_epoch.is_some() {
+                self.epoch = fetch.next_epoch;
+            }
+        }
+        if fetch.undecoded.is_none() {
+            self.buffered = None;
         }
     }
 
@@ -661,6 +708,9 @@ impl SubscriptionState {
     /// issued from. A result with no records but a later next offset (control
     /// batches, compaction gaps) moves the position directly. Returns whether
     /// it was applied.
+    ///
+    /// The partition's position always equals `target.offset` here, and a
+    /// fetch never ends below the offset it was issued from.
     pub(super) fn install_fetch(&mut self, target: &FetchTarget, fetch: CompletedFetch) -> bool {
         let Some(r) = self.partitions.get_mut(&target.key) else {
             return false;
@@ -673,17 +723,61 @@ impl SubscriptionState {
             return false;
         }
         r.backoff = None;
-        if fetch.records.is_empty() {
-            if fetch.next_offset > target.offset {
-                r.position = Some(fetch.next_offset);
-                if fetch.next_epoch.is_some() {
-                    r.epoch = fetch.next_epoch;
-                }
-            }
-        } else {
-            r.buffered = Some(fetch);
-        }
+        r.buffered = Some(fetch);
+        r.settle_buffer();
         true
+    }
+
+    /// Take the undecoded bytes of every partition that has run out of
+    /// decoded records, to decode more of them outside the lock. Each one
+    /// goes back through [`install_decoded`](Self::install_decoded).
+    ///
+    /// The partition keeps its (empty) buffered fetch meanwhile, so it is
+    /// neither fetched nor delivered from.
+    pub(super) fn take_undecoded(&mut self) -> Vec<HeldBytes> {
+        self.partitions
+            .iter_mut()
+            .filter(|(_, r)| !r.paused && !r.delivering)
+            .filter_map(|(key, r)| {
+                let fetch = r.buffered.as_mut().filter(|f| f.records.is_empty())?;
+                Some(HeldBytes {
+                    key: key.clone(),
+                    version: r.version,
+                    decoder: fetch.undecoded.take()?,
+                })
+            })
+            .collect()
+    }
+
+    /// Put back what [`take_undecoded`](Self::take_undecoded) took, with the
+    /// records decoded from it meanwhile. Dropped if the partition was
+    /// repositioned or revoked since.
+    pub(super) fn install_decoded(
+        &mut self,
+        held: HeldBytes,
+        records: Vec<ConsumerRecord>,
+        outcome: &PartitionDecodeOutcome,
+    ) {
+        let Some(r) = self.partitions.get_mut(&held.key) else {
+            return;
+        };
+        if r.version != held.version {
+            return;
+        }
+        let Some(fetch) = r.buffered.as_mut() else {
+            return;
+        };
+        fetch.extend(records, outcome);
+        fetch.undecoded = (!held.decoder.is_finished()).then_some(held.decoder);
+        r.settle_buffer();
+    }
+
+    /// Drop a partition's buffered fetch, after its bytes turned out to be
+    /// undecodable. The next fetch starts at the position again.
+    pub(super) fn drop_buffer(&mut self, key: &PartitionKey) {
+        if let Some(r) = self.partitions.get_mut(key) {
+            r.buffered = None;
+        }
     }
 
     /// Clear a partition's backoff after an unfenced fetch.
@@ -822,18 +916,8 @@ impl SubscriptionState {
                 for record in put_back.into_iter().rev() {
                     fetch.records.push_front(record);
                 }
-                if fetch.records.is_empty() {
-                    let next = fetch.next_offset;
-                    let next_epoch = fetch.next_epoch;
-                    r.buffered = None;
-                    if r.position.is_none_or(|p| next > p) {
-                        r.position = Some(next);
-                        if next_epoch.is_some() {
-                            r.epoch = next_epoch;
-                        }
-                    }
-                }
             }
+            r.settle_buffer();
             out.extend(delivered);
         }
         out
@@ -969,6 +1053,7 @@ mod tests {
             next_offset: offsets.end,
             records: offsets.map(|o| record(topic, partition, o)).collect(),
             next_epoch: Some(3),
+            undecoded: None,
         }
     }
 
@@ -981,6 +1066,105 @@ mod tests {
         assert_eq!(targets.len(), 1);
         assert!(state.install_fetch(&targets[0], fetched("t", 0, 0..10)));
         state
+    }
+
+    /// A decoder over one batch holding `offsets`.
+    fn undecoded(offsets: std::ops::Range<Offset>) -> PartitionDecoder {
+        use crate::protocol::{Record, RecordBatch};
+
+        let mut batch = RecordBatch::new();
+        batch.base_offset = offsets.start;
+        batch.last_offset_delta = (offsets.end - offsets.start - 1) as i32;
+        batch.partition_leader_epoch = 3;
+        for delta in 0..(offsets.end - offsets.start) as i32 {
+            batch.add_record(Record {
+                attributes: 0,
+                timestamp_delta: 0,
+                offset_delta: delta,
+                key: None,
+                value: Some(bytes::Bytes::from_static(b"v")),
+                headers: Vec::new(),
+            });
+        }
+        PartitionDecoder::new(
+            "t",
+            0,
+            batch.encode().unwrap(),
+            offsets.start,
+            Vec::new(),
+            RecordBatch::MAX_DECOMPRESSED_SIZE,
+        )
+    }
+
+    /// A state with `t-0` at position 0, records 0..2 buffered and 2..5 still
+    /// undecoded.
+    fn partly_decoded_state() -> SubscriptionState {
+        let mut state = SubscriptionState::default();
+        state.add_partitions([key("t", 0)]);
+        state.seek(&key("t", 0), 0).unwrap();
+        let targets = state.fetch_targets(Instant::now());
+
+        let mut decoder = undecoded(0..5);
+        let mut records = Vec::new();
+        let outcome = decoder.decode(Some(&mut 2), &mut records);
+        let mut fetch = CompletedFetch {
+            records: VecDeque::new(),
+            next_offset: 0,
+            next_epoch: None,
+            undecoded: Some(decoder),
+        };
+        fetch.extend(records, &outcome);
+        assert!(state.install_fetch(&targets[0], fetch));
+        state
+    }
+
+    fn deliver_all(state: &mut SubscriptionState) -> Vec<Offset> {
+        let Some(delivery) = state.take_delivery(usize::MAX) else {
+            return Vec::new();
+        };
+        let count = delivery.records.len();
+        let delivered = state.complete_delivery(delivery, count);
+        delivered.iter().map(|r| r.offset).collect()
+    }
+
+    #[test]
+    fn undecoded_bytes_are_decoded_before_the_partition_is_fetched_again() {
+        let mut state = partly_decoded_state();
+        assert!(state.take_undecoded().is_empty(), "records come first");
+
+        assert_eq!(deliver_all(&mut state), [0, 1]);
+        assert_eq!(state.partition(&key("t", 0)).unwrap().position, Some(2));
+        assert!(state.fetch_targets(Instant::now()).is_empty());
+
+        let mut held = state.take_undecoded();
+        assert_eq!(held.len(), 1);
+        assert!(state.fetch_targets(Instant::now()).is_empty());
+        let mut held = held.remove(0);
+        let mut records = Vec::new();
+        let outcome = held.decoder.decode(None, &mut records);
+        state.install_decoded(held, records, &outcome);
+
+        assert_eq!(deliver_all(&mut state), [2, 3, 4]);
+        let targets = state.fetch_targets(Instant::now());
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].offset, 5);
+        assert_eq!(targets[0].last_fetched_epoch, 3);
+    }
+
+    #[test]
+    fn a_seek_drops_undecoded_bytes_taken_for_decoding() {
+        let mut state = partly_decoded_state();
+        assert_eq!(deliver_all(&mut state), [0, 1]);
+        let mut held = state.take_undecoded().remove(0);
+
+        state.seek(&key("t", 0), 40).unwrap();
+        let mut records = Vec::new();
+        let outcome = held.decoder.decode(None, &mut records);
+        state.install_decoded(held, records, &outcome);
+
+        let r = state.partition(&key("t", 0)).unwrap();
+        assert!(r.buffered.is_none());
+        assert_eq!(r.position, Some(40));
     }
 
     #[test]

@@ -173,16 +173,19 @@ let consumer = kafka
 
 A fetch response can carry `fetch_max_bytes` (50 MiB by default) while
 `max_poll_records` (500) caps what one `poll()` may return. The consumer
-decodes **`max_poll_records` + the receive buffer's free capacity** and parks
-the surplus:
+decodes **`max_poll_records` + the receive buffer's free capacity**, parks
+the surplus, and keeps the rest of the response as the bytes the broker sent:
 
 ```text
 poll 1   fetch → decode 1000 → deliver 500, park 500
 poll 2   buffer → deliver 500                        (no network)
-poll 3   fetch → decode 1000 → deliver 500, park 500
+poll 3   kept bytes → decode 1000 → deliver 500, park 500   (no network)
 ```
 
-Nothing is decoded twice and nothing is dropped.
+A partition is fetched again only once its response is used up, so nothing is
+fetched twice and nothing is dropped. The price is memory: up to one response
+per broker stays resident until the application has read through it. Lower
+`fetch_max_bytes` or `max_partition_fetch_bytes` to bound that.
 
 Read-ahead depth is `max_buffered_records` (default 500). Raise it to pipeline
 deeper on high-throughput consumers; lower it to bound resident memory:

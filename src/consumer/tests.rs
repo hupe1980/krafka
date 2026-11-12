@@ -56,6 +56,7 @@ fn buffer_records(consumer: &Consumer, count: i64) {
             records,
             next_offset: count,
             next_epoch: None,
+            undecoded: None,
         },
     ));
 }
