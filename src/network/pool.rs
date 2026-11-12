@@ -1,10 +1,11 @@
 //! Connection pool for managing broker connections.
 //!
 //! - **One data connection per broker**, multiplexed, as the Java client
-//!   keeps one per node. A group coordinator gets a second connection
-//!   ([`ConnectionPurpose::Coordination`]) so its heartbeats never queue
-//!   behind fetches and produces on the broker's one-request-at-a-time
-//!   socket.
+//!   keeps one per node. Each group member gets its own connection to its
+//!   coordinator ([`ConnectionPurpose::Coordination`], one per
+//!   [`CoordinationSlot`]) so its heartbeats never queue behind fetches and
+//!   produces, nor behind another member's `JoinGroup` the broker parks for a
+//!   whole rebalance, on the broker's one-request-at-a-time socket.
 //! - **One dial per call.** `get_connection*` makes at most one connection
 //!   attempt, bounded by `connect_timeout`; concurrent callers for the same
 //!   connection share it. The caller's own deadline applies by dropping the
@@ -56,7 +57,7 @@ const RECONNECT_BACKOFF: BackoffPolicy = BackoffPolicy {
 /// The broker reads one request per connection at a time, so a heartbeat
 /// written behind a long-polling fetch on the same socket waits for the
 /// fetch. Coordination traffic therefore gets its own connection to the
-/// coordinator's address.
+/// coordinator's address, one per group member ([`CoordinationSlot`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ConnectionPurpose {
@@ -68,8 +69,47 @@ pub enum ConnectionPurpose {
     Coordination,
 }
 
-/// A pooled connection's identity: where it goes and what it carries.
-type PoolKey = (String, ConnectionPurpose);
+/// A pooled connection's identity: where it goes, what it carries, and for
+/// a coordination connection, which member owns it (`0` for data).
+type PoolKey = (String, ConnectionPurpose, u64);
+
+/// One group member's claim on its own coordination connections.
+///
+/// The broker reads one request per connection at a time and parks a
+/// `JoinGroup` until the rebalance completes, so two members sharing a
+/// coordination connection stall each other's heartbeats for that long.
+/// Every member therefore takes a slot from the pool; dropping it closes the
+/// member's coordination connections once they are idle.
+#[derive(Debug)]
+pub struct CoordinationSlot {
+    id: u64,
+    state: std::sync::Weak<RwLock<PoolState>>,
+}
+
+impl Drop for CoordinationSlot {
+    fn drop(&mut self) {
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        let released: Vec<Arc<BrokerConnection>> = {
+            let mut s = state.write();
+            let keys: Vec<PoolKey> = s
+                .by_key
+                .keys()
+                .filter(|(_, purpose, slot)| {
+                    *purpose == ConnectionPurpose::Coordination && *slot == self.id
+                })
+                .cloned()
+                .collect();
+            keys.into_iter()
+                .filter_map(|k| s.by_key.remove(&k))
+                .collect()
+        };
+        for conn in released {
+            conn.close_when_idle();
+        }
+    }
+}
 
 /// Callers waiting for one dial.
 type DialWaiters = Vec<oneshot::Sender<Result<Arc<BrokerConnection>>>>;
@@ -184,6 +224,8 @@ pub struct ConnectionPool {
     /// `None` unless `TransportConfig::tls_reload_interval` was set.
     /// Aborted by `close_all`.
     tls_reload_handle: Mutex<Option<JoinHandle<()>>>,
+    /// The next [`CoordinationSlot`] id; `0` is the data connections'.
+    next_slot: std::sync::atomic::AtomicU64,
 }
 
 impl ConnectionPool {
@@ -203,6 +245,17 @@ impl ConnectionPool {
             evictor_handle: Mutex::new(None),
             oauth_refresh_handle: Mutex::new(None),
             tls_reload_handle: Mutex::new(None),
+            next_slot: std::sync::atomic::AtomicU64::new(1),
+        }
+    }
+
+    /// A new member's claim on its own coordination connections.
+    pub fn coordination_slot(&self) -> CoordinationSlot {
+        CoordinationSlot {
+            id: self
+                .next_slot
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            state: Arc::downgrade(&self.state),
         }
     }
 
@@ -242,7 +295,9 @@ impl ConnectionPool {
             .read()
             .by_key
             .iter()
-            .filter(|((_, purpose), conn)| *purpose == ConnectionPurpose::Data && conn.is_usable())
+            .filter(|((_, purpose, _), conn)| {
+                *purpose == ConnectionPurpose::Data && conn.is_usable()
+            })
             .map(|(_, conn)| Arc::clone(conn))
             .collect()
     }
@@ -304,18 +359,24 @@ impl ConnectionPool {
     /// with a retriable error. Dropping the returned future abandons the wait
     /// but not the dial, whose connection is kept for the next caller.
     pub async fn get_connection(&self, address: &str) -> Result<Arc<BrokerConnection>> {
-        self.get(address, ConnectionPurpose::Data).await
+        self.get(address, ConnectionPurpose::Data, 0).await
     }
 
-    /// Get or create the coordination connection to a group coordinator.
+    /// Get or create `slot`'s coordination connection to a group coordinator.
     ///
-    /// A separate connection from the data connection to the same address,
-    /// so coordination requests are never queued behind data requests. When
-    /// the connection cap leaves no room for it, the data connection is used
-    /// instead; the pool's `coordination_fallbacks` counter counts those
-    /// calls and the pool logs one warning.
-    pub async fn get_coordinator_connection(&self, address: &str) -> Result<Arc<BrokerConnection>> {
-        self.get(address, ConnectionPurpose::Coordination).await
+    /// Separate from the data connection to the same address and from every
+    /// other member's coordination connection, so a member's coordination
+    /// requests never queue behind data requests or behind another member's
+    /// parked `JoinGroup`. When the connection cap leaves no room for it, the
+    /// data connection is used instead; the pool's `coordination_fallbacks`
+    /// counter counts those calls and the pool logs one warning.
+    pub async fn get_coordinator_connection(
+        &self,
+        address: &str,
+        slot: &CoordinationSlot,
+    ) -> Result<Arc<BrokerConnection>> {
+        self.get(address, ConnectionPurpose::Coordination, slot.id)
+            .await
     }
 
     /// Get or create the data connection to a broker by ID.
@@ -340,7 +401,7 @@ impl ConnectionPool {
             }
         }
 
-        let conn = self.get(address, ConnectionPurpose::Data).await?;
+        let conn = self.get(address, ConnectionPurpose::Data, 0).await?;
         self.state.write().by_id.insert(broker_id, conn.clone());
         Ok(conn)
     }
@@ -349,8 +410,9 @@ impl ConnectionPool {
         &self,
         address: &str,
         purpose: ConnectionPurpose,
+        slot: u64,
     ) -> Result<Arc<BrokerConnection>> {
-        let key = (address.to_string(), purpose);
+        let key = (address.to_string(), purpose, slot);
         {
             let s = self.state.read();
             if let Some(conn) = s.by_key.get(&key)
@@ -366,7 +428,7 @@ impl ConnectionPool {
             DialStart::CapReached(limit) => {
                 if purpose == ConnectionPurpose::Coordination {
                     self.record_coordination_fallback(address, limit);
-                    return Box::pin(self.get(address, ConnectionPurpose::Data)).await;
+                    return Box::pin(self.get(address, ConnectionPurpose::Data, 0)).await;
                 }
                 return Err(connection_cap_error(limit, address));
             }
@@ -798,7 +860,7 @@ impl ConnectionPool {
             (connections, std::mem::take(&mut s.dialing))
         };
 
-        for ((address, _), waiters) in dialing {
+        for ((address, _, _), waiters) in dialing {
             let err = pool_closed_error(&address);
             for waiter in waiters {
                 let _ = waiter.send(Err(err.clone()));
@@ -940,7 +1002,7 @@ mod tests {
             let mut s = pool.state.write();
             s.by_id.insert(1, stale.clone());
             s.by_key
-                .insert(("b1:9092".to_string(), ConnectionPurpose::Data), stale);
+                .insert(("b1:9092".to_string(), ConnectionPurpose::Data, 0), stale);
         }
 
         // Same socket shared across both maps must dedup to a single
@@ -1152,7 +1214,7 @@ mod tests {
         pool.state
             .write()
             .by_key
-            .insert((addr.clone(), ConnectionPurpose::Data), expired.clone());
+            .insert((addr.clone(), ConnectionPurpose::Data, 0), expired.clone());
 
         let fresh = pool
             .get_connection(&addr)

@@ -31,6 +31,12 @@ not a complete record.
   `FENCED_MEMBER_EPOCH` error.
 - A group-less consumer drops the partitions of a topic it no longer
   subscribes to when `subscribe()` replaces the topic list.
+- Consumers and share consumers built from one `Kafka` handle no longer stall
+  each other: each group member has its own coordination connection. A
+  `JoinGroup` the coordinator held for a rebalance used to delay every other
+  member's heartbeats, `SyncGroup` and commits on the same handle whose
+  coordinator was on the same broker, in any group, up to the session or
+  request timeout.
 
 ## [0.30.0] — 2026-11-11
 

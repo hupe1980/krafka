@@ -175,6 +175,9 @@ impl GroupInner {
 pub(crate) struct GroupCoordinator {
     group_id: String,
     pool: Arc<ConnectionPool>,
+    /// This member's own coordination connections: never shared with
+    /// another member of this or any other group on the same handle.
+    coordination_slot: crate::network::CoordinationSlot,
     metadata: Arc<ClusterMetadata>,
     session_timeout: Duration,
     heartbeat_interval: Duration,
@@ -263,6 +266,7 @@ impl GroupCoordinator {
     ) -> Self {
         Self {
             group_id: group_id.into(),
+            coordination_slot: pool.coordination_slot(),
             pool,
             metadata,
             session_timeout,
@@ -707,7 +711,7 @@ impl GroupCoordinator {
             }
         };
         self.pool
-            .get_coordinator_connection(&address)
+            .get_coordinator_connection(&address, &self.coordination_slot)
             .await
             .inspect_err(|_| self.drop_coordinator())
     }

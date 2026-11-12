@@ -76,7 +76,7 @@ in-process fake Kafka cluster with fault injection; see
 | **Clients** | `Producer` (`send` waits, `enqueue` pipelines) and `TypedProducer<K, V>` · `TransactionalProducer` with KIP-447 offset commits and two-phase `prepare`/`complete` · `Consumer`, classic and KIP-848 groups · `ShareConsumer` (KIP-932 share groups) · `AdminClient` |
 | **Security** | rustls TLS and mTLS from files or in-memory PEM, with certificate reload (KIP-1288) · SASL PLAIN, SCRAM-SHA-256/512, OAUTHBEARER · built-in OIDC provider (`client_credentials`, RFC 7523 client assertions) · AWS MSK IAM · every mechanism composes with TLS through `with_tls` |
 | **Observability** | `metrics()` on every client and on `Kafka` returns one `Metrics` snapshot; `prometheus_text()` renders it · spans through `tracing` on OpenTelemetry messaging conventions · KIP-714 client telemetry to brokers that subscribe · producer and consumer interceptors |
-| **Transport** | Set once on the `Kafka` builder: TCP keepalive, response ceiling, in-flight cap, idle eviction, connection cap · a separate coordination connection per broker · KIP-227 incremental fetch sessions · SOCKS5 |
+| **Transport** | Set once on the `Kafka` builder: TCP keepalive, response ceiling, in-flight cap, idle eviction, connection cap · a separate coordination connection per group member · KIP-227 incremental fetch sessions · SOCKS5 |
 | **Testing** | `krafka::testing::FakeBroker`: real clients over a real or in-memory socket, fault injection per request, the full transaction protocol, both group protocols and share groups *(`test-broker`; unstable, outside semver)* |
 
 > **Broker versions:** Apache Kafka **3.9+**. KIP-848 groups need 4.0, share

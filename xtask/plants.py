@@ -19,7 +19,8 @@ Pattern-subscription plants: a matcher not anchored to the whole name, a
 pattern never re-evaluated after subscribe, a replaced broker-side pattern
 never cleared, a broker-side
 pattern member that never joins, and a subscription changed during a join
-that never reaches the coordinator.
+that never reaches the coordinator, and one coordination connection shared by
+every member on a handle.
 
 Cancel-safety plants: the send path's drop guard not reporting a cancelled
 send, an `enqueue` that appends before its last await, a consumer `poll` that
@@ -77,6 +78,7 @@ PLANTS = {
     "pattern-rematch": Plant("simulation", "pattern_group_classic", "[at-least-once]"),
     "regex-clear": Plant("topic_patterns", "switching_from_a_broker_pattern_to_names_clears_it", "only pat-a assigned after the switch"),
     "has-subscription": Plant("topic_patterns", "a_broker_pattern_is_sent_and_follows_new_topics", "pat-a assigned by the coordinator"),
+    "shared-coordination": Plant("coordinator_connection", "a_parked_join_does_not_stall_another_member_on_the_same_handle", "behind group A's parked join"),
     "stale-join": Plant("topic_patterns", "a_classic_subscription_changed_during_a_join_is_not_lost", "b to be assigned after the in-flight join"),
 }
 

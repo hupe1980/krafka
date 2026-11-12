@@ -169,7 +169,11 @@ pub(crate) async fn heartbeat(inner: &Arc<Inner>) -> Result<()> {
         }
     };
 
-    let conn = match inner.pool.get_coordinator_connection(&address).await {
+    let conn = match inner
+        .pool
+        .get_coordinator_connection(&address, &inner.coordination_slot)
+        .await
+    {
         Ok(conn) => conn,
         Err(error) => {
             inner.member.lock().coordinator = None;
@@ -314,7 +318,10 @@ pub(crate) async fn leave(inner: &Inner) -> Result<()> {
         rack_id: None,
         subscribed_topic_names: None,
     };
-    let conn = inner.pool.get_coordinator_connection(&address).await?;
+    let conn = inner
+        .pool
+        .get_coordinator_connection(&address, &inner.coordination_slot)
+        .await?;
     let version = conn
         .negotiate_api_version(
             ApiKey::ShareGroupHeartbeat,

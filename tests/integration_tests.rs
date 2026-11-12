@@ -4084,14 +4084,16 @@ async fn test_pattern_subscription_shares_a_new_topic_across_a_classic_group() {
     create_topic(&bootstrap_servers, &format!("{prefix}-a"), 1).await;
     create_topic(&bootstrap_servers, &format!("{prefix}x-other"), 1).await;
 
-    // One handle per member, as separate processes would have: members of
-    // one group on a shared handle share its coordinator connection.
+    // Both members on one handle: each still gets its own coordination
+    // connection, so one member's parked `JoinGroup` never holds up the
+    // other's `SyncGroup` and heartbeats.
+    let kafka = krafka::Kafka::builder(&bootstrap_servers)
+        .metadata_max_age(Duration::from_secs(2))
+        .connect()
+        .await
+        .expect("connects");
     let member = || async {
-        krafka::Kafka::builder(&bootstrap_servers)
-            .metadata_max_age(Duration::from_secs(2))
-            .connect()
-            .await
-            .expect("connects")
+        kafka
             .consumer(format!("{prefix}-group"))
             .auto_offset_reset(AutoOffsetReset::Earliest)
             .build()

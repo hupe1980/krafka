@@ -1,0 +1,11 @@
+--- a/src/network/pool.rs
++++ b/src/network/pool.rs
+@@ -369,7 +369,7 @@
+         address: &str,
+         slot: &CoordinationSlot,
+     ) -> Result<Arc<BrokerConnection>> {
+-        self.get(address, ConnectionPurpose::Coordination, slot.id)
++        self.get(address, ConnectionPurpose::Coordination, 0 * slot.id)
+             .await
+     }
+ 

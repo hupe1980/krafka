@@ -116,6 +116,9 @@ pub(crate) struct Inner {
     pub config: ShareConsumerConfig,
     pub metadata: Arc<ClusterMetadata>,
     pub pool: Arc<ConnectionPool>,
+    /// This member's own coordination connections (see
+    /// [`CoordinationSlot`](crate::network::CoordinationSlot)).
+    pub coordination_slot: crate::network::CoordinationSlot,
     pub metrics: Arc<crate::metrics::ConsumerRecorder>,
     /// Where `metrics()` and the KIP-714 reporter read from.
     pub metrics_source: Arc<crate::metrics::MetricsSource>,

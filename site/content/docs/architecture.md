@@ -170,14 +170,14 @@ client of the handle. A second identity or separate pool is a second handle.
 
 The pool keys connections by address and `ConnectionPurpose`: one `Data`
 connection per broker, shared by every client of the handle, plus one
-`Coordination` connection per group coordinator. Concurrency comes from
+`Coordination` connection per group member to its coordinator. Concurrency comes from
 request pipelining, not from extra sockets: responses are demultiplexed by
 correlation ID, and up to `max_in_flight_requests` requests may be outstanding
 at once.
 
 ```
   ┌───────────────────────────────────────────────────────────────┐
-  │                 ConnectionPool  (address, purpose)            │
+  │             ConnectionPool  (address, purpose, member)        │
   │  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────┐ │
   │  │ broker 1, Data   │  │ broker 2, Data   │  │ broker 2,    │ │
   │  │  in-flight ≤ N   │  │  in-flight ≤ N   │  │ Coordination │ │
@@ -192,8 +192,12 @@ partition's in-flight batches travel one socket in dispatch order. The broker
 reads one request per connection at a time, so coordination requests
 (`JoinGroup`, `SyncGroup`, `Heartbeat`, `LeaveGroup`, the KIP-848 and share
 heartbeats, `OffsetCommit`, `OffsetFetch`) get their own connection to the
-coordinator, as the Java client does with its separate coordinator node. The
-consumer and the share consumer take it from the pool for every request, so a
+coordinator, as the Java client does with its separate coordinator node. That
+connection belongs to one member: the broker parks a `JoinGroup` until the
+rebalance completes, so two members sharing one, in the same group or in
+different groups on the same handle, would hold up each other's heartbeats and
+commits for that long. A member's coordination connection closes once the
+member is dropped. The consumer and the share consumer take it from the pool for every request, so a
 dead or session-expired one is replaced like any other. A transport error on it
 makes the member find the coordinator again; it keeps its assignment and
 rejoins only if the coordinator has moved to another broker. `FindCoordinator` and the transactional producer's
