@@ -15,6 +15,12 @@ outcome), T1 (a commit after a failed send), T2 (an unanswered commit reported
 as a definite failure), F2 (under TV1, no epoch bump after an unanswered
 `EndTxn`), and a send-engine busy loop the simulation found.
 
+Pattern-subscription plants: a matcher not anchored to the whole name, a
+pattern never re-evaluated after subscribe, a replaced broker-side pattern
+never cleared, a broker-side
+pattern member that never joins, and a subscription changed during a join
+that never reaches the coordinator.
+
 Cancel-safety plants: the send path's drop guard not reporting a cancelled
 send, an `enqueue` that appends before its last await, a consumer `poll` that
 moves the position before returning, a share `poll` that takes records before
@@ -67,6 +73,11 @@ PLANTS = {
     "share-poll": Plant("cancel_safety", "share_poll", "ShareConsumer::poll: the caller's next steps hang"),
     "pending-add": Plant("cancel_safety", "transactional_send", "hang"),
     "txn-ending": Plant("cancel_safety", "transactional_commit", "cannot commit in state Committing"),
+    "pattern-anchor": Plant("simulation", "pattern_group_classic", "[only matching topics]"),
+    "pattern-rematch": Plant("simulation", "pattern_group_classic", "[at-least-once]"),
+    "regex-clear": Plant("topic_patterns", "switching_from_a_broker_pattern_to_names_clears_it", "only pat-a assigned after the switch"),
+    "has-subscription": Plant("topic_patterns", "a_broker_pattern_is_sent_and_follows_new_topics", "pat-a assigned by the coordinator"),
+    "stale-join": Plant("topic_patterns", "a_classic_subscription_changed_during_a_join_is_not_lost", "b to be assigned after the in-flight join"),
 }
 
 

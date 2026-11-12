@@ -13,7 +13,7 @@ use tracing::{Instrument, debug, warn};
 
 use crate::PartitionId;
 use crate::consumer::group::{GroupCoordinator, MemberAssignment, is_coordinator_retriable};
-use crate::consumer::state::PartitionKey;
+use crate::consumer::state::{PartitionKey, SubscriptionKind};
 use crate::consumer::{Consumer, TopicPartition};
 use crate::error::{ErrorCode, KrafkaError, Result};
 
@@ -43,6 +43,7 @@ impl Consumer {
     /// is nothing to fetch mid-rebalance, so the poll returns empty and the
     /// round's outcome is applied by a later poll.
     pub(in crate::consumer) async fn maintain_group(&self, budget: Duration) -> Result<bool> {
+        self.refresh_pattern_subscription(false).await?;
         let Some(coordinator) = self.group_coordinator.clone() else {
             self.resolve_standalone_subscription(false).await?;
             return Ok(false);
@@ -72,13 +73,32 @@ impl Consumer {
         coordinator.note_poll();
         self.maybe_auto_commit().await;
 
-        if self.state.lock().subscription.is_empty() {
+        if !self.state.lock().has_subscription() {
             return Ok(false);
         }
 
         if coordinator.is_consumer_protocol() {
             if coordinator.needs_rejoin() {
-                coordinator.join_consumer_group().await?;
+                match coordinator.join_consumer_group().await {
+                    Ok(()) => {}
+                    // Fenced on the join itself (a subscription change sends
+                    // its full heartbeat here): the join reset the member to
+                    // epoch 0 and recorded the loss. Report it and rejoin on
+                    // the next poll, as when the heartbeat task is fenced.
+                    Err(KrafkaError::Broker {
+                        code:
+                            ErrorCode::UnknownMemberId
+                            | ErrorCode::FencedMemberEpoch
+                            | ErrorCode::StaleMemberEpoch,
+                        ..
+                    }) => {
+                        if coordinator.take_lost() {
+                            self.lose_partitions(&coordinator).await;
+                        }
+                        return Ok(false);
+                    }
+                    Err(error) => return Err(error),
+                }
             }
             if coordinator.take_assignment_changed() {
                 self.apply_assignment(&coordinator, coordinator.assignment(), Protocol::Kip848)
@@ -315,13 +335,82 @@ impl Consumer {
     /// wait out a five-minute timer — the refresh goes through the metadata
     /// writer, whose backoff governs the request rate). A failed refresh keeps
     /// the current assignment.
+    /// Evaluate a client-side pattern against the cluster's topic list and,
+    /// when the matched set changed, install it through the one subscription
+    /// path (classic rejoin, KIP-848 full heartbeat, group-less resolver).
+    ///
+    /// Due on `force`, after a fetch found a matched topic unknown, and once
+    /// per `metadata_max_age`. A failed metadata refresh keeps the matched
+    /// set and is retried no sooner than the metadata retry backoff; it is
+    /// returned only when `force` is set. The result is dropped when a
+    /// subscribe call started a new subscription meanwhile.
+    pub(in crate::consumer) async fn refresh_pattern_subscription(
+        &self,
+        force: bool,
+    ) -> Result<()> {
+        let now = Instant::now();
+        let (pattern, generation) = {
+            let state = self.state.lock();
+            let SubscriptionKind::ClientPattern(pattern) = &state.kind else {
+                return Ok(());
+            };
+            let due = force
+                || state.rematch_requested
+                || state
+                    .pattern_matched_at
+                    .is_none_or(|at| now.saturating_duration_since(at) >= self.metadata.max_age());
+            let backing_off = state.pattern_retry_at.is_some_and(|at| now < at);
+            if !due || (backing_off && !force) {
+                return Ok(());
+            }
+            (pattern.clone(), state.generation)
+        };
+
+        if let Err(e) = self.metadata.refresh().await {
+            debug!(error = %e, pattern = pattern.as_str(), "topic pattern evaluation failed");
+            let mut state = self.state.lock();
+            if state.generation == generation {
+                state.pattern_retry_at =
+                    Some(Instant::now() + crate::metadata::DEFAULT_RETRY_BACKOFF_MAX);
+            }
+            return if force { Err(e) } else { Ok(()) };
+        }
+
+        let mut matched: Vec<String> = self
+            .metadata
+            .topics_arc()
+            .iter()
+            .filter(|topic| !topic.is_internal && pattern.matches(&topic.name))
+            .map(|topic| topic.name.clone())
+            .collect();
+        matched.sort();
+
+        let changed = {
+            let mut state = self.state.lock();
+            if state.generation != generation {
+                return Ok(());
+            }
+            state.pattern_matched_at = Some(Instant::now());
+            state.pattern_retry_at = None;
+            state.rematch_requested = false;
+            let current: HashSet<&String> = state.subscription.iter().collect();
+            force || current.len() != matched.len() || matched.iter().any(|t| !current.contains(t))
+        };
+        if changed {
+            debug!(pattern = pattern.as_str(), topics = ?matched, "topic pattern matched set changed");
+            self.apply_topic_subscription_at(matched, None, Some(generation))
+                .await?;
+        }
+        Ok(())
+    }
+
     pub(in crate::consumer) async fn resolve_standalone_subscription(
         &self,
         force: bool,
     ) -> Result<()> {
         let (topics, due) = {
             let state = self.state.lock();
-            if state.standalone_topics.is_empty() {
+            if state.standalone_topics.is_empty() && !state.has_subscription() {
                 return Ok(());
             }
             let topics: Vec<String> = state.standalone_topics.iter().cloned().collect();
@@ -339,7 +428,9 @@ impl Consumer {
         }
 
         let names: Vec<&str> = topics.iter().map(String::as_str).collect();
-        if let Err(e) = self.metadata.refresh_for_topics(Some(&names)).await {
+        if !names.is_empty()
+            && let Err(e) = self.metadata.refresh_for_topics(Some(&names)).await
+        {
             debug!(error = %e, "metadata refresh for a group-less subscription failed");
             return Ok(());
         }
@@ -351,11 +442,13 @@ impl Consumer {
             }
         }
         let mut state = self.state.lock();
-        let topic_set: HashSet<&String> = topics.iter().collect();
+        // Every partition not taken by `assign()` belongs to the
+        // subscription, so a topic that left it (replaced, or no longer
+        // matched by a pattern) is dropped too.
         let current: Vec<PartitionKey> = state
             .assigned_keys()
             .into_iter()
-            .filter(|(t, _)| topic_set.contains(t))
+            .filter(|(t, _)| !state.manual_topics.contains(t))
             .collect();
         let gone: Vec<PartitionKey> = current
             .iter()

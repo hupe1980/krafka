@@ -1976,6 +1976,7 @@ dependencies = [
  "pkcs8",
  "proptest",
  "rand 0.9.5",
+ "regex-lite",
  "rstest",
  "rustls",
  "rustls-native-certs",

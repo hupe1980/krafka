@@ -38,7 +38,7 @@ impl GroupCoordinator {
             _ => {}
         }
 
-        let topics = self.subscribed_topics();
+        let topics = self.topics_for_join();
         // A joining member (epoch 0) sends an empty owned-partition list, not
         // a null one: brokers reject a null list at epoch 0.
         let owned = if self.member_epoch.load(Ordering::Acquire) == 0 {
@@ -142,6 +142,10 @@ impl GroupCoordinator {
         let server_assignor = subscribed_topic_names
             .as_ref()
             .and(self.server_assignor.clone());
+        // The broker-side pattern travels with the subscription too.
+        let subscribed_topic_regex = subscribed_topic_names
+            .as_ref()
+            .and_then(|_| self.regex_for_join(member_epoch));
 
         let request = ConsumerGroupHeartbeatRequest {
             group_id: self.group_id.clone(),
@@ -151,7 +155,7 @@ impl GroupCoordinator {
             rack_id: self.client_rack.clone(),
             rebalance_timeout_ms: crate::util::duration_to_millis_i32(self.rebalance_timeout),
             subscribed_topic_names,
-            subscribed_topic_regex: None,
+            subscribed_topic_regex,
             server_assignor,
             topic_partitions,
         };
@@ -163,6 +167,19 @@ impl GroupCoordinator {
         ) else {
             return Err(KrafkaError::kip848_unsupported());
         };
+        if hb_version < 1
+            && request
+                .subscribed_topic_regex
+                .as_deref()
+                .is_some_and(|r| !r.is_empty())
+        {
+            return Err(KrafkaError::protocol_kind(
+                crate::error::ProtocolErrorKind::UnknownApiVersion,
+                "a broker-side subscription pattern needs ConsumerGroupHeartbeat v1 (Kafka 4.0+); \
+                 the coordinator supports only v0. Use a client-side pattern \
+                 (`subscribe_pattern`) or upgrade the cluster",
+            ));
+        }
 
         let response = conn
             .send_request(ApiKey::ConsumerGroupHeartbeat, hb_version, |buf| {
@@ -209,12 +226,23 @@ impl GroupCoordinator {
                         self.group_id,
                         self.server_assignor.as_deref().unwrap_or_default()
                     )
+                } else if response.error_code == ErrorCode::InvalidRegularExpression {
+                    format!(
+                        "the coordinator of group '{}' rejected the subscription pattern {:?}: \
+                         {message}",
+                        self.group_id,
+                        request
+                            .subscribed_topic_regex
+                            .as_deref()
+                            .unwrap_or_default()
+                    )
                 } else {
                     format!("ConsumerGroupHeartbeat failed: {message}")
                 },
             ));
         }
 
+        self.note_regex_sent(request.subscribed_topic_regex.as_deref());
         self.apply_heartbeat_response(&response).await?;
         debug!(
             "ConsumerGroupHeartbeat OK for group '{}': member_id='{}', epoch={}",
@@ -369,7 +397,7 @@ impl GroupCoordinator {
 
                         let (topics, owned) = if send_full {
                             let owned = coordinator.owned_assignment.read().clone();
-                            (Some(coordinator.subscribed_topics()), Some(owned))
+                            (Some(coordinator.topics_for_join()), Some(owned))
                         } else {
                             (None, None)
                         };
@@ -433,7 +461,7 @@ impl GroupCoordinator {
                                         code,
                                         format!(
                                             "consumer group '{group_id}' heartbeat failed with \
-                                             a non-retriable error"
+                                             a non-retriable error: {error}"
                                         ),
                                     ));
                                     heartbeat.signal_member_invalidated();

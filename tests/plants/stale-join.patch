@@ -1,0 +1,11 @@
+--- a/src/consumer/group/mod.rs
++++ b/src/consumer/group/mod.rs
+@@ -528,7 +528,7 @@
+             .is_some_and(|joined| *joined != *self.subscribed_topics.read())
+             || (self.is_consumer_protocol()
+                 && *self.sent_regex.lock() != *self.subscribed_regex.read());
+-        if stale && self.state() == GroupState::Stable {
++        if false && stale && self.state() == GroupState::Stable {
+             if self.is_consumer_protocol() {
+                 self.stop_heartbeat_task();
+             }

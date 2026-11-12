@@ -527,9 +527,66 @@ failed metadata refresh leaves the assignment unchanged.
 `consumer.assign("orders", vec![0])` the caller owns that topic's partition
 list, even if `subscribe()` named it.
 
+### Subscribing by pattern
+
+A pattern subscribes to every topic whose **whole name** matches it, including
+topics created later. There are two kinds.
+
+**Client-side, `subscribe_pattern(TopicPattern)`.** The consumer matches the
+pattern itself against the cluster's topic list. It works with and without a
+group, under either group protocol, on every supported broker. The syntax is
+Rust regular-expression syntax without Unicode classes.
+
+```rust,compile
+use krafka::consumer::TopicPattern;
+
+consumer.subscribe_pattern(TopicPattern::new("orders-.*")?).await?;
+```
+
+The pattern is evaluated before the call returns, again once per
+`metadata_max_age` (five minutes by default), and as soon as a fetch finds a
+matched topic gone. Internal topics (`__consumer_offsets`,
+`__transaction_state`) never match. When the matched set changes, a group
+member rejoins (classic) or sends its new topic list (KIP-848); a group-less
+consumer adjusts its own assignment. A deleted topic's partitions are revoked
+through the rebalance listener like any other. A failed evaluation leaves the
+matched set as it was. Each member of a group evaluates the pattern on its own
+schedule, so a new topic may first go to one member and be shared out at the
+next rebalance.
+
+**Broker-side, `subscribe_broker_pattern(SubscriptionPattern)`.** The group
+coordinator evaluates the pattern, with its own RE2J syntax, and assigns what
+matches; the client never parses it and fetches no topic list for it. It
+needs a group on `GroupProtocol::Consumer` and Kafka 4.0+
+(`ConsumerGroupHeartbeat` v1): without a group or under the classic protocol
+the call returns `IllegalState`, and against an older coordinator the next
+`poll()` fails. A pattern the coordinator rejects fails `poll()` with a
+non-retriable `INVALID_REGULAR_EXPRESSION` error that names it.
+
+```rust,compile
+use krafka::consumer::{GroupProtocol, SubscriptionPattern};
+
+let consumer = kafka
+    .consumer("orders-audit")
+    .group_protocol(GroupProtocol::Consumer)
+    .build()
+    .await?;
+consumer
+    .subscribe_broker_pattern(SubscriptionPattern::new("orders-.*")?)
+    .await?;
+```
+
+While a pattern is subscribed, `subscription()` returns the topics it covers
+now: the matched topics for a client-side pattern, the assigned topics for a
+broker-side one.
+
 ### Subscribe, inspect, unsubscribe
 
-`subscribe()` **replaces** the current subscription:
+`subscribe()`, `subscribe_pattern()` and `subscribe_broker_pattern()` each
+**replace** the current subscription, whichever kind it was. A group member
+switches without leaving the group: one rejoin, or one full heartbeat under
+KIP-848, and under cooperative or KIP-848 assignment it keeps the partitions
+both subscriptions cover.
 
 ```rust,compile
 consumer.subscribe(["orders", "payments"]).await?;

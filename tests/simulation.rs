@@ -1,6 +1,6 @@
 //! Deterministic simulation: client workloads against an in-memory fake
 //! cluster under a paused clock, with faults chosen from a seed, judged by
-//! six invariants over the history.
+//! seven invariants over the history.
 //!
 //! Every test runs a seed budget: `KRAFKA_SIM_SEEDS=<a>..<b>` widens it (`just
 //! sim-long`), `KRAFKA_SIM_SEED=<n>` replays one seed. A failure prints its
@@ -25,7 +25,7 @@ use parking_lot::Mutex;
 use rand::Rng;
 use rand::rngs::SmallRng;
 
-use krafka::consumer::{AutoOffsetReset, GroupProtocol, IsolationLevel};
+use krafka::consumer::{AutoOffsetReset, GroupProtocol, IsolationLevel, TopicPattern};
 use krafka::error::ErrorCode;
 use krafka::producer::{DeliveryHandle, Producer, Record, TransactionState, TransactionalProducer};
 use krafka::testing::{ApiKey, Control};
@@ -100,7 +100,11 @@ async fn cluster_event(sim: &Sim) {
 }
 
 fn record(value: &str, partition: u64) -> Record {
-    Record::new(TOPIC, value.as_bytes().to_vec()).partition(i32::try_from(partition).unwrap())
+    record_to(TOPIC, value, partition)
+}
+
+fn record_to(topic: &str, value: &str, partition: u64) -> Record {
+    Record::new(topic, value.as_bytes().to_vec()).partition(i32::try_from(partition).unwrap())
 }
 
 // ── Producer workloads ──────────────────────────────────────────────────────
@@ -484,6 +488,172 @@ async fn group_member(
     }
 }
 
+// ── Pattern-subscription workload ───────────────────────────────────────────
+
+const PATTERN_GROUP: &str = "sim-pattern";
+/// The subscription: `pat-0` exists from the start, `pat-1` and `pat-2` are
+/// created during the run, `pat-gone` is deleted during it.
+const PATTERN: &str = "pat-.*";
+const PATTERN_TOPICS: [&str; 2] = ["pat-1", "pat-2"];
+/// Contains a match of `pat-.*` but is not one as a whole name.
+const NON_MATCHING: &str = "xpat-0";
+const DOOMED: &str = "pat-gone";
+const PATTERN_RECORDS: usize = 8;
+/// Polls one pattern member makes at most. Members stay in one incarnation,
+/// so a topic created later is found only by re-evaluating the pattern, not
+/// by a fresh subscribe (leaving and rejoining is the group workload's).
+const PATTERN_ROUNDS: usize = 200;
+
+/// Write `<topic>/<i>` values, recording the sends.
+async fn seed_topic(sim: &Sim, topic: &str) -> Vec<String> {
+    let producer = producer(sim).await;
+    let pending = Pending::default();
+    let values: Vec<String> = (0..PATTERN_RECORDS)
+        .map(|i| format!("{topic}/{i}"))
+        .collect();
+    for value in &values {
+        let partition = sim.pick(0..PARTITIONS as u64);
+        match producer.enqueue(record_to(topic, value, partition)).await {
+            Ok(handle) => {
+                let op = sim.history.invoke(Kind::Send {
+                    value: value.clone(),
+                    txn: None,
+                });
+                pending.lock().push((op, handle));
+            }
+            Err(error) => {
+                sim.history.instant(
+                    Kind::Send {
+                        value: value.clone(),
+                        txn: None,
+                    },
+                    Outcome::Failed(error.to_string()),
+                );
+            }
+        }
+    }
+    close(sim, &producer, &pending).await;
+    values
+}
+
+/// Write `<topic>/<i>` values without recording them: the topic's log is
+/// not judged (it is never read, or it is deleted).
+async fn write_unjudged(sim: &Sim, topic: &str) {
+    let producer = producer(sim).await;
+    for i in 0..PATTERN_RECORDS {
+        let value = format!("{topic}/{i}");
+        let _ = producer
+            .send(record_to(topic, &value, sim.pick(0..PARTITIONS as u64)))
+            .await;
+    }
+    let _ = producer.close().await;
+}
+
+/// Creates the later matching topics and deletes the doomed one, at seeded
+/// times, then marks the churn done.
+async fn topic_churn(sim: &Sim, expected: &Mutex<HashSet<String>>, churned: &Mutex<bool>) {
+    for topic in PATTERN_TOPICS {
+        tokio::time::sleep(Duration::from_millis(sim.pick(0..4000))).await;
+        sim.broker.create_topic(topic, PARTITIONS);
+        sim.history.judge_topic(topic);
+        let values = seed_topic(sim, topic).await;
+        expected.lock().extend(values);
+        if sim.chance(0.5) || topic == PATTERN_TOPICS[PATTERN_TOPICS.len() - 1] {
+            sim.broker.delete_topic(DOOMED);
+        }
+    }
+    *churned.lock() = true;
+}
+
+/// One member on the pattern: polls, records what it processed and commits
+/// now and then, until the churn is done and every expected value was
+/// processed. It subscribes once.
+async fn pattern_member(
+    sim: &Sim,
+    protocol: GroupProtocol,
+    member: usize,
+    processed: &Mutex<HashSet<String>>,
+    expected: &Mutex<HashSet<String>>,
+    churned: &Mutex<bool>,
+) {
+    let done = || *churned.lock() && expected.lock().is_subset(&processed.lock());
+    let kafka = sim
+        .broker
+        .kafka()
+        .request_timeout(REQUEST_TIMEOUT)
+        .connect_timeout(REQUEST_TIMEOUT)
+        .metadata_max_age(Duration::from_secs(2))
+        .connect()
+        .await
+        .expect("connects");
+    let consumer = kafka
+        .consumer(PATTERN_GROUP)
+        .group_protocol(protocol)
+        .auto_offset_reset(AutoOffsetReset::Earliest)
+        .enable_auto_commit(false)
+        .max_poll_records(i32::try_from(sim.pick(1..6)).unwrap())
+        .session_timeout(Duration::from_secs(10))
+        .heartbeat_interval(Duration::from_secs(1))
+        .build()
+        .await
+        .expect("builds");
+    let pattern = TopicPattern::new(PATTERN).expect("pattern compiles");
+    // The first evaluation can fail under faults; the pattern is subscribed
+    // regardless and evaluated again by the next poll.
+    let _ = consumer.subscribe_pattern(pattern).await;
+    for _ in 0..PATTERN_ROUNDS {
+        if done() {
+            break;
+        }
+        let Ok(records) = consumer.poll(Duration::from_millis(500)).await else {
+            continue;
+        };
+        if !records.is_empty() {
+            let values: Vec<String> = records
+                .iter()
+                .map(|r| String::from_utf8_lossy(r.value.as_deref().unwrap_or_default()).into())
+                .collect();
+            processed.lock().extend(values.iter().cloned());
+            sim.history
+                .instant(Kind::Consume { member, values }, Outcome::Ok);
+        }
+        if sim.chance(0.4) {
+            let op = sim.history.invoke(Kind::CommitOffsets { member });
+            let result = consumer.commit().await;
+            sim.history.complete(op, outcome(&result));
+        }
+        cluster_event(sim).await;
+    }
+    let _ = consumer.close().await;
+}
+
+/// Two members on `pat-.*` while matching topics are created and one is
+/// deleted, through `OffsetCommit` faults and broker crashes: every record
+/// of a matching topic that survives is processed (at-least-once), and
+/// nothing of `xpat-0` ever is (invariant 7).
+async fn pattern_group_workload(sim: &mut Sim, protocol: GroupProtocol) {
+    sim.broker.create_topic(NON_MATCHING, PARTITIONS);
+    sim.broker.create_topic(DOOMED, PARTITIONS);
+    write_unjudged(sim, NON_MATCHING).await;
+    write_unjudged(sim, DOOMED).await;
+    let initial = seed_topic(sim, "pat-0").await;
+    sim.history.consumer_group(PATTERN_GROUP);
+    sim.history.forbid_topic(NON_MATCHING);
+    let faults = sim.faults();
+    sim.broker.on(ApiKey::OffsetCommit, move |_| {
+        offset_commit_fault(&mut faults.lock())
+    });
+    let processed = Mutex::new(HashSet::new());
+    let expected = Mutex::new(initial.into_iter().collect::<HashSet<_>>());
+    let churned = Mutex::new(false);
+    let sim = &*sim;
+    let members = (0..GROUP_MEMBERS).map(|member| {
+        pattern_member(sim, protocol, member, &processed, &expected, &churned).boxed_local()
+    });
+    let churn = topic_churn(sim, &expected, &churned).boxed_local();
+    futures::future::join_all(members.chain(std::iter::once(churn))).await;
+}
+
 /// Two members of one group read a topic through `OffsetCommit` faults,
 /// broker crashes and leader moves, committing now and then and leaving and
 /// rejoining, until the group has processed every record.
@@ -530,6 +700,31 @@ fn run_consumer_group(seed: u64, protocol: GroupProtocol) -> Run {
             consumer_group_workload(sim, protocol).await;
         },
     )
+}
+
+fn run_pattern_group(seed: u64, protocol: GroupProtocol) -> Run {
+    simulate(
+        seed,
+        BROKERS,
+        &[("pat-0", PARTITIONS)],
+        async move |sim: &mut Sim| {
+            pattern_group_workload(sim, protocol).await;
+        },
+    )
+}
+
+#[test]
+fn pattern_group_classic() {
+    assert_seeds("pattern_group_classic", &seeds(PR_SEEDS), |seed| {
+        run_pattern_group(seed, GroupProtocol::Classic)
+    });
+}
+
+#[test]
+fn pattern_group_kip848() {
+    assert_seeds("pattern_group_kip848", &seeds(PR_SEEDS), |seed| {
+        run_pattern_group(seed, GroupProtocol::Consumer)
+    });
 }
 
 #[test]
@@ -582,7 +777,7 @@ type Workload = fn(u64) -> Run;
     ignore = "needs Tokio's RNG seeded: --cfg tokio_unstable (just sim)"
 )]
 fn a_run_is_a_function_of_its_seed() {
-    let runs: [(&str, u64, Workload); 6] = [
+    let runs: [(&str, u64, Workload); 8] = [
         ("transactions_tv1", 100, |seed| run_transactional(seed, 1)),
         ("transactions_tv2", 25, |seed| run_transactional(seed, 2)),
         ("idempotent_producer", 25, run_idempotent),
@@ -592,6 +787,12 @@ fn a_run_is_a_function_of_its_seed() {
         }),
         ("consumer_group_kip848", 25, |seed| {
             run_consumer_group(seed, GroupProtocol::Consumer)
+        }),
+        ("pattern_group_classic", 10, |seed| {
+            run_pattern_group(seed, GroupProtocol::Classic)
+        }),
+        ("pattern_group_kip848", 10, |seed| {
+            run_pattern_group(seed, GroupProtocol::Consumer)
         }),
     ];
     let mut differing = Vec::new();

@@ -1,0 +1,11 @@
+--- a/src/consumer/rebalance/apply.rs
++++ b/src/consumer/rebalance/apply.rs
+@@ -73,7 +73,7 @@
+         coordinator.note_poll();
+         self.maybe_auto_commit().await;
+ 
+-        if !self.state.lock().has_subscription() {
++        if self.state.lock().subscription.is_empty() {
+             return Ok(false);
+         }
+ 

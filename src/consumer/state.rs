@@ -28,6 +28,7 @@ use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use super::PartitionLag;
 use super::config::{AutoOffsetReset, IsolationLevel};
 use super::fetch_session::FetchSessionCache;
+use super::pattern::{SubscriptionPattern, TopicPattern};
 use super::record::{ConsumerRecord, TopicPartition};
 use crate::error::{KrafkaError, Result};
 use crate::{BrokerId, Offset, PartitionId};
@@ -204,6 +205,20 @@ pub(super) struct Delivery {
     partitions: Vec<DeliveredPartition>,
 }
 
+/// What the consumer is subscribed by; exactly one is active.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) enum SubscriptionKind {
+    /// Nothing subscribed (manual `assign` only, or nothing at all).
+    #[default]
+    None,
+    /// A list of topic names.
+    Names,
+    /// A pattern the consumer matches against cluster metadata.
+    ClientPattern(TopicPattern),
+    /// A pattern the KIP-848 coordinator matches.
+    BrokerPattern(SubscriptionPattern),
+}
+
 /// The consumer's mutable state. See the module documentation.
 #[derive(Debug)]
 pub(super) struct SubscriptionState {
@@ -214,6 +229,20 @@ pub(super) struct SubscriptionState {
     pub(super) standalone_topics: HashSet<String>,
     /// When the group-less subscription was last resolved.
     pub(super) standalone_resolved: Option<Instant>,
+    /// What `subscription` was derived from.
+    pub(super) kind: SubscriptionKind,
+    /// Bumped by every subscribe, `unsubscribe` and close; a pattern
+    /// re-evaluation applies its result only if it is unchanged.
+    pub(super) generation: u64,
+    /// When a client-side pattern was last evaluated successfully.
+    pub(super) pattern_matched_at: Option<Instant>,
+    /// After a failed evaluation, the next one waits until then.
+    pub(super) pattern_retry_at: Option<Instant>,
+    /// A fetch found a matched topic unknown: evaluate again on the next poll.
+    pub(super) rematch_requested: bool,
+    /// Topics taken by `assign()`; a pattern never adds them to the
+    /// metadata-driven group-less subscription.
+    pub(super) manual_topics: HashSet<String>,
     /// Assigned partitions; the key set is the assignment.
     partitions: BTreeMap<PartitionKey, PartitionRecord>,
     next_version: u64,
@@ -231,6 +260,12 @@ impl Default for SubscriptionState {
             subscription: HashSet::new(),
             standalone_topics: HashSet::new(),
             standalone_resolved: None,
+            kind: SubscriptionKind::None,
+            generation: 0,
+            pattern_matched_at: None,
+            pattern_retry_at: None,
+            rematch_requested: false,
+            manual_topics: HashSet::new(),
             partitions: BTreeMap::new(),
             next_version: 0,
             fetch_sessions: FetchSessionCache::new(),
@@ -241,6 +276,31 @@ impl Default for SubscriptionState {
 }
 
 impl SubscriptionState {
+    /// Whether a subscribe call is in force.
+    pub(super) fn has_subscription(&self) -> bool {
+        self.kind != SubscriptionKind::None
+    }
+
+    /// Start a new subscription of `kind`: bump the generation and forget
+    /// the previous pattern's evaluation state. Returns the new generation.
+    pub(super) fn begin_subscription(&mut self, kind: SubscriptionKind) -> u64 {
+        self.kind = kind;
+        self.generation = self.generation.wrapping_add(1);
+        self.pattern_matched_at = None;
+        self.pattern_retry_at = None;
+        self.rematch_requested = false;
+        self.generation
+    }
+
+    /// Forget every subscription (`unsubscribe`, close).
+    pub(super) fn clear_subscription(&mut self) {
+        self.begin_subscription(SubscriptionKind::None);
+        self.subscription.clear();
+        self.standalone_topics.clear();
+        self.standalone_resolved = None;
+        self.manual_topics.clear();
+    }
+
     fn bump(&mut self) -> u64 {
         self.next_version += 1;
         self.next_version

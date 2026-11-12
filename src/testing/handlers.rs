@@ -894,7 +894,7 @@ fn metadata(body: &mut Bytes, state: &mut ClusterState, out: &mut BytesMut) -> R
                 // coordinator names topics by ID, and the client maps them
                 // back through this field.
                 out.put_slice(&topic.topic_id);
-                out.put_u8(0); // is_internal
+                out.put_u8(u8::from(is_internal_topic(name)));
                 write_compact_array_len(out, topic.partitions.len())?;
                 for (index, partition) in topic.partitions.iter().enumerate() {
                     write_error(out, ErrorCode::None);
@@ -1490,6 +1490,8 @@ fn consumer_group_heartbeat(
             instance_id: req.instance_id.clone(),
             server_assignor: req.server_assignor.clone(),
             full: req.subscribed_topic_names.is_some(),
+            subscribed_topic_names: req.subscribed_topic_names.clone(),
+            subscribed_topic_regex: req.subscribed_topic_regex.clone(),
         });
 
     // Members whose session expired leave the group, and their partitions
@@ -1562,12 +1564,41 @@ fn consumer_group_heartbeat(
         return write_heartbeat_error(out, ErrorCode::UnknownMemberId, Some(&req.member_id), 0);
     }
 
-    // `None` means "unchanged since my last heartbeat".
-    let subscribed = req
+    // `None` means "unchanged since my last heartbeat"; a joining member
+    // (epoch 0) starts with no pattern; `""` removes the pattern.
+    let names = req
         .subscribed_topic_names
         .clone()
-        .or_else(|| known.as_ref().map(|m| m.subscribed_topics.clone()))
+        .or_else(|| known.as_ref().map(|m| m.subscribed_names.clone()))
         .unwrap_or_default();
+    let regex = match req.subscribed_topic_regex.as_deref() {
+        Some("") => None,
+        Some(pattern) => Some(pattern.to_string()),
+        None if req.member_epoch == 0 => None,
+        None => known.as_ref().and_then(|m| m.subscribed_regex.clone()),
+    };
+    // The coordinator resolves the pattern against whole, non-internal topic
+    // names on every heartbeat, so topics created or deleted since are
+    // followed. (`regex-lite` stands in for the broker's RE2J.)
+    let mut subscribed = names.clone();
+    if let Some(pattern) = &regex {
+        let Ok(matcher) = regex_lite::Regex::new(&format!("^(?:{pattern})$")) else {
+            return write_heartbeat_error(
+                out,
+                ErrorCode::InvalidRegularExpression,
+                Some(&req.member_id),
+                0,
+            );
+        };
+        let mut matched: Vec<String> = partition_counts
+            .keys()
+            .filter(|name| !is_internal_topic(name) && matcher.is_match(name))
+            .filter(|name| !subscribed.contains(name))
+            .cloned()
+            .collect();
+        matched.sort();
+        subscribed.extend(matched);
+    }
 
     // The member reports what it *currently owns*. This is the acknowledgement
     // half of reconciliation: until it arrives, the coordinator must assume the
@@ -1601,6 +1632,8 @@ fn consumer_group_heartbeat(
             .or_default();
         member.instance_id = req.instance_id.clone();
         member.subscribed_topics = subscribed.clone();
+        member.subscribed_names = names;
+        member.subscribed_regex = regex;
         member.last_heartbeat = Some(now);
         if let Some(owned) = reported_owned {
             member.owned = owned;
@@ -3039,6 +3072,11 @@ fn create_topics(
         write_nullable_string(out, message)?;
     }
     Ok(())
+}
+
+/// Kafka's internal topics, reported with `is_internal` set as a broker does.
+fn is_internal_topic(name: &str) -> bool {
+    matches!(name, "__consumer_offsets" | "__transaction_state")
 }
 
 fn delete_topics(

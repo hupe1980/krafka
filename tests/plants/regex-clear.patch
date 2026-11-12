@@ -1,0 +1,11 @@
+--- a/src/consumer/group/mod.rs
++++ b/src/consumer/group/mod.rs
+@@ -497,7 +497,7 @@
+         };
+         match (wanted, held) {
+             (Some(pattern), _) => Some(pattern),
+-            (None, Some(_)) => Some(String::new()),
++            (None, Some(_)) => None,
+             (None, None) => None,
+         }
+     }
