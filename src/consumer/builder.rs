@@ -101,8 +101,10 @@ impl ConsumerBuilder {
     /// out.
     ///
     /// When the buffer reaches this limit, `poll()` stops fetching until it
-    /// drains, bounding memory when the application consumes more slowly than
-    /// the broker delivers. `0` disables the cap. Defaults to 500.
+    /// drains. This bounds the decoded records only: what a fetch response
+    /// holds beyond them is kept as the bytes the broker sent, up to
+    /// [`fetch_max_bytes`](Self::fetch_max_bytes) per broker, and decoded as
+    /// the application reads on. `0` disables the cap. Defaults to 500.
     pub fn max_buffered_records(mut self, max: i32) -> Self {
         self.config.max_buffered_records = max;
         self

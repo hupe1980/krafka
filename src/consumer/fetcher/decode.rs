@@ -1,14 +1,17 @@
 //! The batch walk: turning one partition's fetched bytes into records and the
 //! offset the next fetch starts at.
 
+use std::sync::Arc;
+
 use ahash::AHashSet as HashSet;
+use bytes::Bytes;
 use tracing::{trace, warn};
 
 use crate::Offset;
 use crate::PartitionId;
 use crate::consumer::ConsumerRecord;
 use crate::error::{KrafkaError, ProtocolErrorKind};
-use crate::protocol::{RecordBatch, RecordBatchHeader};
+use crate::protocol::{AbortedTransaction, RecordBatch, RecordBatchHeader};
 
 /// Whether a control batch carries an **abort** marker (as opposed to a commit
 /// marker, or a control record type this client does not know).
@@ -32,20 +35,20 @@ pub(super) fn control_batch_is_abort(batch: &RecordBatch) -> bool {
 
 /// What walking one partition's fetched batches produced, besides the records
 /// themselves (those are appended to the caller's shared output vector).
-pub(super) struct PartitionDecodeOutcome {
+pub(in crate::consumer) struct PartitionDecodeOutcome {
     /// Highest offset the position advanced through: the last record pushed,
     /// or the end of the last batch that was skipped or drained in full.
-    /// `None` when nothing in the payload could move the position.
-    pub(super) last_offset: Option<Offset>,
+    /// `None` when nothing this call walked could move the position.
+    pub(in crate::consumer) last_offset: Option<Offset>,
     /// Leader epoch of the batch `last_offset` came from, reported back on
     /// the next fetch so the broker can detect divergence (KIP-320).
-    pub(super) last_epoch: i32,
+    pub(in crate::consumer) last_epoch: i32,
     /// The batch at the fetch position could not be decoded, so the partition
     /// cannot advance. The caller reports it as a partition-level fault.
-    pub(super) error: Option<KrafkaError>,
+    pub(in crate::consumer) error: Option<KrafkaError>,
     /// A batch failed to decode for a reason other than the benign
     /// truncated-tail case; the caller records it on the metrics sink.
-    pub(super) corrupt: bool,
+    pub(in crate::consumer) corrupt: bool,
 }
 
 /// Advance a partition's pending position bookkeeping through `batch_end`.
@@ -75,333 +78,426 @@ pub(super) fn advance_through_batch(
     }
 }
 
-/// Walk one partition's fetched record bytes, appending deliverable records
-/// to `records` and tracking how far the partition's position may advance.
+/// One partition's fetched record bytes, decoded a slice at a time.
+///
+/// A fetch response can hold far more than one poll may hand out. The decoder
+/// keeps the bytes it has not walked yet together with the state of the walk,
+/// so the rest is decoded when the application gets to it and is not fetched
+/// a second time.
 ///
 /// The walk is where every "this offset range carries nothing to deliver"
 /// case is decided — control batches, aborted transactions, batches the log
 /// cleaner emptied, batches whose surviving records all predate the fetch
 /// offset — and each of those cases must still advance the position past the
 /// range it covers, or the partition re-fetches the same bytes forever. It is
-/// a free function, welded to no socket, precisely so those decisions can be
-/// pinned down by unit tests feeding it hand-built batches.
-///
-/// `partition_fetch_offset` is the position the fetch was issued from;
-/// records below it were delivered by an earlier poll and are skipped.
-/// `record_budget`, when present, is how many records this call may still
-/// decode; it is decremented by what is decoded.
+/// welded to no socket, precisely so those decisions can be pinned down by
+/// unit tests feeding it hand-built batches.
+pub(in crate::consumer) struct PartitionDecoder {
+    /// One allocation per partition response; every record shares it.
+    topic: Arc<str>,
+    partition: PartitionId,
+    /// The bytes not walked yet, starting at a batch boundary.
+    buf: Bytes,
+    /// Records below this offset were handed to an earlier call, or to an
+    /// earlier poll, and are skipped.
+    fetch_offset: Offset,
+    /// Sorted by `first_offset`, so entries are activated in order as the
+    /// walk reaches them.
+    aborted_txns: Vec<AbortedTransaction>,
+    /// Index of the first entry of `aborted_txns` not activated yet.
+    next_aborted: usize,
+    /// Producer IDs currently inside an open aborted transaction. This has to
+    /// outlive one call: an abort marker walked by an earlier call must stay
+    /// walked, or the producer's later committed records would be dropped.
+    aborted_producers: HashSet<i64>,
+    max_decompressed_size: usize,
+    /// Whether any call has moved the position.
+    progressed: bool,
+    /// Nothing is left to decode: the bytes ran out, or a batch failed.
+    finished: bool,
+}
+
+impl std::fmt::Debug for PartitionDecoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PartitionDecoder")
+            .field("topic", &self.topic)
+            .field("partition", &self.partition)
+            .field("fetch_offset", &self.fetch_offset)
+            .field("undecoded_bytes", &self.buf.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartitionDecoder {
+    /// A decoder over `buf`, the record bytes of one partition of a fetch
+    /// issued from `fetch_offset`.
+    ///
+    /// For READ_COMMITTED, the broker still includes data batches from aborted
+    /// transactions in the FetchResponse but lists their (producer_id,
+    /// first_offset) pairs in `aborted_txns` so the client can filter them.
+    pub(in crate::consumer) fn new(
+        topic: &str,
+        partition: PartitionId,
+        buf: Bytes,
+        fetch_offset: Offset,
+        mut aborted_txns: Vec<AbortedTransaction>,
+        max_decompressed_size: usize,
+    ) -> Self {
+        aborted_txns.sort_unstable_by_key(|at| at.first_offset);
+        Self {
+            topic: Arc::from(topic),
+            partition,
+            buf,
+            fetch_offset,
+            aborted_txns,
+            next_aborted: 0,
+            aborted_producers: HashSet::new(),
+            max_decompressed_size,
+            progressed: false,
+            finished: false,
+        }
+    }
+
+    /// Whether every byte has been walked. A finished decoder decodes
+    /// nothing more.
+    pub(in crate::consumer) fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    /// Activate the aborted transactions that start at or before
+    /// `base_offset`.
+    fn activate_aborted(&mut self, base_offset: Offset) {
+        while let Some(at) = self.aborted_txns.get(self.next_aborted)
+            && at.first_offset <= base_offset
+        {
+            self.aborted_producers.insert(at.producer_id);
+            self.next_aborted += 1;
+        }
+    }
+
+    /// Walk further, appending deliverable records to `records` and reporting
+    /// how far the partition's position may advance.
+    ///
+    /// `record_budget`, when present, is how many records this call may still
+    /// decode; it is decremented by what is decoded. A call that stops on the
+    /// budget leaves the decoder unfinished, and the next call carries on
+    /// where this one stopped.
+    pub(in crate::consumer) fn decode(
+        &mut self,
+        mut record_budget: Option<&mut usize>,
+        records: &mut Vec<ConsumerRecord>,
+    ) -> PartitionDecodeOutcome {
+        let mut outcome = PartitionDecodeOutcome {
+            last_offset: None,
+            last_epoch: -1,
+            error: None,
+            corrupt: false,
+        };
+        if self.finished {
+            return outcome;
+        }
+
+        // Decode fetched batches, bounded by the poll's remaining record
+        // budget. The position advances only over records that are actually
+        // pushed and batches that are walked in full.
+        let mut out_of_budget = false;
+        let mut budget_exhausted = false;
+        while self.buf.len() >= 12 {
+            // What the budget does not cover waits for the next call.
+            if record_budget.as_deref().is_some_and(|b| *b == 0) {
+                out_of_budget = true;
+                break;
+            }
+            // Header first: a data batch of an aborted transaction is skipped
+            // without decompressing or decoding its records.
+            if let Ok(header) = RecordBatchHeader::peek(&self.buf)
+                && header.attributes.is_transactional
+                && !header.attributes.is_control_batch
+                && self.buf.len() >= header.total_size()
+            {
+                self.activate_aborted(header.base_offset);
+                if self.aborted_producers.contains(&header.producer_id) {
+                    advance_through_batch(
+                        &mut outcome.last_offset,
+                        &mut outcome.last_epoch,
+                        self.fetch_offset,
+                        header.last_offset(),
+                        header.partition_leader_epoch,
+                    );
+                    let _ = self.buf.split_to(header.total_size());
+                    continue;
+                }
+            }
+            // Decoding consumes the batch; a batch the budget cuts short is
+            // put back, so the next call starts at it again.
+            let batch_start = self.buf.clone();
+            match RecordBatch::decode_with_limit(&mut self.buf, self.max_decompressed_size) {
+                Ok(batch) => {
+                    let batch_epoch = batch.partition_leader_epoch;
+                    // The offset range this batch spans, whether or not any
+                    // record inside it survives to delivery. `last_offset_delta`
+                    // is preserved by the log cleaner even when the records it
+                    // once counted are gone, so this is the only trustworthy
+                    // measure of how far the batch reaches.
+                    let batch_end = batch
+                        .base_offset
+                        .saturating_add(batch.last_offset_delta as i64);
+
+                    self.activate_aborted(batch.base_offset);
+
+                    // Skip transaction control batches (commit/abort markers).
+                    // These are internal Kafka bookkeeping records that must not
+                    // be surfaced to consumers.  When the control batch belongs
+                    // to a tracked aborted producer we also deactivate it so
+                    // subsequent transactions from the same producer are not
+                    // incorrectly filtered.  The offset must still be advanced
+                    // past them so that subsequent fetches do not re-process them.
+                    if batch.attributes.is_control_batch {
+                        // Only an ABORT marker ends an aborted
+                        // transaction. Clearing on any control
+                        // batch (including COMMIT markers) meant
+                        // the client trusted the marker *type* it
+                        // never looked at, so a coordinator that
+                        // wrote a commit marker for a producer the
+                        // broker had listed as aborted would stop
+                        // the filter early and surface aborted
+                        // records to a `read_committed` consumer.
+                        // Mirrors the Java client's
+                        // `CompletedFetch.containsAbortMarker`.
+                        if control_batch_is_abort(&batch) {
+                            self.aborted_producers.remove(&batch.producer_id);
+                        }
+                        advance_through_batch(
+                            &mut outcome.last_offset,
+                            &mut outcome.last_epoch,
+                            self.fetch_offset,
+                            batch_end,
+                            batch_epoch,
+                        );
+                        continue;
+                    }
+
+                    // Skip data records from aborted transactions.
+                    // Once the abort marker (control batch) is seen,
+                    // the producer_id is removed from the set, so
+                    // later committed transactions from the same
+                    // producer are not affected.
+                    if batch.attributes.is_transactional
+                        && self.aborted_producers.contains(&batch.producer_id)
+                    {
+                        advance_through_batch(
+                            &mut outcome.last_offset,
+                            &mut outcome.last_epoch,
+                            self.fetch_offset,
+                            batch_end,
+                            batch_epoch,
+                        );
+                        continue;
+                    }
+
+                    // The log cleaner keeps a batch's header (to preserve the
+                    // producer's last sequence number for idempotence) even after
+                    // compaction has removed every record it originally held.
+                    // Such a batch carries nothing to deliver, but the offset
+                    // range it spans is real and must still be skipped —
+                    // otherwise the position never leaves it and every subsequent
+                    // fetch re-reads the same empty batch forever. Worse, the
+                    // budget check below would read an empty batch as "budget
+                    // exhausted" and throw away every later batch in the response.
+                    if batch.records.is_empty() {
+                        advance_through_batch(
+                            &mut outcome.last_offset,
+                            &mut outcome.last_epoch,
+                            self.fetch_offset,
+                            batch_end,
+                            batch_epoch,
+                        );
+                        continue;
+                    }
+
+                    // Records skipped as already delivered do not consume the
+                    // budget.
+                    let allowed = record_budget.as_deref().copied().unwrap_or(usize::MAX);
+                    let mut used = 0usize;
+
+                    for record in batch.records.into_iter() {
+                        // Use offset_delta for correct offset in compacted topics
+                        // where records may have been deleted (log compaction awareness).
+                        let record_offset =
+                            batch.base_offset.saturating_add(record.offset_delta as i64);
+
+                        // Skip records below the fetch offset — these were
+                        // already delivered in a prior poll but are included
+                        // because Kafka returns whole batches.
+                        if record_offset < self.fetch_offset {
+                            continue;
+                        }
+
+                        if used == allowed {
+                            budget_exhausted = true;
+                            break;
+                        }
+                        used += 1;
+
+                        records.push(ConsumerRecord {
+                            topic: Arc::clone(&self.topic),
+                            partition: self.partition,
+                            offset: record_offset,
+                            timestamp: batch.base_timestamp.saturating_add(record.timestamp_delta),
+                            timestamp_type: batch.attributes.timestamp_type,
+                            key: record.key,
+                            value: record.value,
+                            headers: crate::consumer::headers_from_wire(record.headers),
+                            leader_epoch: Some(batch_epoch),
+                            delivery_count: None,
+                        });
+                        outcome.last_offset = Some(record_offset);
+                        outcome.last_epoch = batch_epoch;
+                    }
+
+                    if let Some(budget) = record_budget.as_deref_mut() {
+                        *budget -= used;
+                    }
+                    if budget_exhausted {
+                        // The batch was cut short mid-delivery: the position must
+                        // stop at the last record pushed, so the next call decodes
+                        // this batch again and skips what was pushed here.
+                        // Deliberately no batch-level advance.
+                        self.buf = batch_start;
+                        out_of_budget = true;
+                        break;
+                    }
+
+                    // The batch was walked to its end, so the position moves to
+                    // the end of the *offset range* it spans — not merely past
+                    // its last surviving record. The two differ on compacted
+                    // topics: when the cleaner has removed a batch's trailing
+                    // records, `batch_end` reaches beyond the last record, and a
+                    // position parked between them re-fetches this same batch,
+                    // finds every record below the fetch offset, delivers
+                    // nothing, and never advances again. Mirrors the Java
+                    // client's `CompletedFetch.nextFetchOffset`, which jumps to
+                    // `batch.nextOffset()` once a batch is drained.
+                    advance_through_batch(
+                        &mut outcome.last_offset,
+                        &mut outcome.last_epoch,
+                        self.fetch_offset,
+                        batch_end,
+                        batch_epoch,
+                    );
+                }
+                Err(e) => {
+                    // Two very different situations arrive here.
+                    //
+                    // 1. The broker cut the response at
+                    //    `partition_max_bytes`, so the trailing
+                    //    batch is incomplete. Expected and benign:
+                    //    the prefix that did decode advances the
+                    //    position and the next fetch requests the
+                    //    rest.
+                    //
+                    // 2. The bytes are corrupt (CRC mismatch,
+                    //    unsupported magic, an out-of-range field).
+                    //    When the *first* batch is the bad one,
+                    //    nothing decodes and no offset update is
+                    //    produced, so breaking silently would
+                    //    stall the partition at that offset.
+                    //
+                    // A decode error that leaves the partition
+                    // unable to advance is therefore reported to
+                    // the caller. Whether it is truncation or
+                    // corruption, a partition that cannot get past
+                    // its current offset is a stall, and a stall
+                    // the application cannot see is worse than one
+                    // it can.
+                    let made_progress = self.progressed || outcome.last_offset.is_some();
+                    let truncated_tail =
+                        e.protocol_error_kind() == Some(ProtocolErrorKind::TruncatedFrame);
+
+                    if made_progress && truncated_tail {
+                        trace!(
+                            topic = %self.topic,
+                            partition = self.partition,
+                            "Trailing record batch truncated by the fetch size limit"
+                        );
+                        break;
+                    }
+
+                    outcome.corrupt = true;
+
+                    if made_progress {
+                        // Deliver the good prefix, but do not let
+                        // the corruption pass unremarked — the next
+                        // fetch will start at the bad batch and
+                        // surface it through the branch below.
+                        warn!(
+                            topic = %self.topic,
+                            partition = self.partition,
+                            fetch_offset = self.fetch_offset,
+                            error = %e,
+                            "Corrupt record batch after a decodable prefix; \
+                             delivering the prefix and stopping here"
+                        );
+                        break;
+                    }
+
+                    // Nothing decoded: this partition is stuck at
+                    // `self.fetch_offset`. Report it as a
+                    // partition-level fault so the caller can move on to the
+                    // next partition — failing the whole request
+                    // here would throw away records from every
+                    // healthy partition that shares this leader,
+                    // which is a far larger blast radius than the
+                    // fault deserves.
+                    warn!(
+                        topic = %self.topic,
+                        partition = self.partition,
+                        fetch_offset = self.fetch_offset,
+                        error = %e,
+                        "Record batch at the fetch position could not be decoded; \
+                         the partition cannot advance"
+                    );
+                    outcome.error = Some(e);
+                    break;
+                }
+            }
+        }
+
+        if let Some(last) = outcome.last_offset {
+            self.progressed = true;
+            self.fetch_offset = last.saturating_add(1);
+        }
+        if !out_of_budget {
+            self.finished = true;
+            // The response is not held for bytes nobody will read.
+            self.buf = Bytes::new();
+        }
+        outcome
+    }
+}
+
+/// Walk all of one partition's fetched record bytes in one call.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn decode_partition_batches(
     topic_name: &str,
     partition: PartitionId,
-    mut batch_buf: bytes::Bytes,
+    batch_buf: Bytes,
     partition_fetch_offset: Offset,
-    mut aborted_txns: Vec<crate::protocol::AbortedTransaction>,
-    mut record_budget: Option<&mut usize>,
+    aborted_txns: Vec<AbortedTransaction>,
+    record_budget: Option<&mut usize>,
     max_decompressed_size: usize,
     records: &mut Vec<ConsumerRecord>,
 ) -> PartitionDecodeOutcome {
-    let mut outcome = PartitionDecodeOutcome {
-        last_offset: None,
-        last_epoch: -1,
-        error: None,
-        corrupt: false,
-    };
-
-    // For READ_COMMITTED, the broker still includes data batches from aborted
-    // transactions in the FetchResponse but lists their (producer_id,
-    // first_offset) pairs in `aborted_transactions` so the client can filter
-    // them. Control batches (abort/commit markers) are filtered below either
-    // way; this state machine handles the data records themselves.
-    //
-    // Sort by first_offset so entries can be activated in-order as the walk
-    // reaches them.
-    aborted_txns.sort_unstable_by_key(|at| at.first_offset);
-    // One allocation per partition response; every record shares it.
-    let topic: std::sync::Arc<str> = std::sync::Arc::from(topic_name);
-    let mut aborted_txns_iter = aborted_txns.iter().peekable();
-    // Producer IDs currently inside an open aborted transaction.
-    let mut aborted_producers: HashSet<i64> = HashSet::new();
-
-    // Decode fetched batches, bounded by the poll's remaining record budget.
-    // The position advances only over records that are actually pushed and
-    // batches that are walked in full, so a batch cut short by the budget is
-    // re-fetched rather than skipped.
-    let mut budget_exhausted = false;
-    while batch_buf.len() >= 12 {
-        // Decoding a batch only to discard it is the waste the budget bounds.
-        if record_budget.as_deref().is_some_and(|b| *b == 0) {
-            break;
-        }
-        // Header first: a data batch of an aborted transaction is skipped
-        // without decompressing or decoding its records.
-        if let Ok(header) = RecordBatchHeader::peek(&batch_buf)
-            && header.attributes.is_transactional
-            && !header.attributes.is_control_batch
-            && batch_buf.len() >= header.total_size()
-        {
-            while aborted_txns_iter
-                .peek()
-                .is_some_and(|at| at.first_offset <= header.base_offset)
-            {
-                if let Some(at) = aborted_txns_iter.next() {
-                    aborted_producers.insert(at.producer_id);
-                }
-            }
-            if aborted_producers.contains(&header.producer_id) {
-                advance_through_batch(
-                    &mut outcome.last_offset,
-                    &mut outcome.last_epoch,
-                    partition_fetch_offset,
-                    header.last_offset(),
-                    header.partition_leader_epoch,
-                );
-                let _ = batch_buf.split_to(header.total_size());
-                continue;
-            }
-        }
-        match RecordBatch::decode_with_limit(&mut batch_buf, max_decompressed_size) {
-            Ok(batch) => {
-                let batch_epoch = batch.partition_leader_epoch;
-                // The offset range this batch spans, whether or not any
-                // record inside it survives to delivery. `last_offset_delta`
-                // is preserved by the log cleaner even when the records it
-                // once counted are gone, so this is the only trustworthy
-                // measure of how far the batch reaches.
-                let batch_end = batch
-                    .base_offset
-                    .saturating_add(batch.last_offset_delta as i64);
-
-                // Advance the aborted-transaction state machine. Activate any
-                // AbortedTransaction entries whose first_offset has been
-                // reached. The list is sorted by first_offset so we only peek
-                // at the front.
-                while aborted_txns_iter
-                    .peek()
-                    .is_some_and(|at| at.first_offset <= batch.base_offset)
-                {
-                    if let Some(at) = aborted_txns_iter.next() {
-                        aborted_producers.insert(at.producer_id);
-                    }
-                }
-
-                // Skip transaction control batches (commit/abort markers).
-                // These are internal Kafka bookkeeping records that must not
-                // be surfaced to consumers.  When the control batch belongs
-                // to a tracked aborted producer we also deactivate it so
-                // subsequent transactions from the same producer are not
-                // incorrectly filtered.  The offset must still be advanced
-                // past them so that subsequent fetches do not re-process them.
-                if batch.attributes.is_control_batch {
-                    // Only an ABORT marker ends an aborted
-                    // transaction. Clearing on any control
-                    // batch (including COMMIT markers) meant
-                    // the client trusted the marker *type* it
-                    // never looked at, so a coordinator that
-                    // wrote a commit marker for a producer the
-                    // broker had listed as aborted would stop
-                    // the filter early and surface aborted
-                    // records to a `read_committed` consumer.
-                    // Mirrors the Java client's
-                    // `CompletedFetch.containsAbortMarker`.
-                    if control_batch_is_abort(&batch) {
-                        aborted_producers.remove(&batch.producer_id);
-                    }
-                    advance_through_batch(
-                        &mut outcome.last_offset,
-                        &mut outcome.last_epoch,
-                        partition_fetch_offset,
-                        batch_end,
-                        batch_epoch,
-                    );
-                    continue;
-                }
-
-                // Skip data records from aborted transactions.
-                // Once the abort marker (control batch) is seen,
-                // the producer_id is removed from the set, so
-                // later committed transactions from the same
-                // producer are not affected.
-                if batch.attributes.is_transactional
-                    && aborted_producers.contains(&batch.producer_id)
-                {
-                    advance_through_batch(
-                        &mut outcome.last_offset,
-                        &mut outcome.last_epoch,
-                        partition_fetch_offset,
-                        batch_end,
-                        batch_epoch,
-                    );
-                    continue;
-                }
-
-                // The log cleaner keeps a batch's header (to preserve the
-                // producer's last sequence number for idempotence) even after
-                // compaction has removed every record it originally held.
-                // Such a batch carries nothing to deliver, but the offset
-                // range it spans is real and must still be skipped —
-                // otherwise the position never leaves it and every subsequent
-                // fetch re-reads the same empty batch forever. Worse, the
-                // budget check below would read an empty batch as "budget
-                // exhausted" and throw away every later batch in the response.
-                if batch.records.is_empty() {
-                    advance_through_batch(
-                        &mut outcome.last_offset,
-                        &mut outcome.last_epoch,
-                        partition_fetch_offset,
-                        batch_end,
-                        batch_epoch,
-                    );
-                    continue;
-                }
-
-                // Records skipped as already delivered do not consume the
-                // budget.
-                let allowed = record_budget.as_deref().copied().unwrap_or(usize::MAX);
-                let mut used = 0usize;
-
-                for record in batch.records.into_iter() {
-                    // Use offset_delta for correct offset in compacted topics
-                    // where records may have been deleted (log compaction awareness).
-                    let record_offset =
-                        batch.base_offset.saturating_add(record.offset_delta as i64);
-
-                    // Skip records below the fetch offset — these were
-                    // already delivered in a prior poll but are included
-                    // because Kafka returns whole batches.
-                    if record_offset < partition_fetch_offset {
-                        continue;
-                    }
-
-                    if used == allowed {
-                        budget_exhausted = true;
-                        break;
-                    }
-                    used += 1;
-
-                    records.push(ConsumerRecord {
-                        topic: std::sync::Arc::clone(&topic),
-                        partition,
-                        offset: record_offset,
-                        timestamp: batch.base_timestamp.saturating_add(record.timestamp_delta),
-                        timestamp_type: batch.attributes.timestamp_type,
-                        key: record.key,
-                        value: record.value,
-                        headers: crate::consumer::headers_from_wire(record.headers),
-                        leader_epoch: Some(batch_epoch),
-                        delivery_count: None,
-                    });
-                    outcome.last_offset = Some(record_offset);
-                    outcome.last_epoch = batch_epoch;
-                }
-
-                if let Some(budget) = record_budget.as_deref_mut() {
-                    *budget -= used;
-                }
-                if budget_exhausted {
-                    // The batch was cut short mid-delivery: the position must
-                    // stop at the last record pushed so the remainder is
-                    // re-fetched, not skipped. Deliberately no batch-level
-                    // advance here.
-                    break;
-                }
-
-                // The batch was walked to its end, so the position moves to
-                // the end of the *offset range* it spans — not merely past
-                // its last surviving record. The two differ on compacted
-                // topics: when the cleaner has removed a batch's trailing
-                // records, `batch_end` reaches beyond the last record, and a
-                // position parked between them re-fetches this same batch,
-                // finds every record below the fetch offset, delivers
-                // nothing, and never advances again. Mirrors the Java
-                // client's `CompletedFetch.nextFetchOffset`, which jumps to
-                // `batch.nextOffset()` once a batch is drained.
-                advance_through_batch(
-                    &mut outcome.last_offset,
-                    &mut outcome.last_epoch,
-                    partition_fetch_offset,
-                    batch_end,
-                    batch_epoch,
-                );
-            }
-            Err(e) => {
-                // Two very different situations arrive here.
-                //
-                // 1. The broker cut the response at
-                //    `partition_max_bytes`, so the trailing
-                //    batch is incomplete. Expected and benign:
-                //    the prefix that did decode advances the
-                //    position and the next fetch re-requests
-                //    the rest.
-                //
-                // 2. The bytes are corrupt (CRC mismatch,
-                //    unsupported magic, an out-of-range field).
-                //    When the *first* batch is the bad one,
-                //    nothing decodes and no offset update is
-                //    produced, so breaking silently would
-                //    stall the partition at that offset.
-                //
-                // A decode error that leaves the partition
-                // unable to advance is therefore reported to
-                // the caller. Whether it is truncation or
-                // corruption, a partition that cannot get past
-                // its current offset is a stall, and a stall
-                // the application cannot see is worse than one
-                // it can.
-                let made_progress = outcome.last_offset.is_some();
-                let truncated_tail =
-                    e.protocol_error_kind() == Some(ProtocolErrorKind::TruncatedFrame);
-
-                if made_progress && truncated_tail {
-                    trace!(
-                        topic = %topic_name,
-                        partition,
-                        "Trailing record batch truncated by the fetch size limit"
-                    );
-                    break;
-                }
-
-                outcome.corrupt = true;
-
-                if made_progress {
-                    // Deliver the good prefix, but do not let
-                    // the corruption pass unremarked — the next
-                    // fetch will start at the bad batch and
-                    // surface it through the branch below.
-                    warn!(
-                        topic = %topic_name,
-                        partition,
-                        fetch_offset = partition_fetch_offset,
-                        error = %e,
-                        "Corrupt record batch after a decodable prefix; \
-                         delivering the prefix and stopping here"
-                    );
-                    break;
-                }
-
-                // Nothing decoded: this partition is stuck at
-                // `partition_fetch_offset`. Report it as a
-                // partition-level fault so the caller can move on to the
-                // next partition — failing the whole request
-                // here would throw away records from every
-                // healthy partition that shares this leader,
-                // which is a far larger blast radius than the
-                // fault deserves.
-                warn!(
-                    topic = %topic_name,
-                    partition,
-                    fetch_offset = partition_fetch_offset,
-                    error = %e,
-                    "Record batch at the fetch position could not be decoded; \
-                     the partition cannot advance"
-                );
-                outcome.error = Some(e);
-                break;
-            }
-        }
-    }
-
-    outcome
+    PartitionDecoder::new(
+        topic_name,
+        partition,
+        batch_buf,
+        partition_fetch_offset,
+        aborted_txns,
+        max_decompressed_size,
+    )
+    .decode(record_budget, records)
 }
 
 #[cfg(test)]
@@ -748,6 +844,134 @@ mod tests {
             "only the committed transaction is delivered"
         );
         assert_eq!(outcome.last_offset, Some(105));
+    }
+
+    // ── resuming: what one call's budget leaves is decoded by the next ──
+
+    fn decoder(
+        payload: bytes::BytesMut,
+        fetch_offset: Offset,
+        aborted_txns: Vec<AbortedTransaction>,
+    ) -> PartitionDecoder {
+        PartitionDecoder::new(
+            "walk-topic",
+            0,
+            payload.freeze(),
+            fetch_offset,
+            aborted_txns,
+            RecordBatch::MAX_DECOMPRESSED_SIZE,
+        )
+    }
+
+    fn encoded(batches: &[RecordBatch]) -> bytes::BytesMut {
+        let mut buf = bytes::BytesMut::new();
+        for batch in batches {
+            buf.extend_from_slice(&batch.encode().expect("encode batch"));
+        }
+        buf
+    }
+
+    /// The offsets one call decodes under `budget`, and its outcome.
+    fn step(
+        decoder: &mut PartitionDecoder,
+        mut budget: usize,
+    ) -> (Vec<Offset>, PartitionDecodeOutcome) {
+        let mut records = Vec::new();
+        let outcome = decoder.decode(Some(&mut budget), &mut records);
+        (records.iter().map(|r| r.offset).collect(), outcome)
+    }
+
+    #[test]
+    fn a_batch_cut_by_the_budget_is_continued_by_the_next_call() {
+        let batches = [
+            walk_batch(100, 4, &[0, 1, 2, 3, 4]),
+            walk_batch(105, 1, &[0, 1]),
+        ];
+        let mut decoder = decoder(encoded(&batches), 100, Vec::new());
+
+        let (offsets, outcome) = step(&mut decoder, 2);
+        assert_eq!(offsets, [100, 101]);
+        assert_eq!(
+            outcome.last_offset,
+            Some(101),
+            "no batch-level advance on a cut"
+        );
+        assert!(!decoder.is_finished());
+
+        assert_eq!(step(&mut decoder, 2).0, [102, 103]);
+        // Across the batch boundary, and cut again inside the second batch.
+        assert_eq!(step(&mut decoder, 2).0, [104, 105]);
+        assert!(!decoder.is_finished());
+
+        let (offsets, outcome) = step(&mut decoder, 2);
+        assert_eq!(offsets, [106]);
+        assert_eq!(outcome.last_offset, Some(106));
+        assert_eq!(outcome.last_epoch, WALK_EPOCH);
+        assert!(decoder.is_finished());
+        assert!(step(&mut decoder, 2).0.is_empty());
+    }
+
+    /// Decoding the rest again from the original aborted-transaction list
+    /// would mark producer 9 aborted a second time and drop offset 105.
+    #[test]
+    fn an_abort_marker_walked_by_an_earlier_call_stays_walked() {
+        let mut aborted_data = walk_batch(100, 2, &[0, 1, 2]);
+        aborted_data.attributes.is_transactional = true;
+        aborted_data.producer_id = 9;
+
+        let mut marker_key = bytes::BytesMut::new();
+        bytes::BufMut::put_i16(&mut marker_key, 0); // control-record version
+        bytes::BufMut::put_i16(&mut marker_key, 0); // type 0 = ABORT
+        let mut abort_marker = walk_batch(103, 0, &[]);
+        abort_marker.attributes.is_control_batch = true;
+        abort_marker.producer_id = 9;
+        abort_marker.add_record(crate::protocol::Record {
+            attributes: 0,
+            timestamp_delta: 0,
+            offset_delta: 0,
+            key: Some(marker_key.freeze()),
+            value: Some(bytes::Bytes::new()),
+            headers: Vec::new(),
+        });
+
+        let mut committed_data = walk_batch(104, 1, &[0, 1]);
+        committed_data.attributes.is_transactional = true;
+        committed_data.producer_id = 9;
+
+        let mut decoder = decoder(
+            encoded(&[aborted_data, abort_marker, committed_data]),
+            100,
+            vec![AbortedTransaction {
+                producer_id: 9,
+                first_offset: 100,
+            }],
+        );
+
+        assert_eq!(step(&mut decoder, 1).0, [104]);
+        assert!(!decoder.is_finished());
+        assert_eq!(step(&mut decoder, 1).0, [105]);
+        assert!(decoder.is_finished());
+    }
+
+    #[test]
+    fn a_truncated_tail_reached_by_a_later_call_is_benign() {
+        let mut payload = encoded(&[walk_batch(1000, 1, &[0, 1])]);
+        let tail = walk_batch(1002, 1, &[0, 1]).encode().expect("encode");
+        payload.extend_from_slice(&tail[..tail.len() - 5]);
+        let mut decoder = decoder(payload, 1000, Vec::new());
+
+        assert_eq!(step(&mut decoder, 2).0, [1000, 1001]);
+        assert!(
+            !decoder.is_finished(),
+            "the tail has not been looked at yet"
+        );
+
+        let (offsets, outcome) = step(&mut decoder, 2);
+        assert!(offsets.is_empty());
+        assert!(outcome.error.is_none(), "an earlier call made progress");
+        assert!(!outcome.corrupt);
+        assert_eq!(outcome.last_offset, None);
+        assert!(decoder.is_finished());
     }
 
     #[test]

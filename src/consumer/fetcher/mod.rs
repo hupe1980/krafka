@@ -30,7 +30,7 @@ use crate::protocol::{
 use crate::{BrokerId, Offset};
 
 use crate::consumer::offsets::needs_metadata_refresh;
-use decode::decode_partition_batches;
+pub(super) use decode::{PartitionDecodeOutcome, PartitionDecoder};
 use plan::build_fetch_routing_plan;
 
 /// A partition whose batch at the fetch position could not be decoded, so it
@@ -114,7 +114,8 @@ impl Consumer {
     /// preferred replica of) a fetchable partition, concurrently.
     ///
     /// `budget` bounds how many records the round decodes; `None` is
-    /// unlimited. `wakeup()` interrupts the round with
+    /// unlimited. What it does not cover is kept undecoded with the
+    /// partition. `wakeup()` interrupts the round with
     /// [`KrafkaError::Wakeup`]; nothing has been installed at that point.
     pub(super) async fn fetch_round(
         &self,
@@ -187,6 +188,54 @@ impl Consumer {
         Ok(round)
     }
 
+    /// Decode more of the bytes earlier fetches left undecoded, for the
+    /// partitions that have run out of decoded records. No request is sent.
+    ///
+    /// `budget` bounds how many records are decoded; `None` is unlimited.
+    /// Returns the partitions whose bytes cannot be decoded at their
+    /// position.
+    pub(super) fn decode_held(&self, mut budget: Option<usize>) -> Vec<FetchFault> {
+        let held = self.state.lock().take_undecoded();
+        if held.is_empty() {
+            return Vec::new();
+        }
+
+        // Decode outside the lock.
+        let decoded: Vec<_> = held
+            .into_iter()
+            .map(|mut held| {
+                let mut records = Vec::new();
+                let outcome = held.decoder.decode(budget.as_mut(), &mut records);
+                if outcome.corrupt {
+                    self.metrics.record_batch_decode_error();
+                }
+                (held, records, outcome)
+            })
+            .collect();
+
+        let mut faults = Vec::new();
+        {
+            let mut state = self.state.lock();
+            for (held, records, mut outcome) in decoded {
+                match outcome.error.take() {
+                    Some(error) => {
+                        if let Some(offset) = state.partition(&held.key).and_then(|r| r.position) {
+                            faults.push(FetchFault {
+                                key: held.key.clone(),
+                                offset,
+                                error,
+                            });
+                        }
+                        state.drop_buffer(&held.key);
+                    }
+                    None => state.install_decoded(held, records, &outcome),
+                }
+            }
+        }
+        self.update_gauges();
+        faults
+    }
+
     /// Decode and install a round's responses, and act on partition errors.
     async fn apply_fetched(
         &self,
@@ -200,38 +249,43 @@ impl Consumer {
         let mut decoded: Vec<Decoded> = Vec::with_capacity(fetched.len());
         for p in &fetched {
             let records = match (&p.records, p.error_code.is_ok(), &p.diverging_epoch) {
-                (Some(records), true, None) if budget != Some(0) => records.clone(),
+                (Some(records), true, None) => records.clone(),
                 _ => {
                     decoded.push(Decoded::Nothing);
                     continue;
                 }
             };
-            let mut out = Vec::new();
-            let outcome = decode_partition_batches(
+            // What the budget does not cover stays in the decoder, to be
+            // decoded by a later poll rather than fetched again.
+            let mut decoder = PartitionDecoder::new(
                 &p.target.key.0,
                 p.target.key.1,
                 records,
                 p.target.offset,
                 p.aborted_transactions.clone(),
-                budget.as_mut(),
                 self.config.max_decompressed_size,
-                &mut out,
             );
+            let mut out = Vec::new();
+            let outcome = decoder.decode(budget.as_mut(), &mut out);
             if outcome.corrupt {
                 self.metrics.record_batch_decode_error();
             }
-            decoded.push(match (outcome.error, outcome.last_offset) {
-                (Some(error), _) => Decoded::Fault(FetchFault {
+            let undecoded = (!decoder.is_finished()).then_some(decoder);
+            decoded.push(match outcome.error {
+                Some(error) => Decoded::Fault(FetchFault {
                     key: p.target.key.clone(),
                     offset: p.target.offset,
                     error,
                 }),
-                (None, Some(last)) => Decoded::Fetch(CompletedFetch {
+                None if outcome.last_offset.is_none() && undecoded.is_none() => Decoded::Nothing,
+                None => Decoded::Fetch(CompletedFetch {
                     records: VecDeque::from(out),
-                    next_offset: last.saturating_add(1),
+                    next_offset: outcome
+                        .last_offset
+                        .map_or(p.target.offset, |last| last.saturating_add(1)),
                     next_epoch: (outcome.last_epoch >= 0).then_some(outcome.last_epoch),
+                    undecoded,
                 }),
-                (None, None) => Decoded::Nothing,
             });
         }
 

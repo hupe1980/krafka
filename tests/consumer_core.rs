@@ -260,6 +260,49 @@ async fn seek_to_beginning_lands_at_the_log_start_offset() {
     let _ = consumer.close().await;
 }
 
+/// The default `max_poll_records` hands a 5000-record response out over ten
+/// polls; the partition must not be fetched again while that lasts.
+#[tokio::test]
+async fn a_response_larger_than_one_poll_is_fetched_once() {
+    const RECORDS: usize = 5000;
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("events", 1);
+    let kafka = krafka::Kafka::builder(broker.bootstrap_servers())
+        .request_timeout(T)
+        .connect_timeout(T)
+        .connect()
+        .await
+        .unwrap();
+    let producer = kafka.producer().build().await.unwrap();
+    let mut handles = Vec::with_capacity(RECORDS);
+    for _ in 0..RECORDS {
+        handles.push(
+            producer
+                .enqueue(krafka::Record::new("events", "v"))
+                .await
+                .unwrap(),
+        );
+    }
+    for handle in handles {
+        let _ = handle.await.unwrap();
+    }
+    let _ = producer.close().await;
+
+    let consumer = kafka.consumer_without_group().build().await.unwrap();
+    consumer.assign("events", vec![0]).await.unwrap();
+    consumer.seek("events", 0, 0).await.unwrap();
+    let mut seen = Vec::with_capacity(RECORDS);
+    while seen.len() < RECORDS {
+        let records = consumer.poll(T).await.unwrap();
+        assert!(!records.is_empty(), "stalled after {} records", seen.len());
+        seen.extend(records.into_iter().map(|r| r.offset));
+    }
+
+    assert_eq!(seen, (0..RECORDS as i64).collect::<Vec<_>>());
+    assert_eq!(broker.request_count(ApiKey::Fetch), 1);
+    let _ = consumer.close().await;
+}
+
 #[tokio::test]
 async fn seek_on_an_unowned_partition_is_rejected_and_not_stored() {
     let broker = FakeBroker::start().await.unwrap();

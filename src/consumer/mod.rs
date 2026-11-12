@@ -758,8 +758,8 @@ impl Consumer {
                 break;
             }
             // Decode one delivery's worth plus what the buffer has room for,
-            // so the next poll is often served without a round trip and a
-            // large response is not decoded only to be thrown away.
+            // so the next poll is often served without a round trip. The
+            // rest of a large response stays undecoded until it is wanted.
             let budget = (max != usize::MAX).then(|| {
                 let headroom = if cap > 0 {
                     (cap as usize).saturating_sub(buffered)
@@ -768,6 +768,14 @@ impl Consumer {
                 };
                 max.saturating_add(headroom)
             });
+            // Bytes an earlier fetch left undecoded come before a new fetch.
+            if let Some(fault) = self.decode_held(budget).into_iter().next() {
+                self.metrics.record_error();
+                return Err(fault.into_error(1));
+            }
+            if self.state.lock().has_deliverable() {
+                continue;
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             let round = match self
                 .fetch_round(self.config.fetch_max_wait.min(remaining), budget)

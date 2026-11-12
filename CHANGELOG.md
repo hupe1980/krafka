@@ -13,6 +13,14 @@ not a complete record.
 
 ## [Unreleased]
 
+### Changed
+
+- The consumer keeps the part of a fetch response that one poll's record
+  budget does not cover and decodes it in later polls. It used to drop it and
+  fetch it again, so with the default `max_poll_records` most of every large
+  response was downloaded several times (#80). Up to one response per broker
+  now stays in memory until it is read through.
+
 ## [0.31.0] — 2026-11-12
 
 ### Added
