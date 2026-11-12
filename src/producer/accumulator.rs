@@ -13,7 +13,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::time::Instant;
 
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::sync::{Semaphore, SemaphorePermit, TryAcquireError, mpsc, oneshot};
 use tracing::warn;
 
 use super::batch::{BufferedRecord, RecordData, Reservation, Waiter};
@@ -243,26 +243,24 @@ impl Accumulator {
 
         // The only await that holds anything. Dropped here, the permit future
         // cancels cleanly and nothing is reserved.
-        let remaining = self.max_block.saturating_sub(send_started_at.elapsed());
         let permits = u32::try_from(record_size).unwrap_or(u32::MAX);
-        let permit = match obligation
-            .suspend(tokio::time::timeout(
-                remaining,
-                self.memory.acquire_many(permits),
-            ))
-            .await
-        {
-            Ok(Ok(permit)) => permit,
-            Ok(Err(_)) => {
-                return Err(EnqueueRejected::new(
-                    KrafkaError::closed("the producer's send engine stopped"),
-                    obligation.take_context(),
-                    record,
-                ));
+        // Memory is usually free, and taking it then needs no timer.
+        let reserved = match self.memory.try_acquire_many(permits) {
+            Ok(permit) => Ok(permit),
+            Err(TryAcquireError::Closed) => {
+                Err(KrafkaError::closed("the producer's send engine stopped"))
             }
-            Err(_) => {
+            Err(TryAcquireError::NoPermits) => {
+                obligation
+                    .suspend(self.wait_for_memory(permits, send_started_at))
+                    .await
+            }
+        };
+        let permit = match reserved {
+            Ok(permit) => permit,
+            Err(error) => {
                 return Err(EnqueueRejected::new(
-                    KrafkaError::timeout("max_block elapsed while waiting for buffer memory"),
+                    error,
                     obligation.take_context(),
                     record,
                 ));
@@ -341,6 +339,20 @@ impl Accumulator {
             response: receiver,
             partition,
         })
+    }
+
+    /// Wait for `permits` of buffer memory for what is left of `max_block`
+    /// since `send_started_at`.
+    async fn wait_for_memory(
+        &self,
+        permits: u32,
+        send_started_at: Instant,
+    ) -> Result<SemaphorePermit<'_>> {
+        let remaining = self.max_block.saturating_sub(send_started_at.elapsed());
+        tokio::time::timeout(remaining, self.memory.acquire_many(permits))
+            .await
+            .map_err(|_| KrafkaError::timeout("max_block elapsed while waiting for buffer memory"))?
+            .map_err(|_| KrafkaError::closed("the producer's send engine stopped"))
     }
 
     /// Seal everything buffered so nothing of `generation` waits for linger.
