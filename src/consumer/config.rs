@@ -244,7 +244,8 @@ pub(crate) struct ConsumerConfig {
     /// Maximum fetched records held before they are handed out.
     ///
     /// A poll decodes up to `max_poll_records` plus the room left under this
-    /// cap, so the next poll is often served without a round trip. When the
+    /// cap, so the next poll is often served without a round trip. The rest
+    /// of a fetch response is kept undecoded and does not count here. When the
     /// buffer is full — in practice, records of paused partitions —
     /// [`poll()`](super::Consumer::poll) skips fetching.
     ///

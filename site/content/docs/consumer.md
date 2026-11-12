@@ -218,8 +218,9 @@ tuning.
 Records fetched but not yet returned are buffered per partition, up to
 `max_buffered_records`. Each fetch decodes `max_poll_records` plus the free
 buffer space and parks the surplus, so the next `poll()` can return without a
-network round trip. A partition with parked records is not fetched again until
-they are returned. When the buffer is full — in practice, with paused
+network round trip. What a response holds beyond that stays undecoded and is
+decoded by later polls. A partition is not fetched again until everything its
+last response held has been returned. When the buffer is full — in practice, with paused
 partitions holding records — `poll()` skips fetching but still runs
 auto-commit and rebalances.
 
