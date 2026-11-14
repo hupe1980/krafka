@@ -13,6 +13,8 @@ not a complete record.
 
 ## [Unreleased]
 
+## [0.32.0] — 2026-11-14
+
 ### Breaking
 
 - The per-record producer `send` span is at `DEBUG` (was `INFO`), so a log
@@ -1818,7 +1820,8 @@ Initial development: wire protocol, producer, consumer, admin client,
 authentication (SASL PLAIN / SCRAM / OAUTHBEARER / AWS MSK IAM), TLS,
 compression codecs, schema registry integration and the metrics layer.
 
-[Unreleased]: https://github.com/hupe1980/krafka/compare/v0.31.1...HEAD
+[Unreleased]: https://github.com/hupe1980/krafka/compare/v0.32.0...HEAD
+[0.32.0]: https://github.com/hupe1980/krafka/compare/v0.31.1...v0.32.0
 [0.31.1]: https://github.com/hupe1980/krafka/compare/v0.31.0...v0.31.1
 [0.31.0]: https://github.com/hupe1980/krafka/compare/v0.30.0...v0.31.0
 [0.30.0]: https://github.com/hupe1980/krafka/compare/v0.29.0...v0.30.0
