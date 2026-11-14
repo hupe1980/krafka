@@ -48,7 +48,7 @@ use crate::telemetry::{ClientType, Telemetry};
 use accumulator::Accumulator;
 use gate::TxnGate;
 use partitioner::Partitioning;
-use record::TopicHandle;
+use record::{TopicHandle, TopicInterner};
 
 use crate::barrier::InFlightBarrier;
 
@@ -113,6 +113,9 @@ pub(crate) struct SendObligation<'a> {
     /// wraps. It distinguishes a cancelled send from a code path in this crate
     /// that returned without reporting.
     suspended: bool,
+    /// When the send first had to wait — the start of its `max_block`. A send
+    /// that never waits never reads the clock for it.
+    blocked_since: Option<Instant>,
     /// The record's `send` span; handed to the engine with the context.
     pub(crate) span: tracing::Span,
 }
@@ -124,6 +127,7 @@ impl<'a> SendObligation<'a> {
     /// with the discharged obligation's callback already fired.
     fn on_send(
         interceptor: &'a dyn crate::interceptor::ProducerInterceptor,
+        topics: &TopicInterner,
         record: &mut Record,
         client_id: &str,
     ) -> std::result::Result<Self, KrafkaError> {
@@ -133,9 +137,10 @@ impl<'a> SendObligation<'a> {
             interceptor,
             // Read after `on_send`, so an interceptor that rewrites the topic
             // is reported against the topic it chose.
-            topic: TopicHandle::from(record.topic.as_str()),
+            topic: topics.get(&record.topic),
             context: Some(context),
             suspended: false,
+            blocked_since: None,
             span: crate::tracing_ext::send_span(
                 &record.topic,
                 client_id,
@@ -159,11 +164,29 @@ impl<'a> SendObligation<'a> {
     /// If the caller drops the `send()` future while it is parked here, `Drop`
     /// reports a cancellation instead of asserting — and still fires
     /// `on_acknowledgement`, because the record will never be delivered.
+    ///
+    /// The first `.await` that does not complete at once starts the send's
+    /// `max_block` budget (see [`remaining`](Self::remaining)).
     pub(crate) async fn suspend<T>(&mut self, fut: impl std::future::Future<Output = T>) -> T {
         self.suspended = true;
-        let output = fut.await;
+        let mut fut = std::pin::pin!(fut);
+        let blocked_since = &mut self.blocked_since;
+        let output = std::future::poll_fn(|cx| {
+            let poll = fut.as_mut().poll(cx);
+            if poll.is_pending() && blocked_since.is_none() {
+                *blocked_since = Some(Instant::now());
+            }
+            poll
+        })
+        .await;
         self.suspended = false;
         output
+    }
+
+    /// What is left of `max_block`: all of it until the send first waited.
+    pub(crate) fn remaining(&self, max_block: Duration) -> Duration {
+        self.blocked_since
+            .map_or(max_block, |since| max_block.saturating_sub(since.elapsed()))
     }
 
     /// Discharge by reporting a terminal failure, returning `error` so call
@@ -258,11 +281,11 @@ where
     R: FnOnce(TopicHandle, PartitionId) -> F,
     F: std::future::Future<Output = Result<()>>,
 {
-    // `max_block` covers everything from here: metadata, registration and the
-    // wait for buffer memory.
-    let send_started_at = Instant::now();
+    // `max_block` covers every wait from here: metadata, registration and
+    // buffer memory. Its clock starts at the first wait (`suspend`).
     let mut record = record;
-    let mut obligation = SendObligation::on_send(interceptor, &mut record, client_id)?;
+    let mut obligation =
+        SendObligation::on_send(interceptor, accumulator.topics(), &mut record, client_id)?;
 
     if let Err(error) = record.validate() {
         return Err(obligation.fail(UNKNOWN_PARTITION, &record.headers, error));
@@ -281,7 +304,7 @@ where
             record.key_bytes(),
             routed.partition,
             record_size,
-            max_block.saturating_sub(send_started_at.elapsed()),
+            obligation.remaining(max_block),
         ))
         .await
     {
@@ -306,7 +329,6 @@ where
             record,
             record_size,
             partition,
-            send_started_at,
             &mut obligation,
             admit,
         )
@@ -791,12 +813,19 @@ impl Drop for Producer {
     /// A producer dropped without [`close()`](Producer::close) still sends what
     /// is buffered: the engine keeps running until every queued batch has an
     /// outcome. Nothing waits for it, and it races the runtime's shutdown.
+    /// That is logged at `warn` when a record is still without an outcome, and
+    /// at `debug` otherwise.
     fn drop(&mut self) {
         if !self.barrier.is_closing() && !std::thread::panicking() {
-            warn!(
-                "Producer dropped without close(); buffered records are still being sent in \
-                 the background with nobody waiting for them. Call `close()` before drop."
-            );
+            if self.barrier.is_idle() {
+                debug!("Producer dropped without close(); nothing was buffered");
+            } else {
+                warn!(
+                    "Producer dropped without close(); buffered records are still being sent \
+                     in the background with nobody waiting for them. Call `close()` before \
+                     drop."
+                );
+            }
             crate::interceptor::safe_producer_close(&*self.interceptor);
         }
     }

@@ -1,0 +1,15 @@
+diff -ruN a/src/producer/batch.rs b/src/producer/batch.rs
+--- a/src/producer/batch.rs
++++ b/src/producer/batch.rs
+@@ -163,9 +163,8 @@
+             half.list = list;
+         }
+         // The shares moved to the halves; `self` gives back nothing.
+-        self.bytes = 0;
+-        self.first = None;
+-        self.more.clear();
++        // Planted: the parent keeps its totals and gives them back too.
++        self.release = halves.0.release.clone();
+         halves
+     }
+ 

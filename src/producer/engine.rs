@@ -481,6 +481,8 @@ impl Engine {
             waiter,
         } = append;
         if let IdentityState::Fatal(error) = &self.identity {
+            // Never joined a batch: its hold is still armed and settles
+            // when `answer` is done with it.
             waiter.answer(
                 &*self.config.interceptor,
                 &topic,
@@ -490,9 +492,8 @@ impl Engine {
             );
             return;
         }
-        let now = Instant::now();
         let batch_size = self.config.batch_size;
-        let deadline = now + self.config.delivery_timeout;
+        let delivery_timeout = self.config.delivery_timeout;
         let seal_now = self.sealed_through.is_some_and(|g| generation <= g);
         let key: PartitionKey = (topic, partition);
         let queue = self.partitions.entry(key.clone()).or_default();
@@ -503,7 +504,11 @@ impl Engine {
         {
             queue.seal_open();
         }
-        let open = queue.open.get_or_insert_with(|| Batch::new(now, deadline));
+        // The clock is read only for a record that opens a batch.
+        let open = queue.open.get_or_insert_with(|| {
+            let now = Instant::now();
+            Batch::new(now, now + delivery_timeout)
+        });
         open.push(data, size, generation, waiter);
         if open.bytes >= batch_size || seal_now {
             queue.seal_open();
@@ -1076,12 +1081,14 @@ impl Engine {
         self.metrics
             .record_batch_for_topic(&key.0, count as u64, batch.bytes as u64);
         self.metrics.send_latency.record(batch.created.elapsed());
-        let Some(waiters) = batch.waiters.take() else {
+        let Some(mut waiters) = batch.waiters.take() else {
             return;
         };
-        for (index, (waiter, data)) in waiters.into_iter().zip(batch.records.iter()).enumerate() {
+        let topic: Arc<str> = Arc::clone(&key.0);
+        // `waiters` settles when it drops, after the last caller below.
+        for (index, (waiter, data)) in waiters.drain().zip(batch.records.iter()).enumerate() {
             let metadata = RecordMetadata {
-                topic: key.0.to_string(),
+                topic: Arc::clone(&topic),
                 partition: key.1,
                 offset: if base_offset >= 0 {
                     base_offset + index as i64
@@ -1199,13 +1206,14 @@ fn answer_all(
     batch: &mut Batch,
     result: &Result<()>,
 ) {
-    let Some(waiters) = batch.waiters.take() else {
+    let Some(mut waiters) = batch.waiters.take() else {
         return;
     };
     let Err(error) = result else {
         return;
     };
-    for (waiter, data) in waiters.into_iter().zip(batch.records.iter()) {
+    // `waiters` settles when it drops, after the last caller below.
+    for (waiter, data) in waiters.drain().zip(batch.records.iter()) {
         waiter.answer(
             interceptor,
             &key.0,

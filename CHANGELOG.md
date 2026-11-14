@@ -13,6 +13,25 @@ not a complete record.
 
 ## [Unreleased]
 
+### Breaking
+
+- The per-record producer `send` span is at `DEBUG` (was `INFO`), so a log
+  layer at the usual `info` level no longer constructs one per record. A
+  tracing pipeline that exports it enables `krafka::producer=debug` on its
+  layer.
+- `RecordMetadata::topic` is `Arc<str>` (was `String`), shared by the records
+  of a batch, like `ConsumerRecord::topic`. Compare with `&*md.topic == "t"`.
+
+### Changed
+
+- Producing a record does less per-record work: buffer memory, flush/close
+  accounting and the `buffered_records` gauge are released once per batch,
+  topic handles are shared, and a send that does not wait reads no clock.
+  Two allocations fewer per record.
+- `max_block` counts from a send's first wait rather than from the call.
+- Dropping a producer without `close()` warns only when records are still
+  without an outcome; otherwise it logs at `debug`.
+
 ## [0.31.1] — 2026-11-12
 
 ### Changed

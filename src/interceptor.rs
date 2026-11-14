@@ -1030,7 +1030,7 @@ mod tests {
     fn test_producer_interceptor_on_acknowledgement() {
         let interceptor = TestProducerInterceptor::new();
         let metadata = RecordMetadata {
-            topic: "test-topic".to_string(),
+            topic: "test-topic".into(),
             partition: 0,
             offset: 42,
             timestamp: 1000,
@@ -1149,7 +1149,7 @@ mod tests {
     fn test_safe_on_acknowledgement_catches_panic() {
         let interceptor = PanickingProducerInterceptor;
         let metadata = RecordMetadata {
-            topic: "test".to_string(),
+            topic: "test".into(),
             partition: 0,
             offset: 0,
             timestamp: 0,
@@ -1266,7 +1266,7 @@ mod tests {
             .unwrap();
 
         let metadata = RecordMetadata {
-            topic: "test".to_string(),
+            topic: "test".into(),
             partition: 0,
             offset: 0,
             timestamp: 0,
@@ -1354,7 +1354,7 @@ mod tests {
         assert!(panicked.to_string().contains("interceptor 1"), "{panicked}");
 
         let metadata = RecordMetadata {
-            topic: "test".to_string(),
+            topic: "test".into(),
             partition: 0,
             offset: 0,
             timestamp: 0,

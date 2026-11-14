@@ -140,6 +140,8 @@ proptest = "1"
 # tests/crypto_backend.rs asserts no process-level rustls CryptoProvider is
 # installed. Same crate version as the main dependency.
 rustls = { version = "0.23.46", default-features = false }
+# `getrusage` for the send_cpu bench's process CPU time. Bindings only, no C build.
+libc = "0.2.183"
 
 # The micro-benchmarks reach the wire-protocol layer through `__private`.
 [[bench]]
@@ -168,6 +170,13 @@ required-features = ["test-broker"]
 # krafka-vs-krafka gate as `send_path`.
 [[bench]]
 name = "consume_path"
+harness = false
+required-features = ["test-broker"]
+
+# CPU time per record on the send path, with and without a log subscriber:
+# a krafka-vs-krafka measurement against the fake broker, not a gate.
+[[bench]]
+name = "send_cpu"
 harness = false
 required-features = ["test-broker"]
 

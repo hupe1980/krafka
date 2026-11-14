@@ -11,15 +11,14 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::time::Instant;
 
 use tokio::sync::{Semaphore, SemaphorePermit, TryAcquireError, mpsc, oneshot};
 use tracing::warn;
 
-use super::batch::{BufferedRecord, RecordData, Reservation, Waiter};
+use super::batch::{RecordData, RecordHold, Release, Waiter};
 use super::engine::{self, Append, Command, EngineConfig, Shared};
 use super::gate::TxnTicket;
-use super::record::{RecordMetadata, RoutedRecord, TopicHandle};
+use super::record::{RecordMetadata, RoutedRecord, TopicHandle, TopicInterner};
 use crate::PartitionId;
 use crate::barrier::InFlightBarrier;
 use crate::error::{KrafkaError, Result};
@@ -160,7 +159,11 @@ pub(crate) struct Accumulator {
     max_request_size: usize,
     max_block: Duration,
     barrier: Arc<InFlightBarrier>,
-    metrics: Arc<ProducerRecorder>,
+    /// What every record's hold gives back: the memory, the barrier count and
+    /// the buffered gauge.
+    release: Arc<Release>,
+    /// The handles of the topics this producer sends to.
+    topics: Arc<TopicInterner>,
     shared: Arc<Shared>,
 }
 
@@ -189,6 +192,11 @@ impl Accumulator {
                 watched.close();
             }
         });
+        let release = Arc::new(Release::new(
+            Arc::clone(&memory),
+            Arc::clone(&barrier),
+            Arc::clone(&metrics),
+        ));
         Self {
             commands,
             memory,
@@ -196,9 +204,15 @@ impl Accumulator {
             max_request_size,
             max_block,
             barrier,
-            metrics,
+            release,
+            topics: Arc::default(),
             shared,
         }
+    }
+
+    /// The interned topic handles.
+    pub(crate) fn topics(&self) -> &TopicInterner {
+        &self.topics
     }
 
     /// The error every send fails with once the producer cannot continue.
@@ -220,7 +234,6 @@ impl Accumulator {
         record: RoutedRecord,
         record_size: usize,
         partition: PartitionId,
-        send_started_at: Instant,
         obligation: &mut super::SendObligation<'_>,
         admit: impl FnOnce() -> Result<Option<TxnTicket>>,
     ) -> std::result::Result<DeliveryHandle, Box<EnqueueRejected>> {
@@ -251,8 +264,9 @@ impl Accumulator {
                 Err(KrafkaError::closed("the producer's send engine stopped"))
             }
             Err(TryAcquireError::NoPermits) => {
+                let remaining = obligation.remaining(self.max_block);
                 obligation
-                    .suspend(self.wait_for_memory(permits, send_started_at))
+                    .suspend(self.wait_for_memory(permits, remaining))
                     .await
             }
         };
@@ -266,16 +280,12 @@ impl Accumulator {
                 ));
             }
         };
-        permit.forget();
-        let reservation = Reservation {
-            bytes: record_size,
-            memory: Arc::clone(&self.memory),
-        };
 
         // From here on nothing awaits: the record is either queued or refused.
-        let operation = match self.barrier.start("producer") {
-            Ok(operation) => operation,
+        let generation = match self.barrier.register("producer") {
+            Ok(generation) => generation,
             Err(error) => {
+                // The permit drops here and gives the memory back.
                 return Err(EnqueueRejected::new(
                     error,
                     obligation.take_context(),
@@ -283,6 +293,10 @@ impl Accumulator {
                 ));
             }
         };
+        // The memory and the barrier count now belong to the hold: dropped
+        // armed, on any refusal below, it gives both back.
+        permit.forget();
+        let hold = RecordHold::new(record_size, generation, Arc::clone(&self.release));
         let txn = match admit() {
             Ok(txn) => txn,
             Err(error) => {
@@ -293,16 +307,13 @@ impl Accumulator {
                 ));
             }
         };
-        let generation = operation.generation();
         let (response, receiver) = oneshot::channel();
         let waiter = Waiter {
             response,
             span: std::mem::replace(&mut obligation.span, tracing::Span::none()),
             context: obligation.take_context(),
             txn,
-            _operation: operation,
-            _reservation: reservation,
-            _buffered: BufferedRecord::new(Arc::clone(&self.metrics)),
+            hold,
         };
         let append = Append {
             topic,
@@ -341,14 +352,12 @@ impl Accumulator {
         })
     }
 
-    /// Wait for `permits` of buffer memory for what is left of `max_block`
-    /// since `send_started_at`.
+    /// Wait at most `remaining` for `permits` of buffer memory.
     async fn wait_for_memory(
         &self,
         permits: u32,
-        send_started_at: Instant,
+        remaining: Duration,
     ) -> Result<SemaphorePermit<'_>> {
-        let remaining = self.max_block.saturating_sub(send_started_at.elapsed());
         tokio::time::timeout(remaining, self.memory.acquire_many(permits))
             .await
             .map_err(|_| KrafkaError::timeout("max_block elapsed while waiting for buffer memory"))?

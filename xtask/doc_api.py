@@ -78,6 +78,8 @@ ALLOWLIST = {
     # coordinator is the point of KIP-939, so the guide has to show one; these
     # are `postgres`-shaped placeholders, not krafka API.
     "query_one", "execute",
+    # tracing-subscriber (the metrics guide's per-layer filter example)
+    "with", "init",
     # testcontainers (the testing guide's real-broker section)
     "with_exposed_port", "with_wait_for", "with_mapped_port", "start",
 }

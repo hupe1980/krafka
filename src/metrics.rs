@@ -941,6 +941,18 @@ impl Gauge {
             tracing::warn!("krafka bug: a gauge was decremented below zero");
         }
     }
+
+    /// Subtract `n`, never below zero. Going below zero is a krafka bug, as
+    /// for [`dec`](Self::dec).
+    #[inline]
+    pub(crate) fn sub(&self, n: u64) {
+        let result = self
+            .0
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(n));
+        if result.is_err() {
+            tracing::warn!("krafka bug: a gauge was decremented below zero");
+        }
+    }
 }
 
 /// Count, total and maximum of a timed operation.

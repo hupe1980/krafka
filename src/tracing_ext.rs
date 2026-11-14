@@ -4,8 +4,17 @@
 //! Every span goes through `tracing`. The name the conventions want,
 //! `{operation} {destination}`, and the span kind travel in the `otel.name`
 //! and `otel.kind` fields, which a `tracing` → OpenTelemetry bridge reads.
-//! Span macros evaluate no field when no subscriber is interested, so a
-//! process without one pays a callsite check per operation and nothing more.
+//!
+//! | Span | Target | Level | Opened |
+//! |---|---|---|---|
+//! | `send` | `krafka::producer` | `DEBUG` | once per record |
+//! | `poll` | `krafka::consumer` | `INFO` | once per `poll`/`recv` |
+//! | `commit` | `krafka::consumer` | `INFO` | once per commit |
+//! | `rebalance` | `krafka::consumer` | `INFO` | once per assignment change |
+//!
+//! A span no subscriber enables costs a callsite check and evaluates none of
+//! its fields. A subscriber that enables it pays for building it, a log layer
+//! included, so the per-record `send` span is at `DEBUG`.
 //!
 //! No span records record keys or values, or anything derived from a key
 //! but its size.
@@ -22,11 +31,11 @@ use crate::error::KrafkaError;
 /// breaking change.
 pub const OTEL_SEMCONV_VERSION: &str = "1.44.0";
 
-/// One `send` span per record, from `send`/`enqueue` to the record's outcome.
-/// The partition and offset are recorded as they become known.
+/// One `send` span per record, from `send`/`enqueue` to the record's outcome,
+/// at `DEBUG`. The partition and offset are recorded as they become known.
 #[inline]
 pub(crate) fn send_span(topic: &str, client_id: &str, key: Option<&[u8]>, tombstone: bool) -> Span {
-    tracing::info_span!(
+    tracing::debug_span!(
         target: "krafka::producer",
         "send",
         otel.name = %format_args!("send {topic}"),

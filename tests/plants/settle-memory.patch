@@ -1,0 +1,14 @@
+diff -ruN a/src/producer/batch.rs b/src/producer/batch.rs
+--- a/src/producer/batch.rs
++++ b/src/producer/batch.rs
+@@ -63,9 +63,7 @@
+     /// Give back `bytes`, `records` and the barrier counts of `generations`,
+     /// each in one operation.
+     fn settle(&self, bytes: usize, records: usize, generations: &[(u64, u32)]) {
+-        if bytes > 0 {
+-            self.memory.add_permits(bytes);
+-        }
++        let _ = bytes;
+         self.barrier.complete_many(generations);
+         self.metrics.buffered_records.sub(records as u64);
+     }

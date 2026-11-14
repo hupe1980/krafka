@@ -1,0 +1,12 @@
+diff -ruN a/src/tracing_ext.rs b/src/tracing_ext.rs
+--- a/src/tracing_ext.rs
++++ b/src/tracing_ext.rs
+@@ -38,7 +38,7 @@
+ /// at `DEBUG`. The partition and offset are recorded as they become known.
+ #[inline]
+ pub(crate) fn send_span(topic: &str, client_id: &str, key: Option<&[u8]>, tombstone: bool) -> Span {
+-    tracing::debug_span!(
++    tracing::info_span!(
+         target: "krafka::producer",
+         "send",
+         otel.name = %format_args!("send {topic}"),
