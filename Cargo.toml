@@ -141,7 +141,7 @@ proptest = "1"
 # installed. Same crate version as the main dependency.
 rustls = { version = "0.23.46", default-features = false }
 # `getrusage` for the send_cpu bench's process CPU time. Bindings only, no C build.
-libc = "0.2.170"
+libc = "0.2.183"
 
 # The micro-benchmarks reach the wire-protocol layer through `__private`.
 [[bench]]
