@@ -196,12 +196,15 @@ conventions **v1.44.0** (`krafka::OTEL_SEMCONV_VERSION`). The messaging
 conventions are still marked *Development* there; krafka follows one named
 version and moves to a newer one as a breaking change.
 
-| Span | When | `otel.kind` | `messaging.operation.type` |
-|---|---|---|---|
-| `send {topic}` | One per record, from `send`/`enqueue` to the record's outcome, across retries | `producer` | `send` |
-| `poll {topic}` | One per `poll`/`recv` of a consumer or share consumer | `client` | `receive` |
-| `commit {topic}` | One per offset commit (auto-commit included) or share `commit()` | `client` | `settle` |
-| `rebalance {group}` | One per assignment change, classic or KIP-848 | `internal` | — |
+| Span | When | Level | `otel.kind` | `messaging.operation.type` |
+|---|---|---|---|---|
+| `send {topic}` | One per record, from `send`/`enqueue` to the record's outcome, across retries | `DEBUG` | `producer` | `send` |
+| `poll {topic}` | One per `poll`/`recv` of a consumer or share consumer | `INFO` | `client` | `receive` |
+| `commit {topic}` | One per offset commit (auto-commit included) or share `commit()` | `INFO` | `client` | `settle` |
+| `rebalance {group}` | One per assignment change, classic or KIP-848 | `INFO` | `internal` | — |
+
+`send` is under the target `krafka::producer`, the others under
+`krafka::consumer`.
 
 The topic is left out of a `poll` or `commit` name when more than one topic
 applies. There is no `process` span: krafka hands records to the application
@@ -225,20 +228,31 @@ from a key but its size.
 The span name and kind travel in the `otel.name` and `otel.kind` fields, which
 the `tracing-opentelemetry` bridge reads. krafka depends on no OpenTelemetry
 crate (`just no-otel` checks the dependency graph); the subscriber, the bridge
-and the SDK belong to the application. Without a subscriber interested in the
-`krafka` targets no span is constructed, so the cost is one callsite check per
-operation. To drop krafka's spans, filter its targets in the subscriber — for
-example `EnvFilter::new("info,krafka=warn")` with `tracing-subscriber`.
+and the SDK belong to the application.
 
-The spans are at `INFO` level, under the targets `krafka::producer` and
-`krafka::consumer`. To see them without an OpenTelemetry pipeline, log each
-one when it closes:
+A span no subscriber enables costs one callsite check. A subscriber that
+enables it pays for constructing it, a log layer included, even if it never
+prints spans. With per-layer filters the log layer stays at `info` and only the
+tracing layer constructs `send` spans:
+
+```rust,ignore
+use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
+
+tracing_subscriber::registry()
+    .with(tracing_subscriber::fmt::layer().with_filter(EnvFilter::new("info")))
+    .with(otel_layer.with_filter(EnvFilter::new("info,krafka::producer=debug")))
+    .init();
+```
+
+To drop krafka's spans altogether, filter its targets — for example
+`EnvFilter::new("info,krafka=warn")`. To see them without an OpenTelemetry
+pipeline, log each one when it closes:
 
 ```rust,compile
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::format::FmtSpan;
 
-let filter = EnvFilter::new("warn,krafka=info");
+let filter = EnvFilter::new("warn,krafka=info,krafka::producer=debug");
 tracing_subscriber::fmt().with_env_filter(filter).with_span_events(FmtSpan::CLOSE).init();
 ```
 

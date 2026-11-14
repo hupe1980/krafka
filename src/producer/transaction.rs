@@ -1344,6 +1344,7 @@ impl TransactionalProducer {
     fn refuse_send(&self, mut record: Record, error: KrafkaError) -> KrafkaError {
         match super::SendObligation::on_send(
             &*self.producer.interceptor,
+            self.producer.accumulator.topics(),
             &mut record,
             self.producer.kafka.client_id(),
         ) {

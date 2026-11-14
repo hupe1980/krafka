@@ -252,8 +252,9 @@ println!("{}", snapshot.prometheus_text());
 
 - **Metrics.** Producer, consumer and connection counters, latencies as
   count/sum/max, Prometheus series named `krafka_*` with a `client_id` label.
-- **Spans.** `send`, `poll`, `commit` and `rebalance` spans through `tracing`,
-  on OpenTelemetry messaging semantic conventions `krafka::OTEL_SEMCONV_VERSION`.
+- **Spans.** `send` (at `DEBUG`, one per record), `poll`, `commit` and
+  `rebalance` (at `INFO`) spans through `tracing`, on OpenTelemetry messaging
+  semantic conventions `krafka::OTEL_SEMCONV_VERSION`.
   Record keys and values are never recorded. krafka depends on no
   OpenTelemetry crate; bridge `tracing` in the application.
 - **KIP-714.** Producers and consumers push their metrics to brokers whose

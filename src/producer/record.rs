@@ -396,6 +396,39 @@ impl Record {
 /// Interned topic handle reused across the producer routing path.
 pub(crate) type TopicHandle = Arc<str>;
 
+/// The topic names a producer has sent to, each held once, so a send shares
+/// its topic's handle instead of allocating one.
+///
+/// Read without a lock. A miss copies the table; past [`Self::CAPACITY`]
+/// topics a miss allocates a handle and leaves the table alone.
+#[derive(Debug, Default)]
+pub(crate) struct TopicInterner {
+    table: arc_swap::ArcSwap<ahash::AHashMap<Box<str>, TopicHandle>>,
+}
+
+impl TopicInterner {
+    /// The most topics held. A producer that writes to more pays one
+    /// allocation per send for the rest.
+    pub(crate) const CAPACITY: usize = 1024;
+
+    /// The handle for `topic`.
+    pub(crate) fn get(&self, topic: &str) -> TopicHandle {
+        if let Some(handle) = self.table.load().get(topic) {
+            return TopicHandle::clone(handle);
+        }
+        let handle = TopicHandle::from(topic);
+        let current = self.table.load_full();
+        if current.len() < Self::CAPACITY {
+            let mut next = (*current).clone();
+            next.insert(Box::from(topic), TopicHandle::clone(&handle));
+            // A racing miss may overwrite this insert; that topic is added
+            // again on its next send.
+            self.table.store(Arc::new(next));
+        }
+        handle
+    }
+}
+
 /// Internal payload retained after partition routing strips the topic.
 #[derive(Debug, Clone)]
 pub(crate) struct RoutedRecord {
@@ -480,8 +513,9 @@ pub const UNKNOWN_PARTITION: PartitionId = -1;
 #[must_use = "contains the result of a send operation"]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordMetadata {
-    /// Topic the record was sent to.
-    pub topic: String,
+    /// Topic the record was sent to, shared by the records of one batch.
+    /// Compare with `&*metadata.topic == "orders"`.
+    pub topic: Arc<str>,
     /// Partition the record was sent to.
     pub partition: PartitionId,
     /// Log offset of the committed record, or `-1` when no offset is available.
@@ -787,7 +821,7 @@ mod tests {
     #[test]
     fn test_record_metadata() {
         let metadata = RecordMetadata {
-            topic: "test".to_string(),
+            topic: "test".into(),
             partition: 0,
             offset: 42,
             timestamp: 1234567890000,
@@ -805,7 +839,7 @@ mod tests {
 
     fn meta_with(delivery: DeliveryConfirmation, offset: i64) -> RecordMetadata {
         RecordMetadata {
-            topic: "t".to_string(),
+            topic: "t".into(),
             partition: 0,
             offset,
             timestamp: -1,
@@ -899,14 +933,14 @@ mod tests {
     #[test]
     fn test_record_metadata_equality() {
         let a = RecordMetadata {
-            topic: "t".to_string(),
+            topic: "t".into(),
             partition: 0,
             offset: 1,
             timestamp: 100,
             delivery: DeliveryConfirmation::Offset,
         };
         let b = RecordMetadata {
-            topic: "t".to_string(),
+            topic: "t".into(),
             partition: 0,
             offset: 1,
             timestamp: 100,

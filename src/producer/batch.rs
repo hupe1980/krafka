@@ -9,7 +9,7 @@ use tokio::sync::{Semaphore, oneshot};
 use super::gate::TxnTicket;
 use super::identity::BatchIdentity;
 use super::record::{RecordMetadata, RoutedRecord};
-use crate::barrier::InFlightOpGuard;
+use crate::barrier::InFlightBarrier;
 use crate::error::{KrafkaError, Result};
 use crate::interceptor::{ProducerInterceptor, RecordContext};
 use crate::metrics::ProducerRecorder;
@@ -37,42 +37,170 @@ impl RecordData {
     }
 }
 
-/// Bytes reserved from the producer's `buffer_memory`, returned on drop.
-pub(crate) struct Reservation {
-    pub(crate) bytes: usize,
-    pub(crate) memory: Arc<Semaphore>,
-}
-
-impl Drop for Reservation {
-    fn drop(&mut self) {
-        self.memory.add_permits(self.bytes);
-    }
-}
-
-impl std::fmt::Debug for Reservation {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Reservation")
-            .field("bytes", &self.bytes)
-            .finish()
-    }
-}
-
-/// Counts one record in the producer's buffered-records gauge while it lives.
+/// What a record holds while it has no outcome, and gives back once it has
+/// one: its bytes of `buffer_memory`, its count in the flush/close barrier,
+/// and its count in the buffered-records gauge. One per producer.
 #[derive(Debug)]
-pub(crate) struct BufferedRecord {
+pub(crate) struct Release {
+    memory: Arc<Semaphore>,
+    barrier: Arc<InFlightBarrier>,
     metrics: Arc<ProducerRecorder>,
 }
 
-impl BufferedRecord {
-    pub(crate) fn new(metrics: Arc<ProducerRecorder>) -> Self {
-        metrics.buffered_records.inc();
-        Self { metrics }
+impl Release {
+    pub(crate) fn new(
+        memory: Arc<Semaphore>,
+        barrier: Arc<InFlightBarrier>,
+        metrics: Arc<ProducerRecorder>,
+    ) -> Self {
+        Self {
+            memory,
+            barrier,
+            metrics,
+        }
+    }
+
+    /// Give back `bytes`, `records` and the barrier counts of `generations`,
+    /// each in one operation.
+    fn settle(&self, bytes: usize, records: usize, generations: &[(u64, u32)]) {
+        if bytes > 0 {
+            self.memory.add_permits(bytes);
+        }
+        self.barrier.complete_many(generations);
+        self.metrics.buffered_records.sub(records as u64);
     }
 }
 
-impl Drop for BufferedRecord {
+/// One record's share of a [`Release`], from the moment it is reserved.
+///
+/// *Armed* when built at enqueue: dropped so, it gives back its own share —
+/// the path of a record refused after its reservation, or still in the
+/// engine's channel when the engine stops. *Disarmed* when a batch takes it
+/// into its [`Waiters`], which give back every record's share at once.
+#[derive(Debug)]
+pub(crate) struct RecordHold {
+    bytes: usize,
+    generation: u64,
+    release: Option<Arc<Release>>,
+}
+
+impl RecordHold {
+    /// Count the record in the buffered gauge and hold `bytes` of memory and
+    /// one barrier count of `generation`, both already taken by the caller.
+    pub(crate) fn new(bytes: usize, generation: u64, release: Arc<Release>) -> Self {
+        release.metrics.buffered_records.inc();
+        Self {
+            bytes,
+            generation,
+            release: Some(release),
+        }
+    }
+
+    /// Hand this record's share to whoever settles it next.
+    fn disarm(&mut self) -> Option<Arc<Release>> {
+        self.release.take()
+    }
+}
+
+impl Drop for RecordHold {
     fn drop(&mut self) {
-        self.metrics.buffered_records.dec();
+        if let Some(release) = self.release.take() {
+            release.settle(self.bytes, 1, &[(self.generation, 1)]);
+        }
+    }
+}
+
+/// The callers of one batch, and everything their records hold, given back
+/// once — when this is dropped, which every resolution path does after it
+/// answered the last caller.
+#[derive(Debug, Default)]
+pub(crate) struct Waiters {
+    list: Vec<Waiter>,
+    bytes: usize,
+    /// Barrier counts per generation, in append order; almost always one run.
+    first: Option<(u64, u32)>,
+    more: Vec<(u64, u32)>,
+    release: Option<Arc<Release>>,
+}
+
+impl Waiters {
+    /// Take `waiter` in, with its record's share.
+    pub(crate) fn push(&mut self, mut waiter: Waiter) {
+        if let Some(release) = waiter.hold.disarm() {
+            self.count(waiter.hold.bytes, waiter.hold.generation);
+            if self.release.is_none() {
+                self.release = Some(release);
+            }
+        }
+        self.list.push(waiter);
+    }
+
+    fn count(&mut self, bytes: usize, generation: u64) {
+        self.bytes += bytes;
+        if let Some((last, n)) = self.more.last_mut().or(self.first.as_mut())
+            && *last == generation
+        {
+            *n += 1;
+        } else if self.first.is_none() {
+            self.first = Some((generation, 1));
+        } else {
+            self.more.push((generation, 1));
+        }
+    }
+
+    /// Split into the first `mid` callers and the rest, each with its own
+    /// records' shares.
+    fn split_off(mut self, mid: usize) -> (Self, Self) {
+        let tail = self.list.split_off(mid.min(self.list.len()));
+        let release = self.release.take();
+        let mut halves = (Self::default(), Self::default());
+        for (half, list) in [
+            (&mut halves.0, std::mem::take(&mut self.list)),
+            (&mut halves.1, tail),
+        ] {
+            half.release.clone_from(&release);
+            for waiter in &list {
+                half.count(waiter.hold.bytes, waiter.hold.generation);
+            }
+            half.list = list;
+        }
+        // The shares moved to the halves; `self` gives back nothing.
+        self.bytes = 0;
+        self.first = None;
+        self.more.clear();
+        halves
+    }
+
+    /// The callers, in record order, to be answered. What they hold is given
+    /// back when `self` drops, after the last of them.
+    pub(crate) fn drain(&mut self) -> std::vec::Drain<'_, Waiter> {
+        self.list.drain(..)
+    }
+}
+
+impl Drop for Waiters {
+    fn drop(&mut self) {
+        let Some(release) = self.release.take() else {
+            return;
+        };
+        let records = self
+            .first
+            .iter()
+            .chain(&self.more)
+            .map(|&(_, n)| n as usize)
+            .sum();
+        match self.first {
+            Some(first) if self.more.is_empty() => {
+                release.settle(self.bytes, records, &[first]);
+            }
+            Some(first) => {
+                let mut all = Vec::with_capacity(self.more.len() + 1);
+                all.push(first);
+                all.extend_from_slice(&self.more);
+                release.settle(self.bytes, records, &all);
+            }
+            None => {}
+        }
     }
 }
 
@@ -85,9 +213,8 @@ pub(crate) struct Waiter {
     pub(crate) span: tracing::Span,
     pub(crate) context: RecordContext,
     pub(crate) txn: Option<TxnTicket>,
-    pub(crate) _operation: InFlightOpGuard,
-    pub(crate) _reservation: Reservation,
-    pub(crate) _buffered: BufferedRecord,
+    /// The record's memory and counts; settled with its batch's [`Waiters`].
+    pub(crate) hold: RecordHold,
 }
 
 impl Waiter {
@@ -129,7 +256,7 @@ pub(crate) struct Batch {
     /// Shared with the request future that encodes them.
     pub(crate) records: Arc<Vec<RecordData>>,
     /// `None` once the callers were answered while the batch was in flight.
-    pub(crate) waiters: Option<Vec<Waiter>>,
+    pub(crate) waiters: Option<Waiters>,
     /// Estimated bytes, as charged against `buffer_memory`.
     pub(crate) bytes: usize,
     /// When the first record was appended: the linger clock.
@@ -156,7 +283,7 @@ impl Batch {
     pub(crate) fn new(now: Instant, deadline: Instant) -> Self {
         Self {
             records: Arc::new(Vec::new()),
-            waiters: Some(Vec::new()),
+            waiters: Some(Waiters::default()),
             bytes: 0,
             created: now,
             deadline,
@@ -186,8 +313,12 @@ impl Batch {
 
     pub(crate) fn push(&mut self, data: RecordData, size: usize, generation: u64, waiter: Waiter) {
         Arc::make_mut(&mut self.records).push(data);
-        if let Some(waiters) = self.waiters.as_mut() {
-            waiters.push(waiter);
+        match self.waiters.as_mut() {
+            Some(waiters) => waiters.push(waiter),
+            // Not reached: records join only an open batch, whose callers
+            // are unanswered. Dropped, the armed hold settles and the caller
+            // sees `Closed`.
+            None => drop(waiter),
         }
         self.bytes += size;
         self.generation = self.generation.max(generation);
@@ -203,10 +334,9 @@ impl Batch {
         let mid = count / 2;
         let mut records: Vec<RecordData> = self.records.as_ref().clone();
         let tail_records = records.split_off(mid);
-        let mut waiters = self.waiters.take().unwrap_or_default();
-        let tail_waiters = waiters.split_off(mid.min(waiters.len()));
+        let (waiters, tail_waiters) = self.waiters.take().unwrap_or_default().split_off(mid);
         let ratio = |n: usize| self.bytes * n / count;
-        let half = |records: Vec<RecordData>, waiters: Vec<Waiter>, bytes: usize| Self {
+        let half = |records: Vec<RecordData>, waiters: Waiters, bytes: usize| Self {
             records: Arc::new(records),
             waiters: Some(waiters),
             bytes,
@@ -332,5 +462,145 @@ mod tests {
             (42, 3, 17)
         );
         assert!(decoded.attributes.is_transactional);
+    }
+
+    // ── Settling ────────────────────────────────────────────────────────
+
+    const CAPACITY: usize = 1000;
+
+    struct Rig {
+        memory: Arc<Semaphore>,
+        barrier: Arc<InFlightBarrier>,
+        metrics: Arc<ProducerRecorder>,
+        release: Arc<Release>,
+    }
+
+    impl Rig {
+        fn new() -> Self {
+            let memory = Arc::new(Semaphore::new(CAPACITY));
+            let barrier = Arc::new(InFlightBarrier::new());
+            let metrics = Arc::new(ProducerRecorder::default());
+            let release = Arc::new(Release::new(
+                Arc::clone(&memory),
+                Arc::clone(&barrier),
+                Arc::clone(&metrics),
+            ));
+            Self {
+                memory,
+                barrier,
+                metrics,
+                release,
+            }
+        }
+
+        /// A waiter for a record of `bytes`, taken from the budget and
+        /// registered in the barrier's current generation, as enqueue does.
+        fn waiter(&self, bytes: usize) -> Waiter {
+            self.memory
+                .try_acquire_many(u32::try_from(bytes).unwrap())
+                .unwrap()
+                .forget();
+            let generation = self.barrier.register("test").unwrap();
+            Waiter {
+                response: oneshot::channel().0,
+                span: tracing::Span::none(),
+                context: RecordContext::new(),
+                txn: None,
+                hold: RecordHold::new(bytes, generation, Arc::clone(&self.release)),
+            }
+        }
+
+        fn assert_whole(&self) {
+            assert_eq!(self.memory.available_permits(), CAPACITY, "memory");
+            assert!(self.barrier.is_idle(), "barrier");
+            assert_eq!(self.metrics.buffered_records.get(), 0, "gauge");
+        }
+    }
+
+    #[test]
+    fn waiters_count_bytes_and_generation_runs() {
+        let rig = Rig::new();
+        let mut waiters = Waiters::default();
+        waiters.push(rig.waiter(10));
+        waiters.push(rig.waiter(20));
+        let _ = rig.barrier.snapshot();
+        waiters.push(rig.waiter(30));
+        assert_eq!(waiters.bytes, 60);
+        assert_eq!(waiters.first, Some((0, 2)));
+        assert_eq!(waiters.more, vec![(1, 1)]);
+        assert_eq!(rig.memory.available_permits(), CAPACITY - 60);
+
+        let (head, tail) = waiters.split_off(1);
+        assert_eq!(
+            (head.bytes, head.first, head.more.len()),
+            (10, Some((0, 1)), 0)
+        );
+        assert_eq!(
+            (tail.bytes, tail.first, tail.more.clone()),
+            (50, Some((0, 1)), vec![(1, 1)])
+        );
+
+        drop(head);
+        assert_eq!(
+            rig.memory.available_permits(),
+            CAPACITY - 50,
+            "head gave back 10"
+        );
+        assert_eq!(rig.metrics.buffered_records.get(), 2);
+        drop(tail);
+        rig.assert_whole();
+    }
+
+    /// Answering does not settle; dropping the drained collection does, once.
+    #[test]
+    fn waiters_settle_once_after_the_last_caller() {
+        let rig = Rig::new();
+        let mut waiters = Waiters::default();
+        for _ in 0..5 {
+            waiters.push(rig.waiter(100));
+        }
+        for waiter in waiters.drain() {
+            assert_eq!(rig.memory.available_permits(), CAPACITY - 500, "not before");
+            drop(waiter);
+        }
+        assert_eq!(
+            rig.memory.available_permits(),
+            CAPACITY - 500,
+            "not on drain"
+        );
+        drop(waiters);
+        rig.assert_whole();
+    }
+
+    /// An armed hold gives back its own share; a disarmed one gives nothing.
+    #[test]
+    fn an_armed_hold_settles_alone_and_a_disarmed_one_not_at_all() {
+        let rig = Rig::new();
+        let alone = rig.waiter(100);
+        assert_eq!(rig.metrics.buffered_records.get(), 1);
+        drop(alone);
+        rig.assert_whole();
+
+        let mut taken = rig.waiter(100);
+        let release = taken.hold.disarm();
+        drop(taken);
+        assert_eq!(
+            rig.memory.available_permits(),
+            CAPACITY - 100,
+            "disarmed: nothing"
+        );
+        assert!(release.is_some());
+    }
+
+    /// A batch dropped without answering (the engine is gone) still settles.
+    #[test]
+    fn unanswered_waiters_settle_on_drop() {
+        let rig = Rig::new();
+        let mut waiters = Waiters::default();
+        for _ in 0..3 {
+            waiters.push(rig.waiter(50));
+        }
+        drop(waiters);
+        rig.assert_whole();
     }
 }

@@ -83,7 +83,20 @@ impl Recorder {
     }
 }
 
+/// Keep a second dispatcher registered for the life of the test process.
+///
+/// With one live dispatcher, `tracing-core` stops consulting its dispatcher
+/// list and caches a new callsite's interest from the default of whichever
+/// thread hits it first. In parallel tests that thread is often another
+/// test's, without a subscriber, and the callsite is cached `never` for this
+/// test's subscriber too. A second dispatcher keeps the list in use.
+fn keep_dispatchers_listed() {
+    static SECOND: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    SECOND.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+}
+
 fn record() -> (Recorder, tracing::subscriber::DefaultGuard) {
+    keep_dispatchers_listed();
     let recorder = Recorder::default();
     let guard =
         tracing::subscriber::set_default(tracing_subscriber::registry().with(recorder.clone()));

@@ -1,0 +1,11 @@
+diff -ruN a/src/producer/engine.rs b/src/producer/engine.rs
+--- a/src/producer/engine.rs
++++ b/src/producer/engine.rs
+@@ -1222,6 +1222,7 @@
+             Err(error.clone()),
+         );
+     }
++    std::mem::forget(waiters);
+ }
+ 
+ // ── The request ─────────────────────────────────────────────────────────────

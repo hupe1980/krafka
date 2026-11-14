@@ -973,7 +973,7 @@ async fn test_auto_create_topics_materialises_the_topic() {
         .send(krafka::Record::new("created-by-the-producer", "v"))
         .await
         .expect("the broker creates the topic because the client asked it to");
-    assert_eq!(metadata.topic, "created-by-the-producer");
+    assert_eq!(&*metadata.topic, "created-by-the-producer");
 
     producer.close().await.unwrap();
 }

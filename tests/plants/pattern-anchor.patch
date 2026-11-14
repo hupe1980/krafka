@@ -1,11 +1,12 @@
+diff -ruN a/src/consumer/pattern.rs b/src/consumer/pattern.rs
 --- a/src/consumer/pattern.rs
 +++ b/src/consumer/pattern.rs
 @@ -32,7 +32,7 @@
      ///
      /// [`KrafkaError::Config`] naming the pattern when it does not compile.
      pub fn new(pattern: &str) -> Result<Self> {
--        let matcher = regex_lite::Regex::new(&format!("^(?:{pattern})$")).map_err(|e| {
-+        let matcher = regex_lite::Regex::new(&pattern.to_string()).map_err(|e| {
-             KrafkaError::config(format!("invalid topic pattern {pattern:?}: {e}"))
-         })?;
+-        let matcher = regex_lite::Regex::new(&format!("^(?:{pattern})$"))
++        let matcher = regex_lite::Regex::new(&pattern.to_string())
+             .map_err(|e| KrafkaError::config(format!("invalid topic pattern {pattern:?}: {e}")))?;
          Ok(Self {
+             source: pattern.to_string(),

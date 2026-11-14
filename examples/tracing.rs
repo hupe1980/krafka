@@ -6,7 +6,8 @@
 //! per poll, `commit` per offset commit, `rebalance` per assignment change —
 //! with their OpenTelemetry messaging attributes (`otel.name`, `otel.kind`,
 //! `messaging.*`). An OpenTelemetry bridge such as `tracing-opentelemetry`
-//! exports the same spans. `RUST_LOG` overrides the filter.
+//! exports the same spans. The per-record `send` span is at `DEBUG`, the
+//! others at `INFO`. `RUST_LOG` overrides the filter.
 //!
 //! Needs a broker at `KAFKA_BOOTSTRAP_SERVERS` (default `localhost:9092`) with
 //! `auto.create.topics.enable=true` (the broker default), or an existing
@@ -31,7 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("warn,krafka=info")),
+                .unwrap_or_else(|_| EnvFilter::new("warn,krafka=info,krafka::producer=debug")),
         )
         .with_span_events(FmtSpan::CLOSE)
         .init();

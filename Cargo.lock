@@ -1970,6 +1970,7 @@ dependencies = [
  "futures",
  "futures-core",
  "hmac 0.12.1",
+ "libc",
  "lz4_flex",
  "parking_lot",
  "pbkdf2",

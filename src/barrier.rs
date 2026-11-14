@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
@@ -11,12 +10,14 @@ use crate::error::{KrafkaError, Result};
 /// Counts operations by the generation they started in, so a flush or a close
 /// waits for exactly the operations that started before it.
 ///
-/// Each [`start`](Self::start) registers in the current generation.
-/// [`snapshot`](Self::snapshot) and [`begin_close`](Self::begin_close) end
-/// the current generation and return it; [`wait_for`](Self::wait_for) then
-/// waits until no operation of that generation or an earlier one is still
-/// running. An operation started afterwards belongs to a later generation, so
-/// it can neither hold the wait up nor, by completing, release it early.
+/// Each [`register`](Self::register) counts one operation in the current
+/// generation; [`complete_many`](Self::complete_many) uncounts any number of
+/// them, of any generations, under one lock. [`snapshot`](Self::snapshot) and
+/// [`begin_close`](Self::begin_close) end the current generation and return
+/// it; [`wait_for`](Self::wait_for) then waits until no operation of that
+/// generation or an earlier one is still running. An operation registered
+/// afterwards belongs to a later generation, so it can neither hold the wait
+/// up nor, by completing, release it early.
 pub(crate) struct InFlightBarrier {
     closing: AtomicBool,
     state: Mutex<Generations>,
@@ -44,8 +45,10 @@ impl InFlightBarrier {
         self.closing.load(Ordering::Acquire)
     }
 
-    /// Register a new operation unless shutdown has already started.
-    pub(crate) fn start(self: &Arc<Self>, owner: &str) -> Result<InFlightOpGuard> {
+    /// Count a new operation in the current generation, unless shutdown has
+    /// already begun, and return that generation. The caller owes exactly one
+    /// [`complete_many`](Self::complete_many) count for it.
+    pub(crate) fn register(&self, owner: &str) -> Result<u64> {
         let mut state = self.state.lock();
         // Checked under the lock `begin_close` takes, so an operation is
         // either counted in a generation the close waits for or refused.
@@ -54,10 +57,37 @@ impl InFlightBarrier {
         }
         let generation = state.current;
         *state.running.entry(generation).or_default() += 1;
-        Ok(InFlightOpGuard {
-            barrier: Some(self.clone()),
-            generation,
-        })
+        Ok(generation)
+    }
+
+    /// Uncount `count` operations of each `(generation, count)`.
+    ///
+    /// Waiters are woken only when a generation has no operation left: a
+    /// [`wait_for`](Self::wait_for) can end at no other moment.
+    pub(crate) fn complete_many(&self, generations: &[(u64, u32)]) {
+        let drained = {
+            let mut state = self.state.lock();
+            let mut drained = false;
+            for &(generation, count) in generations {
+                if let Some(running) = state.running.get_mut(&generation) {
+                    *running = running.saturating_sub(u64::from(count));
+                    if *running == 0 {
+                        state.running.remove(&generation);
+                        drained = true;
+                    }
+                }
+            }
+            drained
+        };
+        if drained {
+            // Broadcast: a flush and a close can wait on different generations.
+            self.notify.notify_waiters();
+        }
+    }
+
+    /// Whether no registered operation is still running.
+    pub(crate) fn is_idle(&self) -> bool {
+        self.state.lock().running.is_empty()
     }
 
     /// End the current generation and return it, for [`wait_for`](Self::wait_for).
@@ -101,20 +131,6 @@ impl InFlightBarrier {
             .next()
             .is_none()
     }
-
-    fn complete(&self, generation: u64) {
-        {
-            let mut state = self.state.lock();
-            if let Some(count) = state.running.get_mut(&generation) {
-                *count -= 1;
-                if *count == 0 {
-                    state.running.remove(&generation);
-                }
-            }
-        }
-        // Broadcast: a flush and a close can wait on different generations.
-        self.notify.notify_waiters();
-    }
 }
 
 impl Default for InFlightBarrier {
@@ -134,32 +150,39 @@ impl fmt::Debug for InFlightBarrier {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct InFlightOpGuard {
-    barrier: Option<Arc<InFlightBarrier>>,
-    generation: u64,
-}
-
-impl InFlightOpGuard {
-    /// The generation this operation started in.
-    #[inline]
-    pub(crate) fn generation(&self) -> u64 {
-        self.generation
-    }
-}
-
-impl Drop for InFlightOpGuard {
-    fn drop(&mut self) {
-        if let Some(barrier) = self.barrier.take() {
-            barrier.complete(self.generation);
-        }
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    use std::sync::Arc;
+    use std::task::Poll;
+
+    /// One registered operation, uncounted on drop.
+    struct Op {
+        barrier: Arc<InFlightBarrier>,
+        generation: u64,
+    }
+
+    impl Drop for Op {
+        fn drop(&mut self) {
+            self.barrier.complete_many(&[(self.generation, 1)]);
+        }
+    }
+
+    trait Start {
+        fn start(&self, owner: &str) -> Result<Op>;
+    }
+
+    impl Start for Arc<InFlightBarrier> {
+        fn start(&self, owner: &str) -> Result<Op> {
+            let generation = self.register(owner)?;
+            Ok(Op {
+                barrier: Arc::clone(self),
+                generation,
+            })
+        }
+    }
 
     // The tests below tell the real implementations from stubs (a constant
     // `is_closing`, an empty `Debug`).
@@ -422,5 +445,78 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), barrier.wait_for(target))
             .await
             .expect("drained once the slow operation completes");
+    }
+
+    /// `complete_many` across two generations releases the older wait only
+    /// when that generation's count reaches zero.
+    #[tokio::test]
+    async fn complete_many_releases_a_wait_only_when_its_generation_drains() {
+        let barrier = Arc::new(InFlightBarrier::new());
+        let g0a = barrier.register("producer").unwrap();
+        let g0b = barrier.register("producer").unwrap();
+        let target = barrier.snapshot();
+        let g1 = barrier.register("producer").unwrap();
+        assert_eq!((g0a, g0b, g1), (0, 0, 1));
+
+        barrier.complete_many(&[(0, 1), (1, 1)]);
+        let early = tokio::time::timeout(
+            std::time::Duration::from_millis(25),
+            barrier.wait_for(target),
+        )
+        .await;
+        assert!(early.is_err(), "one operation of generation 0 still runs");
+
+        barrier.complete_many(&[(0, 1)]);
+        tokio::time::timeout(std::time::Duration::from_secs(1), barrier.wait_for(target))
+            .await
+            .expect("generation 0 drained");
+        assert!(barrier.is_idle());
+    }
+
+    /// A completion that drains no generation wakes nobody.
+    #[tokio::test]
+    async fn a_completion_that_drains_nothing_wakes_nobody() {
+        let barrier = Arc::new(InFlightBarrier::new());
+        barrier.register("producer").unwrap();
+        barrier.register("producer").unwrap();
+        let notified = barrier.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        barrier.complete_many(&[(0, 1)]);
+        assert_eq!(
+            futures_poll(notified.as_mut()),
+            Poll::Pending,
+            "one operation still runs: no wake"
+        );
+        barrier.complete_many(&[(0, 1)]);
+        assert_eq!(
+            futures_poll(notified.as_mut()),
+            Poll::Ready(()),
+            "the generation drained: wake"
+        );
+    }
+
+    fn futures_poll<F: std::future::Future>(fut: std::pin::Pin<&mut F>) -> Poll<F::Output> {
+        let waker = std::task::Waker::noop();
+        fut.poll(&mut std::task::Context::from_waker(waker))
+    }
+
+    #[test]
+    fn is_idle_follows_registration() {
+        let barrier = InFlightBarrier::new();
+        assert!(barrier.is_idle(), "fresh");
+        let generation = barrier.register("producer").unwrap();
+        assert!(!barrier.is_idle(), "one registered");
+        barrier.complete_many(&[(generation, 1)]);
+        assert!(barrier.is_idle(), "completed");
+    }
+
+    #[test]
+    fn register_after_begin_close_refuses() {
+        let barrier = InFlightBarrier::new();
+        barrier.begin_close();
+        assert!(barrier.register("producer").is_err());
+        assert!(barrier.is_idle());
     }
 }

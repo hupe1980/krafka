@@ -1,0 +1,14 @@
+diff -ruN a/src/producer/batch.rs b/src/producer/batch.rs
+--- a/src/producer/batch.rs
++++ b/src/producer/batch.rs
+@@ -172,6 +172,10 @@
+     /// The callers, in record order, to be answered. Everything is given
+     /// back when the iterator is dropped, after the last caller.
+     pub(crate) fn drain(&mut self) -> std::vec::Drain<'_, Waiter> {
++        if let Some(release) = self.release.take() {
++            let first = self.first.unwrap_or((0, 0));
++            release.settle(self.bytes, first.1 as usize, &[first]);
++        }
+         self.list.drain(..)
+     }
+ }

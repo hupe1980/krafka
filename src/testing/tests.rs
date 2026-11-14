@@ -4782,7 +4782,7 @@ async fn auto_create_topics_lets_a_send_materialise_its_topic() {
         .send(crate::Record::new("created-on-demand", "v"))
         .await
         .expect("the broker creates the topic because the client asked it to");
-    assert_eq!(metadata.topic, "created-on-demand");
+    assert_eq!(&*metadata.topic, "created-on-demand");
 
     producer.close().await.unwrap();
 }

@@ -22,6 +22,11 @@ pattern member that never joins, and a subscription changed during a join
 that never reaches the coordinator, and one coordination connection shared by
 every member on a handle.
 
+Producer-overhead plants: the per-record `send` span back at `INFO`; a
+batch's memory, flush/close count and gauge released before its callers
+are answered, never on a failure path, twice after a split, or without its
+memory; and the drop warning for a producer with nothing buffered.
+
 Cancel-safety plants: the send path's drop guard not reporting a cancelled
 send, an `enqueue` that appends before its last await, a consumer `poll` that
 moves the position before returning, a share `poll` that takes records before
@@ -80,6 +85,12 @@ PLANTS = {
     "has-subscription": Plant("topic_patterns", "a_broker_pattern_is_sent_and_follows_new_topics", "pat-a assigned by the coordinator"),
     "shared-coordination": Plant("coordinator_connection", "a_parked_join_does_not_stall_another_member_on_the_same_handle", "behind group A's parked join"),
     "stale-join": Plant("topic_patterns", "a_classic_subscription_changed_during_a_join_is_not_lost", "b to be assigned after the in-flight join"),
+    "send-span-level": Plant("producer_overhead", "span_send_is_not_built_at_info", "no send span at info"),
+    "settle-early": Plant("producer_overhead", "settle_flush_waits_for_every_caller", "flush returned before every caller was answered"),
+    "settle-skipped": Plant("producer_overhead", "settle_on_every_failure_path", "flush did not return"),
+    "settle-twice": Plant("producer_overhead", "settle_after_split", "split: released twice"),
+    "settle-memory": Plant("producer_overhead", "settle_parked_sender_is_woken", "max_block elapsed"),
+    "drop-warning": Plant("producer_overhead", "drop_warns_only_with_records_at_risk", "a producer that never sent"),
 }
 
 
