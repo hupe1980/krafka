@@ -159,6 +159,12 @@ name = "protocol"
 harness = false
 required-features = ["internal"]
 
+# Zstd batch encode and decode at the producer default level.
+[[bench]]
+name = "zstd_batch"
+harness = false
+required-features = ["internal", "zstd"]
+
 # End-to-end send path against the fake broker: a krafka-vs-krafka regression
 # gate, not a quotable benchmark.
 [[bench]]
