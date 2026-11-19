@@ -13,6 +13,14 @@ not a complete record.
 
 ## [Unreleased]
 
+### Changed
+
+- zstd record batches encode and decode with zrip, a pure-Rust codec,
+  instead of ruzstd (decoding) and the C-backed `zstd` crate (encoding).
+  The `zstd` feature no longer compiles C. Decoding is 1.8-2.9x faster.
+  Level 3 encoding is 2.5x faster on 1 KiB batches and 0.46-0.77x as fast
+  on 16-256 KiB batches, with output 1-7% larger than C zstd's.
+
 ## [0.32.0] — 2026-11-14
 
 ### Breaking
