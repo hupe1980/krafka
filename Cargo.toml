@@ -36,7 +36,7 @@ tracing = "0.1.41"
 flate2 = "1"                                          # gzip
 snap = "1"                                            # snappy
 lz4_flex = "0.11.6"                                   # lz4
-zrip = { version = "0.8.18", default-features = false, features = ["std", "simd"] } # zstd (pure Rust; encode behind `zstd`)
+zrip = { version = "0.8.21", default-features = false, features = ["std", "simd"] } # zstd (pure Rust; encode behind `zstd`)
 
 # CRC32 for protocol
 crc32c = "0.6"
