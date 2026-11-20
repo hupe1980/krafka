@@ -53,8 +53,7 @@ gzip, Snappy and LZ4 compression, the share consumer, SOCKS5 and client
 telemetry are always compiled in.
 
 krafka links no C library and needs no system dependency. The default build
-compiles C only for `ring`; `zstd`, `rustls-aws-lc-rs` and `aws-msk` compile
-more.
+compiles C only for `ring`; `rustls-aws-lc-rs` and `aws-msk` compile more.
 
 ## Prerequisites
 

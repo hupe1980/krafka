@@ -9,8 +9,8 @@
 //!
 //! - **No C library, no system dependency**: the default build needs a Rust
 //!   toolchain and the C compiler `cc` finds for `ring`, nothing else. Every
-//!   codec decodes in pure Rust; the opt-in `zstd`, `rustls-aws-lc-rs` and
-//!   `aws-msk` features compile more C
+//!   codec encodes and decodes in pure Rust; the opt-in `rustls-aws-lc-rs`
+//!   and `aws-msk` features compile more C
 //! - **Async-native**: built on Tokio
 //! - **Shared buffers**: decoded record keys, values and header values are slices of
 //!   the fetched response (one allocation per uncompressed batch, for the
@@ -89,7 +89,7 @@
 //! |---------|---------|-------------|
 //! | `ring` | **yes** | rustls crypto backend using `ring`. |
 //! | `rustls-aws-lc-rs` | no | rustls crypto backend using `aws-lc-rs`; offers post-quantum X25519MLKEM768 key exchange first. Compiles C and needs CMake. |
-//! | `zstd` | no | Zstd *encoding* via `zstd` (compiles C). Zstd decoding is always available. |
+//! | `zstd` | no | Zstd *encoding* via `zrip` (pure Rust). Zstd decoding is always available. |
 //! | `aws-msk` | no | AWS MSK IAM authentication with the SDK credential chain (compiles C and needs CMake, via `aws-lc-sys`). |
 //! | `oauth-oidc` | no | Built-in OIDC token provider for SASL/OAUTHBEARER: the `client_credentials` grant (KIP-768) and RFC 7523 client assertions (KIP-1258). Adds no cryptography dependency — assertions are supplied pre-signed. |
 //! | `native-tls-roots` | no | Load platform-native root certificates via `rustls-native-certs`. |

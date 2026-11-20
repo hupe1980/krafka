@@ -41,7 +41,7 @@ table.
 <!-- generated:kips:features -->
 | Feature | Default | Gates API versions | Description |
 |---------|---------|--------------------|-------------|
-| `zstd` | no | — | Zstd compression on the producer via `zstd`, which compiles C (`zstd-sys`). Zstd decompression is pure Rust and always on. |
+| `zstd` | no | — | Zstd compression on the producer via `zrip` (pure Rust). Zstd decompression is always on. |
 | `aws-msk` | no | — | AWS MSK IAM authentication with the SDK credential chain; compiles C and needs CMake (`aws-lc-sys`). |
 | `oauth-oidc` | no | — | Built-in OIDC token provider for SASL/OAUTHBEARER: the `client_credentials` grant (KIP-768) and RFC 7523 client assertions (KIP-1258). Adds no cryptography dependency. |
 | `native-tls-roots` | no | — | Load platform-native root certificates via `rustls-native-certs`. |
@@ -144,9 +144,9 @@ Acks::All     // -1: Wait for all in-sync replicas
 
 ### Compression Values
 
-Every codec decodes in every build (zstd through the pure-Rust `ruzstd`).
+Every codec decodes in every build (zstd through the pure-Rust `zrip`).
 Gzip, Snappy and LZ4 also encode in every build; zstd *encoding* is opt-in
-through the `zstd` feature, which compiles the C zstd library through `zstd-sys`.
+through the `zstd` feature, also pure Rust through `zrip`.
 Use `Compression::is_available()` to check whether a codec can encode;
 `build()` rejects a codec that cannot.
 
