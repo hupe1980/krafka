@@ -19,8 +19,7 @@ through the same checks and review.
 - **Supported versions.** krafka is pre-1.0. Only the latest minor release
   receives fixes, security fixes included; a minor release may carry breaking
   changes, each listed under `Breaking` in
-  [CHANGELOG.md](https://github.com/hupe1980/krafka/blob/main/CHANGELOG.md),
-  and [Upgrading to 0.27](@/docs/upgrading.md) maps the current one.
+  [CHANGELOG.md](https://github.com/hupe1980/krafka/blob/main/CHANGELOG.md).
 - **Release cadence.** Releases ship when a change is ready, not on a
   schedule; dates are in CHANGELOG.md.
 - **Rust and Kafka.** The minimum supported Rust version is 1.95, checked by
@@ -39,25 +38,9 @@ verify a published crate against its build-provenance attestation are in
 
 ## How a change is checked
 
-The `justfile` defines every check, and CI runs the same recipes. A pull
-request merges only when the single
-required check, which depends on every CI job, passes. `just ci` runs:
-
-| Recipe | What fails it |
-|---|---|
-| `fmt-check`, `clippy`, `check`, `doc` | formatting; any lint, with `unsafe_code`, `panic`, `unwrap` and `expect` denied; a broken doc link |
-| `test`, `test-ring`, `test-aws-lc`, `minimal-features` | the test suites under each TLS backend and the smallest feature set |
-| `sim`, `cancel-safety` | a seeded fault workload breaking an invariant; a data-path method without a cancel-safety section |
-| `protocol-parity`, `protocol-reachability`, `fuzz-coverage` | the API version table disagreeing with Kafka's schemas; a version nothing negotiates; a version with no fuzz path |
-| `claims-check`, `docs-test`, `site-check` | a capability claim not generated from its registry; a documentation sample that does not compile; a guide naming an API the crate does not have |
-| `config-reachability`, `test-reachability` | a setting no builder reaches; a public API no test names |
-| `no-c`, `no-otel`, `advisory-floors`, `secret-debug` | C beyond `ring` in the default build; an OpenTelemetry crate in the graph; a dependency floor with a known advisory; a credential type deriving `Debug` |
-| `version-check`, `ci-job-parity`, `workflow-lint` | versions out of step; a recipe with no CI job; an unsafe workflow pattern |
-
-Beyond `just ci`, CI runs the Docker integration suites against several Kafka
-versions and Redpanda, `just deny` for licences and advisories, and fuzzing on
-each pull request. Releases are published
-only from the release workflow, with an attested crate and SBOM.
+Run `just ci` for local checks. CI also exercises supported Kafka versions and
+Redpanda, runs the fuzz targets, and checks dependency licences and advisories.
+The [justfile](https://github.com/hupe1980/krafka/blob/main/justfile) lists the recipes.
 
 ## AI-assisted development
 

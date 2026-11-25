@@ -1,42 +1,4 @@
-//! AWS MSK IAM authentication using AWS Signature v4.
-//!
-//! This module implements the AWS_MSK_IAM SASL mechanism for authenticating
-//! with Amazon Managed Streaming for Apache Kafka (MSK) using IAM credentials.
-//!
-//! The authentication process:
-//! 1. Client sends a signed authentication payload
-//! 2. MSK verifies the signature against IAM
-//! 3. MSK returns success/failure
-//!
-//! # Example
-//!
-//! ## With explicit credentials (not recommended for production)
-//!
-//! ```ignore
-//! use krafka::auth::{MskIamAuthenticator, AwsMskIamCredentials};
-//!
-//! let credentials = AwsMskIamCredentials::new("AKID", "secret", "us-east-1");
-//! let authenticator = MskIamAuthenticator::new(&credentials, "broker.kafka.us-east-1.amazonaws.com")?;
-//! let payload = authenticator.create_auth_payload();
-//! ```
-//!
-//! ## From environment variables
-//!
-//! ```ignore
-//! use krafka::auth::AwsMskIamCredentials;
-//!
-//! // Loads from AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, AWS_REGION
-//! let credentials = AwsMskIamCredentials::from_env()?;
-//! ```
-//!
-//! ## From AWS SDK default chain (requires `aws-msk` feature)
-//!
-//! ```ignore
-//! use krafka::auth::AwsMskIamCredentials;
-//!
-//! // Loads from default chain (env vars, instance profile, ECS task role, etc.)
-//! let credentials = AwsMskIamCredentials::from_default_chain("us-east-1").await?;
-//! ```
+//! AWS Signature Version 4 signing for the `AWS_MSK_IAM` SASL mechanism.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;

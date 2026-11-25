@@ -6,11 +6,10 @@
 [![MSRV](https://img.shields.io/badge/MSRV-1.95-blue.svg)](https://github.com/rust-lang/rust/releases/tag/1.95.0)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 
-A pure-Rust, async-native Apache Kafka client: producer, transactions,
-consumer groups, share groups and a full admin client, on Tokio. No C library
-and no system dependency in the default build, no `unsafe`, no panics on a
-malformed response. Protocol versions tracked against
-<!-- generated:kips:kafka-ref -->Apache Kafka 4.3<!-- /generated -->, checked in CI against Kafka's own schemas.
+An async Apache Kafka client in Rust for Tokio. Produce records, run
+transactions, read from consumer groups or share groups, and administer a cluster.
+Protocol support is checked against
+<!-- generated:kips:kafka-ref -->Apache Kafka 4.3<!-- /generated -->.
 
 ## 🚀 Quick start
 
@@ -40,12 +39,8 @@ built from it and shares the pool: `kafka.producer()`, `kafka.consumer(group)`,
 
 ## ✨ Why krafka
 
-**No C library, no system dependency.** The default build needs a Rust
-toolchain and the C compiler `cc` finds for `ring`, and nothing else: no
-OpenSSL, no librdkafka, no CMake, no pkg-config. `ring` is the only crate in
-the default graph that compiles C; the features that compile more (`zstd`,
-`rustls-aws-lc-rs`, `aws-msk`) say so below. `just no-c` checks this for six
-targets.
+**Build dependencies.** The default build needs Rust and a C compiler for
+`ring`. It links neither librdkafka nor OpenSSL.
 
 **A broker response is untrusted input.** `unsafe_code`, `panic`, `unwrap` and
 `expect` are denied crate-wide. A malformed frame surfaces as a `KrafkaError`,
@@ -293,7 +288,8 @@ krafka speaks the **client** side of the Kafka protocol, tracked against
 **KIPs named in this documentation:** 59 implemented · 8 partial (KIP-368, KIP-525, KIP-794, KIP-800, KIP-853, KIP-932, KIP-1071, KIP-1242). Each with its status, evidence and reason: [KIP support](https://hupe1980.github.io/krafka/docs/protocol/#kip-support).
 <!-- /generated -->
 
-Not implemented, or implemented in part:
+<details>
+<summary>Protocol limits and partial implementations</summary>
 
 <!-- generated:kips:not-implemented -->
 - **SASL/GSSAPI (Kerberos) authentication** (GSSAPI) — No mature pure-Rust GSSAPI implementation exists, and linking system Kerberos libraries would add a C dependency for every user.
@@ -315,9 +311,7 @@ Not implemented, or implemented in part:
 - Not spoken by a client (broker-, controller- and KRaft-internal): `LeaderAndIsr`, `StopReplica`, `UpdateMetadata`, `ControlledShutdown`, `Vote`, `BeginQuorumEpoch`, `EndQuorumEpoch`, `AlterPartition`, `Envelope`, `FetchSnapshot`, `BrokerRegistration`, `BrokerHeartbeat`, `UnregisterBroker`, `AllocateProducerIds`, `ControllerRegistration`, `AssignReplicasToDirs`, `UpdateRaftVoter`, `InitializeShareGroupState`, `ReadShareGroupState`, `WriteShareGroupState`, `DeleteShareGroupState`, `ReadShareGroupStateSummary`
 <!-- /generated -->
 
-Schema registries are a separate service; krafka provides the
-`serdes::Serializer` and `Deserializer` hooks. See the
-[Cookbook](https://hupe1980.github.io/krafka/docs/cookbook/).
+</details>
 
 ## 🎮 Examples
 
@@ -355,8 +349,6 @@ Release history: **[CHANGELOG.md](CHANGELOG.md)**
 
 krafka is pre-1.0: a **minor** release may carry breaking changes, and each
 one is listed under `Breaking` in [CHANGELOG.md](CHANGELOG.md).
-[Upgrading to 0.27](https://hupe1980.github.io/krafka/docs/upgrading/) maps
-every removed name to its replacement.
 
 ## 🛠️ Development
 

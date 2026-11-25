@@ -8,7 +8,7 @@ name: Release
 #   package  `cargo package` once, in a job with no write, OIDC or attestation
 #            permission; the CycloneDX SBOM is checked against `cargo tree`
 #   attest   build provenance for exactly that `.crate` and the SBOM
-#   publish  in the `release` environment (a required reviewer approves):
+#   publish  in the `release` environment:
 #            repackages from the same commit without building and stops if the
 #            digest differs, then publishes through crates.io Trusted
 #            Publishing with a token minted for this run

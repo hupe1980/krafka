@@ -1,6 +1,6 @@
 [package]
 name = "krafka"
-version = "0.32.0"
+version = "0.32.1"
 edition = "2024"
 rust-version = "1.95"
 authors = ["hupe1980"]
@@ -57,7 +57,7 @@ regex-lite = "0.1.9"
 # TCP keepalive configuration
 socket2 = "0.5"
 
-# Cryptography for SASL/SCRAM
+# SCRAM authentication and AWS MSK IAM signing
 sha2 = "0.11"
 hmac = "0.13"
 pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }

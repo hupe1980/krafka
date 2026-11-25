@@ -1,30 +1,5 @@
-//! SCRAM (Salted Challenge Response Authentication Mechanism) implementation.
-//!
-//! This module implements SCRAM-SHA-256 and SCRAM-SHA-512 as defined in RFC 5802.
-//! It provides a complete SCRAM client implementation for SASL authentication.
-//!
-//! # SCRAM Protocol Flow
-//!
-//! 1. **Client First**: Client sends username and nonce
-//! 2. **Server First**: Server responds with salt, iteration count, and combined nonce
-//! 3. **Client Final**: Client sends proof of password knowledge
-//! 4. **Server Final**: Server sends verification signature
-//!
-//! The client never uses channel binding: every exchange carries the `n,,`
-//! GS2 header, which is what Apache Kafka brokers accept.
-//!
-//! # Example
-//!
-//! ```ignore
-//! use krafka::auth::scram::{ScramClient, ScramMechanism};
-//!
-//! let mut client = ScramClient::new("username", "password", ScramMechanism::Sha256);
-//! let client_first = client.client_first_message();
-//! // ... send to server, receive server_first ...
-//! let client_final = client.client_final_message(&server_first)?;
-//! // ... send to server, receive server_final ...
-//! client.verify_server_final(&server_final)?;
-//! ```
+//! SCRAM-SHA-256 and SCRAM-SHA-512 for Kafka SASL authentication.
+//! Exchanges use the `n,,` GS2 header (no channel binding).
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use hmac::{Hmac, KeyInit, Mac};
@@ -314,9 +289,6 @@ impl ScramClient {
             ));
         }
 
-        // Calculate salted password — offloaded to a blocking thread pool to
-        // avoid stalling the Tokio executor during the CPU-intensive PBKDF2
-        // computation (up to MAX_PBKDF2_ITERATIONS iterations).
         let password_bytes = Zeroizing::new(self.password.as_bytes().to_vec());
         let salted_password =
             match compute_pbkdf2(self.mechanism, password_bytes, salt, iteration_count).await {
@@ -492,13 +464,7 @@ fn xor_bytes(a: &[u8], b: &[u8]) -> Vec<u8> {
     a.iter().zip(b.iter()).map(|(x, y)| x ^ y).collect()
 }
 
-/// Run PBKDF2 on a dedicated blocking thread to avoid stalling the Tokio executor.
-///
-/// PBKDF2 with high iteration counts (up to [`MAX_PBKDF2_ITERATIONS`] = 1,000,000)
-/// can take tens of milliseconds on a single CPU core. Running it directly on a
-/// Tokio worker thread would block the executor from processing other tasks during
-/// that time. `tokio::task::spawn_blocking` moves the computation to a dedicated
-/// blocking-thread pool, keeping async tasks responsive.
+/// Derive the salted password on the blocking pool to keep Tokio workers responsive.
 async fn compute_pbkdf2(
     mechanism: ScramMechanism,
     password: Zeroizing<Vec<u8>>,

@@ -102,7 +102,7 @@ OpenTelemetry meter — is a function of the snapshot in the application.
 Latencies are summaries (`_seconds_sum`, `_seconds_count`) with a `_max_seconds`
 gauge beside each:
 
-```promql
+```text
 # Mean send latency over 5 minutes
 rate(krafka_producer_send_latency_seconds_sum[5m])
   / rate(krafka_producer_send_latency_seconds_count[5m])
@@ -184,7 +184,7 @@ it looks like an unreachable broker. A failed fetch counts in both
 `oauth_token_fetches_total` and `oauth_token_fetch_failures_total` and leaves
 the expiry alone.
 
-```promql
+```text
 rate(krafka_oauth_token_fetch_failures_total[5m]) > 0
 (krafka_oauth_token_expiry_epoch_ms / 1000) - time()
 ```

@@ -57,11 +57,3 @@ A crash, timeout or out-of-memory exits non-zero and leaves the input in
 cd fuzz
 cargo +nightly fuzz run <target> artifacts/<target>/<crash-file>
 ```
-
-## Bounds under test
-
-A broker can send arbitrary bytes, so no decoder may panic, hang or allocate
-without bound. Array decode loops are bounded by `MAX_DECODE_ARRAY_LEN` and by
-the bytes available, record counts by the bytes that hold them, decompression
-by `RecordBatch::decode_with_limit`'s cap, and the OIDC HTTP parser by its
-line, header-count, trailer and body caps.

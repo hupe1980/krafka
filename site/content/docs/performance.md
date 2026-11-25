@@ -12,6 +12,7 @@ slug_id = "performance"
 | Command | What it measures |
 |---------|------------------|
 | `just bench` | The criterion suite in `benches/`: varints, CRC32C, murmur2, record-batch encode/decode, compression, the partitioners, and the send and consume paths against `krafka::testing::FakeBroker` |
+| `cargo bench --bench send_cpu --features test-broker` | Process CPU time per enqueued record, including the in-process broker, with and without an INFO log subscriber |
 | `just bench-baseline` | Saves a baseline for `bench-check`; run it on a known-good commit |
 | `just bench-check` | Compares `benches/send_path.rs` and `benches/consume_path.rs` against the baseline; fails when a measurement regresses by more than 10 % with a confidence interval excluding zero. It never overwrites the baseline |
 

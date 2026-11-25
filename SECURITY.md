@@ -18,8 +18,7 @@ receives security fixes; upgrade to it to get them.
 ## Verifying a release
 
 Every release is published to crates.io from `.github/workflows/publish.yml`
-through crates.io Trusted Publishing, after the tagged commit passed CI and a
-maintainer approved the release environment. The workflow attests build
+through crates.io Trusted Publishing, after the tagged commit passes CI. The workflow attests build
 provenance for the exact `.crate` it publishes and for the release's CycloneDX
 SBOM, then checks that crates.io serves those bytes.
 
