@@ -58,9 +58,9 @@ regex-lite = "0.1.9"
 socket2 = "0.5"
 
 # Cryptography for SASL/SCRAM
-sha2 = "0.10.2"
-hmac = "0.12"
-pbkdf2 = { version = "0.12.1", default-features = false, features = ["hmac"] }
+sha2 = "0.11"
+hmac = "0.13"
+pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
 base64 = "0.22"
 zeroize = { version = "1.8", features = ["derive"] }
 subtle = "2.5"
