@@ -13,7 +13,7 @@ slug_id = "architecture"
 - No C library to install and no system dependency: TLS is rustls, every
   codec decodes in Rust
 - The default build compiles C only inside `ring`, rustls' crypto backend;
-  the `zstd` (encoding), `rustls-aws-lc-rs` and `aws-msk` features compile more
+  the `rustls-aws-lc-rs` and `aws-msk` features compile more
 - `just no-c` checks the dependency graph
 
 ### 2. Tokio
@@ -139,7 +139,7 @@ feature.
 | Gzip | `flate2` | Best ratio, slowest |
 | Snappy | `snap`, snappy-java stream format (as the Java client writes it); raw snappy also decodes | Good balance |
 | LZ4 | `lz4_flex` | Fastest |
-| Zstd | `ruzstd` (decode), `zstd` (encode, feature) | High ratio, fast decode |
+| Zstd | `zrip` (decode; encode with the `zstd` feature) | High ratio, fast decode |
 
 ## Network Layer
 

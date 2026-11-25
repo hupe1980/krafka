@@ -43,8 +43,8 @@ built from it and shares the pool: `kafka.producer()`, `kafka.consumer(group)`,
 **No C library, no system dependency.** The default build needs a Rust
 toolchain and the C compiler `cc` finds for `ring`, and nothing else: no
 OpenSSL, no librdkafka, no CMake, no pkg-config. `ring` is the only crate in
-the default graph that compiles C; the features that compile more (`zstd`,
-`rustls-aws-lc-rs`, `aws-msk`) say so below. `just no-c` checks this for six
+the default graph that compiles C; the features that compile more
+(`rustls-aws-lc-rs`, `aws-msk`) say so below. `just no-c` checks this for six
 targets.
 
 **A broker response is untrusted input.** `unsafe_code`, `panic`, `unwrap` and
@@ -92,7 +92,7 @@ in-process fake Kafka cluster with fault injection; see
 |---|---|---|
 | `ring` | **yes** | rustls crypto backend on `ring` (compiles C with `cc`). |
 | `rustls-aws-lc-rs` | no | rustls crypto backend on `aws-lc-rs`; offers post-quantum `X25519MLKEM768` first. Needs CMake. |
-| `zstd` | no | Zstd *encoding* (`zstd-sys`, compiles C). Zstd decoding is always available. |
+| `zstd` | no | Zstd *encoding* (`zrip`, pure Rust). Zstd decoding is always available. |
 | `aws-msk` | no | MSK IAM with the AWS SDK credential chain (pulls `aws-lc-sys`, needs CMake). |
 | `oauth-oidc` | no | Built-in OIDC token provider for OAUTHBEARER. No cryptography dependency. |
 | `native-tls-roots` | no | The platform's root certificates. |

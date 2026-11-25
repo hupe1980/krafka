@@ -32,8 +32,8 @@ pub enum Compression {
     Lz4 = 3,
     /// Zstd compression.
     ///
-    /// Decoding is pure Rust and always available. Encoding requires the
-    /// `zstd` Cargo feature, which pulls in `zstd-sys` and needs a C toolchain.
+    /// Decoding is always available. Encoding requires the `zstd` Cargo
+    /// feature. Both use the pure-Rust zrip codec.
     Zstd = 4,
 }
 
@@ -106,17 +106,13 @@ impl Compression {
     /// Inclusive range of levels this codec accepts, or `None` when it takes
     /// no level.
     ///
-    /// `Gzip` is zlib's 0–9. `Zstd`'s range comes from the linked libzstd
-    /// rather than a hard-coded constant, because it has widened over time:
-    /// negative "fast" levels were added in 1.3.4 and the floor has moved
-    /// since.
+    /// `Gzip` is zlib's 0–9. `Zstd` takes libzstd's range, which the Java
+    /// client accepts; the encoder maps it onto the -7..=4 that zrip
+    /// implements.
     #[must_use]
     pub fn level_range(&self) -> Option<std::ops::RangeInclusive<i32>> {
         match self {
             Self::Gzip => Some(0..=9),
-            #[cfg(feature = "zstd")]
-            Self::Zstd => Some(zstd::compression_level_range()),
-            #[cfg(not(feature = "zstd"))]
             Self::Zstd => Some(-131_072..=22),
             _ => None,
         }
@@ -177,8 +173,14 @@ impl Compression {
             }
             #[cfg(feature = "zstd")]
             Self::Zstd => {
-                // 3 is libzstd's default and the Java client's.
-                let compressed = zstd::encode_all(payload, level.unwrap_or(3))
+                // 3 is libzstd's default and the Java client's, and libzstd's
+                // level 0 means that default. zrip implements -7..=4, so
+                // denser levels clamp to 4 and faster ones to -7.
+                let level = match level.unwrap_or(3) {
+                    0 => 3,
+                    l => l.clamp(-7, 4),
+                };
+                let compressed = zrip::compress(payload, level)
                     .map_err(|e| KrafkaError::compression(e.to_string()))?;
                 Ok(Bytes::from(compressed))
             }
@@ -1161,22 +1163,15 @@ fn decompress_records(
     Ok(Bytes::from(result))
 }
 
-/// Decompress zstd with the pure-Rust decoder. A batch may hold several
-/// concatenated frames; all are decoded, bounded by `max` in total.
+/// Decompress zstd. A batch may hold several concatenated frames; all are
+/// decoded (skippable frames ignored), bounded by `max` in total.
 fn decompress_zstd(data: &[u8], max: usize) -> Result<Vec<u8>> {
-    use std::io::Read;
-    let mut out = Vec::with_capacity(data.len().saturating_mul(3).min(max));
-    let mut input = data;
-    while !input.is_empty() && out.len() <= max {
-        let decoder = ruzstd::decoding::StreamingDecoder::new(&mut input)
-            .map_err(|e| KrafkaError::compression(format!("zstd: {e}")))?;
-        let budget = (max as u64 + 1) - out.len() as u64;
-        decoder
-            .take(budget)
-            .read_to_end(&mut out)
-            .map_err(|e| KrafkaError::compression(format!("zstd: {e}")))?;
-    }
-    Ok(out)
+    zrip::decompress_with_limit(data, max).map_err(|e| match e {
+        zrip::DecompressError::OutputTooSmall => KrafkaError::compression(format!(
+            "zstd decompressed size exceeds maximum {max} bytes (possible compression bomb)"
+        )),
+        e => KrafkaError::compression(format!("zstd: {e}")),
+    })
 }
 
 /// Read a decoder to the end, stopping one byte past `max` so an oversized
@@ -1482,8 +1477,8 @@ mod tests {
         let payload = compressible_payload();
 
         let fast = Compression::Zstd
-            .compress_with_level(&payload, Some(1))
-            .expect("level 1 must encode");
+            .compress_with_level(&payload, Some(-7))
+            .expect("level -7 must encode");
         let dense = Compression::Zstd
             .compress_with_level(&payload, Some(19))
             .expect("level 19 must encode");
@@ -1495,10 +1490,11 @@ mod tests {
         // in output size — on this fixture level 3 is *larger* than level 1,
         // because they use different match-finding strategies rather than the
         // same one turned up. Asserting a monotonic ladder would encode a
-        // property zstd does not promise.
+        // property zstd does not promise. zrip clamps 19 to 4, which is also
+        // larger than 1 here, so the fast end is -7.
         assert!(
             dense.len() < fast.len(),
-            "level 19 must compress better than level 1, got {} vs {}",
+            "level 19 must compress better than level -7, got {} vs {}",
             dense.len(),
             fast.len()
         );
@@ -1555,7 +1551,7 @@ mod tests {
                 .expect("batch must encode")
         };
 
-        let fast = encode_at(Some(1));
+        let fast = encode_at(Some(-7));
         let dense = encode_at(Some(19));
         assert!(
             dense.len() < fast.len(),
@@ -1845,6 +1841,23 @@ mod tests {
         let encoded = batch.encode().unwrap();
         let decoded = RecordBatch::decode(&mut encoded.clone()).unwrap();
         assert_eq!(decoded.records.len(), 1);
+    }
+
+    /// zrip implements -7..=4: denser libzstd levels clamp to 4, faster ones
+    /// to -7, and 0 is libzstd's default, 3.
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn zstd_levels_map_onto_zrip_range() {
+        let payload = compressible_payload();
+        let at = |level| {
+            Compression::Zstd
+                .compress_with_level(&payload, Some(level))
+                .expect("every level in level_range must encode")
+        };
+
+        assert_eq!(at(22), at(4));
+        assert_eq!(at(0), at(3));
+        assert_eq!(at(-131_072), at(-7));
     }
 
     #[test]
@@ -2146,38 +2159,31 @@ mod tests {
     #[test]
     fn zstd_decodes_in_every_build() {
         let plain = plain_batch(50, 100);
-        let one = ruzstd::encoding::compress_to_vec(
-            records_of(&plain),
-            ruzstd::encoding::CompressionLevel::Fastest,
-        );
+        let one = zrip::compress(records_of(&plain), 1).unwrap();
         let mut batch = repack(&plain, Compression::Zstd, &one);
         assert_eq!(RecordBatch::decode(&mut batch).unwrap().records.len(), 50);
 
         // Two concatenated frames are one record section.
         let records = records_of(&plain);
         let (a, b) = records.split_at(records.len() / 2);
-        let mut two =
-            ruzstd::encoding::compress_to_vec(a, ruzstd::encoding::CompressionLevel::Fastest);
-        two.extend(ruzstd::encoding::compress_to_vec(
-            b,
-            ruzstd::encoding::CompressionLevel::Fastest,
-        ));
+        let mut two = zrip::compress(a, 1).unwrap();
+        two.extend(zrip::compress(b, 1).unwrap());
         let mut batch = repack(&plain, Compression::Zstd, &two);
         assert_eq!(RecordBatch::decode(&mut batch).unwrap().records.len(), 50);
     }
 
     #[test]
     fn zstd_decode_is_bounded() {
-        let frame = ruzstd::encoding::compress_to_vec(
-            &vec![0u8; 1024 * 1024][..],
-            ruzstd::encoding::CompressionLevel::Fastest,
-        );
-        // Decoding stops one byte past the limit instead of inflating it all.
-        assert_eq!(
-            decompress_zstd(&frame, 64 * 1024).unwrap().len(),
-            64 * 1024 + 1
-        );
+        let frame = zrip::compress(&vec![0u8; 1024 * 1024], 1).unwrap();
         let err = decompress_records(Compression::Zstd, &Bytes::from(frame), 64 * 1024)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exceeds maximum"), "{err}");
+
+        // The limit spans concatenated frames, each under it on its own.
+        let frame = zrip::compress(&[0u8; 48], 1).unwrap();
+        let two = [frame.as_slice(), &frame].concat();
+        let err = decompress_records(Compression::Zstd, &Bytes::from(two), 64)
             .unwrap_err()
             .to_string();
         assert!(err.contains("exceeds maximum"), "{err}");

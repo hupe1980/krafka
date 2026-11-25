@@ -469,7 +469,7 @@ description = "rustls crypto backend using `ring`."
 description = "rustls crypto backend using `aws-lc-rs`; offers post-quantum X25519MLKEM768 key exchange first. Compiles C and needs CMake (`aws-lc-sys`)."
 
 [feature.zstd]
-description = "Zstd compression on the producer via `zstd`, which compiles C (`zstd-sys`). Zstd decompression is pure Rust and always on."
+description = "Zstd compression on the producer via `zrip` (pure Rust). Zstd decompression is always on."
 
 [feature.aws-msk]
 description = "AWS MSK IAM authentication with the SDK credential chain; compiles C and needs CMake (`aws-lc-sys`)."

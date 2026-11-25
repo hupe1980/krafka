@@ -16,8 +16,8 @@ title = "Nothing to link"
 body = """
 `cargo add krafka` needs a Rust toolchain and the C compiler `ring` uses — \
 no librdkafka, no OpenSSL, no CMake, no pkg-config, no system library. \
-`ring` is the only crate in the default build that compiles C; `zstd` \
-encoding, the aws-lc-rs backend and MSK IAM are opt-in features that add more.
+`ring` is the only crate in the default build that compiles C; the aws-lc-rs \
+backend and MSK IAM are opt-in features that add more.
 """
 
 [[extra.pillars]]

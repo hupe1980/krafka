@@ -356,7 +356,7 @@ not covered by semver.
 | Gzip | Always on | Good compression, slower |
 | Snappy | Always on | Fast, moderate compression. Encoded and decoded in snappy-java's stream format, as the Java client writes it; raw snappy also decodes |
 | LZ4 | Always on | Very fast, good compression |
-| Zstd | Decode always on; encode with `zstd` | High ratio, fast decode. Decoding is pure Rust (`ruzstd`); encoding compiles the C zstd library through `zstd-sys` |
+| Zstd | Decode always on; encode with `zstd` | High ratio, fast decode. Pure Rust (`zrip`) both ways |
 
 > **Note:** Decompression output is capped at 128 MiB by default to protect against compression bombs. This limit is configurable with the consumer builder's `max_decompressed_size`. Compressed payloads that expand beyond the limit will return a `KrafkaError::compression` error.
 

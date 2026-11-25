@@ -59,7 +59,7 @@ SYS_ALLOWLIST = {
 # (a C compiler), or "cmake" (a C compiler and CMake), with the crate that
 # causes it.
 FEATURE_C: dict[str, tuple[str | None, str | None]] = {
-    "zstd": ("cc", "zstd-sys"),
+    "zstd": (None, None),
     "rustls-aws-lc-rs": ("cmake", "aws-lc-sys"),
     "aws-msk": ("cmake", "aws-lc-sys"),
     "oauth-oidc": (None, None),
@@ -271,8 +271,8 @@ def self_test() -> int:
     import tempfile
 
     plants = {
-        # A default dependency whose build script compiles C (zstd-sys).
-        "cc-build-dep": ("default = [", "default = [\"zstd\", ", "compiles C"),
+        # A default dependency whose build script compiles C (aws-lc-sys).
+        "cc-build-dep": ("default = [", "default = [\"rustls-aws-lc-rs\", ", "compiles C"),
         # cmake as a build dependency of the crate itself.
         "cmake-build-dep": ("[dev-dependencies]\n", "[build-dependencies]\ncmake = \"0.1\"\n\n[dev-dependencies]\n", "cmake"),
     }
